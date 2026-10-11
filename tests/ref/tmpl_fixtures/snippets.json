@@ -1,0 +1,692 @@
+[
+ {
+  "source": "{% for i in range(2) %}[{{ x }}]{% endfor %}{% set x = 1 %}{{ x }}",
+  "context": {
+   "x": 5
+  },
+  "expect": "[][]1"
+ },
+ {
+  "source": "{% macro m() %}[{{ y }}]{% endmacro %}{{ m() }}{% set y = 2 %}{{ m() }}",
+  "context": {
+   "y": 7
+  },
+  "expect": "[][2]"
+ },
+ {
+  "source": "{% macro m() %}[{{ z }}]{% endmacro %}{{ m() }}{% set z = 2 %}{{ m() }}{% for i in [1] %}{% set z = 3 %}{{ m() }}{% endfor %}",
+  "context": {},
+  "expect": "[][2][2]"
+ },
+ {
+  "source": "{% set a = 1 %}{% for i in [1,2] %}{{ a }}{% set a = a + 10 %}{{ a }},{% endfor %}{{ a }}",
+  "context": {},
+  "expect": "111,111,1"
+ },
+ {
+  "source": "{% for i in [1,2] %}{% if i == 2 %}{{ b }}{% endif %}{% set b = i %}{% endfor %}",
+  "context": {
+   "b": "ctx"
+  },
+  "expect": "ctx"
+ },
+ {
+  "source": "{% for i in [1,2] %}{% if i == 1 %}{% set c = 'set' %}{% endif %}[{{ c }}]{% endfor %}",
+  "context": {
+   "c": "ctx"
+  },
+  "expect": "[set][ctx]"
+ },
+ {
+  "source": "{{ loop }}|{% for i in [1] %}{% for j in [2] %}{{ loop.index }}{% endfor %}{% endfor %}",
+  "context": {},
+  "expect": "|1"
+ },
+ {
+  "source": "{% for a, b in [[1,2],[3,4]] %}{{ a }}{{ b }}{% endfor %}|{% for a, b in {'x': 1}.items() %}{{ a }}{{ b }}{% endfor %}",
+  "context": {},
+  "expect": "1234|x1"
+ },
+ {
+  "source": "{% for x in [] %}a{% else %}empty{% endfor %}|{% for x in [1,2,3] if x > 1 %}{{ loop.index }}/{{ loop.length }}{{ loop.last }}{% endfor %}",
+  "context": {},
+  "expect": "empty|1/2False2/2True"
+ },
+ {
+  "source": "{% for x in [1,2] %}{% continue %}{% else %}E{% endfor %}|{% for x in [1,2] %}{{ x }}{% break %}{% else %}E{% endfor %}",
+  "context": {},
+  "expect": "E|1E"
+ },
+ {
+  "source": "{% for x in xs %}{{ loop.index0 }}{{ loop.revindex }}{{ loop.revindex0 }}{{ loop.first }}{{ loop.last }}{{ loop.previtem }}{{ loop.nextitem }}{{ loop.cycle('a','b') }}{{ loop.changed(x) }};{% endfor %}",
+  "context": {
+   "xs": [
+    1,
+    1,
+    2
+   ]
+  },
+  "expect": "032TrueFalse1aTrue;121FalseFalse12bFalse;210FalseTrue1aTrue;"
+ },
+ {
+  "source": "{{ namespace(a=1) }}|{{ namespace(a=1).a }}|{{ namespace(a=1).b }}|{{ namespace({'q': 2}, r=3) }}",
+  "context": {},
+  "expect": "<Namespace {'a': 1}>|1||<Namespace {'q': 2, 'r': 3}>"
+ },
+ {
+  "source": "{{ range(3) }}|{{ range(3)|list }}|{{ range(1,10,3)|list }}|{{ range(5,0,-2)|list }}|{{ range(10)[2:8:3] }}",
+  "context": {},
+  "expect": "range(0, 3)|[0, 1, 2]|[1, 4, 7]|[5, 3, 1]|range(2, 8, 3)"
+ },
+ {
+  "source": "{{ 'a b  c'.split() }}|{{ 'a,b,,c'.split(',') }}|{{ 'a,b,c'.split(',', 1) }}|{{ 'a,b,c'.rsplit(',', 1) }}|{{ '  x  '.strip() }}|{{ 'xxhixx'.strip('x') }}|{{ ' a  b '.rsplit(None, 1) }}",
+  "context": {},
+  "expect": "['a', 'b', 'c']|['a', 'b', '', 'c']|['a', 'b,c']|['a,b', 'c']|x|hi|[' a', 'b']"
+ },
+ {
+  "source": "{{ [1, 'a', none]|join(',') }}|{{ 'abc'|join('-') }}|{{ {'a':1,'b':2}|join('-') }}|{{ users|join(', ', attribute='n') }}",
+  "context": {
+   "users": [
+    {
+     "n": "x"
+    },
+    {
+     "n": "y"
+    }
+   ]
+  },
+  "expect": "1,a,None|a-b-c|a-b|x, y"
+ },
+ {
+  "source": "{{ 'é😀a'|length }}|{{ 'é😀a'[1] }}|{{ 'é😀a'[-1] }}|{{ 'é😀a'[::-1] }}|{{ 'héllo'[1:3] }}|{{ 'héllo'.find('l') }}|{{ 'ǆemo ßtraße'.title() }}|{{ 'ßtraße'.upper() }}|{{ 'ΑΣ ΣΑ'.lower() }}",
+  "context": {},
+  "expect": "3|😀|a|a😀é|él|2|ǅemo Sstraße|SSTRASSE|ας σα"
+ },
+ {
+  "source": "{{ (1, 'a') }}|{{ {'a': 1}.items() }}|{{ {'a': 1}.keys() }}|{{ {'a': 1}.values() }}|{{ [1, 'a', none, true, 1.5, {'k': 'v'}] }}|{{ (1,) }}",
+  "context": {},
+  "expect": "(1, 'a')|dict_items([('a', 1)])|dict_keys(['a'])|dict_values([1])|[1, 'a', None, True, 1.5, {'k': 'v'}]|(1,)"
+ },
+ {
+  "source": "{{ \"it's\" }}|{{ [\"it's\", 'say \"hi\"', \"both ' \\\"\"] }}|{{ ['\\n\\t\\\\', 'é😀\\u200b\\xa0\\x07'] }}",
+  "context": {},
+  "expect": "it's|[\"it's\", 'say \"hi\"', 'both \\' \"']|['\\n\\t\\\\', 'é😀\\u200b\\xa0\\x07']"
+ },
+ {
+  "source": "{{ 3/2 }}|{{ 4/2 }}|{{ 7//2 }}|{{ -7//2 }}|{{ -7 % 3 }}|{{ 7.5 % 2 }}|{{ 2**10 }}|{{ 1e20 }}|{{ 1.0e-5 }}|{{ 0.1+0.2 }}|{{ 1_000 }}|{{ 0x1F }}|{{ 0b101 }}|{{ 0o17 }}",
+  "context": {},
+  "expect": "1.5|2.0|3|-4|2|1.5|1024|1e+20|1e-05|0.30000000000000004|1000|31|5|15"
+ },
+ {
+  "source": "{{ ('<b>'|safe) + '<i>' }}|{{ '<i>' + ('<b>'|safe) }}|{{ ('<b>'|safe) ~ '<i>' }}|{{ '<a href=\"x\">'|e }}|{{ ('<b>'|safe)|e }}|{{ ('<b>'|safe)|forceescape }}",
+  "context": {},
+  "expect": "<b>&lt;i&gt;|&lt;i&gt;<b>|<b><i>|&lt;a href=&#34;x&#34;&gt;|<b>|&lt;b&gt;"
+ },
+ {
+  "source": "{% if []|selectattr('a') %}T{% else %}F{% endif %}|{% if {}|items %}T{% else %}F{% endif %}|{{ xs|select('odd')|list }}|{{ xs|reject('even')|list }}|{{ xs|map('string')|join }}",
+  "context": {
+   "xs": [
+    1,
+    2,
+    3,
+    4
+   ]
+  },
+  "expect": "T|T|[1, 3]|[1, 3]|1234"
+ },
+ {
+  "source": "{{ ms|selectattr('role', 'equalto', 'user')|map(attribute='content')|list }}|{{ ms|rejectattr('role', '==', 'user')|list|length }}|{{ ms|map(attribute='missing', default='d')|list }}",
+  "context": {
+   "ms": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    }
+   ]
+  },
+  "expect": "['a']|1|['d', 'd']"
+ },
+ {
+  "source": "{{ d|dictsort }}|{{ d|dictsort(reverse=true) }}|{{ d|dictsort(false, 'value') }}|{{ d|items|list }}",
+  "context": {
+   "d": {
+    "b": 2,
+    "A": 3,
+    "c": 1
+   }
+  },
+  "expect": "[('A', 3), ('b', 2), ('c', 1)]|[('c', 1), ('b', 2), ('A', 3)]|[('c', 1), ('b', 2), ('A', 3)]|[('b', 2), ('A', 3), ('c', 1)]"
+ },
+ {
+  "source": "{{ xs|sort }}|{{ xs|sort(reverse=true) }}|{{ ws|sort }}|{{ ws|sort(case_sensitive=true) }}|{{ ps|sort(attribute='age')|map(attribute='n')|list }}|{{ xs|unique|list }}|{{ ws|unique|list }}",
+  "context": {
+   "xs": [
+    3,
+    1,
+    2,
+    3
+   ],
+   "ws": [
+    "b",
+    "A",
+    "a",
+    "B"
+   ],
+   "ps": [
+    {
+     "n": "x",
+     "age": 3
+    },
+    {
+     "n": "y",
+     "age": 1
+    }
+   ]
+  },
+  "expect": "[1, 2, 3, 3]|[3, 3, 2, 1]|['A', 'a', 'b', 'B']|['A', 'B', 'a', 'b']|['y', 'x']|[3, 1, 2]|['b', 'A']"
+ },
+ {
+  "source": "{{ xs|min }}|{{ xs|max }}|{{ xs|sum }}|{{ xs|first }}|{{ xs|last }}|{{ []|first }}|{{ xs|batch(2)|list }}|{{ xs|slice(2)|list }}|{{ xs|batch(3, 'x')|list }}",
+  "context": {
+   "xs": [
+    4,
+    2,
+    9,
+    1,
+    7
+   ]
+  },
+  "expect": "1|9|23|4|7||[[4, 2], [9, 1], [7]]|[[4, 2, 9], [1, 7]]|[[4, 2, 9], [1, 7, 'x']]"
+ },
+ {
+  "source": "{{ 'hello world'|title }}|{{ 'hELLO'|capitalize }}|{{ 'x'|center(7) }}|{{ '  t  '|trim }}|{{ 'xxtxx'|trim('x') }}|{{ 'a-b'|replace('-', '+') }}|{{ 'aaa'|replace('a', 'b', 2) }}|{{ 'one two  three'|wordcount }}",
+  "context": {},
+  "expect": "Hello World|Hello|   x   |t|t|a+b|bba|3"
+ },
+ {
+  "source": "{{ 'a\\nb\\n\\nc'|indent }}|{{ 'a\\nb'|indent(2, true) }}|{{ 'a\\n\\nb'|indent('> ', blank=true) }}",
+  "context": {},
+  "expect": "a\n    b\n\n    c|  a\n  b|a\n> \n> b"
+ },
+ {
+  "source": "{{ '42'|int }}|{{ '4.7'|int }}|{{ 'x'|int(-1) }}|{{ '0x1A'|int(0, 16) }}|{{ 3.9|int }}|{{ '3.5'|float }}|{{ 'nan'|float }}|{{ 'bad'|float(1.5) }}|{{ -3|abs }}|{{ 2.5|round }}|{{ 3.14159|round(2) }}|{{ 2.1|round(0, 'ceil') }}|{{ 42.55|round(1, 'floor') }}",
+  "context": {},
+  "expect": "42|4|-1|26|3|3.5|nan|1.5|3|2.0|3.14|3.0|42.5"
+ },
+ {
+  "source": "{{ x|default('d') }}|{{ ''|default('d') }}|{{ ''|default('d', true) }}|{{ none|default('d') }}|{{ x|d('y') }}|{{ 0|default(5, boolean=true) }}",
+  "context": {},
+  "expect": "d||d|None|y|5"
+ },
+ {
+  "source": "{{ v|tojson }}|{{ v|tojson(indent=2) }}|{{ v|tojson(sort_keys=true) }}|{{ v|tojson(separators=(',', ':')) }}|{{ v|tojson(ensure_ascii=true) }}|{{ 'x'|tojson }}",
+  "context": {
+   "v": {
+    "b": [
+     1,
+     2.5,
+     null,
+     true
+    ],
+    "a": "é\"\n",
+    "c": {}
+   }
+  },
+  "expect": "{\"b\": [1, 2.5, null, true], \"a\": \"é\\\"\\n\", \"c\": {}}|{\n  \"b\": [\n    1,\n    2.5,\n    null,\n    true\n  ],\n  \"a\": \"é\\\"\\n\",\n  \"c\": {}\n}|{\"a\": \"é\\\"\\n\", \"b\": [1, 2.5, null, true], \"c\": {}}|{\"b\":[1,2.5,null,true],\"a\":\"é\\\"\\n\",\"c\":{}}|{\"b\": [1, 2.5, null, true], \"a\": \"\\u00e9\\\"\\n\", \"c\": {}}|\"x\""
+ },
+ {
+  "source": "{{ 'abc' is string }}{{ 1 is number }}{{ 1 is integer }}{{ 1.0 is float }}{{ true is boolean }}{{ none is none }}{{ {} is mapping }}{{ [] is sequence }}{{ 'a' is iterable }}{{ 3 is odd }}{{ 4 is even }}{{ 9 is divisibleby 3 }}{{ 'ABC' is upper }}{{ 'abc' is lower }}{{ x is undefined }}{{ range is callable }}{{ 2 is in [1, 2] }}{{ false is sameas false }}{{ 1 is eq 1 }}{{ 1 is lt 2 }}{{ 'a' is escaped }}{{ 'length' is filter }}{{ 'odd' is test }}",
+  "context": {},
+  "expect": "TrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueTrueFalseTrueTrue"
+ },
+ {
+  "source": "{% set x %}  block {{ 1 + 1 }}  {% endset %}[{{ x }}]{% set y | upper %}up{% endset %}{{ y }}{% filter upper %}f{{ 'x' }}{% endfilter %}",
+  "context": {},
+  "expect": "[  block 2  ]UPFX"
+ },
+ {
+  "source": "{% with a = 1, b = 2 %}{{ a + b }}{% endwith %}|{{ a }}",
+  "context": {},
+  "expect": "3|"
+ },
+ {
+  "source": "{% macro m(a, b=2, c='x') %}{{ a }}{{ b }}{{ c }}{{ varargs }}{{ kwargs }}{% endmacro %}{{ m(1) }}|{{ m(1, 3) }}|{{ m(1, c='y') }}|{{ m(1, 2, 3, 4, 5) }}|{{ m(1, z=9) }}",
+  "context": {},
+  "expect": "12x(){}|13x(){}|12y(){}|123(4, 5){}|12x(){'z': 9}"
+ },
+ {
+  "source": "{% macro wrap() %}<{{ caller() }}>{% endmacro %}{% call wrap() %}inner{% endcall %}|{% macro twice(x) %}{{ caller(x) }}{{ caller(x+1) }}{% endmacro %}{% call(n) twice(1) %}[{{ n }}]{% endcall %}",
+  "context": {},
+  "expect": "<inner>|[1][2]"
+ },
+ {
+  "source": "{% raw %}{{ not rendered }}{% endraw %}|{{ '{{' }}|{# comment #}|x",
+  "context": {},
+  "expect": "{{ not rendered }}|{{||x"
+ },
+ {
+  "source": "  {% if true %}\n    kept\n  {% endif %}\n  {%+ if true %}plus{% endif %}\n{% if true +%}\nno trim\n{%- endif %}\n  {{- ' dash' -}}  \n  end",
+  "context": {},
+  "expect": "    kept\n  plus\nno trim dashend"
+ },
+ {
+  "source": "a {#- c -#} b {#+ c +#}\n c",
+  "context": {},
+  "expect": "ab \n c"
+ },
+ {
+  "source": "{%- for m in ms -%}\n  {{ m }}\n{%- endfor %}\n{% if x %}\n  yes\n{% else %}\n  no\n{% endif %}",
+  "context": {
+   "ms": [
+    1,
+    2
+   ],
+   "x": false
+  },
+  "expect": "12  no\n"
+ },
+ {
+  "source": "{{ 'a' if true }}|{{ 'a' if false }}|{{ 'a' if false else 'b' }}|{{ 1 if 0 else 2 if 0 else 3 }}",
+  "context": {},
+  "expect": "a||b|3"
+ },
+ {
+  "source": "{{ 1 < 2 < 3 }}{{ 1 < 3 < 2 }}{{ 'b' in 'abc' }}{{ 'z' not in ['a'] }}{{ 1 in {1: 2} }}{{ not 1 == 2 }}{{ 1 and 0 }}|{{ 0 or '' or 'x' }}|{{ none or [] }}",
+  "context": {},
+  "expect": "TrueFalseTrueTrueTrueTrue0|x|[]"
+ },
+ {
+  "source": "{{ '%s-%d-%05.2f-%x-%r' % ('a', 3, 2.5, 255, 'q') }}|{{ '%(a)s' % {'a': 1} }}|{{ '%s'|format([1]) }}|{{ '{} {x} {0}'.format(1, x=2) if false else '{0}-{1}|{a}'.format(1, 2, a=3) }}|{{ '{:>5}|{:.2f}|{:,}'.format('x', 3.14159, 1234567) }}",
+  "context": {},
+  "expect": "a-3-02.50-ff-'q'|1|[1]|1-2|3|    x|3.14|1,234,567"
+ },
+ {
+  "source": "{{ d.items is defined }}|{{ d['items'] is callable }}|{{ d.get('k') }}|{{ d.get('zz', 'dflt') }}|{{ d.missing is defined }}|{{ d['items'] is defined }}",
+  "context": {
+   "d": {
+    "k": "v"
+   }
+  },
+  "expect": "True|True|v|dflt|False|True"
+ },
+ {
+  "source": "{{ x.a.b }}",
+  "context": {
+   "x": {
+    "a": {}
+   }
+  },
+  "expect": ""
+ },
+ {
+  "source": "{{ x.a.b.c }}",
+  "context": {
+   "x": {
+    "a": {}
+   }
+  },
+  "error": {
+   "type": "UndefinedError",
+   "message": "'dict object' has no attribute 'b'"
+  }
+ },
+ {
+  "source": "{{ undefined_thing.attr }}",
+  "context": {},
+  "error": {
+   "type": "UndefinedError",
+   "message": "'undefined_thing' is undefined"
+  }
+ },
+ {
+  "source": "{{ [1,2][5] }}|{{ 'ab'[9] }}|{{ none[0] }}|{{ 5.foo }}",
+  "context": {},
+  "expect": "|||"
+ },
+ {
+  "source": "{{ xs|last }}",
+  "context": {
+   "xs": []
+  },
+  "expect": ""
+ },
+ {
+  "source": "{{ (xs|map('upper'))|last }}",
+  "context": {
+   "xs": [
+    "a"
+   ]
+  },
+  "error": {
+   "type": "TypeError",
+   "message": "'generator' object is not reversible"
+  }
+ },
+ {
+  "source": "{{ (xs|map('upper'))|length }}",
+  "context": {
+   "xs": [
+    "a"
+   ]
+  },
+  "error": {
+   "type": "TypeError",
+   "message": "object of type 'generator' has no len()"
+  }
+ },
+ {
+  "source": "{% set g = xs|map('upper') %}{{ g|list }}{{ g|list }}",
+  "context": {
+   "xs": [
+    "a",
+    "b"
+   ]
+  },
+  "expect": "['A', 'B'][]"
+ },
+ {
+  "source": "{{ d.update({}) }}",
+  "context": {
+   "d": {}
+  },
+  "error": {
+   "type": "SecurityError",
+   "message": "access to attribute 'update' of 'dict' object is unsafe."
+  }
+ },
+ {
+  "source": "{{ strftime_now('%Y-%m-%d %H:%M:%S %A %b %j %f') }}",
+  "context": {},
+  "expect": "2026-03-15 09:05:07 Sunday Mar 074 000000"
+ },
+ {
+  "source": "{{ cycler('a', 'b').next() }}{% set c = cycler(1, 2) %}{{ c.next() }}{{ c.next() }}{{ c.next() }}{{ c.current }}|{% set j = joiner('/') %}{{ j() }}a{{ j() }}b{{ j() }}c",
+  "context": {},
+  "expect": "a1212|a/b/c"
+ },
+ {
+  "source": "{{ dict(a=1, b=2) }}|{{ dict([('x', 1), ['y', 2]]) }}|{{ dict({'k': 'v'}, z=0) }}|{{ dict([(1, 2, 3)]) }}",
+  "context": {},
+  "error": {
+   "type": "ValueError",
+   "message": "dictionary update sequence element #0 has length 3; 2 is required"
+  }
+ },
+ {
+  "source": "{{ [1, [2, [3]]]|tojson }}|{{ {'a': (1, 2)}|tojson }}|{{ {1: 'int', none: 'n', true: 'b', 2.5: 'f'}|tojson }}",
+  "context": {},
+  "expect": "[1, [2, [3]]]|{\"a\": [1, 2]}|{\"1\": \"b\", \"null\": \"n\", \"2.5\": \"f\"}"
+ },
+ {
+  "source": "{{ ns }}{% set ns = namespace(v=[]) %}{% for i in range(3) %}{% set ns.v = ns.v + [i] %}{% endfor %}{{ ns.v }}",
+  "context": {
+   "ns": "ctx"
+  },
+  "expect": "ctx[0, 1, 2]"
+ },
+ {
+  "source": "{% for i in range(3) %}{% if loop.first %}first{% elif loop.last %}last{% else %}mid{% endif %}{% endfor %}",
+  "context": {},
+  "expect": "firstmidlast"
+ },
+ {
+  "source": "{%- set content = 'x' -%}{%- for m in ms -%}{%- if m is string -%}{%- set content = m -%}{%- endif -%}{{ content }}{%- endfor -%}{{ content }}",
+  "context": {
+   "ms": [
+    "a",
+    1,
+    "b"
+   ]
+  },
+  "expect": "axbx"
+ },
+ {
+  "source": "{% macro f(n) %}{% if n > 0 %}{{ n }}{{ f(n - 1) }}{% endif %}{% endmacro %}{{ f(4) }}",
+  "context": {},
+  "expect": "4321"
+ },
+ {
+  "source": "{{ 'abc' ~ 1 ~ none ~ [1] ~ x }}|{{ -x|default(3) }}|{{ -2**2 }}|{{ (-2)**2 }}|{{ 2 * 3 + 4 ~ 'x' }}|{{ 10 - 2 - 3 }}|{{ 2 ** 3 ** 2 }}",
+  "context": {},
+  "error": {
+   "type": "UndefinedError",
+   "message": "'x' is undefined"
+  }
+ },
+ {
+  "source": "{{ 'a' * 3 + 'b' }}|{{ [0] * 3 }}|{{ 'x' * -1 }}|{{ 7 % -3 }}|{{ -7.5 // 2 }}|{{ 5 // 0.5 }}|{{ 1e308 * 10 }}|{{ -(1e308 * 10) }}|{{ (1e308*10) - (1e308*10) }}",
+  "context": {},
+  "expect": "aaab|[0, 0, 0]||-2|-4.0|10.0|inf|-inf|nan"
+ },
+ {
+  "source": "{{ x }}",
+  "context": {
+   "x": [
+    1.0,
+    1e+16,
+    1e-07,
+    123456789.123,
+    -0.0,
+    3e-05,
+    1.5e+300
+   ]
+  },
+  "expect": "[1.0, 1e+16, 1e-07, 123456789.123, -0.0, 3e-05, 1.5e+300]"
+ },
+ {
+  "source": "{{ x|string|length }}|{{ x|list }}|{{ x|reverse|list }}|{{ x|first }}",
+  "context": {
+   "x": "héllo"
+  },
+  "expect": "5|['h', 'é', 'l', 'l', 'o']|['o', 'l', 'l', 'é', 'h']|h"
+ },
+ {
+  "source": "{{ 'a\\x00b' }}|{{ ['a\\x00b', '\\u2028', '\\U0001F600'] }}",
+  "context": {},
+  "expect": "a\u0000b|['a\\x00b', '\\u2028', '😀']"
+ },
+ {
+  "source": "{{ ['caf\\u00e9', 'ﬁ', 'İ', 'ǅ']|map('upper')|list }}|{{ ['CAFÉ', 'İ', 'ΣΑΣ']|map('lower')|list }}|{{ 'ǆ xyz'|capitalize }}",
+  "context": {},
+  "expect": "['CAFÉ', 'FI', 'İ', 'Ǆ']|['café', 'i̇', 'σας']|ǅ xyz"
+ },
+ {
+  "source": "{{ items|groupby('k')|list }}|{% for g, v in items|groupby('k') %}{{ g }}:{{ v|length }};{% endfor %}",
+  "context": {
+   "items": [
+    {
+     "k": "b",
+     "v": 1
+    },
+    {
+     "k": "a",
+     "v": 2
+    },
+    {
+     "k": "B",
+     "v": 3
+    }
+   ]
+  },
+  "expect": "[('a', [{'k': 'a', 'v': 2}]), ('b', [{'k': 'b', 'v': 1}, {'k': 'B', 'v': 3}])]|a:1;b:2;"
+ },
+ {
+  "source": "{{ 'hello world foo'|truncate(9) }}|{{ 'hello world foo'|truncate(9, true) }}|{{ 'hello'|truncate(3) }}|{{ 12345678|filesizeformat }}|{{ 1|filesizeformat }}|{{ 2048|filesizeformat(true) }}|{{ '<p>a <b>b</b> &amp; c</p>'|striptags }}",
+  "context": {},
+  "expect": "hello...|hello ...|hello|12.3 MB|1 Byte|2.0 KiB|a b & c"
+ },
+ {
+  "source": "{% set t = (1, 2) %}{{ t[0] }}{{ t|length }}{% set a, b = t %}{{ a }}{{ b }}{% set x, (y, z) = [1, (2, 3)] %}{{ x }}{{ y }}{{ z }}",
+  "context": {},
+  "expect": "1212123"
+ },
+ {
+  "source": "{{ 'x' is sameas 'x' }}|{{ none is sameas none }}|{{ [] is sameas [] }}|{{ 256 is sameas 256 }}",
+  "context": {},
+  "expect": "True|True|False|True"
+ },
+ {
+  "source": "{{ messages[0]['content']|trim }}{{ messages[-1].role }}{{ messages[1:]|length }}{{ messages[::-1][0].content }}",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": " a "
+    },
+    {
+     "role": "x",
+     "content": "b"
+    }
+   ]
+  },
+  "expect": "ax1b"
+ },
+ {
+  "source": "{% if foo is not defined %}nd{% endif %}{% if not foo %}nf{% endif %}{% if foo is none %}n{% endif %}",
+  "context": {},
+  "expect": "ndnf"
+ },
+ {
+  "source": "{{ x.startswith(('a', 'z')) }}{{ x.endswith('c', 0, 2) }}{{ x.count('b') }}{{ x.index('c') }}{{ x.zfill(6) }}{{ x.ljust(5, '*') }}{{ x.partition('b') }}{{ x.splitlines() }}{{ 'A\\nB\\r\\nC'.splitlines(true) }}{{ x.isalpha() }}{{ '12'.isdigit() }}{{ ' '.isspace() }}{{ 'Ab Cd'.istitle() }}",
+  "context": {
+   "x": "abc"
+  },
+  "expect": "TrueFalse12000abcabc**('a', 'b', 'c')['abc']['A\\n', 'B\\r\\n', 'C']TrueTrueTrueTrue"
+ },
+ {
+  "source": "{{ x|replace('a', '') }}|{{ 'abc'.replace('', '-') }}|{{ 'abc'.removeprefix('a') }}{{ 'abc'.removesuffix('c') }}|{{ 'a\\tb'.expandtabs(4) }}|{{ 'ABC'.swapcase() }}|{{ 'x'.join(['1', '2']) }}",
+  "context": {
+   "x": "banana"
+  },
+  "expect": "bnn|-a-b-c-|bcab|a   b|abc|1x2"
+ },
+ {
+  "source": "{{ 1 + 2 }}{{ foo(1) }}",
+  "context": {},
+  "error": {
+   "type": "UndefinedError",
+   "message": "'foo' is undefined"
+  }
+ },
+ {
+  "source": "{{ [3, 1]|sort|first }}{{ none|list }}",
+  "context": {},
+  "error": {
+   "type": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  }
+ },
+ {
+  "source": "{{ 'x'|nonexistent_filter }}",
+  "context": {},
+  "error": {
+   "type": "TemplateAssertionError",
+   "message": "No filter named 'nonexistent_filter'."
+  }
+ },
+ {
+  "source": "{% if false %}{{ 'x'|nonexistent_filter }}{% endif %}ok",
+  "context": {},
+  "expect": "ok"
+ },
+ {
+  "source": "{{ x is nonexistent_test }}",
+  "context": {},
+  "error": {
+   "type": "TemplateAssertionError",
+   "message": "No test named 'nonexistent_test'."
+  }
+ },
+ {
+  "source": "{% for x in y %}{% endfor",
+  "context": {},
+  "error": {
+   "type": "TemplateSyntaxError",
+   "message": "unexpected end of template, expected 'end of statement block'."
+  }
+ },
+ {
+  "source": "{{ 1 +* 2 }}",
+  "context": {},
+  "error": {
+   "type": "TemplateSyntaxError",
+   "message": "unexpected '*'"
+  }
+ },
+ {
+  "source": "{% set x.y = 1 %}",
+  "context": {},
+  "error": {
+   "type": "TemplateRuntimeError",
+   "message": "cannot assign attribute on non-namespace object"
+  }
+ },
+ {
+  "source": "{% set loop = 1 %}{{ loop }}",
+  "context": {},
+  "expect": "1"
+ },
+ {
+  "source": "{% for loop in [1] %}{% endfor %}",
+  "context": {},
+  "error": {
+   "type": "TemplateAssertionError",
+   "message": "Can't assign to special loop variable in for-loop target"
+  }
+ },
+ {
+  "source": "{{ range(3)|reverse|list }}|{{ {'a': 1, 'b': 2}|reverse|list }}|{{ 'abc'|reverse }}",
+  "context": {},
+  "expect": "[2, 1, 0]|['b', 'a']|cba"
+ },
+ {
+  "source": "{% for k in d %}{{ k }}{% endfor %}|{{ d|length }}|{{ d.values()|list }}|{{ ('a', 1) in d.items() }}|{{ d.keys() == d.keys() }}",
+  "context": {
+   "d": {
+    "a": 1,
+    "b": 2
+   }
+  },
+  "expect": "ab|2|[1, 2]|True|True"
+ },
+ {
+  "source": "{{ caller }}|{{ varargs }}|{{ kwargs }}|{{ self is defined }}",
+  "context": {},
+  "expect": "|||True"
+ },
+ {
+  "source": "{{ lipsum is defined }}{{ cycler is defined }}{{ joiner is defined }}{{ namespace is defined }}{{ range is defined }}{{ dict is defined }}{{ raise_exception is defined }}{{ strftime_now is defined }}",
+  "context": {},
+  "expect": "TrueTrueTrueTrueTrueTrueTrueTrue"
+ },
+ {
+  "source": "{% generation %}gen {{ x }}{% set y = 1 %}{% endgeneration %}{{ y }}",
+  "context": {
+   "x": 5
+  },
+  "expect": "gen 5"
+ },
+ {
+  "source": "{{ x }}",
+  "context": {
+   "x": {
+    "nested": [
+     {
+      "a": null,
+      "b": [
+       true,
+       false
+      ]
+     },
+     "s'q",
+     7
+    ]
+   }
+  },
+  "expect": "{'nested': [{'a': None, 'b': [True, False]}, \"s'q\", 7]}"
+ }
+]

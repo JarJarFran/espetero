@@ -1,0 +1,311 @@
+[
+ {
+  "name": "Dream-v0-Instruct-7B-8bit",
+  "file": "Dream-v0-Instruct-7B-8bit.jinja",
+  "sha256": "44d5f08f3f72b837eaad09f13a54c1f9f4eb58d75240334548b7fd52a5437fa5",
+  "special_tokens": {
+   "bos_token": "<|beginoftext|>",
+   "eos_token": "<|endoftext|>",
+   "pad_token": "<|endoftext|>",
+   "mask_token": "<|mask|>"
+  },
+  "origin": "Dream-org/Dream-v0-Instruct-7B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Muse-Glimmer-30B-4bit",
+  "file": "Muse-Glimmer-30B-4bit.jinja",
+  "sha256": "114f55ebdc1804c1af371197b9fdf2d6bb925966c9dfe46b73782a71bc07965e",
+  "special_tokens": {
+   "bos_token": "<|begin_of_text|>",
+   "eos_token": "<|end_of_text|>",
+   "pad_token": "<|finetune_right_pad|>"
+  },
+  "origin": "meta-models/Muse-Glimmer-30B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Qwen-Drive-1.0-4B",
+  "file": "Qwen-Drive-1.0-4B.jinja",
+  "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "Qwen/Qwen-Drive-1.0-4B (same text as Qwen/Qwen3.5-9B)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Qwen-Drive-1.0-4B_2",
+  "file": "Qwen-Drive-1.0-4B_2.jinja",
+  "sha256": "ce53917ed10dfe4e671e0a6cbad92b842ca52d20d7a170ae5e8cba9e18bed88b",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "Qwen/Qwen-Drive-1.0-4B (chat_template.json)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "mlx-community__Qwen3.5-2B-4bit",
+  "file": "mlx-community__Qwen3.5-2B-4bit.jinja",
+  "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "mlx-community/Qwen3.5-2B-4bit (Qwen/Qwen3.5-2B)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "mlx-community__Qwen3.8-27B-4bit",
+  "file": "mlx-community__Qwen3.8-27B-4bit.jinja",
+  "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "mlx-community/Qwen3.8-27B-4bit",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Qwen__Qwen3-4B-Instruct-2507",
+  "file": "Qwen__Qwen3-4B-Instruct-2507.jinja",
+  "sha256": "64f85b198065d0fba2a81f37e10ed68161ce2c19a754c7100e67e0ca2ee9c326",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "Qwen/Qwen3-4B-Instruct-2507",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "RND1-Base-0910-4bit",
+  "file": "RND1-Base-0910-4bit.jinja",
+  "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "radicalnumerics/RND1-Base-0910",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "XHToken__Spark-X2.5-4B",
+  "file": "XHToken__Spark-X2.5-4B.jinja",
+  "sha256": "25576c2aaec931fce04fedbd6ba06de209e553673858073120697884316158fe",
+  "special_tokens": {
+   "bos_token": "<｜start▁of▁sentence｜>",
+   "eos_token": "<｜end▁of▁sentence｜>",
+   "unk_token": "<unk>",
+   "pad_token": "<｜▁pad▁｜>"
+  },
+  "origin": "XHToken/Spark-X2.5-4B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "mlx-community__gemma-4-31b-it-4bit",
+  "file": "mlx-community__gemma-4-31b-it-4bit.jinja",
+  "sha256": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0",
+  "special_tokens": {
+   "bos_token": "<bos>",
+   "eos_token": "<eos>",
+   "unk_token": "<unk>",
+   "pad_token": "<pad>",
+   "mask_token": "<mask>"
+  },
+  "origin": "mlx-community/gemma-4-31b-it-4bit (google/gemma-4-31B-it)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "mlx-community__Qwen3.6-35B-A3B-8bit",
+  "file": "mlx-community__Qwen3.6-35B-A3B-8bit.jinja",
+  "sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "mlx-community/Qwen3.6-35B-A3B-8bit (Qwen/Qwen3.6-35B-A3B)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "mlx-community__diffusiongemma-26B-A4B-it-8bit",
+  "file": "mlx-community__diffusiongemma-26B-A4B-it-8bit.jinja",
+  "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082",
+  "special_tokens": {
+   "bos_token": "<bos>",
+   "eos_token": "<eos>",
+   "unk_token": "<unk>",
+   "pad_token": "<pad>",
+   "mask_token": "<mask>"
+  },
+  "origin": "mlx-community/diffusiongemma-26B-A4B-it-8bit",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "numind__NuExtract3",
+  "file": "numind__NuExtract3.jinja",
+  "sha256": "31e44d28615d268efdc3dcf59cb59bd2d51714d517455fbad97518d351b84119",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "numind/NuExtract3",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "openbmb__MiniCPM5-1B",
+  "file": "openbmb__MiniCPM5-1B.jinja",
+  "sha256": "7451a05cf1e28a79d97d7c0bc951028c0b1915119bf9046acd06a0e3d931f47c",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>",
+   "unk_token": "<unk>",
+   "pad_token": "</s>"
+  },
+  "origin": "openbmb/MiniCPM5-1B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "openbmb__MiniCPM5-2B",
+  "file": "openbmb__MiniCPM5-2B.jinja",
+  "sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>",
+   "unk_token": "<unk>",
+   "pad_token": "</s>"
+  },
+  "origin": "openbmb/MiniCPM5-2B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Qwen__Qwen3-Embedding-0.6B",
+  "file": "Qwen__Qwen3-Embedding-0.6B.jinja",
+  "sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "Qwen/Qwen3-Embedding-0.6B",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "Qwen__Qwen3-VL-2B-Instruct",
+  "file": "Qwen__Qwen3-VL-2B-Instruct.jinja",
+  "sha256": "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
+  "special_tokens": {
+   "eos_token": "<|im_end|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "Qwen/Qwen3-VL-2B-Instruct",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "HuggingFaceTB__SmolLM2-135M-Instruct",
+  "file": "HuggingFaceTB__SmolLM2-135M-Instruct.jinja",
+  "sha256": "872be49dbb638044ad01b60388f48d469ff2980e5f0dccdc22ec907db54d0788",
+  "special_tokens": {
+   "bos_token": "<|im_start|>",
+   "eos_token": "<|im_end|>",
+   "unk_token": "<|endoftext|>",
+   "pad_token": "<|im_end|>"
+  },
+  "origin": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "HuggingFaceTB__SmolVLM2-500M-Video-Instruct",
+  "file": "HuggingFaceTB__SmolVLM2-500M-Video-Instruct.jinja",
+  "sha256": "830005085ddd94cec605b6e21b885b28ffad6e3f82ee6a212c523533e8f04f01",
+  "special_tokens": {
+   "bos_token": "<|im_start|>",
+   "eos_token": "<end_of_utterance>",
+   "unk_token": "<|endoftext|>",
+   "pad_token": "<|im_end|>"
+  },
+  "origin": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "XHToken__Spark-X2.5-4B-6bit",
+  "file": "XHToken__Spark-X2.5-4B-6bit.jinja",
+  "sha256": "705345721970da40e6aa56db548a46ecd1d8d94a5418808fa180ac19ee77a9ba",
+  "special_tokens": {
+   "bos_token": "<｜start▁of▁sentence｜>",
+   "eos_token": "<｜end▁of▁sentence｜>",
+   "unk_token": "<unk>",
+   "pad_token": "<｜▁pad▁｜>"
+  },
+  "origin": "XHToken/Spark-X2.5-4B (6-bit MLX conversion)",
+  "license": "apache-2.0",
+  "synthetic": false
+ },
+ {
+  "name": "synthetic__mistral_style",
+  "file": "synthetic__mistral_style.jinja",
+  "sha256": "d703f012fa2a7afdb890ea47f552302d2a1dbbfc4b1b61839e75eb78c11378df",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  "origin": "synthetic, after mistralai/Mistral-7B-Instruct-v0.3",
+  "license": "apache-2.0",
+  "synthetic": true
+ },
+ {
+  "name": "synthetic__deepseek_style",
+  "file": "synthetic__deepseek_style.jinja",
+  "sha256": "babdbcdbe9cd17c762744543fe99ea51e608b567c8ed77883dd0e2dca36348eb",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  "origin": "synthetic, after deepseek-ai/DeepSeek-R1",
+  "license": "mit",
+  "synthetic": true
+ },
+ {
+  "name": "synthetic__hermes_style",
+  "file": "synthetic__hermes_style.jinja",
+  "sha256": "fd82a137d5826e6a948065fc3610c6f4307d63f774c97de1052c03f679ac1904",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  "origin": "synthetic, json_to_python_type from NousResearch/Hermes-2-Pro-Mistral-7B",
+  "license": "apache-2.0",
+  "synthetic": true
+ },
+ {
+  "name": "synthetic__harmony_style",
+  "file": "synthetic__harmony_style.jinja",
+  "sha256": "71e3da9fda4a2f28b0b54a2224cad6937babcb5e5d53157edd9d4c029b157dcc",
+  "special_tokens": {
+   "bos_token": "<s>",
+   "eos_token": "</s>"
+  },
+  "origin": "synthetic, render_typescript_type from openai/gpt-oss-20b",
+  "license": "apache-2.0",
+  "synthetic": true
+ }
+]

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Francisco José García Barbero
+
+# Builds Espetero and runs the tests that need no model or GPU.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  build-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make -j3
+      - name: Tests (no model or GPU)
+        run: make test
+      - name: Version
+        run: build/espetero --version
