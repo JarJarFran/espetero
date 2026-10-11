@@ -24,13 +24,41 @@ namespace espetero::native {
 // drafter, as the loader does for the Qwen3.5 MTP layers); quantized ones stay.
 inline HostMat rq8(Arena& tmp, const HostMat& h, int rq) { return rq == 8 && h.dense ? requant<8>(tmp, h) : h; }
 
+// The up matrix's rows in the hcmix order (EPI_HCMIX, q4_hc_mix): row s * D + c
+// (stream s, channel c) moves to (c / per) * 32 + (c % per) * S + s, per = 32 / S,
+// so a 32-column GEMV block holds every stream of its channels.
+inline HostMat hcmix_rows(Arena& tmp, const HostMat& h, int S, int D) {
+  if (32 % S || D % (32 / S) || h.out != S * D) fail("hyper-connection up matrix: unexpected shape for the hcmix order");
+  if (!h.dense && h.q.scale_mode) fail("hyper-connection up matrix: unexpected scale format");
+  const int per = 32 / S;
+  auto permuted = [&](const Buf& src, size_t row_bytes) {
+    Buf dst = tmp.alloc(row_bytes * size_t(h.out));
+    const uint8_t* a = static_cast<const uint8_t*>(ptr(src));
+    uint8_t* b = static_cast<uint8_t*>(ptr(dst));
+    for (int s = 0; s < S; ++s)
+      for (int c = 0; c < D; ++c)
+        std::memcpy(b + size_t((c / per) * 32 + (c % per) * S + s) * row_bytes, a + size_t(s * D + c) * row_bytes, row_bytes);
+    return dst;
+  };
+  HostMat o = h;
+  if (h.dense) {
+    o.f16 = permuted(h.f16, size_t(h.in) * 2);
+  } else {
+    o.q.w = permuted(h.q.w, size_t(h.in) * size_t(h.q.src_bits) / 8);
+    o.q.s = permuted(h.q.s, size_t(h.in / h.q.group) * 2);
+    o.q.z = permuted(h.q.z, size_t(h.in / h.q.group) * 2);
+  }
+  return o;
+}
+
 inline HCBlock load_hc(Model& m, const SafetensorsSource& src, const std::string& p, bool inject, int rq = 0) {
   const Config& c = m.cfg;
   HCBlock B;
   B.norm = vec(m, src, p + "hc_norm.weight", size_t(c.W()), 1.0f);
   Arena tmp(m.dev);
   const HostMat down = rq8(tmp, host_mat(m, tmp, src, p + "input_mix_weight_down.weight", c.hc_rank, c.W()), rq);
-  const HostMat up = rq8(tmp, host_mat(m, tmp, src, p + "input_mix_weight_up.weight", c.W(), c.hc_rank), rq);
+  const HostMat up =
+      hcmix_rows(tmp, rq8(tmp, host_mat(m, tmp, src, p + "input_mix_weight_up.weight", c.W(), c.hc_rank), rq), c.hc, c.D);
   std::vector<HostMat> runs{down};
   if (inject) runs = fuse(tmp, {down, rq8(tmp, host_mat(m, tmp, src, p + "block_inject_weight.weight", c.hc, c.W()), rq)});
   id<MTLCommandBuffer> cb = [m.queue commandBuffer];
@@ -297,8 +325,56 @@ inline void load_q4_ple(Model& m, const SafetensorsSource& src, const std::strin
     const int fd = ::open(f.c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open " + f);
     T.fds.push_back(fd);
+    // Rows are read from a mapping: three small preads per row cost a system
+    // call each (16 rows per token, ~116K calls for a 2.4K-token prompt).
+    struct stat st{};
+    void* p = MAP_FAILED;
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) p = ::mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+    T.maps.push_back(p == MAP_FAILED ? nullptr : static_cast<const uint8_t*>(p));
   }
   P.present = true;
+}
+
+// The n-gram table into the file cache in the background (sequential reads
+// in 64 MB chunks, 4 readers; the pages the mapping reads come from that
+// cache): a cold prompt otherwise reads its rows from the SSD at random
+// (M4 Max 128 GB, resident experts: 3K tokens 14.2 s prefill cold, 5.1 s
+// after the preload). Opt-in (ESPETERO_NGRAM_PRELOAD=1): beside 85 GB of
+// resident experts and weights on a 128 GB Mac, 32 GB more of file cache left
+// macOS compressing tens of GB, and the next load took 16 minutes instead of 30 s.
+inline void ensure_ngram_preload(const NgramTable& T) {
+  if (const char* v = std::getenv("ESPETERO_NGRAM_PRELOAD"); !v || *v != '1') return;
+  struct Job { int fd; uint64_t off, n; };
+  std::vector<Job> jobs;
+  const uint64_t chunk = uint64_t(64) << 20;
+  const uint64_t ng = uint64_t(T.width / T.group);
+  for (const NgramTable::Shard& S : T.shards) {
+    const int fd = T.fds[size_t(S.file)];
+    const uint64_t rows = uint64_t(T.shard_rows);
+    for (auto [off, len] : {std::pair<uint64_t, uint64_t>{S.w, rows * uint64_t(T.width / 2)}, {S.s, rows * ng * 2}, {S.b, rows * ng * 2}})
+      for (uint64_t o = 0; o < len; o += chunk) jobs.push_back({fd, off + o, std::min(chunk, len - o)});
+  }
+  std::thread([jobs = std::move(jobs)] {
+    const auto t0 = Clock::now();
+    std::atomic<size_t> next{0};
+    std::atomic<uint64_t> bytes{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r)
+      readers.emplace_back([&] {
+        std::vector<uint8_t> buf(size_t(64) << 20);
+        for (size_t i; (i = next.fetch_add(1)) < jobs.size();) {
+          const Job& j = jobs[i];
+          for (uint64_t done = 0; done < j.n;) {
+            const ssize_t got = ::pread(j.fd, buf.data(), size_t(j.n - done), off_t(j.off + done));
+            if (got <= 0) break;
+            done += uint64_t(got);
+          }
+          bytes += j.n;
+        }
+      });
+    for (std::thread& t : readers) t.join();
+    std::fprintf(stderr, "n-gram table: %.1f GB in the file cache (%.0f s)\n", double(bytes) / 1e9, ms_since(t0) / 1000.0);
+  }).detach();
 }
 
 inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision) {

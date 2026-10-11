@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     m->run({t}, &st);
     std::printf("q4 prefill %d tokens: %.1f ms wall (gpu %.1f)\nxcache prefill: %s\n", ctx, ms_since(t0), st.gpu_ms,
                 m->bench_json("xcache_reset").c_str());
-    std::vector<double> ms;
+    std::vector<double> ms, gpu, enc;
     if (!forced.empty()) {
       next = forced[0];
       q4_steps = std::min(q4_steps, int(forced.size()) - 1);
@@ -152,17 +152,21 @@ int main(int argc, char** argv) {
       int32_t out = 0;
       d.out_argmax = &out;
       const auto t1 = Clock::now();
-      m->run({d});
+      PassStats ps;
+      m->run({d}, &ps);
       ms.push_back(ms_since(t1));
+      gpu.push_back(ps.gpu_ms);
+      enc.push_back(ps.encode_ms);
       next = forced.empty() ? out : forced[size_t(j) + 1];
     }
     std::vector<double> sorted = ms;
     std::sort(sorted.begin(), sorted.end());
     double sum = 0;
     for (double x : ms) sum += x;
-    std::printf("q4 decode %d steps: median %.1f ms, mean %.1f ms (%.2f tok/s), first %.1f ms\nxcache decode: %s\n", q4_steps,
-                sorted[sorted.size() / 2], sum / double(ms.size()), 1000.0 * double(ms.size()) / sum, ms[0],
-                m->bench_json("xcache").c_str());
+    auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+    std::printf("q4 decode %d steps: median %.1f ms, mean %.1f ms (%.2f tok/s), first %.1f ms; median gpu %.2f ms, encode %.2f ms\n"
+                "xcache decode: %s\n", q4_steps, sorted[sorted.size() / 2], sum / double(ms.size()),
+                1000.0 * double(ms.size()) / sum, ms[0], median(gpu), median(enc), m->bench_json("xcache").c_str());
     if (profile) {  // one more decode step, every dispatch timed on its own
       m->set_profile(true);
       TreeSpec d;

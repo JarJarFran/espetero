@@ -411,6 +411,8 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
       out.push_back({moe_gemv_name(dn, sdn, true, rows, 0, false, ks), dn.fc()});
     }
   for (int ks : {8, 4, 2}) out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks), gu.fc()});
+  if (m.cfg.E > 256)  // routes of 257-512 experts (Qwen4-Exp)
+    for (int ks : {8, 4, 2}) out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks) + "_e512", gu.fc()});
   if (sdn)
     for (int kk : {1, 2}) out.push_back({moe_down_comb_name(dn, *sdn, kk), dn.fc()});
 }
@@ -451,7 +453,12 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // route with fp16 partial GEMVs for both (moe_route_parhh).
   const bool gate_f16 = L.router.dense && L.shared_gate.dense && L.shared_gate.d.out == 1 && m.route_par && c.D % 64 == 0;
   const bool router_f16 = L.router.dense && (!L.shared_gate.dense || gate_f16) && m.route_par && c.D % 64 == 0;
-  const bool fused_route = m.fuse_route && rows <= 8 && (!L.shared_gate.dense || gate_f16) && c.E <= 256 &&
+  // 257-512 experts (Qwen4-Exp): only the two-dispatch parallel route with the
+  // single-simdgroup finalize (16 experts per lane), and only without an
+  // expert cache (its sort remaps the routed ids to pool slots).
+  const bool route_e512 = c.E > 256 && c.E <= 512 && m.route_par && (m.route_sync & 15) == 2 && m.route_fin1 &&
+                          m.xpool.empty() && c.D % 64 == 0;
+  const bool fused_route = m.fuse_route && rows <= 8 && (!L.shared_gate.dense || gate_f16) && (c.E <= 256 || route_e512) &&
                            (router_f16 || (!L.router.dense && L.router.q.bits == L.shared_gate.q.bits &&
                                            L.router.q.fc() == L.shared_gate.q.fc()));
   const bool par_route = fused_route && (m.route_par || router_f16) && c.D % 64 == 0;
@@ -464,7 +471,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const QW& g = L.shared_gate.q;
     const int nblocks = (c.E + 31) / 32;
     const int KG = c.D / 64;
-    const int nsl = std::max(1, std::min(8, m.route_nsl > 0 ? m.route_nsl : (KG + 7) / 8));
+    // 512 experts: at most 4 slices by default, so the finalize (16 experts
+    // per lane) takes route_topk_simd's branchless loads (M4 Max, Flash-Next:
+    // 5 slices 17.4 ms per decode step, 4 slices 16.7 ms).
+    const int nsl = std::max(1, std::min(route_e512 && m.route_nsl <= 0 ? 4 : 8, m.route_nsl > 0 ? m.route_nsl : (KG + 7) / 8));
     const int sync = m.route_sync | (m.route_seqexp ? 16 : 0);
     // build_tiles 2: single-row pass with direct grids, the indirect arguments are not written
     const int build = (rows == 1 && !m.route_notiles) ? (m.moe_direct ? 2 : 1) : 0;
@@ -523,7 +533,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     if ((sync & 15) == 2 && !(m.moe_stages & 16) && !route_in_gemv) {
       // Finalize: one simdgroup per row without barriers (route_fin1), or the
       // 256-thread kernel with threadgroup reductions.
-      E.pipe(m.route_fin1 ? "moe_route_fin1" : "moe_route_fin");
+      E.pipe(m.route_fin1 ? (route_e512 ? "moe_route_fin1_e512" : "moe_route_fin1") : "moe_route_fin");
       E.set(0, z.rparts);
       E.set(1, z.ids);
       E.set(2, z.w);
@@ -666,7 +676,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const int ks_opt = epi == 2 ? m.moe_ks : m.moe_ks_dn;
     const int ks = fma_path ? (ks_opt == 4 || (ks_opt == 2 && rows <= 2) ? ks_opt : 8) : 8;  // no k2 variants above 2 rows
     const bool route_name = route_in_gemv && epi == 2 && fma_path && rows == 1 && m.moe_direct;
-    const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks);
+    const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks) +
+                             (route_name && route_e512 ? "_e512" : "");  // routes of 257-512 experts (Qwen4-Exp)
     E.pipe(name, w.fc());
     gemm_tag(E, name, w.out, w.in, rows);
     // Several column blocks per threadgroup only on direct grids (the indirect arguments hold the block count).
@@ -1424,11 +1435,14 @@ inline void ensure_q4_scratch(Model& m, int rows) {
 // ---- Qwen4-Exp hyper-connection helpers (run_forest and the MTP draft loop)
 // The block input of the streams X [rows][W] into xout [rows][D] (fp16):
 // grouped stream norm, the low-rank read (down), gates, up, the gated mix.
-// With `inject`, the block's injection weights go to q4s.inj.
-inline void q4_hc_read(Model& m, Enc& E, const HCBlock& B, bool inject, const Buf& X, int rows, const Buf& xout) {
+// With `inject`, the block's injection weights go to q4s.inj. `prenormed`:
+// q4s.N16 already holds X's normalized streams (q4_hc_inject_norm).
+inline void q4_hc_read(Model& m, Enc& E, const HCBlock& B, bool inject, const Buf& X, int rows, const Buf& xout,
+                       bool prenormed = false) {
   const Config& c = m.cfg;
   Model::Q4Scratch& q = m.q4s;
   const int W = c.W(), R = c.hc_rank, S4 = c.hc;
+  if (!prenormed) {
   E.pipe("q4_stream_norm");
   E.set(0, X);
   E.set(1, B.norm);
@@ -1443,12 +1457,42 @@ inline void q4_hc_read(Model& m, Enc& E, const HCBlock& B, bool inject, const Bu
   E.rd(X);
   E.wr(q.N16);
   E.groups(MTLSizeMake(size_t(S4), size_t(rows), 1), MTLSizeMake(256, 1, 1));
+  }
   const int dn_ld = B.down.out();
   gemm(E, m.tune, B.down, q.N16, 0, W, q.dn, 0, dn_ld, rows, 0);
   int mode = 2;
   if (inject) {
     mode = B.inj_fused ? 1 : 0;
     if (!B.inj_fused) gemm(E, m.tune, B.inj, q.N16, 0, W, q.injr, 0, S4, rows, 0);
+  }
+  // 1-2 rows: gates, up and mix in one GEMV (rgemv NRM 3 + EPI_HCMIX; ESPETERO_Q4_HCMIX=0: separate).
+  static const bool hcmix = !(std::getenv("ESPETERO_Q4_HCMIX") && *std::getenv("ESPETERO_Q4_HCMIX") == '0');
+  if (hcmix && rows <= std::min(2, m.tune.gemv_max_m) && m.tune.gemv && !B.up.dense) {
+    const QW& w = B.up.q;
+    const std::string name = "rgemv" + std::to_string(w.bits) + "_" + std::to_string(rows) + "_hcmix";
+    E.pipe(name, w.fc());
+    gemm_tag(E, name, w.out, w.in, rows);
+    const GemmParams gp{rows, w.out, w.in, dn_ld, c.D, 0, 0};
+    const NormParamsHost np{mode, W, S4, 0.0f, c.D};
+    E.set(0, q.dn);
+    E.set(1, w.wr);
+    E.set(2, w.sb);
+    E.set(3, w.wh ? w.wh : w.wr);
+    E.set(4, xout);
+    E.bytes(5, gp);
+    E.bytes(6, np);
+    E.set(7, B.norm);  // unread
+    E.set(8, q.injr);
+    E.set(9, q.inj);
+    E.set(10, q.N16);
+    for (int i = 11; i <= 14; ++i) E.set(i, q.dn);  // unread (no K split, no fused norm)
+    E.rd(q.dn);
+    E.rd(q.injr);
+    E.rd(q.N16);
+    E.wr(q.inj);
+    E.wr(xout);
+    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
+    return;
   }
   E.pipe("q4_hc_gates");
   E.set(0, q.dn);
@@ -1491,6 +1535,28 @@ inline void q4_hc_inject(Model& m, Enc& E, const Buf& H, const Buf& y, const Buf
   E.rd(inj);
   E.wr(H);
   E.threads(MTLSizeMake(size_t(c.D / 4), size_t(rows), 1), MTLSizeMake(64, 1, 1));
+}
+
+// q4_hc_inject and the stream norm of the next read (block `next`) in one
+// dispatch: H += inj y, then q4s.N16 = the normalized streams of H, so that
+// read runs with `prenormed` (ESPETERO_Q4_FUSE_INJ=0: separate dispatches).
+inline void q4_hc_inject_norm(Model& m, Enc& E, const Buf& H, const Buf& y, const Buf& inj, const HCBlock& next, int rows) {
+  const Config& c = m.cfg;
+  E.pipe("q4_hc_inject_norm");
+  E.set(0, H);
+  E.set(1, y);
+  E.set(2, inj);
+  E.set(3, next.norm);
+  E.set(4, m.q4s.N16);
+  E.bytes(5, c.D);
+  E.bytes(6, c.hc);
+  E.bytes(7, c.eps);
+  E.rd(H);
+  E.rd(y);
+  E.rd(inj);
+  E.wr(H);
+  E.wr(m.q4s.N16);
+  E.groups(MTLSizeMake(size_t(c.hc), size_t(rows), 1), MTLSizeMake(256, 1, 1));
 }
 
 // One RMS-normalized group of `d` values per row (weight w, eps): fp32 rows of
@@ -1541,6 +1607,35 @@ inline void reset_arrival_counters(Model& m) {
   for (id<MTLBuffer> b : {m.tune.kctr, m.norm_ctr, m.gdn_ctr, m.mz.cctr, m.mz.rctr})
     if (b) std::memset([b contents], 0, [b length]);
   m.ctr_dirty = false;
+}
+
+// Resident experts: every layer's experts read once from the checkpoint and
+// repacked into resident GPU buffers in the whole-layer format moe_mlp reads
+// (slot = expert id), so a pass routes on the GPU without handshakes. Chosen
+// at load when they all fit (model.mm); replaces the expert cache.
+inline void ensure_resident_experts(Model& m) {
+  const Config& c = m.cfg;
+  if (!m.xres_l.empty() || !m.xs.present) return;
+  const auto t0 = Clock::now();
+  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true);
+  Arena tmp(m.dev, size_t(1) << 30);
+  m.xres_l.resize(size_t(c.L));
+  for (int li = 0; li < c.L; ++li) {
+    tmp.reset();
+    QW gu, dn;
+    read_layer_experts(m, li, tmp, gu, dn);
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    repack(m, e, gu, tmp, m.xres.get());
+    repack(m, e, dn, tmp, m.xres.get());
+    [e endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) fail("resident experts: repack of layer " + std::to_string(li) + " failed");
+    m.xres_l[size_t(li)] = {gu, dn};
+  }
+  std::fprintf(stderr, "expert cache: all %d experts of %d layers resident (%.1f GB, %.0f s)\n", c.E, c.L,
+               double(m.xres->held()) / 1e9, ms_since(t0) / 1000.0);
 }
 
 // Expert-cache admissions of a failed pass: the slot maps were updated
@@ -2311,10 +2406,25 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   static const bool q4_flushlog = env_on("ESPETERO_Q4_FLUSHLOG");
   Enc::FlushLog q4_fl;
   if (q4_flushlog && c.q4) E.flush_log = &q4_fl;
+  // q4_pre: the block whose normalized input q4s.N16 already holds (written by
+  // the injection before it, q4_hc_inject_norm); its read of H skips the norm.
+  static const bool q4_fuse_inj = !(std::getenv("ESPETERO_Q4_FUSE_INJ") && *std::getenv("ESPETERO_Q4_FUSE_INJ") == '0');
+  const HCBlock* q4_pre = nullptr;
   auto q4_read = [&](const HCBlock& B, bool inject, id<MTLBuffer> X, int rows, id<MTLBuffer> xout) {
-    q4_hc_read(m, E, B, inject, X, rows, xout);
+    const bool pre = q4_pre == &B && X == m.q4s.H;
+    q4_pre = nullptr;
+    q4_hc_read(m, E, B, inject, X, rows, xout, pre);
   };
-  auto q4_inject = [&](int rows) { q4_hc_inject(m, E, m.q4s.H, m.q4s.y, m.q4s.inj, rows); };
+  // The injection; with `next`, also the stream norm of that block's read (which follows it directly).
+  auto q4_inject = [&](int rows, const HCBlock* next = nullptr) {
+    if (next && q4_fuse_inj) {
+      q4_hc_inject_norm(m, E, m.q4s.H, m.q4s.y, m.q4s.inj, *next, rows);
+      q4_pre = next;
+    } else {
+      q4_hc_inject(m, E, m.q4s.H, m.q4s.y, m.q4s.inj, rows);
+      q4_pre = nullptr;
+    }
+  };
   auto q4_ple = [&]() {
     Model::Q4Scratch& q = m.q4s;
     const Ple& P = m.ple;
@@ -3284,9 +3394,15 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       }
     }
     if (c.q4) {
-      q4_inject(M);
+      q4_inject(M, &L.hcm);
       q4_read(L.hcm, true, m.q4s.H, M, s.xn);
-      if (m.xpool.empty()) q4_experts(li);
+      if (!m.xres_l.empty()) {
+        Layer& Lr = m.layers[size_t(li)];
+        Lr.experts_gu = m.xres_l[size_t(li)].first;
+        Lr.experts_down = m.xres_l[size_t(li)].second;
+      } else if (m.xpool.empty()) {
+        q4_experts(li);
+      }
       E.pipe("q4_zero");
       const uint32_t ny = uint32_t(M) * uint32_t(c.D);
       E.set(0, m.q4s.y);
@@ -3320,7 +3436,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       Layer& Lm = m.layers[size_t(li)];
       Lm.experts_gu.wr = Lm.experts_gu.sb = Lm.experts_gu.wh = Buf{};
       Lm.experts_down.wr = Lm.experts_down.sb = Lm.experts_down.wh = Buf{};
-      q4_inject(M);
+      // The next layer's input read follows directly, except after the n-gram mix (q4_ple changes H first).
+      const bool next_read = li + 1 < c.L && li + 1 != c.ple_layer;
+      q4_inject(M, next_read ? &m.layers[size_t(li + 1)].hca : nullptr);
       // Debug (parity): ESPETERO_Q4_DUMP=dir writes the residual streams after
       // every layer (P<pass>_H<li>.f32, [M][W] fp32) and the pass's n-gram rows (P<pass>_e16.f16).
       static const char* q4dump = std::getenv("ESPETERO_Q4_DUMP");

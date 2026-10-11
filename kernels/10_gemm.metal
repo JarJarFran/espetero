@@ -822,6 +822,12 @@ struct NormParams {
 };
 
 constant constexpr int EPI_ADDP = 3;
+// Qwen4-Exp hyper-connection mix (q4_hc_mix folded in): the up matrix's rows
+// are ordered so a 32-column block holds 32 / S channels x S streams (column
+// j * S + s = stream s of channel nb * 32 / S + j); Yv gets the fp16 block
+// input x[c] = 1/S sum_s sigmoid(m[s, c]) N[s, c], with N = y16 (fp16 streams,
+// row stride np.part_ld, stream stride np.out_ld = D) and S = np.D.
+constant constexpr int EPI_HCMIX = 4;
 
 // Inverse RMS of MM rows from their P partial sums of squares: the KS
 // simdgroups of the threadgroup each sum a slice (instead of every simdgroup
@@ -923,6 +929,18 @@ kernel void rgemv(
   float inv[MM];
   threadgroup float nred[KS][MM];
   if (NRM == 1) row_inv<MM, KS>(pin, np, p.M, ushort(sgid), ushort(lane), nred, inv);
+  // NRM 3 (Qwen4-Exp hyper-connection read, q4_hc_gates folded in): the input
+  // is the down projection's fp32 rows (lda = their width), read as
+  // half(silu(dn / S)) with S = np.D; np.P is the gates' mode (0 injection
+  // logits in pin [rows][S], 1 in dn after the K inputs, 2 none), and
+  // threadgroup 0 writes the injection weights inj = 2 sigmoid(v / S) to pout.
+  const float invS = NRM == 3 ? 1.0f / float(np.D) : 0.0f;
+  if (NRM == 3 && np.P != 2 && tgid.x == 0 && tgid.y == 0 && sgid == 0 && int(lane) < np.D) {
+    for (int m = 0; m < p.M; ++m) {
+      const float v = np.P == 1 ? Af[ulong(m) * p.lda + p.K + lane] : pin[ulong(m) * np.D + lane];
+      pout[ulong(m) * np.D + lane] = 2.0f / (1.0f + exp(-v * invS));
+    }
+  }
   float acc[MM][8];
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
@@ -953,6 +971,8 @@ kernel void rgemv(
       } else if (NRM == 2) {
         const float z = m < p.M ? pin[ulong(m) * np.part_ld + k] : 0.0f;
         return m < p.M ? Af[ulong(m) * p.lda + k] * inv[m] * wn[k & 127] * (z / (1.0f + exp(-z))) : 0.0f;
+      } else if (NRM == 3) {
+        return m < p.M ? float(half(silu(Af[ulong(m) * p.lda + k] * invS))) : 0.0f;
       } else {
         return m < p.M ? float(A[ulong(m) * p.lda + k]) : 0.0f;
       }
@@ -1058,6 +1078,15 @@ kernel void rgemv(
         const int out = ((n0 + (c / 8) * 8) / 16) * 8 + (c % 8);
         ((device half*)Yv)[ulong(m) * p.ldy + out] = half(glu_gate(v) * u);
       }
+    } else if (EPI == EPI_HCMIX) {
+      const int S = np.D, per = 32 / S;
+      if (c < per) {
+        const int d = nb * per + c;
+        float acc = 0.0f;
+        for (int s = 0; s < S; ++s)
+          acc += float(y16[ulong(m) * np.part_ld + ulong(s) * np.out_ld + d]) / (1.0f + exp(-red[m][c * S + s]));
+        ((device half*)Yv)[ulong(m) * p.ldy + d] = half(acc / float(S));
+      }
     } else if (EPI == EPI_ADDP) {
       // Values another threadgroup (the finalizer) reads inside this dispatch
       // are stored atomically: plain stores are not visible across
@@ -1133,6 +1162,14 @@ INSTANTIATE_RGEMV("rgemv4_", 4)
 INSTANTIATE_RGEMV("rgemv5_", 5)
 INSTANTIATE_RGEMV("rgemv6_", 6)
 INSTANTIATE_RGEMV("rgemv8_", 8)
+// Qwen4-Exp hyper-connection read, gates + up + mix in one GEMV (NRM 3, EPI_HCMIX).
+#define INSTANTIATE_RGEMV_HCMIX(PRE, BITS)                                                           \
+  template [[host_name(PRE "1_hcmix")]] kernel void rgemv<BITS, 1, 4, 8, 3>(RGEMV_ARGS);            \
+  template [[host_name(PRE "2_hcmix")]] kernel void rgemv<BITS, 2, 4, 8, 3>(RGEMV_ARGS);
+INSTANTIATE_RGEMV_HCMIX("rgemv4_", 4)
+INSTANTIATE_RGEMV_HCMIX("rgemv5_", 5)
+INSTANTIATE_RGEMV_HCMIX("rgemv6_", 6)
+INSTANTIATE_RGEMV_HCMIX("rgemv8_", 8)
 // One row, 16 K-slices per threadgroup (512 threads): GEMVs with few column
 // blocks (the MoE's 2048-row projections: 64 threadgroups) keep twice the
 // simdgroups in flight and still reduce inside the threadgroup.

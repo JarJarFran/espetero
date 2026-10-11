@@ -46,13 +46,21 @@ inline void ngram_rows(const NgramTable& T, int per_ngram, int64_t c0, int64_t c
 inline void ngram_read_row(const NgramTable& T, int64_t row, __fp16* out) {
   const int64_t sh = row / T.shard_rows, r = row % T.shard_rows;
   const NgramTable::Shard& S = T.shards[size_t(sh)];
-  const int fd = T.fds[size_t(S.file)];
   const int ng = T.width / T.group;
   uint32_t codes[64];
   uint16_t sc[16], bi[16];
-  pread_all(fd, codes, size_t(T.width / 2), S.w + uint64_t(r) * uint64_t(T.width / 2));
-  pread_all(fd, sc, size_t(ng) * 2, S.s + uint64_t(r) * uint64_t(ng) * 2);
-  pread_all(fd, bi, size_t(ng) * 2, S.b + uint64_t(r) * uint64_t(ng) * 2);
+  const uint64_t ow = S.w + uint64_t(r) * uint64_t(T.width / 2), os = S.s + uint64_t(r) * uint64_t(ng) * 2,
+                 ob = S.b + uint64_t(r) * uint64_t(ng) * 2;
+  if (const uint8_t* base = T.maps.empty() ? nullptr : T.maps[size_t(S.file)]) {
+    std::memcpy(codes, base + ow, size_t(T.width / 2));
+    std::memcpy(sc, base + os, size_t(ng) * 2);
+    std::memcpy(bi, base + ob, size_t(ng) * 2);
+  } else {
+    const int fd = T.fds[size_t(S.file)];
+    pread_all(fd, codes, size_t(T.width / 2), ow);
+    pread_all(fd, sc, size_t(ng) * 2, os);
+    pread_all(fd, bi, size_t(ng) * 2, ob);
+  }
   auto bf = [](uint16_t x) {
     uint32_t u = uint32_t(x) << 16;
     float f;

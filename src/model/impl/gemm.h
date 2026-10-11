@@ -52,6 +52,7 @@ struct Tuner {
   // rows beside it (embedding passes, "gemm_fixed").
   bool fixed = false;
   bool gemv_splitk = false; // decode GEMVs with few column blocks split K over threadgroups (+10 us per call, off)
+  int max_splits = 8;       // ... into at most this many K slices (ESPETERO_GEMV_SPLITS)
   int gemv_ks = 8;          // K-slices per 1-row GEMV threadgroup when it has few column blocks: 8 or 16 (ESPETERO_GEMV_KS)
   int ks16_blocks = 128;    // ... "few": fewer column blocks than this
   // Micro benchmarks: a kernel name for decode-sized GEMMs without norm
@@ -213,7 +214,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     // Few column blocks: split K over threadgroups (last arriver reduces).
     int splits = 1, g_split = 0;
     if (T.gemv_splitk && nblocks < 128 && nblocks <= Tuner::kMaxSplitBlocks && KG >= 8) {
-      splits = std::min({8, std::max(1, 256 / nblocks), KG / 4});
+      splits = std::min({T.max_splits, std::max(1, 256 / nblocks), KG / 4});
       g_split = (KG + splits - 1) / splits;
       splits = (KG + g_split - 1) / g_split;
       if (splits < 2) splits = 1, g_split = 0;

@@ -83,11 +83,14 @@ struct Layer {
 // Qwen4-Exp n-gram embedding table, left in the checkpoint's safetensors
 // (docs/qwen4_exp.md 5): 16 hashed rows of 160 values per token, 4-bit affine
 // group 32 (codes, bf16 scales, bf16 biases in three tensors per shard) times
-// one weight_scale. Rows are read with pread; the table never enters memory.
+// one weight_scale. Rows are read from a read-only mapping of the files (pread
+// when mapping fails); the table is not copied into memory, but a background
+// reader can warm the file cache with it (ensure_ngram_preload).
 struct NgramTable {
   struct Shard { int file = -1; uint64_t w = 0, s = 0, b = 0; };
   std::vector<std::string> files;
   std::vector<int> fds;
+  std::vector<const uint8_t*> maps;  // per file: its whole mapping, or nullptr (never unmapped)
   std::vector<Shard> shards;
   int64_t shard_rows = 0, rows = 0;
   int width = 160, group = 32;
@@ -423,6 +426,10 @@ struct Model : Runtime {
   double expert_cache_gb = 0;  // GB of expert slots (0: whole layers per pass, the test path)
   std::vector<ExpertPool> xpool;
   std::unique_ptr<Arena> xstage;  // staging of expert reads, reused across handshakes (reset per handshake)
+  // Resident experts (ensure_resident_experts): every layer's experts in the
+  // whole-layer format, loaded once when they all fit; empty otherwise.
+  std::unique_ptr<Arena> xres;
+  std::vector<std::pair<QW, QW>> xres_l;  // per layer: gate/up, down
   std::unique_ptr<ExpertPrefetch> xpf;  // prefetch entries and reader pool, made at the first handshake
   // Admissions of a long pass: (staged record, pool slot) copies encoded after its MoE.
   std::vector<std::pair<int, int>> xadmit;

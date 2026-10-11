@@ -101,7 +101,9 @@ kernel void q4_hc_gates(
   }
 }
 
-// x[c] = 1/S sum_s sigmoid(m[s, c]) N[s, c] as fp16 (the block input).
+// x[c] = 1/S sum_s sigmoid(m[s, c]) N[s, c] as fp16 (the block input). The up
+// matrix's rows (so m's columns) are in the hcmix order (EPI_HCMIX): m[s, c]
+// at (c / per) * 32 + (c % per) * S + s with per = 32 / S.
 kernel void q4_hc_mix(
     device const float* m [[buffer(0)]],
     device const half* N [[buffer(1)]],
@@ -112,10 +114,16 @@ kernel void q4_hc_mix(
   const int j = gid.x;  // float4 column
   const ulong row = gid.y;
   if (j >= D / 4) return;
+  const int per = 32 / S;
   float4 acc = 0.0f;
   for (int s = 0; s < S; ++s) {
     const ulong o = row * ulong(S * D) + ulong(s) * D;
-    const float4 g = ((device const float4*)(m + o))[j];
+    device const float* mr = m + row * ulong(S * D) + s;
+    float4 g;
+    UNROLL for (int i = 0; i < 4; ++i) {
+      const int c = 4 * j + i;
+      g[i] = mr[(c / per) * 32 + (c % per) * S];
+    }
     acc += float4(((device const half4*)(N + o))[j]) / (1.0f + exp(-g));
   }
   ((device half4*)(x + row * ulong(D)))[j] = half4(acc / float(S));
@@ -135,6 +143,55 @@ kernel void q4_hc_inject(
   const float4 v = ((device const float4*)(y + row * ulong(D)))[j];
   for (int s = 0; s < S; ++s)
     ((device float4*)(H + row * ulong(S * D) + ulong(s) * D))[j] += inj[row * ulong(S) + s] * v;
+}
+
+// q4_hc_inject then q4_stream_norm of the next hyper-connection read in one
+// dispatch (decode: the injection is the read's only producer): threadgroup
+// (s, row) updates stream s of H in place, H[s, c] += inj[s] y[c], and writes
+// the block input's normalized fp16 stream Y[s, c] = H[s, c] rsqrt(mean(H[s]^2)
+// + eps) w[s, c]. The same arithmetic and reduction order as the two kernels,
+// so the results are identical.
+kernel void q4_hc_inject_norm(
+    device float* H [[buffer(0)]],
+    device const float* yv [[buffer(1)]],
+    device const float* inj [[buffer(2)]],
+    device const float* w [[buffer(3)]],
+    device half* Y [[buffer(4)]],
+    constant int& D [[buffer(5)]],
+    constant int& S [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 ntg2 [[threads_per_threadgroup]]) {
+  const uint ntg = ntg2.x;
+  threadgroup float red[32];
+  const int s = tg.x;
+  const ulong row = tg.y;
+  device float4* x = (device float4*)(H + row * ulong(S * D) + ulong(s) * D);
+  device const float4* v = (device const float4*)(yv + row * ulong(D));
+  const float g = inj[row * ulong(S) + s];
+  float acc = 0.0f;
+  for (int j = int(tid); j < D / 4; j += int(ntg)) {
+    float4 h = x[j];
+    h += g * v[j];
+    x[j] = h;
+    acc += dot(h, h);
+  }
+  acc = simd_sum(acc);
+  if (lane == 0) red[sg] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float t = lane < (ntg + 31) / 32 ? red[lane] : 0.0f;
+    t = simd_sum(t);
+    if (lane == 0) red[0] = t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(red[0] / float(D) + eps);
+  device const float4* ws = (device const float4*)(w + ulong(s) * D);
+  device half4* y = (device half4*)(Y + row * ulong(S * D) + ulong(s) * D);
+  for (int j = int(tid); j < D / 4; j += int(ntg)) y[j] = half4(x[j] * inv * ws[j]);
 }
 
 kernel void q4_zero(device float* y [[buffer(0)]], constant uint& n [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
