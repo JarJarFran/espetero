@@ -58,9 +58,9 @@ otherwise:
   mixture-of-experts or Gemma 4 checkpoints yet, and it serves images only
   with `--vision`, which these runs did not pass.
 
-Some runs shared the GPU with the Mac's screen: the window server took 5 to 26
-% of the GPU's time during them, which slows the engine down. Their notes say
-so. Every request, with the replies to the answer checks, is in
+Some runs shared the GPU with another app (the screen's window server, or
+another app's GPU process) for 5 to 33 % of the run's time on the GPU, which
+can slow the engine down. Their notes say so. Every request, with the replies to the answer checks, is in
 [2026-10-11-m1-max.jsonl](2026-10-11-m1-max.jsonl).
 
 ## Qwen3.8-27B MLX 4-bit
@@ -69,28 +69,28 @@ so. Every request, with the replies to the answer checks, is in
 
 | Measure | Espetero | Espetero + MTP | MLX | MLX + draft model | oMLX | oMLX + MTP | oMLX + DFlash2 | TensorFold |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|
-| Load time (s) | 23.1 | 16.3 | **6.4** | – | 12.3 | 13.5 | 16.4 | 53.7 |
-| Decode, 1 user (tok/s) | 12.7 | **20.2** | 12.5 | – | 11.2 | 13.6 | 15.1 | 11.0 |
-| Time to first token, short prompt (s) | 0.45 | **0.44** | 1.11 | – | 1.34 | 1.24 | 1.36 | 1.03 |
-| Decode on code (tok/s) | 13.6 | **31.9** | 12.9 | – | 11.4 | 16.6 | 26.2 | 11.0 |
-| Prefill 1K (tok/s) | **138** | 135 | 83 | – | 77 | – | 83 | 55 |
-| Prefill 8K (tok/s) | **127** | 124 | 85 | – | 89 | – | 97 | 45 |
-| Prefill 32K (tok/s) | **109** | 103 | 80 | – | 83 | – | 86 | 23 |
-| Decode after 1K context (tok/s) | 13.9 | **18.3** | 12.9 | – | 11.1 | – | 12.5 | 10.7 |
-| Decode after 8K context (tok/s) | 12.8 | **17.2** | 12.4 | – | 11.1 | – | 11.4 | 10.2 |
-| Decode after 32K context (tok/s) | 11.9 | **13.0** | 10.8 | – | 9.7 | – | 11.3 | 7.4 |
-| 4 users, total (tok/s) | **35.1** | 27.4 | 17.4 | – | 15.8 | – | 18.9 | 10.9 |
-| 8 users, total (tok/s) | **54.6** | 46.0 | 18.8 | – | 17.5 | – | 19.6 | 11.0 |
-| 16 users, total (tok/s) | **81.6** | 72.3 | 34.3 | – | 26.6 | – | 20.0 | 11.1 |
-| 16 users, first token (s) | **4.17** | 4.72 | 13.15 | – | 18.08 | – | 17.51 | 173.55 |
-| Image 1024x768, 128 tokens (s) | **15.39** | – | 21.55 | – | 21.16 | – | – | – |
-| Peak GPU memory (GB) | 40.8 | 39.9 | 28.5 | – | **28.0** | – | 44.8 | 37.4 |
+| Load time (s) | 9.9 | 16.3 | **6.4** | – | 12.3 | 13.5 | 16.4 | 53.7 |
+| Decode, 1 user (tok/s) | 14.7 | **20.2** | 12.5 | – | 11.2 | 13.6 | 15.1 | 11.0 |
+| Time to first token, short prompt (s) | **0.42** | 0.44 | 1.11 | – | 1.34 | 1.24 | 1.36 | 1.03 |
+| Decode on code (tok/s) | 15.0 | **31.9** | 12.9 | – | 11.4 | 16.6 | 26.2 | 11.0 |
+| Prefill 1K (tok/s) | **148** | 135 | 83 | – | 77 | – | 83 | 55 |
+| Prefill 8K (tok/s) | **137** | 124 | 85 | – | 89 | – | 97 | 45 |
+| Prefill 32K (tok/s) | **119** | 103 | 80 | – | 83 | – | 86 | 23 |
+| Decode after 1K context (tok/s) | 15.4 | **18.3** | 12.9 | – | 11.1 | – | 12.5 | 10.7 |
+| Decode after 8K context (tok/s) | 14.9 | **17.2** | 12.4 | – | 11.1 | – | 11.4 | 10.2 |
+| Decode after 32K context (tok/s) | **13.6** | 13.0 | 10.8 | – | 9.7 | – | 11.3 | 7.4 |
+| 4 users, total (tok/s) | **38.1** | 27.4 | 17.4 | – | 15.8 | – | 18.9 | 10.9 |
+| 8 users, total (tok/s) | **63.5** | 46.0 | 18.8 | – | 17.5 | – | 19.6 | 11.0 |
+| 16 users, total (tok/s) | **87.2** | 72.3 | 34.3 | – | 26.6 | – | 20.0 | 11.1 |
+| 16 users, first token (s) | **3.90** | 4.72 | 13.15 | – | 18.08 | – | 17.51 | 173.55 |
+| Image 1024x768, 128 tokens (s) | **14.21** | – | 21.55 | – | 21.16 | – | – | – |
+| Peak GPU memory (GB) | 40.1 | 39.9 | 28.5 | – | **28.0** | – | 44.8 | 37.4 |
 | Short answers right | 20/20 | 20/20 | 20/20 | – | 20/20 | – | 20/20 | 20/20 |
 | Python functions passing tests | 12/12 | 12/12 | 12/12 | – | 12/12 | – | 12/12 | 12/12 |
 
-- Espetero: measured while the screen was in use (see Method)
+- Espetero: another app used the GPU during this run (see Method)
 - MLX + draft model, load: speculative decoding with a draft model (Qwen3.8-2B 4-bit) fails on every request: 'Speculative decoding requires a trimmable prompt cache (got ArraysCache)' (the model's linear-attention layers)
-- TensorFold: measured while the screen was in use (see Method)
+- TensorFold: another app used the GPU during this run (see Method)
 - TensorFold, image: HTTP 400: it serves images only with `--vision`, which these runs did not pass
 
 ## Qwen3.8-27B MLX 8-bit
@@ -124,27 +124,26 @@ so. Every request, with the replies to the answer checks, is in
 
 | Measure | Espetero | Espetero + MTP | llama.cpp | llama.cpp + MTP |
 |:--|--:|--:|--:|--:|
-| Load time (s) | 23.7 | 25.9 | 19.6 | **19.3** |
-| Decode, 1 user (tok/s) | 9.1 | **15.6** | 5.8 | 9.9 |
-| Time to first token, short prompt (s) | **0.52** | 0.52 | 1.20 | 1.10 |
-| Decode on code (tok/s) | 9.3 | **25.8** | 5.8 | 15.3 |
-| Prefill 1K (tok/s) | **124** | 120 | 68 | 90 |
-| Prefill 8K (tok/s) | **116** | 113 | 67 | 91 |
-| Prefill 32K (tok/s) | 103 | **103** | 59 | 82 |
-| Decode after 1K context (tok/s) | 9.4 | **14.3** | 5.8 | 9.8 |
-| Decode after 8K context (tok/s) | 9.2 | **14.1** | 5.7 | 10.2 |
-| Decode after 32K context (tok/s) | 8.7 | **14.5** | 5.3 | 8.8 |
-| 4 users, total (tok/s) | 25.7 | **26.6** | 13.1 | 23.6 |
-| 8 users, total (tok/s) | 43.0 | **44.5** | 20.6 | 28.8 |
-| 16 users, total (tok/s) | 66.9 | **67.6** | 26.2 | 31.6 |
-| 16 users, first token (s) | 6.02 | **4.92** | 14.29 | 12.16 |
-| Image 1024x768, 128 tokens (s) | **20.51** | – | 34.09 | – |
+| Load time (s) | 23.7 | 25.9 | **4.4** | 5.9 |
+| Decode, 1 user (tok/s) | 9.1 | **15.6** | 6.9 | 11.5 |
+| Time to first token, short prompt (s) | **0.52** | 0.52 | 0.92 | 0.94 |
+| Decode on code (tok/s) | 9.3 | **25.8** | 7.0 | 15.5 |
+| Prefill 1K (tok/s) | **124** | 120 | 90 | 91 |
+| Prefill 8K (tok/s) | **116** | 113 | 90 | 93 |
+| Prefill 32K (tok/s) | 103 | **103** | 82 | 82 |
+| Decode after 1K context (tok/s) | 9.4 | **14.3** | 7.1 | 10.0 |
+| Decode after 8K context (tok/s) | 9.2 | **14.1** | 7.0 | 10.2 |
+| Decode after 32K context (tok/s) | 8.7 | **14.5** | 6.6 | 9.0 |
+| 4 users, total (tok/s) | 25.7 | **26.6** | 16.4 | 23.7 |
+| 8 users, total (tok/s) | 43.0 | **44.5** | 25.3 | 29.4 |
+| 16 users, total (tok/s) | 66.9 | **67.6** | 31.8 | 32.1 |
+| 16 users, first token (s) | 6.02 | **4.92** | 10.81 | 12.05 |
+| Image 1024x768, 128 tokens (s) | **20.51** | – | 27.35 | – |
 | Peak GPU memory (GB) | 42.2 | 42.9 | **30.0** | 39.6 |
 | Short answers right | 20/20 | 20/20 | 20/20 | 20/20 |
 | Python functions passing tests | 12/12 | 12/12 | 12/12 | 12/12 |
 
-- llama.cpp: measured while the screen was in use (see Method)
-- llama.cpp + MTP: measured while the screen was in use (see Method)
+- llama.cpp: another app used the GPU during this run (see Method)
 
 ## Qwen3.6-35B-A3B MLX 4-bit
 
@@ -205,27 +204,24 @@ so. Every request, with the replies to the answer checks, is in
 
 | Measure | Espetero | llama.cpp |
 |:--|--:|--:|
-| Load time (s) | 34.5 | **19.2** |
-| Decode, 1 user (tok/s) | **59.5** | 48.7 |
-| Time to first token, short prompt (s) | **0.10** | 0.24 |
-| Decode on code (tok/s) | **57.7** | 47.2 |
-| Prefill 1K (tok/s) | **781** | 547 |
-| Prefill 8K (tok/s) | **754** | 554 |
-| Prefill 32K (tok/s) | **573** | 448 |
-| Decode after 1K context (tok/s) | **57.9** | 47.7 |
-| Decode after 8K context (tok/s) | **55.2** | 45.1 |
-| Decode after 32K context (tok/s) | **51.3** | 38.1 |
-| 4 users, total (tok/s) | **104.7** | 80.2 |
-| 8 users, total (tok/s) | **138.1** | 95.6 |
-| 16 users, total (tok/s) | **176.9** | 98.6 |
-| 16 users, first token (s) | **0.77** | 2.20 |
-| Image 1024x768, 128 tokens (s) | **3.89** | 4.74 |
-| Peak GPU memory (GB) | 40.8 | **32.3** |
+| Load time (s) | 40.4 | **15.6** |
+| Decode, 1 user (tok/s) | **59.6** | 53.8 |
+| Time to first token, short prompt (s) | **0.10** | 0.22 |
+| Decode on code (tok/s) | **59.5** | 52.9 |
+| Prefill 1K (tok/s) | **943** | 630 |
+| Prefill 8K (tok/s) | **829** | 627 |
+| Prefill 32K (tok/s) | **623** | 480 |
+| Decode after 1K context (tok/s) | **59.2** | 52.9 |
+| Decode after 8K context (tok/s) | **57.4** | 49.5 |
+| Decode after 32K context (tok/s) | **52.9** | 41.6 |
+| 4 users, total (tok/s) | **113.4** | 85.8 |
+| 8 users, total (tok/s) | **145.9** | 99.3 |
+| 16 users, total (tok/s) | **189.7** | 105.1 |
+| 16 users, first token (s) | **0.87** | 1.98 |
+| Image 1024x768, 128 tokens (s) | **3.94** | 4.69 |
+| Peak GPU memory (GB) | 44.1 | **32.1** |
 | Short answers right | 20/20 | 20/20 |
 | Python functions passing tests | 12/12 | 12/12 |
-
-- Espetero: measured while the screen was in use (see Method)
-- llama.cpp: measured while the screen was in use (see Method)
 
 ## Gemma 4 26B-A4B MLX 4-bit
 
@@ -233,28 +229,27 @@ so. Every request, with the replies to the answer checks, is in
 
 | Measure | Espetero | MLX | oMLX | vLLM-metal |
 |:--|--:|--:|--:|--:|
-| Load time (s) | 10.3 | **7.8** | 11.5 | 63.0 |
-| Decode, 1 user (tok/s) | **81.4** | 49.9 | 59.0 | 46.4 |
-| Time to first token, short prompt (s) | **0.08** | 0.33 | 0.34 | 0.28 |
-| Decode on code (tok/s) | **81.1** | 48.6 | 49.7 | 44.5 |
-| Prefill 1K (tok/s) | **824** | 428 | 370 | 414 |
-| Prefill 8K (tok/s) | **706** | 420 | 411 | 235 |
-| Prefill 32K (tok/s) | **471** | 452 | 410 | 84 |
-| Decode after 1K context (tok/s) | **73.6** | 45.7 | 51.5 | 42.7 |
-| Decode after 8K context (tok/s) | **71.2** | 42.8 | 46.4 | 23.2 |
-| Decode after 32K context (tok/s) | **64.4** | 33.9 | 33.2 | 8.6 |
-| 4 users, total (tok/s) | **124.7** | 74.8 | 67.2 | 65.3 |
-| 8 users, total (tok/s) | **174.8** | 87.2 | 74.8 | 75.2 |
-| 16 users, total (tok/s) | **244.5** | 121.0 | 99.6 | 107.9 |
-| 16 users, first token (s) | **0.84** | 2.13 | 4.85 | 2.39 |
-| Image 1024x768, 128 tokens (s) | – | – | 3.56 | – |
-| Peak GPU memory (GB) | 36.3 | 22.5 | **19.3** | 44.9 |
+| Load time (s) | 10.3 | **7.8** | 13.5 | 63.0 |
+| Decode, 1 user (tok/s) | **81.4** | 49.9 | 60.5 | 46.4 |
+| Time to first token, short prompt (s) | **0.08** | 0.33 | 0.32 | 0.28 |
+| Decode on code (tok/s) | **81.1** | 48.6 | 58.8 | 44.5 |
+| Prefill 1K (tok/s) | **824** | 428 | 504 | 414 |
+| Prefill 8K (tok/s) | **706** | 420 | 531 | 235 |
+| Prefill 32K (tok/s) | 471 | 452 | **477** | 84 |
+| Decode after 1K context (tok/s) | **73.6** | 45.7 | 56.6 | 42.7 |
+| Decode after 8K context (tok/s) | **71.2** | 42.8 | 50.8 | 23.2 |
+| Decode after 32K context (tok/s) | **64.4** | 33.9 | 36.5 | 8.6 |
+| 4 users, total (tok/s) | **124.7** | 74.8 | 73.5 | 65.3 |
+| 8 users, total (tok/s) | **174.8** | 87.2 | 84.2 | 75.2 |
+| 16 users, total (tok/s) | **244.5** | 121.0 | 109.9 | 107.9 |
+| 16 users, first token (s) | **0.84** | 2.13 | 4.21 | 2.39 |
+| Image 1024x768, 128 tokens (s) | – | – | 3.23 | – |
+| Peak GPU memory (GB) | 36.3 | **22.5** | 23.8 | 44.9 |
 | Short answers right | 20/20 | 20/20 | 20/20 | 20/20 |
 | Python functions passing tests | 11/12 | 11/12 | 12/12 | 11/12 |
 
 - Espetero, image: Espetero runs Gemma 4 text only so far (HTTP 422)
-- oMLX: measured while the screen was in use (see Method)
-- vLLM-metal: measured while the screen was in use (see Method)
+- vLLM-metal: another app used the GPU during this run (see Method)
 - vLLM-metal, image: the server refused the image request (HTTP 400)
 
 ## Gemma 4 26B-A4B GGUF UD-Q4_K_M
@@ -263,27 +258,26 @@ so. Every request, with the replies to the answer checks, is in
 
 | Measure | Espetero | llama.cpp |
 |:--|--:|--:|
-| Load time (s) | 21.4 | **10.2** |
-| Decode, 1 user (tok/s) | **53.5** | 45.6 |
-| Time to first token, short prompt (s) | **0.09** | 0.26 |
-| Decode on code (tok/s) | **53.5** | 42.6 |
-| Prefill 1K (tok/s) | **757** | 481 |
-| Prefill 8K (tok/s) | **654** | 417 |
-| Prefill 32K (tok/s) | **455** | 250 |
-| Decode after 1K context (tok/s) | **50.3** | 43.9 |
-| Decode after 8K context (tok/s) | **48.9** | 41.5 |
-| Decode after 32K context (tok/s) | **45.8** | 36.2 |
-| 4 users, total (tok/s) | **105.0** | 73.6 |
-| 8 users, total (tok/s) | **148.9** | 87.5 |
-| 16 users, total (tok/s) | **209.9** | 87.4 |
-| 16 users, first token (s) | **0.89** | 1.93 |
-| Image 1024x768, 128 tokens (s) | – | 4.74 |
+| Load time (s) | 21.4 | **9.7** |
+| Decode, 1 user (tok/s) | **53.5** | 51.6 |
+| Time to first token, short prompt (s) | **0.09** | 0.23 |
+| Decode on code (tok/s) | **53.5** | 50.8 |
+| Prefill 1K (tok/s) | **757** | 595 |
+| Prefill 8K (tok/s) | **654** | 517 |
+| Prefill 32K (tok/s) | **455** | 279 |
+| Decode after 1K context (tok/s) | **50.3** | 49.5 |
+| Decode after 8K context (tok/s) | **48.9** | 46.3 |
+| Decode after 32K context (tok/s) | **45.8** | 41.0 |
+| 4 users, total (tok/s) | **105.0** | 89.3 |
+| 8 users, total (tok/s) | **148.9** | 104.6 |
+| 16 users, total (tok/s) | **209.9** | 106.4 |
+| 16 users, first token (s) | **0.89** | 1.60 |
+| Image 1024x768, 128 tokens (s) | – | 4.25 |
 | Peak GPU memory (GB) | 36.7 | **23.5** |
 | Short answers right | 20/20 | 20/20 |
 | Python functions passing tests | 11/12 | 11/12 |
 
 - Espetero, image: Espetero runs Gemma 4 text only so far (HTTP 422)
-- llama.cpp: measured while the screen was in use (see Method)
 
 ## Gemma 4 31B MLX 4-bit
 

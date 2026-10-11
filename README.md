@@ -10,28 +10,28 @@ Same model files, same client ([tools/bench_compare.py](tools/bench_compare.py))
 
 | Model · file | Engine | Decode, tok/s | First token, s | Prompt of 8K tokens, tok/s | Decode at 32K context, tok/s | 8 users at once, tok/s | Photo, s |
 |:--|:--|--:|--:|--:|--:|--:|--:|
-| **Qwen3.8-27B** · MLX 4-bit | Espetero 0.1.0† | 12.7 · **20.2** with MTP¹ | **0.45** | **127** | **11.9** | **54.6** | **15.4** |
+| **Qwen3.8-27B** · MLX 4-bit | Espetero 0.1.0† | 14.7 · **20.2** with MTP¹ | **0.42** | **137** | **13.6** | **63.5** | **14.2** |
 |  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 12.5 | 1.11 | 85 | 10.8 | 18.8 | 21.6 |
 |  | oMLX 0.7.0 | 11.2 · 15.1 with DFlash2 | 1.34 | 89 | 9.7 | 17.5 | 21.2 |
 |  | TensorFold 1.0.4²† | 11.0 | 1.03 | 45 | 7.4 | 11.0 | – |
 | **Qwen3.8-27B** · GGUF UD-Q6_K | Espetero 0.1.0 | 9.1 · **15.6** with MTP | **0.52** | **116** | **8.7** | **43.0** | **20.5** |
-|  | llama.cpp b11429† | 5.8 · 9.9 with MTP | 1.20 | 67 | 5.3 | 20.6 | 34.1 |
+|  | llama.cpp b11429† | 6.9 · 11.5 with MTP | 0.92 | 90 | 6.6 | 25.3 | 27.3 |
 | **Qwen3.6-35B-A3B** (MoE) · MLX 4-bit | Espetero 0.1.0 | **105.7** | **0.09** | **945** | **84.5** | **194.0** | **3.0** |
 |  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 58.2 | 0.23 | 663 | 40.8 | 118.1 | 3.6 |
 |  | oMLX 0.7.0 | 80.6 | 0.26 | 676 | 58.7 | 114.4 | 3.4 |
 |  | vLLM-metal 0.30.0 | 44.5 | 0.18 | 528 | 22.8 | 112.8 | – |
-| **Qwen3.6-35B-A3B** (MoE) · GGUF UD-Q6_K | Espetero 0.1.0† | **59.5** | **0.10** | **754** | **51.3** | **138.1** | **3.9** |
-|  | llama.cpp b11429† | 48.7 | 0.24 | 554 | 38.1 | 95.6 | 4.7 |
+| **Qwen3.6-35B-A3B** (MoE) · GGUF UD-Q6_K | Espetero 0.1.0 | **59.6** | **0.10** | **829** | **52.9** | **145.9** | **3.9** |
+|  | llama.cpp b11429 | 53.8 | 0.22 | 627 | 41.6 | 99.3 | 4.7 |
 | **Gemma 4 26B-A4B** (MoE) · MLX 4-bit | Espetero 0.1.0 | **81.4** | **0.08** | **706** | **64.4** | **174.8** | –³ |
 |  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 49.9 | 0.33 | 420 | 33.9 | 87.2 | – |
-|  | oMLX 0.7.0† | 59.0 | 0.34 | 411 | 33.2 | 74.8 | 3.6 |
+|  | oMLX 0.7.0 | 60.5 | 0.32 | 531 | 36.5 | 84.2 | 3.2 |
 |  | vLLM-metal 0.30.0† | 46.4 | 0.28 | 235 | 8.6 | 75.2 | – |
 | **Gemma 4 26B-A4B** (MoE) · GGUF UD-Q4_K_M | Espetero 0.1.0 | **53.5** | **0.09** | **654** | **45.8** | **148.9** | –³ |
-|  | llama.cpp b11429† | 45.6 | 0.26 | 417 | 36.2 | 87.5 | 4.7 |
+|  | llama.cpp b11429 | 51.6 | 0.23 | 517 | 41.0 | 104.6 | 4.2 |
 
 Greedy decoding with thinking off. *Decode*: 8 short prompts, 512 new tokens each, one at a time; after the dot, with the engine's own drafts (checked by the full model, so the replies do not change). *First token*: the same prompts. *Prompt of 8K tokens*: prefill speed on a 7.9K-token document. *Decode at 32K context*: 256 new tokens after a 31.5K-token document. *8 users*: 8 different requests at once, 256 new tokens each, in total. *Photo*: a 1024×768 picture and a 128-token description. Every server had 16 parallel slots and a 40K context and its defaults otherwise; Espetero ran without drafts except *with MTP*. Files: [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit), [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit), [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF). The flags, every measure (load time, prefill at 1K and 32K, 16 users, memory, answers checked), more files (8-bit MLX, Gemma 4 31B) and every request: [docs/benchmarks](docs/benchmarks/README.md). Measured on 2026-10-10 and 11 with macOS 26.5.
 
-† Measured while the screen was in use: the window server took 5 to 26 % of the GPU's time, which slows that engine down (llama.cpp read prompts at 67 tok/s in its 27B Q6_K run and at 91 in its MTP run, where the screen took 6 %).
+† Another app used the GPU during this run (5 to 33 % of the run's time on the GPU), which can slow the engine down.
 ¹ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF.
 ² TensorFold's native engine has no backend for the Qwen3.6 mixture-of-experts or Gemma 4 checkpoints yet, and it serves images only with `--vision`, which these runs did not pass.
 ³ Espetero runs Gemma 4 text only so far.
