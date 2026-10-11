@@ -229,27 +229,26 @@ can slow the engine down. Their notes say so. Every request, with the replies to
 
 | Measure | Espetero | MLX | oMLX | vLLM-metal |
 |:--|--:|--:|--:|--:|
-| Load time (s) | 10.3 | **7.8** | 13.5 | 63.0 |
-| Decode, 1 user (tok/s) | **81.4** | 49.9 | 60.5 | 46.4 |
-| Time to first token, short prompt (s) | **0.08** | 0.33 | 0.32 | 0.28 |
-| Decode on code (tok/s) | **81.1** | 48.6 | 58.8 | 44.5 |
-| Prefill 1K (tok/s) | **824** | 428 | 504 | 414 |
-| Prefill 8K (tok/s) | **706** | 420 | 531 | 235 |
-| Prefill 32K (tok/s) | 471 | 452 | **477** | 84 |
-| Decode after 1K context (tok/s) | **73.6** | 45.7 | 56.6 | 42.7 |
-| Decode after 8K context (tok/s) | **71.2** | 42.8 | 50.8 | 23.2 |
-| Decode after 32K context (tok/s) | **64.4** | 33.9 | 36.5 | 8.6 |
-| 4 users, total (tok/s) | **124.7** | 74.8 | 73.5 | 65.3 |
-| 8 users, total (tok/s) | **174.8** | 87.2 | 84.2 | 75.2 |
-| 16 users, total (tok/s) | **244.5** | 121.0 | 109.9 | 107.9 |
-| 16 users, first token (s) | **0.84** | 2.13 | 4.21 | 2.39 |
+| Load time (s) | 10.3 | **7.8** | 13.5 | 55.8 |
+| Decode, 1 user (tok/s) | **81.4** | 49.9 | 60.5 | 47.9 |
+| Time to first token, short prompt (s) | **0.08** | 0.33 | 0.32 | 0.23 |
+| Decode on code (tok/s) | **81.1** | 48.6 | 58.8 | 47.9 |
+| Prefill 1K (tok/s) | **824** | 428 | 504 | 508 |
+| Prefill 8K (tok/s) | **706** | 420 | 531 | 247 |
+| Prefill 32K (tok/s) | 471 | 452 | **477** | 88 |
+| Decode after 1K context (tok/s) | **73.6** | 45.7 | 56.6 | 43.0 |
+| Decode after 8K context (tok/s) | **71.2** | 42.8 | 50.8 | 23.6 |
+| Decode after 32K context (tok/s) | **64.4** | 33.9 | 36.5 | 8.8 |
+| 4 users, total (tok/s) | **124.7** | 74.8 | 73.5 | 75.6 |
+| 8 users, total (tok/s) | **174.8** | 87.2 | 84.2 | 86.4 |
+| 16 users, total (tok/s) | **244.5** | 121.0 | 109.9 | 118.8 |
+| 16 users, first token (s) | **0.84** | 2.13 | 4.21 | 1.99 |
 | Image 1024x768, 128 tokens (s) | – | – | 3.23 | – |
-| Peak GPU memory (GB) | 36.3 | **22.5** | 23.8 | 44.9 |
+| Peak GPU memory (GB) | 36.3 | **22.5** | 23.8 | 44.8 |
 | Short answers right | 20/20 | 20/20 | 20/20 | 20/20 |
 | Python functions passing tests | 11/12 | 11/12 | 12/12 | 11/12 |
 
 - Espetero, image: Espetero runs Gemma 4 text only so far (HTTP 422)
-- vLLM-metal: another app used the GPU during this run (see Method)
 - vLLM-metal, image: the server refused the image request (HTTP 400)
 
 ## Gemma 4 26B-A4B GGUF UD-Q4_K_M

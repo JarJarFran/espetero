@@ -25,7 +25,7 @@ Same model files, same client ([tools/bench_compare.py](tools/bench_compare.py))
 | **Gemma 4 26B-A4B** (MoE) · MLX 4-bit | Espetero 0.1.0 | **81.4** | **0.08** | **706** | **64.4** | **174.8** | –³ |
 |  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 49.9 | 0.33 | 420 | 33.9 | 87.2 | – |
 |  | oMLX 0.7.0 | 60.5 | 0.32 | 531 | 36.5 | 84.2 | 3.2 |
-|  | vLLM-metal 0.30.0† | 46.4 | 0.28 | 235 | 8.6 | 75.2 | – |
+|  | vLLM-metal 0.30.0 | 47.9 | 0.23 | 247 | 8.8 | 86.4 | – |
 | **Gemma 4 26B-A4B** (MoE) · GGUF UD-Q4_K_M | Espetero 0.1.0 | **53.5** | **0.09** | **654** | **45.8** | **148.9** | –³ |
 |  | llama.cpp b11429 | 51.6 | 0.23 | 517 | 41.0 | 104.6 | 4.2 |
 
