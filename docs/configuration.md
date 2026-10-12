@@ -495,6 +495,51 @@ it started with.
   is in `/health`. Errors have Ollama's shape, `{"error": "..."}`, also as
   the last line of a stream that fails.
 
+### Coding agents
+
+Claude Code, Codex CLI and opencode run against Espetero as they are: each
+fixed a small Python package with failing unit tests (8 of 8 passing, the
+tests untouched) on Qwen3.6-35B-A3B 6-bit served with `--context 65536`.
+Give the server a context that holds the agent's system prompt and tools
+plus the work; the prompt checkpoints keep the system prompt and the history
+an agent re-sends every turn from being computed again.
+
+- **Claude Code** (Anthropic Messages): any model name works, the server
+  serves its one model.
+
+  ```bash
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=local \
+  ANTHROPIC_MODEL=local ANTHROPIC_DEFAULT_HAIKU_MODEL=local claude
+  ```
+
+- **Codex CLI** (OpenAI Responses), in `~/.codex/config.toml`. Espetero
+  refuses tools it cannot run instead of ignoring them, so Codex's hosted web
+  search and its sub-agent tools (sent as a namespace of tools) are turned off:
+
+  ```toml
+  model = "local"
+  model_provider = "espetero"
+  web_search = "disabled"
+
+  [features]
+  multi_agent = false
+
+  [model_providers.espetero]
+  name = "Espetero"
+  base_url = "http://127.0.0.1:8080/v1"
+  wire_api = "responses"
+  env_key = "ESPETERO_API_KEY"   # the server's --api-key, or any value without one
+  ```
+
+- **opencode** (OpenAI Chat Completions), in `opencode.json`:
+
+  ```json
+  {"provider": {"espetero": {"npm": "@ai-sdk/openai-compatible", "name": "Espetero",
+     "options": {"baseURL": "http://127.0.0.1:8080/v1", "apiKey": "local"},
+     "models": {"local": {"name": "Espetero", "limit": {"context": 65536, "output": 8192}}}}},
+   "model": "espetero/local"}
+  ```
+
 ### Clef decision models
 
 Cloudflare's Clef releases (`Cloudflare/clef-flash`: Qwen3.5-9B; `Cloudflare/clef`:

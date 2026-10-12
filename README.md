@@ -73,7 +73,7 @@ espetero rm unsloth/Qwen3.8-27B-GGUF:UD-Q6_K     # remove it from the Hugging Fa
 
 They work on the shared Hugging Face cache: `list` shows what `hf download` fetched too, with each model's format, quantization, size, the memory it needs and whether it fits; `rm` deletes as `hf cache delete` does (the repository's files, or one GGUF quantization's, and the blobs nothing else links to) and never touches anything outside that cache.
 
-Any OpenAI, Anthropic or Ollama client works against `http://127.0.0.1:8080`: the OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`), Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`), Ollama's CLI, libraries and apps (`OLLAMA_HOST=http://127.0.0.1:8080`), curl:
+Any OpenAI, Anthropic or Ollama client works against `http://127.0.0.1:8080`: the OpenAI SDKs (`base_url="http://127.0.0.1:8080/v1"`), Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080`), Codex CLI and opencode ([coding agents](docs/configuration.md#coding-agents)), Ollama's CLI, libraries and apps (`OLLAMA_HOST=http://127.0.0.1:8080`), curl:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
