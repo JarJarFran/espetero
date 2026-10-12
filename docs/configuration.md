@@ -497,8 +497,8 @@ it started with.
 
 ### Coding agents
 
-Claude Code, Codex CLI and opencode run against Espetero as they are: each
-fixed a small Python package with failing unit tests (8 of 8 passing, the
+Claude Code, Codex CLI (with the two settings below) and opencode run
+against Espetero: each fixed a small Python package with failing unit tests (8 of 8 passing, the
 tests untouched) on Qwen3.6-35B-A3B 6-bit served with `--context 65536`.
 Give the server a context that holds the agent's system prompt and tools
 plus the work; the prompt checkpoints keep the system prompt and the history
