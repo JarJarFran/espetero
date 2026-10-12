@@ -217,6 +217,16 @@ class MetalModel final : public NativeModel {
     if (slots <= 0) {
       const double for_slots = kv_tokens ? budget - double(kv_tokens) * double(tok_bytes) : budget * 0.35;
       slots = int(std::clamp(for_slots / double(slot_bytes), 8.0, 256.0));
+      // A large slot state (Gemma 4 31B's sliding-window rings: 0.84 GB a
+      // slot) leaves fewer slots than concurrent requests, and the requests
+      // past them wait for a free one. Automatic slots then grow to the
+      // requests, as far as the budget allows beside the KV of two full
+      // contexts.
+      if (!kv_tokens && o.users > slots) {
+        const double kv_min = 2.0 * double(m.max_ctx) * double(tok_bytes);
+        const int fit = int(std::max(0.0, budget - kv_min) / double(slot_bytes));
+        slots = std::clamp(std::min(o.users, fit), slots, 256);
+      }
     }
     if (!kv_tokens) {
       const double rest = std::max(budget - double(slots) * double(slot_bytes), 0.5e9);

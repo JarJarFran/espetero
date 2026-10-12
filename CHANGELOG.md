@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Automatic slots grow to `--users` (concurrent requests) when the memory budget allows, beside the KV of two full contexts. Gemma 4 31B, whose slots carry the sliding-window rings (0.84 GB each), had 8 slots: with 16 requests at once the second 8 waited for the first 8 (now 16 slots: first token about 10x sooner, 40 % more tokens per second in total). With the default 64 users, Qwen3.8-27B goes from 48 to 64 slots and from 218K to 157K tokens of KV.
+
 ## 0.1.0 (2026-10-11)
 
 The first public release.

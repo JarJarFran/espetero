@@ -29,6 +29,7 @@ namespace espetero {
 
 struct LoadOptions {
   int slots = 0;            // user state slots (0: automatic from the memory budget)
+  int users = 0;            // concurrent requests (--users): automatic slots grow to them when the budget allows
   double kv_gb = 0;         // KV pool size in GB (0: automatic)
   double memory_gb = 0;     // budget for slots + KV (0: ~60% of free GPU memory)
   double expert_cache_gb = 0;  // models whose experts stay on the SSD (Qwen4-Exp): GB of expert slots in memory

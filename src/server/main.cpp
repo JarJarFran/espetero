@@ -544,6 +544,7 @@ EngineOptions engine_options(const Args& a) {
   o.load.vision = !a.has("no-vision");
   o.max_seqs = a.i("max-seqs", 64);
   if (o.max_seqs < 1) config_error("--max-seqs (--users): at least 1");  // 0 left every request waiting forever
+  o.load.users = o.max_seqs;
   o.draft_tokens = a.i("draft", -1);  // -1: the model's default (5; Qwen4-Exp 3)
   o.sibling_drafts = a.i("siblings", 0);
   o.draft_auto = a.has("draft-auto");
