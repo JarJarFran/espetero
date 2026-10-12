@@ -17,6 +17,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -793,10 +794,24 @@ json::Value responses_to_chat(const json::Value& b, json::Value& history) {
     }
   }
   if (const json::Value* tools = b.get("tools"); tools && tools->is_array() && tools->size()) {
+    // Tools this server cannot run are refused, named, with the fix for the
+    // client that sends them by default (Codex CLI: its hosted web search and
+    // its sub-agent tools, a namespace of functions).
+    std::vector<std::string> other;
+    for (const json::Value& t : tools->as_array()) {
+      const std::string ty = t.get_string("type", "function");
+      if (ty != "function" && std::find(other.begin(), other.end(), ty) == other.end()) other.push_back(ty);
+    }
+    if (!other.empty()) {
+      std::string msg = "tools: only function tools (no built-in tools); this request also has ";
+      for (size_t i = 0; i < other.size(); ++i) msg += (i ? ", " : "") + other[i];
+      if (std::find(other.begin(), other.end(), "web_search") != other.end() ||
+          std::find(other.begin(), other.end(), "namespace") != other.end())
+        msg += " (Codex CLI: web_search = \"disabled\" and, under [features], multi_agent = false in config.toml)";
+      throw RequestError(422, msg);
+    }
     json::Value ts = arr();
     for (const json::Value& t : tools->as_array()) {
-      if (t.get_string("type", "function") != "function")
-        throw RequestError(422, "tools: only function tools (no built-in tools)");
       json::Value fn = obj();
       fn.set("name", t.get_string("name", ""));
       if (const json::Value* d = t.get("description")) fn.set("description", *d);
