@@ -3,6 +3,8 @@
 ## 0.1.1 (2026-10-12)
 
 - Automatic slots grow to `--users` (concurrent requests) when the memory budget allows, beside the KV of two full contexts. Gemma 4 31B, whose slots carry the sliding-window rings (0.84 GB each), had 8 slots: with 16 requests at once the second 8 waited for the first 8 (now 16 slots: first token about 10x sooner, 40 % more tokens per second in total). With the default 64 users, Qwen3.8-27B goes from 48 to 64 slots and from 218K to 157K tokens of KV.
+- Coding agents: [docs/configuration.md](docs/configuration.md#coding-agents) shows Claude Code, Codex CLI and opencode against Espetero (each fixed a small Python package with failing tests on Qwen3.6-35B-A3B 6-bit); Codex CLI needs `web_search = "disabled"` and `[features] multi_agent = false`.
+- A Responses request with tools that are not functions gets a 422 that names them, and for Codex's hosted web search and sub-agent tools the config fix.
 
 ## 0.1.0 (2026-10-11)
 
