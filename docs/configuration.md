@@ -130,7 +130,7 @@ stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.0; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; text only) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; text only) and Cloudflare Clef classifiers
 ```
 
 Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models, text
@@ -583,7 +583,7 @@ state are rendered as floats.
 
 ### Limits for untrusted clients
 
-Espetero 0.1.0 is meant for one trusted user, but the server refuses what a
+This release is meant for one trusted user, but the server refuses what a
 stray web page or an abusive request could do with it:
 
 - **Browsers.** Without `--api-key` the server answers only requests addressed

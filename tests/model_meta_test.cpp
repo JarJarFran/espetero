@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "../src/server/version.h"
+
 #include "../src/engine/model_meta.h"
 
 using namespace espetero;
@@ -126,7 +128,7 @@ static void test_family() {
   // Other families: one message naming the model_type.
   const std::string llama = dir_with("llama4", "{\"model_type\": \"llama4\", \"text_config\": {\"model_type\": \"llama4_text\"}}");
   const std::string e = error_of(llama);
-  CHECK(contains(e, llama + ": model_type 'llama4' is not supported by Espetero 0.1.0; it runs the Qwen3.5 family (qwen3_5, "
+  CHECK(contains(e, llama + ": model_type 'llama4' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family (qwen3_5, "
                             "qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), "
                             "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; text only) and Cloudflare Clef classifiers"));
   // Other Gemma generations are not Gemma 4.
@@ -149,7 +151,7 @@ static void test_family() {
   CHECK(error_of(Gguf().strings("tokenizer.ggml.tokens", 10).s("general.architecture", "qwen35moe").file("m.gguf")).empty());
   CHECK(error_of(Gguf().strings("tokenizer.ggml.tokens", 10).s("general.architecture", "gemma4").file("g4.gguf")).empty());
   const std::string g = Gguf().s("general.architecture", "llama").ints("x.sections", 4).file("g.gguf");
-  CHECK(contains(error_of(g), g + ": GGUF architecture 'llama' is not supported by Espetero 0.1.0; it runs the Qwen3.5 family "
+  CHECK(contains(error_of(g), g + ": GGUF architecture 'llama' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family "
                                  "(qwen35, qwen35moe:"));
   CHECK(contains(error_of(g), "and Gemma 4 (gemma4: 31B, 26B-A4B; text only)"));
   CHECK(contains(error_of(g), "Cloudflare Clef classifiers run from MLX directories"));

@@ -5,11 +5,11 @@
 #
 # The tap (github.com/JarJarFran/homebrew-espetero) carries this formula with
 # the sha256 of the release's source tarball:
-#   curl -sL https://github.com/JarJarFran/espetero/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
+#   curl -sL https://github.com/JarJarFran/espetero/archive/refs/tags/v0.1.1.tar.gz | shasum -a 256
 class Espetero < Formula
   desc "Fast LLM inference for Apple silicon with OpenAI and Anthropic APIs"
   homepage "https://github.com/JarJarFran/espetero"
-  url "https://github.com/JarJarFran/espetero/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/JarJarFran/espetero/archive/refs/tags/v0.1.1.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000" # set in the tap (see above)
   license all_of: ["MIT", "Apache-2.0"] # Apache-2.0: src/engine/clef.{h,cpp}
 

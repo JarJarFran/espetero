@@ -89,7 +89,7 @@ The port opens at once; `GET /health` answers 503 `{"status": "loading"}` until 
 ```bash
 make && sudo make install      # /usr/local/bin/espetero (PREFIX=... and DESTDIR=... change where)
 sudo make uninstall
-make dist                      # build/espetero-0.1.0-macos-arm64.tar.gz: the binary, README, licenses and notices
+make dist                      # build/espetero-0.1.1-macos-arm64.tar.gz: the binary, README, licenses and notices
 ```
 
 Homebrew: `brew install JarJarFran/espetero/espetero` builds Espetero from the release's source ([packaging/homebrew/espetero.rb](packaging/homebrew/espetero.rb)).
@@ -132,7 +132,7 @@ The model-level tests (parity against reference runtimes, vision fidelity agains
 
 ## Security
 
-Espetero listens on `127.0.0.1` by default. Version 0.1.0 is meant for one trusted user: every API key holder shares the prompt cache and the Batch API. Request, image and upload sizes are bounded, images are fetched by URL only with `--image-urls` and never from this machine or its networks unless `--image-urls-private` allows it, and without an API key the server refuses requests from web pages (DNS rebinding, cross-site requests); see [limits for untrusted clients](docs/configuration.md#limits-for-untrusted-clients). Keep it on localhost, or behind an authenticating proxy, and set `--api-key` (or `ESPETERO_API_KEY`).
+Espetero listens on `127.0.0.1` by default. This release is meant for one trusted user: every API key holder shares the prompt cache and the Batch API. Request, image and upload sizes are bounded, images are fetched by URL only with `--image-urls` and never from this machine or its networks unless `--image-urls-private` allows it, and without an API key the server refuses requests from web pages (DNS rebinding, cross-site requests); see [limits for untrusted clients](docs/configuration.md#limits-for-untrusted-clients). Keep it on localhost, or behind an authenticating proxy, and set `--api-key` (or `ESPETERO_API_KEY`).
 
 ## License
 
