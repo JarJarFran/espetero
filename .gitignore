@@ -3,3 +3,4 @@ build*/
 *.o
 .DS_Store
 __pycache__/
+deploy/

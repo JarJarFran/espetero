@@ -40,6 +40,40 @@ int main(int argc, char** argv) {
     auto m = NativeModel::load(argv[1], o);
     auto ms = [&](auto a) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count(); };
     std::fprintf(stderr, "loaded in %.1f s\n", ms(t0) / 1e3);
+    if (const char* b = std::getenv("DS4_RUN_BATCH")) {  // two prompts: separately, then as one pass of two trees
+      std::vector<int32_t> ids2;
+      std::stringstream s2(b);
+      std::string t;
+      while (std::getline(s2, t, ',')) ids2.push_back(int32_t(std::stoi(t)));
+      auto one = [&](const std::vector<int32_t>& v, std::vector<float>& lg) {
+        TreeSpec t1;
+        t1.root = v.data(), t1.root_len = int(v.size()), t1.score_root = true, t1.want_logits = true;
+        m->run({t1});
+        lg.assign(m->logits(0, 0), m->logits(0, 0) + m->info().vocab);
+      };
+      std::vector<float> a, bb, a2, b2;
+      one(ids, a);
+      one(ids2, bb);
+      TreeSpec x, y;
+      x.root = ids.data(), x.root_len = int(ids.size()), x.score_root = true, x.want_logits = true;
+      y.root = ids2.data(), y.root_len = int(ids2.size()), y.score_root = true, y.want_logits = true;
+      m->run({x, y});
+      a2.assign(m->logits(0, 0), m->logits(0, 0) + m->info().vocab);
+      b2.assign(m->logits(1, 0), m->logits(1, 0) + m->info().vocab);
+      auto cmp = [](const std::vector<float>& u, const std::vector<float>& v) {
+        double d = 0, n = 0;
+        int au = 0, av = 0;
+        for (size_t i = 0; i < u.size(); ++i) {
+          d += (u[i] - v[i]) * (u[i] - v[i]), n += v[i] * v[i];
+          if (u[i] > u[size_t(au)]) au = int(i);
+          if (v[i] > v[size_t(av)]) av = int(i);
+        }
+        std::printf("rel %.2e argmax %d %d\n", std::sqrt(d / n), au, av);
+      };
+      cmp(a2, a);
+      cmp(b2, bb);
+      return 0;
+    }
     const int s = m->slot_alloc();
     TreeSpec t;
     t.parent = -1;

@@ -56,7 +56,8 @@ class Dsv4Model final : public NativeModel {
     alloc_scratch();
     // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each
     int nslots = o.slots > 0 ? o.slots : 4;
-    seqs_.resize(size_t(nslots) + 1);  // the last one: scratch for passes that save nothing
+    nuser_ = nslots;
+    seqs_.resize(size_t(nslots) + size_t(kScratch));  // scratch slots after the user ones: trees that save nothing
     for (Seq& s : seqs_) alloc_seq(s);
     // ---- expert cache: what the GPU working set and the Mac's memory leave
     {
@@ -96,7 +97,7 @@ class Dsv4Model final : public NativeModel {
     info_.kv_blocks = nslots * max_ctx_ / 64;
     info_.max_ctx = max_ctx_;
     info_.max_rows = T_;
-    info_.max_readouts = 1;
+    info_.max_readouts = max_reads_;
     info_.weight_bytes = rt_.arena->total();
     info_.kv_bytes = seq_bytes_ * size_t(nslots);
     info_.slot_state_bytes = seq_bytes_;
@@ -118,7 +119,7 @@ class Dsv4Model final : public NativeModel {
 
   // ---- slots
   int slot_alloc() override {
-    for (size_t i = 0; i + 1 < seqs_.size(); ++i)
+    for (size_t i = 0; i < size_t(nuser_); ++i)
       if (!seqs_[i].used) {
         seqs_[i].used = true;
         reset(seqs_[i]);
@@ -138,12 +139,12 @@ class Dsv4Model final : public NativeModel {
   bool slot_mtp(int) const override { return false; }
   int free_slots() const override {
     int n = 0;
-    for (size_t i = 0; i + 1 < seqs_.size(); ++i) n += seqs_[i].used ? 0 : 1;
+    for (size_t i = 0; i < size_t(nuser_); ++i) n += seqs_[i].used ? 0 : 1;
     return n;
   }
   int free_kv_tokens() const override {
     int n = 0;
-    for (size_t i = 0; i + 1 < seqs_.size(); ++i) n += max_ctx_ - (seqs_[i].used ? seqs_[i].len : 0);
+    for (size_t i = 0; i < size_t(nuser_); ++i) n += max_ctx_ - (seqs_[i].used ? seqs_[i].len : 0);
     return n;
   }
   int pass_kv_tokens(const std::vector<TreeSpec>&) const override { return 0; }
@@ -153,20 +154,74 @@ class Dsv4Model final : public NativeModel {
     for (int s : slots) n += seqs_.at(size_t(s)).used ? seqs_[size_t(s)].len : 0;
     return n;
   }
-  bool slot_save(int, const std::string&) override { return false; }
-  int slot_load(const std::string&) override { return -1; }
-  std::string state_signature() const override { return "deepseek_v41-unsaved"; }
+  // Checkpoint files: header, the window rings, each KV source's compressed
+  // entries and index keys up to the length, the compressor's pending rows.
+  struct CkptHead {
+    char magic[8];
+    int32_t version, len, nsrc, nhist;
+    int32_t hist[8];
+    uint64_t ring_bytes, pend_bytes;
+  };
+  bool slot_save(int slot, const std::string& path) override {
+    const Seq& q = seq(slot);
+    CkptHead h{};
+    std::memcpy(h.magic, "ESPDS4CK", 8);
+    h.version = 1, h.len = q.len, h.nsrc = int32_t(src_ratio_.size()), h.nhist = int32_t(q.hist.size());
+    for (size_t i = 0; i < q.hist.size() && i < 8; ++i) h.hist[i] = q.hist[i];
+    h.ring_bytes = uint64_t(c_.L) * uint64_t(c_.WIN) * uint64_t(c_.HD) * 2;
+    h.pend_bytes = uint64_t(src_ratio_.size()) * 2 * 8 * uint64_t(c_.HD) * 4;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(ptr(q.ring), 1, h.ring_bytes, f) == h.ring_bytes;
+    for (size_t i = 0; ok && i < src_ratio_.size(); ++i) {
+      const size_t n = size_t(q.len / src_ratio_[i]);
+      ok = std::fwrite(ptr(q.comp[i]), 1, n * size_t(c_.HD) * 2, f) == n * size_t(c_.HD) * 2 &&
+           std::fwrite(ptr(q.idxk[i]), 1, n * size_t(c_.IHD) * 2, f) == n * size_t(c_.IHD) * 2;
+    }
+    ok = ok && std::fwrite(ptr(q.pend), 1, h.pend_bytes, f) == h.pend_bytes;
+    return std::fclose(f) == 0 && ok;
+  }
+  int slot_load(const std::string& path) override {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    struct Closer {
+      FILE* f;
+      ~Closer() { std::fclose(f); }
+    } closer{f};
+    CkptHead h{};
+    if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "ESPDS4CK", 8) != 0 || h.version != 1 ||
+        h.nsrc != int32_t(src_ratio_.size()) || h.len < 0 || h.len > max_ctx_ || h.nhist < 0 || h.nhist > 8 ||
+        h.ring_bytes != uint64_t(c_.L) * uint64_t(c_.WIN) * uint64_t(c_.HD) * 2 ||
+        h.pend_bytes != uint64_t(src_ratio_.size()) * 2 * 8 * uint64_t(c_.HD) * 4)
+      return -1;
+    const int slot = slot_alloc();
+    if (slot < 0) return -2;
+    Seq& q = seq(slot);
+    bool ok = std::fread(ptr(q.ring), 1, h.ring_bytes, f) == h.ring_bytes;
+    for (size_t i = 0; ok && i < src_ratio_.size(); ++i) {
+      const size_t n = size_t(h.len / src_ratio_[i]);
+      ok = std::fread(ptr(q.comp[i]), 1, n * size_t(c_.HD) * 2, f) == n * size_t(c_.HD) * 2 &&
+           std::fread(ptr(q.idxk[i]), 1, n * size_t(c_.IHD) * 2, f) == n * size_t(c_.IHD) * 2;
+    }
+    ok = ok && std::fread(ptr(q.pend), 1, h.pend_bytes, f) == h.pend_bytes;
+    if (!ok) {
+      slot_free(slot);
+      return -1;
+    }
+    q.len = h.len;
+    q.hist.assign(h.hist, h.hist + h.nhist);
+    return slot;
+  }
+  std::string state_signature() const override { return "deepseek_v41-1|" + info_.path + "|" + std::to_string(max_ctx_); }
 
   // ---- passes
   void run(const std::vector<TreeSpec>& trees, PassStats* stats) override {
     @autoreleasepool {
       const auto t0 = Clock::now();
       out_.assign(trees.size(), Readout{});
+      run_trees(trees);
       int rows = 0;
-      for (size_t i = 0; i < trees.size(); ++i) {
-        run_tree(trees[i], out_[i]);
-        rows += trees[i].root_len;
-      }
+      for (const TreeSpec& t : trees) rows += t.root_len;
       if (stats) {
         stats->wall_ms = stats->gpu_ms = ms_since(t0);
         stats->rows = rows;
@@ -279,7 +334,9 @@ class Dsv4Model final : public NativeModel {
   ExpertCache xc_;
   std::vector<Seq> seqs_;
   ModelInfo info_;
-  int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0;
+  int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0, nuser_ = 0;
+  static constexpr int kScratch = 4;
+  int max_reads_ = 32;  // segments (readouts) per pass
   size_t seq_bytes_ = 0;
   double engram_gb_ = 0;
   bool verbose_ = false, profile_ = false, partial_ = false, no_engram_ = false;
@@ -481,7 +538,7 @@ class Dsv4Model final : public NativeModel {
     IDX_ = F(T * size_t(c_.ITOPK));
     cstride_ = c_.cand_bs > 0 ? max_ctx_ / c_.cand_bs + 2 : 1;
     CAND_ = rt_.buffer(T * size_t(cstride_));
-    const size_t nsub = (T + P - 1) / P;
+    const size_t nsub = (T + P - 1) / P + 1;
     tile_cap_ = 3 * int(A / 16 + size_t(c_.E) + 1);  // three tile lists (64, 32, 16 rows)
     XGRP_ = rt_.buffer(nsub * size_t(2 * c_.E) * 24);
     XTILE_ = rt_.buffer(nsub * size_t(tile_cap_) * 8);
@@ -508,7 +565,7 @@ class Dsv4Model final : public NativeModel {
     SG_ = F(P * size_t(c_.IE)), SU_ = F(P * size_t(c_.IE)), SH_ = F(P * size_t(c_.IE));
     EE_ = F(P * ecols * size_t(c_.eng_hd));
     EKV_ = F(P * D * 5);
-    XN_ = F(D), LOG_ = F(size_t(c_.V));
+    XN_ = F(D * size_t(max_reads_)), LOG_ = F(size_t(c_.V) * size_t(max_reads_));
   }
 
   void alloc_seq(Seq& s) {
@@ -528,7 +585,7 @@ class Dsv4Model final : public NativeModel {
   }
 
   Seq& seq(int s) {
-    if (s < 0 || s + 1 >= int(seqs_.size())) fail("deepseek_v41: bad slot " + std::to_string(s));
+    if (s < 0 || s >= nuser_) fail("deepseek_v41: bad slot " + std::to_string(s));
     return seqs_[size_t(s)];
   }
   void reset(Seq& s) {
@@ -767,7 +824,7 @@ class Dsv4Model final : public NativeModel {
   // ---------------------------------------------------------------- engram (host)
   // The pass's Engram rows as stored (fp8 codes, then e8m0 scales), read from
   // the SSD into ERAW_[g] ([T][cols][hd + hd / 32] bytes); the GPU dequantizes them.
-  void engram_gather(const Seq& s, const int32_t* toks, int T) {
+  void engram_gather(const Seq& s, const int32_t* toks, int T, int row0) {
     const auto t0 = Clock::now();
     const int nb = eng_.max_n - 1;
     const int ncol = nb * eng_.heads, hd = c_.eng_hd, rb = hd + hd / 32;
@@ -807,7 +864,7 @@ class Dsv4Model final : public NativeModel {
           ok = false;
       });
       if (!ok) fail("deepseek_v41: Engram table read failed (row out of range or I/O error)");
-      uint8_t* dst = static_cast<uint8_t*>([ERAW_[g] contents]);
+      uint8_t* dst = static_cast<uint8_t*>([ERAW_[g] contents]) + size_t(row0) * size_t(ncol) * size_t(rb);
       for (size_t i = 0; i < rows.size(); ++i)
         std::memcpy(dst + i * size_t(rb), vals.data() + size_t(uniq[rows[i]]) * size_t(rb), size_t(rb));
     }
@@ -890,22 +947,54 @@ class Dsv4Model final : public NativeModel {
   }
 
   // ---------------------------------------------------------------- forward
-  // T rows of one sequence at positions s.len ... (T <= T_), layer by layer:
-  // every layer runs over all rows (in sub-chunks of P_ rows on the GPU)
+  // A pass: rows of one or more sequences (segments), layer by layer: every
+  // layer runs over all rows (GPU blocks of P_ rows, which may mix segments)
   // before the next one, so each layer's experts come from the SSD once per
-  // pass. Logits of the last row into `logits` when given.
-  void forward_rows(Seq& s, const int32_t* toks, int T, float* logits) {
+  // pass and the dense projections serve every sequence at once. Attention
+  // runs per segment part of a block.
+  struct Seg {
+    Seq* s = nullptr;
+    const int32_t* toks = nullptr;
+    int n = 0;
+    float* logits = nullptr;  // the last row's logits, or null
+    int r0 = 0, p0 = 0;       // first row in the pass, first position
+  };
+  struct Part {
+    int seg = 0, ro = 0, m = 0, p0 = 0;  // block rows [ro, ro + m) of segment seg, at positions p0 ...
+    int topk = 0;                        // index entries per row for the current compressed layers (0: dense)
+  };
+  struct Blk {
+    int r0 = 0, M = 0;
+    std::vector<Part> parts;
+  };
+
+  void forward(std::vector<Seg>& segs) {
     const Cfg& c = c_;
-    const int D = c.D, K = c.K, p0 = s.len;
-    if (p0 + T > max_ctx_) fail("deepseek_v41: context full (" + std::to_string(max_ctx_) + " tokens)");
-    for (int i = 0; i < T; ++i) {
-      if (toks[i] < 0 || toks[i] >= c.V) fail("deepseek_v41: token id out of range");
-      static_cast<int32_t*>([ids_ contents])[i] = toks[i];
-      static_cast<int32_t*>([pos_ contents])[i] = p0 + i;
+    const int D = c.D, K = c.K;
+    int T = 0;
+    for (Seg& g : segs) {
+      g.r0 = T, g.p0 = g.s->len;
+      if (g.p0 + g.n > max_ctx_) fail("deepseek_v41: context full (" + std::to_string(max_ctx_) + " tokens)");
+      for (int i = 0; i < g.n; ++i) {
+        if (g.toks[i] < 0 || g.toks[i] >= c.V) fail("deepseek_v41: token id out of range");
+        static_cast<int32_t*>([ids_ contents])[T + i] = g.toks[i];
+        static_cast<int32_t*>([pos_ contents])[T + i] = g.p0 + i;
+      }
+      T += g.n;
     }
-    if (!no_engram_) engram_gather(s, toks, T);
-    const int nsub = (T + P_ - 1) / P_;
-    std::vector<int> topk_mode(size_t(nsub), 0);
+    if (T > T_ || segs.size() > size_t(max_reads_)) fail("deepseek_v41: pass too large");
+    if (!no_engram_)
+      for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0);
+    std::vector<Blk> blks;
+    for (int r0 = 0; r0 < T; r0 += P_) {
+      Blk bk;
+      bk.r0 = r0, bk.M = std::min(P_, T - r0);
+      for (size_t i = 0; i < segs.size(); ++i) {
+        const int a0 = std::max(r0, segs[i].r0), a1 = std::min(r0 + bk.M, segs[i].r0 + segs[i].n);
+        if (a0 < a1) bk.parts.push_back(Part{int(i), a0 - r0, a1 - a0, segs[i].p0 + (a0 - segs[i].r0), 0});
+      }
+      blks.push_back(std::move(bk));
+    }
     Enc2 E(rt_);
     if (profile_ || env_on("ESPETERO_DS4_PROFILE")) E.prof = &prof_;
     {
@@ -921,9 +1010,10 @@ class Dsv4Model final : public NativeModel {
     int cur = 0;
     for (int l = 0; l < c.L; ++l) {
       const LayerW& w = L_[size_t(l)];
-      // ---- phase 1: Engram, attention, the MoE input and its routing, per sub-chunk
-      for (int ci = 0; ci < nsub; ++ci) {
-        const int r0 = ci * P_, M = std::min(P_, T - r0);
+      // ---- phase 1: Engram, attention, the MoE input and its routing, per block
+      for (size_t ci = 0; ci < blks.size(); ++ci) {
+        Blk& bk = blks[ci];
+        const int r0 = bk.r0, M = bk.M;
         if (w.eg >= 0) {
           const int ncol = (c.eng_max_n - 1) * c.eng_heads, Ke = w.e_wkv.K;
           struct {
@@ -945,7 +1035,7 @@ class Dsv4Model final : public NativeModel {
         }
         hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, mixA_, r0, M);
         hc_pre(E, prev, w.attn_norm, X_, 0, r0, M);
-        attention(E, s, l, r0, M, p0 + r0, topk_mode[size_t(ci)]);
+        attention_block(E, l, bk, segs);
         if (!dump_dir_.empty()) dump_rows(E, "a" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
         hc_post(E, mixA_, r0, M);
         hc_mix(E, w.hcf_fn, w.hcf_base, w.hcf_scale, mixF_[cur], r0, M);
@@ -970,10 +1060,10 @@ class Dsv4Model final : public NativeModel {
       const std::vector<int> slots = expert_slots(E, l, need);
       std::vector<int> slot_of(size_t(c.E), -1);
       for (size_t i = 0; i < need.size(); ++i) slot_of[size_t(need[i])] = slots[i];
-      // ---- phase 3: shared and routed experts, per sub-chunk
-      for (int ci = 0; ci < nsub; ++ci) {
-        const int r0 = ci * P_, M = std::min(P_, T - r0);
-        moe_experts(E, l, ci, r0, M, slot_of);
+      // ---- phase 3: shared and routed experts, per block
+      for (size_t ci = 0; ci < blks.size(); ++ci) {
+        const int r0 = blks[ci].r0, M = blks[ci].M;
+        moe_experts(E, l, int(ci), r0, M, slot_of);
         if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
         hc_post(E, mixF_[cur], r0, M);
       }
@@ -981,20 +1071,27 @@ class Dsv4Model final : public NativeModel {
       cur ^= 1;
       if (!dump_dir_.empty()) dump_rows(E, "h" + std::to_string(l), H_, size_t(T) * 4 * size_t(D));
     }
-    if (logits && !head_.b) std::memset([LOG_ contents], 0, size_t(c.V) * 4);
-    if (logits && head_.b) {
-      hc_pre(E, prev, norm_, XN_, 0, T - 1, 1);
-      gemv(E, 2, Buf(head_), Buf{}, XN_, 0, D, LOG_, 0, c.V, c.V, D, 1);
-    }
+    // ---- logits of the segments' last rows
+    int R = 0;
+    for (const Seg& g : segs)
+      if (g.logits && head_.b) hc_pre(E, prev, norm_, XN_, size_t(R++) * size_t(D) * 4, g.r0 + g.n - 1, 1);
+    if (R && head_.b) gemv(E, 2, Buf(head_), Buf{}, XN_, 0, D, LOG_, 0, c.V, c.V, D, R);
     E.end();
     gpu_ms_ += E.gpu_ms;
     flushes_ += uint64_t(E.flushes);
-    for (int i = 0; i < T; ++i) s.hist.push_back(toks[i]);
-    const size_t keep = size_t(std::max(0, eng_.max_n - 1));
-    if (s.hist.size() > keep) s.hist.erase(s.hist.begin(), s.hist.end() - long(keep));
-    s.len = p0 + T;
+    R = 0;
+    for (Seg& g : segs) {
+      for (int i = 0; i < g.n; ++i) g.s->hist.push_back(g.toks[i]);
+      const size_t keep = size_t(std::max(0, eng_.max_n - 1));
+      if (g.s->hist.size() > keep) g.s->hist.erase(g.s->hist.begin(), g.s->hist.end() - long(keep));
+      g.s->len = g.p0 + g.n;
+      if (g.logits) {
+        if (head_.b) std::memcpy(g.logits, static_cast<const float*>([LOG_ contents]) + size_t(R) * size_t(c.V), size_t(c.V) * 4);
+        else std::memset(g.logits, 0, size_t(c.V) * 4);
+        ++R;
+      }
+    }
     ++dump_pass_;
-    if (logits) std::memcpy(logits, [LOG_ contents], size_t(c.V) * 4);
   }
 
   int dump_pass_ = 0;
@@ -1007,13 +1104,14 @@ class Dsv4Model final : public NativeModel {
     }
   }
 
-  // Attention of rows [r0, r0 + M) (positions p0 ...): X_ in, Y_ out (scratch rows 0..M).
-  void attention(Enc2& E, Seq& s, int l, int r0, int M, int p0, int& topk_mode) {
+  // Attention of a block: X_ in, Y_ out (scratch rows 0..M); the projections
+  // over all rows, the sequence mixing per segment part.
+  void attention_block(Enc2& E, int l, Blk& bk, std::vector<Seg>& segs) {
     const Cfg& c = c_;
     const LayerW& w = L_[size_t(l)];
-    const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD;
+    const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD, M = bk.M;
     const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
-    const size_t po = size_t(r0) * 4;  // pos_ rows of this sub-chunk
+    const size_t po = size_t(bk.r0) * 4;  // pos_ rows of this block
     copy(E, X_, 0, XQ_, 0, size_t(M) * size_t(D) * 4);
     quant(E, XQ_, 0, M, D, D, 0);
     gemv8(E, w.wq_a, XQ_, D, QA_, QR, M);
@@ -1025,53 +1123,73 @@ class Dsv4Model final : public NativeModel {
     norm(E, KVp_, 0, w.kv_norm, M, 1, HD, HD);
     rope(E, KVp_, 0, pos_, po, invf, M, 1, HD, HD, false);
     quant(E, KVp_, 0, M, HD, HD, 0);
+    for (Part& pt : bk.parts) attention_seq(E, l, *segs[size_t(pt.seg)].s, bk.r0, pt);
+    rope(E, Q_, 0, pos_, po, invf, M, c.H, HD, HQ, true);
+    quant(E, Q_, 0, M, HQ, HQ, 0);
+    gemv(E, 0, w.wo_a.w, w.wo_a.s, Q_, 0, HQ, OA_, 0, c.OG * c.OR, w.wo_a.N, w.wo_a.K, M, c.OR, w.wo_a.K);
+    quant(E, OA_, 0, M, c.OG * c.OR, c.OG * c.OR, 0);
+    gemv8(E, w.wo_b, OA_, c.OG * c.OR, Y_, D, M);
+  }
+
+  // The sequence mixing of one segment part: block rows [ro, ro + m) of `s`
+  // at positions p0 ...: compressor, indexer, attention, window ring.
+  void attention_seq(Enc2& E, int l, Seq& s, int br0, Part& pt) {
+    const Cfg& c = c_;
+    const LayerW& w = L_[size_t(l)];
+    const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD;
+    const int ro = pt.ro, M = pt.m, p0 = pt.p0, r0 = br0 + ro;  // r0: pass row of the part's first row
+    const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
+    const size_t po = size_t(r0) * 4;
+    const size_t xo = size_t(ro) * size_t(D) * 4, ho = size_t(ro) * size_t(HD) * 4;
+    int& topk_mode = pt.topk;
     if (w.ratio > 0 && w.kv_src) {
       const int r = w.ratio, si = w.src;
       const int g0 = p0 / r, G = (p0 + M) / r - g0;
       if (G > s.cap[size_t(si)] - g0) fail("deepseek_v41: compressed KV full");
-      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + r0;  // this sub-chunk's own rows
+      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + r0;  // this part's own rows
       for (int g = 0; g < G; ++g) gp[g] = (g0 + g) * r;
       if (r == 1) {
-        gemvb(E, w.c_wkv, X_, D, LAT_, HD, M);
+        gemvb(E, w.c_wkv, X_, D, LAT_, HD, M, xo, ho);
       } else {
-        gemvb(E, w.c_wkv, X_, D, CKV_, HD, M);
-        gemvb(E, w.c_wgate, X_, D, CSC_, HD, M);
+        gemvb(E, w.c_wkv, X_, D, CKV_, HD, M, xo, ho);
+        gemvb(E, w.c_wgate, X_, D, CSC_, HD, M, xo, ho);
         if (G > 0) {
           struct {
             int M, n, ratio, p0, g0;
           } p{M, HD, r, p0, g0};
           E.pipe("ds4_compress");
-          E.set(0, CKV_);
-          E.set(1, CSC_);
+          E.set(0, CKV_, ho);
+          E.set(1, CSC_, ho);
           E.set(2, s.pend, size_t(si) * 2 * 8 * size_t(HD) * 4);
           E.set(3, s.pend, size_t(si) * 2 * 8 * size_t(HD) * 4 + 8 * size_t(HD) * 4);
-          E.set(4, LAT_);
+          E.set(4, LAT_, ho);
           E.bytes(5, p);
           E.threads(size_t(HD), size_t(G), 1, 256);
         }
       }
       if (G > 0) {
-        norm(E, LAT_, 0, w.c_norm, G, 1, HD, HD);
-        gemvb(E, w.i_wk, LAT_, HD, IK_, c.IHD, G);  // index keys from the RoPE-free latent
-        norm(E, IK_, 0, w.i_knorm, G, 1, c.IHD, c.IHD);
-        rope(E, IK_, 0, gpos_, po, invf, G, 1, c.IHD, c.IHD, false);
-        quant(E, IK_, 0, G, c.IHD, c.IHD, 1);
-        store_half(E, IK_, 0, c.IHD, s.idxk[size_t(si)], 0, G, c.IHD, g0, 0);
-        rope(E, LAT_, 0, gpos_, po, invf, G, 1, HD, HD, false);
-        quant(E, LAT_, 0, G, HD, HD, 2);
-        store_half(E, LAT_, 0, HD, s.comp[size_t(si)], 0, G, HD, g0, 0);
+        const size_t ko = size_t(ro) * size_t(c.IHD) * 4;
+        norm(E, LAT_, ho, w.c_norm, G, 1, HD, HD);
+        gemvb(E, w.i_wk, LAT_, HD, IK_, c.IHD, G, ho, ko);  // index keys from the RoPE-free latent
+        norm(E, IK_, ko, w.i_knorm, G, 1, c.IHD, c.IHD);
+        rope(E, IK_, ko, gpos_, po, invf, G, 1, c.IHD, c.IHD, false);
+        quant(E, IK_, ko, G, c.IHD, c.IHD, 1);
+        store_half(E, IK_, ro, c.IHD, s.idxk[size_t(si)], 0, G, c.IHD, g0, 0);
+        rope(E, LAT_, ho, gpos_, po, invf, G, 1, HD, HD, false);
+        quant(E, LAT_, ho, G, HD, HD, 2);
+        store_half(E, LAT_, ro, HD, s.comp[size_t(si)], 0, G, HD, g0, 0);
       }
       if (r > 1) {  // the incomplete group's rows wait in the slot
         const int end = p0 + M, t0 = end - end % r;
         for (int t = std::max(t0, p0); t < end; ++t) {
           const size_t pb = size_t(si) * 2 * 8 * size_t(HD) * 4;
-          copy(E, CKV_, size_t(t - p0) * size_t(HD) * 4, s.pend.b, s.pend.off + pb + size_t(t % r) * size_t(HD) * 4, size_t(HD) * 4);
-          copy(E, CSC_, size_t(t - p0) * size_t(HD) * 4, s.pend.b, s.pend.off + pb + 8 * size_t(HD) * 4 + size_t(t % r) * size_t(HD) * 4,
-               size_t(HD) * 4);
+          copy(E, CKV_, ho + size_t(t - p0) * size_t(HD) * 4, s.pend.b, s.pend.off + pb + size_t(t % r) * size_t(HD) * 4, size_t(HD) * 4);
+          copy(E, CSC_, ho + size_t(t - p0) * size_t(HD) * 4, s.pend.b,
+               s.pend.off + pb + 8 * size_t(HD) * 4 + size_t(t % r) * size_t(HD) * 4, size_t(HD) * 4);
         }
       }
     }
-    const size_t io = size_t(r0) * size_t(c.ITOPK) * 4;  // IDX_ rows of this sub-chunk
+    const size_t io = size_t(r0) * size_t(c.ITOPK) * 4;  // IDX_ rows of this part
     if (w.ratio > 0 && w.idx_src) {
       const int r = w.ratio, si = w.src;
       const int nvis_max = (p0 + M) / r;
@@ -1079,15 +1197,16 @@ class Dsv4Model final : public NativeModel {
         // candidate blocks: only beyond cand_blocks x cand_bs visible entries do they restrict anything
         const bool cand = c.cand_src >= 0 && nvis_max > c.cand_blocks * c.cand_bs && (w.cand_src || w.uses_cand);
         const int IQN = c.IH * c.IHD;
-        gemv8(E, w.i_wq_b, QA_, QR, IQ_, IQN, M);
-        rope(E, IQ_, 0, pos_, po, invf, M, c.IH, c.IHD, IQN, false);
-        quant(E, IQ_, 0, M * c.IH, c.IHD, c.IHD, 1);
-        gemvb(E, w.i_wproj, X_, D, IW_, c.IH, M);
+        const size_t qo = size_t(ro) * size_t(IQN) * 4, wo = size_t(ro) * size_t(c.IH) * 4;
+        gemv8(E, w.i_wq_b, QA_, QR, IQ_, IQN, M, size_t(ro) * size_t(QR) * 4, qo);
+        rope(E, IQ_, qo, pos_, po, invf, M, c.IH, c.IHD, IQN, false);
+        quant(E, IQ_, qo, M * c.IH, c.IHD, c.IHD, 1);
+        gemvb(E, w.i_wproj, X_, D, IW_, c.IH, M, xo, wo);
         {
           const float sc = 1.0f / std::sqrt(float(c.IHD)) / std::sqrt(float(c.IH));
           const float p[2] = {float(M * c.IH), sc};
           E.pipe("ds4_scale");
-          E.set(0, IW_);
+          E.set(0, IW_, wo);
           E.bytes(1, p);
           E.threads(size_t(M * c.IH), 1, 1, 256);
         }
@@ -1099,8 +1218,8 @@ class Dsv4Model final : public NativeModel {
             int M, nh, hd, ratio, ncols;
           } ip{mr, c.IH, c.IHD, r, ncols};
           E.pipe("ds4_index_score");
-          E.set(0, IQ_, size_t(m0) * size_t(IQN) * 4);
-          E.set(1, IW_, size_t(m0) * size_t(c.IH) * 4);
+          E.set(0, IQ_, qo + size_t(m0) * size_t(IQN) * 4);
+          E.set(1, IW_, wo + size_t(m0) * size_t(c.IH) * 4);
           E.set(2, s.idxk[size_t(si)]);
           E.set(3, ISC_);
           E.set(4, pos_, po + size_t(m0) * 4);
@@ -1150,26 +1269,21 @@ class Dsv4Model final : public NativeModel {
         float scale;
       } ap{M, c.H, c.WIN, p0, w.ratio, w.ratio ? topk_mode : 0, 0, 1.0f / std::sqrt(float(HD))};
       E.pipe("ds4_attn");
-      E.set(0, Q_);
-      E.set(1, KVp_);
+      E.set(0, Q_, size_t(ro) * size_t(HQ) * 4);
+      E.set(1, KVp_, ho);
       E.set(2, s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2);
       if (w.ratio > 0) E.set(3, s.comp[size_t(w.src)]);
       else E.set(3, s.ring);
       E.set(4, IDX_, io);
       E.set(5, w.sink);
-      E.set(6, Q_);  // in place: each simdgroup reads its query before writing
+      E.set(6, Q_, size_t(ro) * size_t(HQ) * 4);  // in place: each simdgroup reads its query before writing
       E.set(7, pos_, po);
       E.bytes(8, ap);
       E.groups(size_t((c.H + 7) / 8), size_t(M), 1, 256);
     }
-    rope(E, Q_, 0, pos_, po, invf, M, c.H, HD, HQ, true);
-    quant(E, Q_, 0, M, HQ, HQ, 0);
-    gemv(E, 0, w.wo_a.w, w.wo_a.s, Q_, 0, HQ, OA_, 0, c.OG * c.OR, w.wo_a.N, w.wo_a.K, M, c.OR, w.wo_a.K);
-    quant(E, OA_, 0, M, c.OG * c.OR, c.OG * c.OR, 0);
-    gemv8(E, w.wo_b, OA_, c.OG * c.OR, Y_, D, M);
     // ---- the window ring keeps the last WIN rows
     const int k0 = std::max(0, M - c.WIN);
-    store_half(E, KVp_, k0, HD, s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2, M - k0, HD, p0 + k0, c.WIN);
+    store_half(E, KVp_, ro + k0, HD, s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2, M - k0, HD, p0 + k0, c.WIN);
   }
 
   // Router of rows [r0, r0 + M): XF_ rows -> SEL_ / RW_ rows.
@@ -1322,36 +1436,90 @@ class Dsv4Model final : public NativeModel {
   }
 
   // ---------------------------------------------------------------- trees
-  void run_seq(Seq& s, const int32_t* toks, int n, Readout* out) {
-    for (int i = 0; i < n; i += T_) {
-      const int m = std::min(T_, n - i);
-      const bool last = i + m == n;
-      if (last && out) out->logits.resize(size_t(c_.V));
-      forward_rows(s, toks + i, m, last && out ? out->logits.data() : nullptr);
+  // Segments into passes of at most T_ rows and max_reads_ segments; a
+  // segment longer than a pass runs in chunks, one per pass.
+  void run_segments(std::vector<Seg> todo) {
+    while (!todo.empty()) {
+      std::vector<Seg> pass, rest;
+      int rows = 0;
+      for (Seg& g : todo) {
+        if (pass.size() >= size_t(max_reads_) || rows >= T_) {
+          rest.push_back(g);
+          continue;
+        }
+        const int m = std::min(g.n, T_ - rows);
+        Seg h = g;
+        h.n = m;
+        if (m < g.n) {
+          h.logits = nullptr;
+          Seg tail = g;
+          tail.toks += m;
+          tail.n -= m;
+          rest.push_back(tail);
+        }
+        pass.push_back(h);
+        rows += m;
+      }
+      forward(pass);
+      todo = std::move(rest);
     }
   }
 
-  void run_tree(const TreeSpec& t, Readout& out) {
-    if (t.n_leaves > 0) fail("deepseek_v41: leaves are not supported");
-    if (t.images && t.n_images > 0) fail("deepseek_v41: images are not supported yet");
-    if (t.root_len <= 0) fail("deepseek_v41: empty root");
-    Seq& scratch = seqs_.back();
-    const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
-    Seq* tgt = t.save >= 0 ? &seq(t.save) : t.work >= 0 ? &seq(t.work) : &scratch;
-    if (t.parent >= 0) fork(*tgt, seq(t.parent));
-    else reset(*tgt);
-    const bool want = t.score_root;
-    const int first = (t.save >= 0) ? save_len : t.root_len;
-    run_seq(*tgt, t.root, first, want && first == t.root_len ? &out : nullptr);
-    if (first < t.root_len) {
-      Seq* rest = (t.work >= 0 && &seq(t.work) != tgt) ? &seq(t.work) : &scratch;
-      fork(*rest, *tgt);
-      run_seq(*rest, t.root + first, t.root_len - first, want ? &out : nullptr);
-    } else if (t.work >= 0 && &seq(t.work) != tgt) {
-      fork(seq(t.work), *tgt);
+  // Trees: their target slots prepared, then every tree's first segment in
+  // shared passes, then the remainders (rows after save_len) likewise.
+  void run_trees(const std::vector<TreeSpec>& trees) {
+    struct Plan {
+      Seq* tgt = nullptr;
+      int first = 0;
+    };
+    std::vector<Plan> plan(trees.size());
+    size_t scratch = size_t(nuser_);
+    auto take_scratch = [&]() -> Seq* {
+      if (scratch >= seqs_.size()) fail("deepseek_v41: too many trees without a slot in one pass");
+      return &seqs_[scratch++];
+    };
+    std::vector<Seg> a;
+    for (size_t i = 0; i < trees.size(); ++i) {
+      const TreeSpec& t = trees[i];
+      if (t.n_leaves > 0) fail("deepseek_v41: leaves are not supported");
+      if (t.images && t.n_images > 0) fail("deepseek_v41: images are not supported yet");
+      if (t.root_len <= 0) fail("deepseek_v41: empty root");
+      const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
+      Plan& p = plan[i];
+      p.tgt = t.save >= 0 ? &seq(t.save) : t.work >= 0 ? &seq(t.work) : take_scratch();
+      if (t.parent >= 0) fork(*p.tgt, seq(t.parent));
+      else reset(*p.tgt);
+      p.first = t.save >= 0 ? save_len : t.root_len;
+      Seg g;
+      g.s = p.tgt, g.toks = t.root, g.n = p.first;
+      if (t.score_root && p.first == t.root_len) {
+        out_[i].logits.resize(size_t(c_.V));
+        g.logits = out_[i].logits.data();
+      }
+      a.push_back(g);
     }
-    if (!want || out.logits.empty()) return;
-    finish_readout(t, out);
+    run_segments(a);
+    std::vector<Seg> b;
+    for (size_t i = 0; i < trees.size(); ++i) {
+      const TreeSpec& t = trees[i];
+      Plan& p = plan[i];
+      if (p.first < t.root_len) {
+        Seq* rest = (t.work >= 0 && &seq(t.work) != p.tgt) ? &seq(t.work) : take_scratch();
+        fork(*rest, *p.tgt);
+        Seg g;
+        g.s = rest, g.toks = t.root + p.first, g.n = t.root_len - p.first;
+        if (t.score_root) {
+          out_[i].logits.resize(size_t(c_.V));
+          g.logits = out_[i].logits.data();
+        }
+        b.push_back(g);
+      } else if (t.work >= 0 && &seq(t.work) != p.tgt) {
+        fork(seq(t.work), *p.tgt);
+      }
+    }
+    run_segments(b);
+    for (size_t i = 0; i < trees.size(); ++i)
+      if (trees[i].score_root && !out_[i].logits.empty()) finish_readout(trees[i], out_[i]);
   }
 
   static uint64_t tk_mix(uint64_t x) {
