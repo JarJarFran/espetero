@@ -341,8 +341,21 @@ class Ref:
                     score = (np.maximum(score, 0) * w[:, :, None]).sum(1)
                     clen = (np.arange(1, T + 1) // ratio)[:, None]
                     score = np.where(np.arange(ncomp)[None, :] >= clen, -np.inf, score)
-                    if l == self.cand:
-                        pass  # candidates only restrict beyond candidate_topk_blocks * block_size positions
+                    bs, kb = c.get("candidate_block_size", 0), c.get("candidate_topk_blocks", 0)
+                    if l == self.cand:  # select_candidate_blocks
+                        nb = -(-ncomp // bs)
+                        pad = np.full((T, nb * bs), -np.inf, np.float32)
+                        pad[:, :ncomp] = score
+                        bsc = pad.reshape(T, nb, bs).max(-1)
+                        last = (clen[:, 0] - 1) // bs
+                        bsc[np.arange(nb)[None, :] == last[:, None]] = np.inf
+                        keep = np.zeros((T, nb), bool)
+                        for t in range(T):
+                            o = np.argsort(-bsc[t], kind="stable")[:min(kb, nb)]
+                            keep[t, o] = bsc[t, o] > -np.inf
+                        shared["cand"] = np.repeat(keep, bs, 1)[:, :ncomp]
+                    elif self.cand >= 0 and l > self.cand and "cand" in shared:
+                        score = np.where(shared["cand"], score, -np.inf)
                     topk = min(c["index_topk"], ncomp)
                     part = np.argsort(-score, axis=-1, kind="stable")[:, :topk]
                     part = np.sort(part, -1)

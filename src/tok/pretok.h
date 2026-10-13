@@ -24,12 +24,13 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 #include "unicode.h"
 
 namespace espetero::tok {
 
-enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3 };
+enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3, kDeepSeekV3 };
 
 // Exact pattern strings as they appear in tokenizer.json.
 std::optional<SplitPattern> split_pattern_from_regex(std::string_view regex);
@@ -164,5 +165,154 @@ class PieceSplitter {
   bool marks_are_letters_;
   int max_digits_;
 };
+
+// DeepSeek-V3 / V4 pre-tokenizer: three Split(Isolated) steps, each applied to
+// the pieces of the previous one (matches and the gaps between them both
+// become pieces):
+//   1  \p{N}{1,3}
+//   2  [一-龥぀-ゟ゠-ヿ]+                         (U+4E00-9FA5, U+3040-309F, U+30A0-30FF)
+//   3  [!-/:-@[-`{-~][A-Za-z]+                  ASCII punctuation + ASCII letters
+//      | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+   optional prefix + letters/marks
+//      |  ?[\p{P}\p{S}]+[\r\n]*                 optional space + punctuation/symbols + newlines
+//      | \s*[\r\n]+ | \s+(?!\S) | \s+
+// Characters no alternative of step 3 matches (digits, controls, ...) stay
+// together as gap pieces. f(begin, end) gets the byte ranges in order.
+// \p{P}|\p{S}: the "other" class without controls, format characters and
+// private use (unassigned code points count as symbols here).
+inline bool ds3_ps(uint32_t cp, uint8_t cls) {
+  if (cls != ucd::kOther || cp == kInvalidCp) return false;
+  if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) return false;                   // Cc
+  if (cp == 0xAD || (cp >= 0x600 && cp <= 0x605) || cp == 0x61C || cp == 0x6DD || cp == 0x70F || cp == 0x890 ||
+      cp == 0x891 || cp == 0x8E2 || cp == 0x180E || (cp >= 0x200B && cp <= 0x200F) || (cp >= 0x202A && cp <= 0x202E) ||
+      (cp >= 0x2060 && cp <= 0x2064) || (cp >= 0x2066 && cp <= 0x206F) || cp == 0xFEFF || (cp >= 0xFFF9 && cp <= 0xFFFB) ||
+      cp == 0x110BD || cp == 0x110CD || (cp >= 0x13430 && cp <= 0x1343F) || (cp >= 0x1BCA0 && cp <= 0x1BCA3) ||
+      (cp >= 0x1D173 && cp <= 0x1D17A) || cp == 0xE0001 || (cp >= 0xE0020 && cp <= 0xE007F))
+    return false;                                                               // Cf
+  if ((cp >= 0xE000 && cp <= 0xF8FF) || cp >= 0xF0000) return false;            // Co
+  if (cp == 0x2028 || cp == 0x2029) return false;                               // Zl, Zp
+  return true;
+}
+
+template <class F>
+void deepseek_split(std::string_view s, F&& f) {
+  struct C {
+    uint32_t cp;
+    uint8_t cls;
+    uint32_t off;
+  };
+  const unsigned char* b = reinterpret_cast<const unsigned char*>(s.data());
+  const unsigned char* e = b + s.size();
+  std::vector<C> c;
+  c.reserve(s.size());
+  for (const unsigned char* p = b; p < e;) {
+    uint32_t cp;
+    const int len = decode_utf8(p, e, cp);
+    const uint8_t cls = p[0] < 0x80 ? uint8_t(ucd::kAscii[p[0]] & ucd::kClassMask)
+                                    : uint8_t(cp == kInvalidCp ? ucd::kOther : cp_class(cp));
+    c.push_back({cp, cls, uint32_t(p - b)});
+    p += len;
+  }
+  const size_t n = c.size();
+  auto off = [&](size_t i) { return i < n ? size_t(c[i].off) : s.size(); };
+  auto cjk = [&](size_t i) {
+    const uint32_t x = c[i].cp;
+    return (x >= 0x4E00 && x <= 0x9FA5) || (x >= 0x3040 && x <= 0x30FF);
+  };
+  auto lm = [&](size_t i) { return c[i].cls == ucd::kLetter || c[i].cls == ucd::kMark; };
+  auto ps = [&](size_t i) { return ds3_ps(c[i].cp, c[i].cls); };
+  auto sp = [&](size_t i) { return c[i].cls == ucd::kSpace; };
+  auto nl = [&](size_t i) { return c[i].cp == '\r' || c[i].cp == '\n'; };
+  auto apunct = [&](size_t i) {
+    const uint32_t x = c[i].cp;
+    return (x >= '!' && x <= '/') || (x >= ':' && x <= '@') || (x >= '[' && x <= '`') || (x >= '{' && x <= '~');
+  };
+  auto aalpha = [&](size_t i) {
+    const uint32_t x = c[i].cp;
+    return (x >= 'A' && x <= 'Z') || (x >= 'a' && x <= 'z');
+  };
+  // step 3 on [i0, i1): the end of the match at i, or i when nothing matches
+  auto match3 = [&](size_t i, size_t i1) -> size_t {
+    if (apunct(i) && i + 1 < i1 && aalpha(i + 1)) {
+      size_t j = i + 1;
+      while (j < i1 && aalpha(j)) ++j;
+      return j;
+    }
+    {
+      const bool pre = !nl(i) && c[i].cls != ucd::kLetter && !ps(i);
+      size_t j = i;
+      if (pre && i + 1 < i1 && lm(i + 1)) j = i + 1;
+      else if (lm(i)) j = i;
+      else j = SIZE_MAX;
+      if (j != SIZE_MAX) {
+        while (j < i1 && lm(j)) ++j;
+        return j;
+      }
+    }
+    {
+      size_t j = SIZE_MAX;
+      if (c[i].cp == ' ' && i + 1 < i1 && ps(i + 1)) j = i + 1;
+      else if (ps(i)) j = i;
+      if (j != SIZE_MAX) {
+        while (j < i1 && ps(j)) ++j;
+        while (j < i1 && nl(j)) ++j;
+        return j;
+      }
+    }
+    if (sp(i)) {
+      size_t j = i, last_nl = SIZE_MAX, last_start = i;
+      while (j < i1 && sp(j)) {
+        last_start = j;
+        if (nl(j)) last_nl = j + 1;
+        ++j;
+      }
+      if (last_nl != SIZE_MAX) return last_nl;     // \s*[\r\n]+
+      if (j == i1 || last_start == i) return j;    // \s+(?!\S) at the end, or \s+ of one
+      return last_start;                           // \s+(?!\S): the last space starts the next piece
+    }
+    return i;
+  };
+  auto step3 = [&](size_t i0, size_t i1) {
+    size_t gap = i0, i = i0;
+    while (i < i1) {
+      const size_t j = match3(i, i1);
+      if (j == i) {
+        ++i;
+        continue;
+      }
+      if (gap < i) f(off(gap), off(i));
+      f(off(i), off(j));
+      i = gap = j;
+    }
+    if (gap < i1) f(off(gap), off(i1));
+  };
+  auto step2 = [&](size_t i0, size_t i1) {
+    size_t i = i0, gap = i0;
+    while (i < i1) {
+      if (!cjk(i)) {
+        ++i;
+        continue;
+      }
+      size_t j = i;
+      while (j < i1 && cjk(j)) ++j;
+      if (gap < i) step3(gap, i);
+      step3(i, j);
+      i = gap = j;
+    }
+    if (gap < i1) step3(gap, i1);
+  };
+  size_t i = 0, gap = 0;
+  while (i < n) {
+    if (c[i].cls != ucd::kNumber) {
+      ++i;
+      continue;
+    }
+    if (gap < i) step2(gap, i);
+    size_t j = i;
+    while (j < n && j < i + 3 && c[j].cls == ucd::kNumber) ++j;
+    step2(i, j);
+    i = gap = j;
+  }
+  if (gap < n) step2(gap, n);
+}
 
 }  // namespace espetero::tok

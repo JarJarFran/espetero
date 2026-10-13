@@ -270,6 +270,22 @@ bool parse_normalizer(const Value& v) {
 // pre_tokenizer: Sequence[Split(Regex, Isolated), ByteLevel(add_prefix_space=false, use_regex=false)].
 tok::SplitPattern parse_pre_tokenizer(const Value& v) {
   const Value* list = v.get("pretokenizers");
+  // DeepSeek-V3 / V4: Split(\p{N}{1,3}), Split(CJK runs), Split(regex), ByteLevel (tok::deepseek_split).
+  if (v.get_string("type", "") == "Sequence" && list && list->is_array() && list->size() == 4) {
+    auto regex = [&](size_t i) {
+      const Value& sp = (*list)[i];
+      const Value* pat = sp.get("pattern");
+      const Value* re = pat ? pat->get("Regex") : nullptr;
+      const bool ok = sp.get_string("type", "") == "Split" && re && re->is_string() &&
+                      sp.get_string("behavior", "") == "Isolated" && !sp.get_bool("invert", false);
+      return ok ? re->as_string() : std::string();
+    };
+    const Value& bl = (*list)[3];
+    if (regex(0) == "\\p{N}{1,3}" && regex(1) == "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+" &&
+        tok::split_pattern_from_regex(regex(2)) == tok::SplitPattern::kDeepSeekV3 &&
+        bl.get_string("type", "") == "ByteLevel" && !bl.get_bool("add_prefix_space", false) && !bl.get_bool("use_regex", true))
+      return tok::SplitPattern::kDeepSeekV3;
+  }
   if (v.get_string("type", "") != "Sequence" || !list || !list->is_array() || list->size() != 2)
     fail("unsupported pre_tokenizer (expected Sequence[Split, ByteLevel]): " + describe(v));
   const Value& split = (*list)[0];

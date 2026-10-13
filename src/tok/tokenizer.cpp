@@ -517,6 +517,10 @@ void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& ou
     if (start < s.size()) encode_word(s.substr(start), out);
     return;
   }
+  if (pattern == tok::SplitPattern::kDeepSeekV3) {
+    tok::deepseek_split(s, [&](size_t b, size_t e) { encode_word(s.substr(b, e - b), out); });
+    return;
+  }
   tok::PieceSplitter sp(pattern, s);
   size_t b, e;
   while (sp.next(b, e)) encode_word(s.substr(b, e - b), out);

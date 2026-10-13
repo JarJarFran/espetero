@@ -20,6 +20,16 @@ class Dsv4Model final : public NativeModel {
   Dsv4Model(const std::string& path, const LoadOptions& o, const std::string& kernels) {
     const auto t0 = Clock::now();
     verbose_ = o.verbose || env_on("ESPETERO_DS4_VERBOSE");
+    // Memory the system can give before this model: free, inactive, speculative and purgeable pages
+    // (other processes' wired GPU memory is not available).
+    double sys_avail = 0;
+    {
+      vm_statistics64_data_t vs;
+      mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+      if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs), &cnt) == KERN_SUCCESS)
+        sys_avail = (double(vs.free_count) + double(vs.inactive_count) + double(vs.speculative_count) +
+                     double(vs.purgeable_count)) * double(vm_kernel_page_size);
+    }
     const json::Value root = json::parse(read_file(path + "/config.json"));
     c_ = read_cfg(root);
     rt_.init(kernels);
@@ -57,7 +67,12 @@ class Dsv4Model final : public NativeModel {
       const double mine = double([rt_.dev currentAllocatedSize]);
       double gb = o.expert_cache_gb;
       if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) gb = std::atof(v);
-      if (gb <= 0) gb = std::min(ws - mine - 4e9, double(ram) - mine - 26e9) / 1e9;
+      if (gb <= 0) {
+        gb = std::min({ws - mine - 4e9, double(ram) - mine - 26e9, sys_avail - mine - 12e9}) / 1e9;
+        if (gb < 20)
+          std::fprintf(stderr, "deepseek_v41: only %.1f GB of memory available for the expert cache (%.1f GB free "
+                               "before loading): every token will read most experts from the SSD\n", gb, sys_avail / 1e9);
+      }
       const double all = double(c_.L) * c_.E * double(xc_.slot_bytes) / 1e9;
       gb = std::max(1.0, std::min(gb, all));
       make_cache(gb);
