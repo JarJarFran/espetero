@@ -111,9 +111,30 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
   prompt, not once per chunk.
 * **Sequences** are slots of their own (no paged KV): 40 window rings of 128
   latents, the four compressed caches and index-key caches for the context,
-  the compressor's pending rows; ≈ 3.3 KB per token of context.
-* Not yet: leaves (decisions, prompt-lookup drafts), the DSpark draft head,
-  images, DSML tool-call parsing, checkpoints on disk.
+  the compressor's pending rows; ≈ 3.3 KB per token of context. Slots save to
+  and load from disk (`slot_save` / `slot_load`, the engine's prompt checkpoints).
+* **Several sequences per pass**: the trees of a step (users decoding at once,
+  prompts) share each pass: a GPU block of rows may mix sequences, the dense
+  projections and the experts serve all of them, attention runs per sequence.
+  A layer's experts are the union of every row's.
+* **Images** (`vision_layout` "deepseek"): the engine plans and pads each image
+  as `inference/image_processor.py` does (PIL-exact bicubic, grey padding, bf16
+  pixels: identical to PIL), the run is `[start] + (row + newline) x rows + [end]`
+  of `<｜deepseek_image｜>`; the model runs the 32-layer ViT (2D RoPE, Espetero's
+  ViT attention) and the 3 x 3 aligner, places the learned start / newline / end
+  rows, routes image-span rows with the VL router bias and keeps them out of the
+  n-grams. Embeddings match a numpy transcription to bf16 precision (the same
+  distance a bf16 run of the reference has from fp32).
+* **Tool calls**: replies in DeepSeek's DSML format (`<｜DSML｜ calls>` …) are parsed
+  into OpenAI `tool_calls` (string parameters as strings, the rest as JSON);
+  `tool_choice` "required" or a named function force the call's opening.
+* **DSpark** (the draft head, `mtp.*`): implemented and exact (verified chains
+  produce the plain chain's tokens), but off by default (`ESPETERO_DS4_SPEC=1`):
+  its drafts were accepted ~1 in 3 (2.1 tokens per round), and verifying a block
+  reads several times one token's experts from the SSD, so a chain decoded at
+  1.45 tok/s against 3.1 tok/s plain (12 GB expert cache). The draft rings, the
+  target-layer states and the rollback of rejected rows are in `dsv4_model.h`.
+* Not yet: leaves (decisions, prompt-lookup drafts).
 
 ## 4. Chat template
 
