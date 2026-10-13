@@ -94,12 +94,23 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
 * **Weights** stay as stored. Decode GEMVs decode FP8 (`e4m3` bits shifted
   into a half = value·2⁻⁸) and FP4 (`e2m1` → value·2⁻¹⁴) in registers; prefill
   GEMMs (≥ 16 rows) decode into bfloat tiles (exact) for simdgroup matrices.
-* **Experts**: an LRU cache of expert slots in ≤ 3 GPU-private buffers (by
-  default what the GPU working set and the Mac's memory leave: ~95 GB, a third of
-  the experts; `--expert-cache-gb`). After each layer's routing the pass waits
-  for the GPU, reads the missing experts with parallel 1 MB `pread`s
-  (`F_NOCACHE`, ≈ 8 GB/s from the internal SSD) into staging and copies them into
-  their slots. One grouped dispatch computes all of a layer's experts.
+* **Experts**: an LRU cache of expert slots in ≤ 3 buffers of host memory
+  locked with `mlock` and wrapped for the GPU without copies (by default what
+  the GPU working set and the Mac's memory leave: ~97 GB, 5168 slots, a third
+  of the experts; `--expert-cache-gb`). Locked pages are never compressed or
+  paged out; GPU-private buffers were, whenever macOS unwired an idle GPU's
+  memory (`iogpu.wired_lwm_mb` = 0), which cost minutes of compression storms.
+  After each layer's routing the missing experts are read with parallel 1 MB
+  `pread`s (`F_NOCACHE`, ≈ 8 GB/s from the internal SSD) straight into their
+  slots; long passes pipeline reads with the GPU (shared events), decode
+  prefetches the next layer's likely experts. The hottest slots are saved at
+  exit and read back at start (`ESPETERO_DS4_WARM=0` skips it).
+  Eviction: `ESPETERO_DS4_TRACE=FILE` records every access and
+  `tools/dsv4_xsim.py` replays policies on it. On a mixed trace (decodes and a
+  4.5 K-token prompt) LRU missed 19 experts per decoded token, ARC 19.4, SLRU
+  18.6, decayed frequency 18.7–58 (the longer its memory the worse: new experts
+  are evicted before they earn a count), and Belady's optimum, which knows the
+  future, 9.2. The policy is not where the misses are; LRU stays.
 * **Engram**: the 24 rows a position needs per Engram layer are hashed on the
   host and read with `pread` from the checkpoint (264 B each; never loaded).
   The compressed token map needs a Unicode normalizer Espetero does not have:
@@ -164,4 +175,5 @@ chaos (10⁻²).
 Development switches: `ESPETERO_DS4_LAYERS=n` (first n layers, no head),
 `ESPETERO_DS4_NO_ENGRAM=1`, `ESPETERO_DS4_NOQUANT=1`, `ESPETERO_DS4_DUMP=dir`,
 `ESPETERO_DS4_PROFILE=1` (per-kernel GPU times), `ESPETERO_DS4_GEMM_MIN`,
-`ESPETERO_DS4_SUB`, `ESPETERO_DS4_ROWS`, `ESPETERO_EXPERT_CACHE_GB`.
+`ESPETERO_DS4_SUB`, `ESPETERO_DS4_ROWS`, `ESPETERO_DS4_PREFETCH=0`,
+`ESPETERO_DS4_WARM=0`, `ESPETERO_DS4_TRACE=file`, `ESPETERO_EXPERT_CACHE_GB`.

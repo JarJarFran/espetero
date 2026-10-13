@@ -83,7 +83,6 @@ class Dsv4Model final : public NativeModel {
       const double all = double(c_.L) * c_.E * double(xc_.slot_bytes) / 1e9;
       gb = std::max(1.0, std::min(gb, all));
       make_cache(gb);
-      if (pf_on_) pf_init(64);  // 1.2 GB of prefetch staging
       if (!partial_) {
         uint64_t hsh = 1469598103934665603ull;
         for (unsigned char ch : path) hsh = (hsh ^ ch) * 1099511628211ull;
@@ -827,21 +826,54 @@ class Dsv4Model final : public NativeModel {
     if (verbose_) std::fprintf(stderr, "deepseek_v41: dense weights loaded in %.1f s\n", ms_since(t0) / 1e3);
   }
 
+  // The expert pool: host memory locked with mlock (macOS compressed and paged a
+  // GPU-private pool whenever the GPU went idle under memory pressure, then
+  // decompressed tens of GB at the next pass), at most 3 buffers (the grouped
+  // expert kernel binds them all).
   void make_cache(double gb) {
     ExpertCache& x = xc_;
     x.n = int(gb * 1e9 / double(x.slot_bytes));
     x.n = std::max(x.n, c_.E + 16);
-    // at most 3 buffers (the grouped expert kernel binds them all)
     const size_t maxlen = std::min<size_t>(size_t([rt_.dev maxBufferLength]), size_t(64) << 30);
     x.per_buf = std::max(int((size_t(x.n) + 2) / 3), 1);
     x.per_buf = std::min(x.per_buf, int(maxlen / x.slot_bytes));
     if ((x.n + x.per_buf - 1) / x.per_buf > 3) x.n = 3 * x.per_buf;
-    for (int s = 0; s < x.n; s += x.per_buf) x.bufs.push_back(rt_.private_buffer(size_t(std::min(x.per_buf, x.n - s)) * x.slot_bytes));
+    const size_t pg = size_t(::getpagesize());
+    const auto t0 = Clock::now();
+    bool locked = true;
+    for (int s0 = 0; s0 < x.n; s0 += x.per_buf) {
+      const size_t len = align_up(size_t(std::min(x.per_buf, x.n - s0)) * x.slot_bytes, pg);
+      void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (p == MAP_FAILED) fail("deepseek_v41: cannot map the expert pool");
+      if (locked) {  // in 1 GB pieces on every core (faulting 100 GB in on one thread is slow)
+        const size_t piece = size_t(1) << 30;
+        std::atomic<bool> ok{true};
+        parallel_for((len + piece - 1) / piece, [&](size_t i) {
+          if (::mlock(static_cast<uint8_t*>(p) + i * piece, std::min(piece, len - i * piece)) != 0) ok = false;
+        });
+        if (!ok) {
+          locked = false;
+          ::munlock(p, len);
+          std::fprintf(stderr, "deepseek_v41: could not lock the expert pool in memory (vm.user_wire_limit?): macOS may "
+                               "compress it when the GPU is idle\n");
+        }
+      }
+      id<MTLBuffer> b = [rt_.dev newBufferWithBytesNoCopy:p length:len options:kShared deallocator:nil];
+      if (!b) fail("deepseek_v41: cannot wrap the expert pool for the GPU");
+      Residency::get().add(b);
+      x.bufs.push_back(b);
+      x.host.push_back(static_cast<uint8_t*>(p));
+    }
+    x.locked = locked;
     x.key.assign(size_t(x.n), -1);
     x.stamp.assign(size_t(x.n), 0);
+    x.pref.assign(size_t(x.n), 0);
+    x.loading.reset(new std::atomic<int>[size_t(x.n)]);
+    for (int i = 0; i < x.n; ++i) x.loading[size_t(i)].store(0);
     x.where.assign(size_t(c_.L + c_.n_mtp) * size_t(c_.E), -1);  // (layer, expert); draft layers after the backbone
-    x.stage_n = 48;
-    x.stage = rt_.buffer(size_t(x.stage_n) * x.slot_bytes);
+    x.stage_n = 32;  // pipelined rounds: experts read per round
+    if (verbose_ || ms_since(t0) > 2000)
+      std::fprintf(stderr, "deepseek_v41: expert pool %s in %.1f s\n", locked ? "locked in memory" : "mapped", ms_since(t0) / 1e3);
   }
 
   // Pass state for T_ rows (residual streams, mixes, MoE inputs, routing, index
@@ -1581,84 +1613,11 @@ class Dsv4Model final : public NativeModel {
                  double(ks.size()) * double(xc_.slot_bytes) / 1e9, ms_since(t0) / 1e3);
   }
 
-  // ---- prefetch: experts the next layer will probably need, read in the
-  // background while the GPU works (decode: the next layer's router applied to
-  // this layer's MoE input; long passes: every expert of the next layer).
-  // Their staging slots are consumed by expert_slots (a GPU copy instead of a
-  // read) and freed after the next flush.
-  struct Pref {
-    int key = -1;               // layer * E + expert; -1: free
-    std::atomic<int> state{0};  // 0 free, 1 reading, 2 ready, 3 failed
-    uint64_t age = 0;
-  };
-  std::unique_ptr<Pref[]> pf_;
-  int pf_n_ = 0;
-  id<MTLBuffer> pf_stage_ = nil;
-  std::unordered_map<int, int> pf_map_;
-  std::vector<int> pf_release_;
-  uint64_t pf_clock_ = 0, pf_issued_ = 0, pf_used_ = 0, pf_wasted_ = 0;
-  double pf_wait_ms_ = 0;
-  bool pf_on_ = !(std::getenv("ESPETERO_DS4_PREFETCH") && std::atoi(std::getenv("ESPETERO_DS4_PREFETCH")) == 0);
-
-  void pf_init(int n) {
-    pf_n_ = n;
-    pf_.reset(new Pref[size_t(n)]);
-    pf_stage_ = rt_.buffer(size_t(n) * xc_.slot_bytes);
-  }
-  // Slots whose copies the last flush executed become free.
-  void pf_collect() {
-    for (int i : pf_release_) pf_[size_t(i)].key = -1, pf_[size_t(i)].state.store(0);
-    pf_release_.clear();
-  }
-  void prefetch(int l, const LayerW& lw, const std::vector<int>& experts) {
-    if (!pf_n_) return;
-    ExpertCache& x = xc_;
-    for (int e : experts) {
-      const int k = l * c_.E + e;
-      if (x.where[size_t(k)] >= 0 || pf_map_.count(k)) continue;
-      int best = -1;
-      uint64_t ba = UINT64_MAX;
-      for (int i = 0; i < pf_n_; ++i) {
-        const int st = pf_[size_t(i)].state.load();
-        if (st == 0) {
-          best = i;
-          break;
-        }
-        const bool releasing = std::find(pf_release_.begin(), pf_release_.end(), i) != pf_release_.end();
-        if ((st == 2 || st == 3) && !releasing && pf_[size_t(i)].age < ba) ba = pf_[size_t(i)].age, best = i;
-      }
-      if (best < 0) return;  // every slot is being read or copied
-      Pref& P = pf_[size_t(best)];
-      if (P.key >= 0) {
-        pf_map_.erase(P.key);
-        ++pf_wasted_;
-      }
-      P.key = k, P.age = ++pf_clock_;
-      P.state.store(1);
-      pf_map_[k] = best;
-      ++pf_issued_;
-      const XLoc loc = lw.x[size_t(e)];
-      const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
-      uint8_t* dst = static_cast<uint8_t*>([pf_stage_ contents]) + size_t(best) * x.slot_bytes;
-      const size_t wb = x.wbytes, sb = x.sbytes;
-      Pref* pp = &P;
-      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        const size_t piece = size_t(1) << 20, np = (wb + piece - 1) / piece;
-        std::atomic<bool>* ok = new std::atomic<bool>(true);
-        dispatch_apply(np + 1, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
-          bool r;
-          if (i < np) r = pread_all(fd, dst + i * piece, std::min(piece, wb - i * piece), size_t(loc.w + i * piece));
-          else r = pread_all(fd, dst + wb, sb, size_t(loc.s));
-          if (!r) ok->store(false);
-        });
-        pp->state.store(ok->load() ? 2 : 3);
-        delete ok;
-      });
-    }
-  }
-
-  // Experts `es` of layer l from the SSD into staging slots [s0, s0 + es.size()).
-  void read_experts(int l, const LayerW& lw, const std::vector<int>& es, int s0) {
+  // ---- expert reads go straight into their cache slots (the pool is host
+  // memory locked with mlock: macOS cannot compress or page it, and the SSD
+  // writes where the GPU reads). A slot being read is marked loading until done.
+  void read_slots(const LayerW& lw, const std::vector<std::pair<int, int>>& es) {  // (expert, slot)
+    if (es.empty()) return;
     ExpertCache& x = xc_;
     const auto t0 = Clock::now();
     struct Job {
@@ -1668,11 +1627,10 @@ class Dsv4Model final : public NativeModel {
       uint64_t off;
     };
     std::vector<Job> jobs;
-    uint8_t* stage = static_cast<uint8_t*>([x.stage contents]);
     const size_t piece = size_t(1) << 20;
-    for (size_t j = 0; j < es.size(); ++j) {
-      const XLoc& loc = lw.x[size_t(es[j])];
-      uint8_t* dst = stage + (size_t(s0) + j) * x.slot_bytes;
+    for (const auto& [e, sl] : es) {
+      const XLoc& loc = lw.x[size_t(e)];
+      uint8_t* dst = x.host_ptr(sl);
       const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
       for (size_t o = 0; o < x.wbytes; o += piece) jobs.push_back({fd, dst + o, std::min(piece, x.wbytes - o), loc.w + o});
       jobs.push_back({fd, dst + x.wbytes, x.sbytes, loc.s});
@@ -1684,20 +1642,109 @@ class Dsv4Model final : public NativeModel {
     if (!ok) fail("deepseek_v41: expert read failed");
     x.read_ms += ms_since(t0);
     x.read_gb += double(es.size()) * double(x.slot_bytes) / 1e9;
-    (void)l;
   }
 
-  // pending: misses are left to the caller (indices into need), their slots assigned but not loaded.
-  std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need, std::vector<size_t>* pending = nullptr) {
+  // The least recently used slot not used by this layer (stamp `now`) and not being read.
+  // (Offline simulations on a trace of real traffic, ESPETERO_DS4_TRACE + tools/dsv4_xsim.py: ARC, SLRU and
+  // decayed-frequency policies come within a few percent of LRU, and frequency with a long memory is far worse.)
+  int evict_slot(uint64_t now) {
     ExpertCache& x = xc_;
-    pf_collect();
+    int best = -1;
+    double bs = 1e300;
+    for (int sl = 0; sl < x.n; ++sl) {
+      if (x.key[size_t(sl)] < 0) return sl;
+      if (x.stamp[size_t(sl)] == now || x.loading[size_t(sl)].load() == 1) continue;
+      const double v = double(x.stamp[size_t(sl)]);
+      if (v < bs) bs = v, best = sl;
+    }
+    if (best < 0) fail("deepseek_v41: expert cache too small for one layer");
+    x.where[size_t(x.key[size_t(best)])] = -1;
+    x.key[size_t(best)] = -1;
+    return best;
+  }
+
+  // ---- prefetch: experts the next layer will probably need, read in the
+  // background into their slots while the GPU works (long passes: every expert
+  // of the next layer; decode: the next layer's router on this layer's input,
+  // off by default). At most kPfMax reads in flight.
+  static constexpr int kPfMax = 64;
+  std::atomic<int> pf_inflight_{0};
+  uint64_t pf_issued_ = 0, pf_used_ = 0, pf_wasted_ = 0;
+  double pf_wait_ms_ = 0;
+  bool pf_on_ = !(std::getenv("ESPETERO_DS4_PREFETCH") && std::atoi(std::getenv("ESPETERO_DS4_PREFETCH")) == 0);
+
+  void prefetch(int l, const LayerW& lw, const std::vector<int>& experts) {
+    ExpertCache& x = xc_;
+    if (x.n < 2 * c_.E + kPfMax) return;  // a small cache needs every slot for the layer at hand
+    const uint64_t now = x.clock;
+    for (int e : experts) {
+      if (pf_inflight_.load() >= kPfMax) return;
+      const int k = l * c_.E + e;
+      if (x.where[size_t(k)] >= 0) continue;
+      const int sl = evict_slot(now);
+      x.key[size_t(sl)] = k;
+      x.where[size_t(k)] = sl;
+      x.stamp[size_t(sl)] = now;  // kept from eviction until the next layer runs
+      x.pref[size_t(sl)] = 1;
+      x.loading[size_t(sl)].store(1);
+      ++pf_issued_;
+      ++pf_inflight_;
+      const XLoc loc = lw.x[size_t(e)];
+      const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
+      uint8_t* dst = x.host_ptr(sl);
+      const size_t wb = x.wbytes, sb = x.sbytes;
+      std::atomic<int>* flag = &x.loading[size_t(sl)];
+      std::atomic<int>* inflight = &pf_inflight_;
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const size_t piece = size_t(1) << 20, np = (wb + piece - 1) / piece;
+        std::atomic<bool>* ok = new std::atomic<bool>(true);
+        dispatch_apply(np + 1, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+          bool r;
+          if (i < np) r = pread_all(fd, dst + i * piece, std::min(piece, wb - i * piece), size_t(loc.w + i * piece));
+          else r = pread_all(fd, dst + wb, sb, size_t(loc.s));
+          if (!r) ok->store(false);
+        });
+        flag->store(ok->load() ? 0 : 2);
+        delete ok;
+        inflight->fetch_sub(1);
+      });
+    }
+  }
+
+  // Slots for this layer's experts `need` (sorted, distinct): hits, then the
+  // misses' slots (LRU), read here unless `pending` takes them (indices into
+  // need: assigned but not read). Prefetched slots still loading are waited for.
+  std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need, std::vector<size_t>* pending = nullptr,
+                                const std::vector<int>* rows = nullptr) {  // rows: how many rows use each needed expert (for the trace)
+    (void)E;
+    ExpertCache& x = xc_;
     const uint64_t now = ++x.clock;
+    static FILE* trace = std::getenv("ESPETERO_DS4_TRACE") ? std::fopen(std::getenv("ESPETERO_DS4_TRACE"), "w") : nullptr;
+    if (trace) {  // pass layer expert rows, for offline policy studies
+      for (size_t i = 0; i < need.size(); ++i)
+        std::fprintf(trace, "%llu %d %d %d\n", (unsigned long long)x.pass, l, need[i], rows ? (*rows)[i] : 1);
+      std::fflush(trace);
+    }
     std::vector<int> slot(need.size(), -1);
     std::vector<size_t> miss;
     for (size_t i = 0; i < need.size(); ++i) {
       const int k = l * c_.E + need[i];
       const int s = x.where[size_t(k)];
       if (s >= 0) {
+        if (x.loading[size_t(s)].load() == 1) {  // a prefetch still reading it
+          const auto tw = Clock::now();
+          while (x.loading[size_t(s)].load() == 1) std::this_thread::yield();
+          pf_wait_ms_ += ms_since(tw);
+        }
+        if (x.loading[size_t(s)].load() == 2) {  // its read failed: read again below
+          x.loading[size_t(s)].store(0);
+          slot[i] = s;
+          x.stamp[size_t(s)] = now;
+          miss.push_back(i);
+          ++x.misses;
+          continue;
+        }
+        if (x.pref[size_t(s)]) x.pref[size_t(s)] = 0, ++pf_used_;
         slot[i] = s;
         x.stamp[size_t(s)] = now;
         ++x.hits;
@@ -1706,87 +1753,23 @@ class Dsv4Model final : public NativeModel {
         ++x.misses;
       }
     }
-    // evict the least recently used slots not used by this layer
     for (size_t i : miss) {
-      int best = -1;
-      uint64_t bs = UINT64_MAX;
-      for (int s = 0; s < x.n; ++s) {
-        if (x.key[size_t(s)] < 0) {
-          best = s;
-          break;
-        }
-        if (x.stamp[size_t(s)] < bs && x.stamp[size_t(s)] != now) bs = x.stamp[size_t(s)], best = s;
-      }
-      if (best < 0) fail("deepseek_v41: expert cache too small for one layer");
-      if (x.key[size_t(best)] >= 0) x.where[size_t(x.key[size_t(best)])] = -1;
+      if (slot[i] >= 0) continue;  // a failed prefetch keeps its slot
+      const int sl = evict_slot(now);
       const int k = l * c_.E + need[i];
-      x.key[size_t(best)] = k;
-      x.where[size_t(k)] = best;
-      x.stamp[size_t(best)] = now;
-      slot[i] = best;
-    }
-    // misses a prefetch already brought (or is bringing): copies from its staging
-    {
-      std::vector<size_t> rest;
-      for (size_t i : miss) {
-        const int k = l * c_.E + need[i];
-        auto it = pf_map_.find(k);
-        if (it == pf_map_.end()) {
-          rest.push_back(i);
-          continue;
-        }
-        Pref& P = pf_[size_t(it->second)];
-        const auto tw = Clock::now();
-        while (P.state.load() == 1) std::this_thread::yield();
-        pf_wait_ms_ += ms_since(tw);
-        if (P.state.load() != 2) {
-          rest.push_back(i);
-          continue;
-        }
-        const Buf d = x.slot(slot[i]);
-        copy(E, pf_stage_, size_t(it->second) * x.slot_bytes, d.b, d.off, x.slot_bytes);
-        pf_release_.push_back(it->second);
-        pf_map_.erase(it);
-        ++pf_used_;
-      }
-      miss.swap(rest);
+      if (x.pref[size_t(sl)]) x.pref[size_t(sl)] = 0, ++pf_wasted_;
+      x.key[size_t(sl)] = k;
+      x.where[size_t(k)] = sl;
+      x.stamp[size_t(sl)] = now;
+      slot[i] = sl;
     }
     if (pending) {
       *pending = miss;
       return slot;
     }
-    for (size_t b0 = 0; b0 < miss.size(); b0 += size_t(x.stage_n)) {
-      const size_t b1 = std::min(miss.size(), b0 + size_t(x.stage_n));
-      if (b0 > 0) E.flush();  // the previous round's copies have read the staging buffer
-      const auto t0 = Clock::now();
-      struct Job {
-        int fd;
-        uint8_t* dst;
-        size_t n;
-        uint64_t off;
-      };
-      std::vector<Job> jobs;
-      uint8_t* stage = static_cast<uint8_t*>([x.stage contents]);
-      const size_t piece = size_t(1) << 20;  // 1 MB reads: ~8 GB/s from the internal SSD even for a few experts
-      for (size_t j = b0; j < b1; ++j) {
-        const XLoc& loc = lw.x[size_t(need[miss[j]])];
-        uint8_t* dst = stage + (j - b0) * x.slot_bytes;
-        const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
-        for (size_t o = 0; o < x.wbytes; o += piece) jobs.push_back({fd, dst + o, std::min(piece, x.wbytes - o), loc.w + o});
-        jobs.push_back({fd, dst + x.wbytes, x.sbytes, loc.s});
-      }
-      std::atomic<bool> ok{true};
-      parallel_for(jobs.size(), [&](size_t i) {
-        if (!pread_all(jobs[i].fd, jobs[i].dst, jobs[i].n, size_t(jobs[i].off))) ok = false;
-      });
-      if (!ok) fail("deepseek_v41: expert read failed");
-      x.read_ms += ms_since(t0);
-      x.read_gb += double(b1 - b0) * double(x.slot_bytes) / 1e9;
-      for (size_t j = b0; j < b1; ++j) {
-        const Buf d = x.slot(slot[miss[j]]);
-        copy(E, x.stage, (j - b0) * x.slot_bytes, d.b, d.off, x.slot_bytes);
-      }
-    }
+    std::vector<std::pair<int, int>> es;
+    for (size_t i : miss) es.push_back({need[i], slot[i]});
+    read_slots(lw, es);
     return slot;
   }
 
@@ -1819,6 +1802,7 @@ class Dsv4Model final : public NativeModel {
   // drafts land in DTOK_).
   void forward(std::vector<Seg>& segs, bool draft = false) {
     const auto tf0 = Clock::now();
+    ++xc_.pass;
     struct Timer {
       double& acc;
       Clock::time_point t0;
@@ -1962,14 +1946,14 @@ class Dsv4Model final : public NativeModel {
       }
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
-      std::vector<char> used(size_t(w.nE), 0);
+      std::vector<int> used(size_t(w.nE), 0);
       for (int i = 0; i < T * K; ++i) {
         if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
-        used[size_t(sel[i])] = 1;
+        ++used[size_t(sel[i])];
       }
-      std::vector<int> need;
+      std::vector<int> need, nrows;
       for (int e = 0; e < w.nE; ++e)
-        if (used[size_t(e)]) need.push_back(e);
+        if (used[size_t(e)]) need.push_back(e), nrows.push_back(used[size_t(e)]);
       if (!dump_dir_.empty())
         if (FILE* f = std::fopen((dump_dir_ + "/p" + std::to_string(dump_pass_) + "_route" + std::to_string(l) + ".i32").c_str(), "wb")) {
           std::fwrite(sel, 4, size_t(T * K), f);
@@ -1979,7 +1963,7 @@ class Dsv4Model final : public NativeModel {
       static const bool pipe_on = !(std::getenv("ESPETERO_DS4_PIPE") && std::atoi(std::getenv("ESPETERO_DS4_PIPE")) == 0);
       const bool pipe = pipe_on && !draft && T >= 256;
       std::vector<size_t> pend;
-      const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr);
+      const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr, &nrows);
       if (more) {  // the next layer's experts, read while the GPU works on this one
         const LayerW& nw = LW[size_t(l + 1)];
         std::vector<int> nx;
@@ -2020,21 +2004,19 @@ class Dsv4Model final : public NativeModel {
         for (size_t ci = 0; ci < blks.size(); ++ci)
           moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, true, YT_, size_t(blks[ci].r0) * yrow, 0);
         id<MTLCommandBuffer> used[2] = {E.submit_chained(), nil};
-        const size_t RB = size_t(std::max(1, xc_.stage_n / 2));
+        const size_t RB = size_t(std::max(1, xc_.stage_n));
         int k = 1;
         for (size_t b0 = 0; b0 < pend.size(); b0 += RB, ++k) {
           const int par = k % 2;
-          if (used[par]) E.wait_cb(used[par]);  // its staging half and tables are free again
+          if (used[par]) E.wait_cb(used[par]);  // its host tables are free again
           const size_t b1 = std::min(pend.size(), b0 + RB);
-          std::vector<int> es;
-          for (size_t j = b0; j < b1; ++j) es.push_back(need[pend[j]]);
-          read_experts(key, w, es, par * int(RB));
+          std::vector<std::pair<int, int>> es;
           std::fill(in.begin(), in.end(), 0);
           for (size_t j = b0; j < b1; ++j) {
-            const Buf d = xc_.slot(slots[pend[j]]);
-            copy(E, xc_.stage, (size_t(par) * RB + (j - b0)) * xc_.slot_bytes, d.b, d.off, xc_.slot_bytes);
+            es.push_back({need[pend[j]], slots[pend[j]]});
             in[size_t(need[pend[j]])] = 1;
           }
+          read_slots(w, es);  // straight into the slots, while the GPU runs the earlier rounds
           for (size_t ci = 0; ci < blks.size(); ++ci)
             moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, false, YT_, size_t(blks[ci].r0) * yrow, par);
           used[par] = E.submit_chained();

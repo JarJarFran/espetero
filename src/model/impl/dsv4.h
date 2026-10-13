@@ -24,6 +24,9 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <atomic>
+#include <memory>
+#include <sys/mman.h>
 #include <unordered_map>
 
 #include "../../util/json.h"
@@ -369,9 +372,12 @@ struct ExpertCache {
   std::vector<uint64_t> stamp;   // slot -> last use
   std::vector<int> where;        // layer * E + expert -> slot, -1
   uint64_t clock = 0;
-  // staging (shared) for reads
-  id<MTLBuffer> stage = nil;
-  int stage_n = 0;
+  std::vector<uint8_t*> host;    // the buffers' host addresses (the pool is host memory)
+  bool locked = false;           // locked with mlock
+  std::vector<uint8_t> pref;     // slot -> filled by a prefetch, not used yet
+  uint64_t pass = 0;              // forward passes (the access trace's clock)
+  std::unique_ptr<std::atomic<int>[]> loading;  // slot -> 0 ready, 1 being read, 2 read failed
+  int stage_n = 0;               // experts per pipelined round
   // stats
   uint64_t hits = 0, misses = 0;
   double read_ms = 0, read_gb = 0;
@@ -379,6 +385,7 @@ struct ExpertCache {
   Buf slot(int s) const { return Buf{bufs[size_t(s / per_buf)], size_t(s % per_buf) * slot_bytes}; }
   int part(int s) const { return s / per_buf; }
   size_t offset(int s) const { return size_t(s % per_buf) * slot_bytes; }
+  uint8_t* host_ptr(int s) const { return host[size_t(s / per_buf)] + offset(s); }
 };
 
 // ---------------------------------------------------------------- sequence slots
