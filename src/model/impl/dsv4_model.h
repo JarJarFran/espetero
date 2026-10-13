@@ -12,6 +12,7 @@
 #include <sys/sysctl.h>
 
 #include "../api.h"
+#include "../../util/paths.h"
 #include "dsv4.h"
 
 namespace espetero::native::ds4 {
@@ -72,7 +73,9 @@ class Dsv4Model final : public NativeModel {
       if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) gb = std::atof(v);
       if (gb <= 0) {
         // what the GPU working set allows, keeping ~14 GB of the Mac for macOS, apps and the file cache
-        gb = std::min({ws - mine - 3e9, double(ram) - mine - 14e9, sys_avail - mine - 6e9}) / 1e9;
+        // macOS compressed and swapped tens of GB when the process wired 128 of 137 GB (prefill 3x slower):
+        // keep ~24 GB of the Mac out of it
+        gb = std::min({ws - mine - 3e9, double(ram) - mine - 24e9, sys_avail - mine - 6e9}) / 1e9;
         if (gb < 20)
           std::fprintf(stderr, "deepseek_v41: only %.1f GB of memory available for the expert cache (%.1f GB free "
                                "before loading): every token will read most experts from the SSD\n", gb, sys_avail / 1e9);
@@ -80,6 +83,17 @@ class Dsv4Model final : public NativeModel {
       const double all = double(c_.L) * c_.E * double(xc_.slot_bytes) / 1e9;
       gb = std::max(1.0, std::min(gb, all));
       make_cache(gb);
+      if (pf_on_) pf_init(64);  // 1.2 GB of prefetch staging
+      if (!partial_) {
+        uint64_t hsh = 1469598103934665603ull;
+        for (unsigned char ch : path) hsh = (hsh ^ ch) * 1099511628211ull;
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "/dsv41-%016llx.experts", (unsigned long long)hsh);
+        const std::string dir = paths::user_cache_dir();
+        ::mkdir(dir.c_str(), 0755);
+        warm_path_ = dir + nm;
+        warm_load();
+      }
       std::fprintf(stderr, "deepseek_v41: %.1f GB of weights in memory, %d of %d experts (%.1f GB) cached in GPU memory, "
                            "the rest read from the SSD; Engram tables (%.0f GB) read from the SSD\n",
                    wgb, xc_.n, c_.L * c_.E, double(xc_.n) * double(xc_.slot_bytes) / 1e9, engram_gb_);
@@ -539,6 +553,13 @@ class Dsv4Model final : public NativeModel {
     o.set("expert_read_gb", xc_.read_gb);
     o.set("engram_read_ms", eng_read_ms_);
     o.set("gpu_ms", gpu_ms_);
+    o.set("wait_ms", wait_ms_);    // host time waiting for command buffers (GPU time + launch + wake-up)
+    o.set("wake_ms", wake_ms_);    // from each command buffer's end to the host noticing
+    o.set("forward_ms", fwd_ms_);  // wall time inside passes
+    o.set("prefetch_issued", int64_t(pf_issued_));
+    o.set("prefetch_used", int64_t(pf_used_));
+    o.set("prefetch_wasted", int64_t(pf_wasted_));
+    o.set("prefetch_wait_ms", pf_wait_ms_);
     o.set("flushes", int64_t(flushes_));
     o.set("spec_rounds", spec_rounds_);
     o.set("spec_drafts", spec_drafts_);
@@ -553,7 +574,8 @@ class Dsv4Model final : public NativeModel {
   bool set_option(const std::string& name, int value) override {
     if (name == "expert_stats_reset") {
       xc_.hits = xc_.misses = 0;
-      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = 0;
+      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = wait_ms_ = wake_ms_ = fwd_ms_ = pf_wait_ms_ = 0;
+      pf_issued_ = pf_used_ = pf_wasted_ = 0;
       flushes_ = 0;
       spec_rounds_ = spec_drafts_ = spec_accepted_ = 0;
       prof_.clear();
@@ -593,7 +615,7 @@ class Dsv4Model final : public NativeModel {
   ExpertCache xc_;
   std::vector<Seq> seqs_;
   ModelInfo info_;
-  int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0, nuser_ = 0;
+  int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0, nuser_ = 0, nsub_cap_ = 1;
   static constexpr int kScratch = 8;  // trees without a slot, and leaves (in rounds)
   int max_reads_ = 64;  // logits rows per pass
   static constexpr int kDsRows = 1024;  // target states entering the draft rings per draft pass
@@ -602,14 +624,15 @@ class Dsv4Model final : public NativeModel {
   bool verbose_ = false, profile_ = false, partial_ = false, no_engram_ = false;
   std::vector<std::vector<Readout>> out_;  // [tree][readout]: leaves first, then the root
   std::map<std::string, std::pair<double, int>> prof_;
-  double eng_read_ms_ = 0, gpu_ms_ = 0;
+  double eng_read_ms_ = 0, gpu_ms_ = 0, wait_ms_ = 0, wake_ms_ = 0, fwd_ms_ = 0;
   uint64_t flushes_ = 0;
   std::vector<int> src_ratio_;  // per KV source: its ratio
 
   // scratch (shared)
   id<MTLBuffer> ids_, pos_, gpos_, mix0_, H_, X_, XQ_, Y_, mixA_, mixF_[2], QA_, Q_, KVp_, OA_, CKV_, CSC_, LAT_, IK_, IQ_, IW_,
       ISC_, IDX_, BS_, CAND_, XGRP_, XTILE_, HCP_, RL_, SEL_, RW_, xrow_, yrow_, wsc_, amap_, ident_, ones_, XG_, XU_, XH_, XP_, SG_, SU_, SH_, EE_,
-      ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, DSX_, DSM_, DSQ_, DKV_, DPOS_;
+      ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, DSX_, DSM_, DSQ_, DKV_, DPOS_, PSEL_, PRW_, YT_;
+  static constexpr int kPredRows = 16;  // passes up to this many rows predict the next layer's experts
   size_t isc_floats_ = 0;
   int cstride_ = 1;
   int gemm_min_ = [] {  // rows from which the fp8 matrices and the experts use the GEMM kernels
@@ -680,9 +703,20 @@ class Dsv4Model final : public NativeModel {
     w.gate = matb(p + "ffn.gate.weight", nE, D);
     w.gate_bias = vecf(p + "ffn.gate.bias", size_t(nE));
     w.gate_bias_vl = ck_.has(p + "ffn.gate.bias_vl") ? vecf(p + "ffn.gate.bias_vl", size_t(nE)) : w.gate_bias;
-    w.sh1 = mat8(p + "ffn.shared_experts.w1", c_.IE, D);
+    {  // the shared expert's gate and up stacked: one GEMV ([w1; w3], scales likewise)
+      const TInfo &a = ck_.at(p + "ffn.shared_experts.w1.weight"), &b = ck_.at(p + "ffn.shared_experts.w3.weight");
+      const TInfo &sa = ck_.at(p + "ffn.shared_experts.w1.scale"), &sb = ck_.at(p + "ffn.shared_experts.w3.scale");
+      if (a.nbytes != uint64_t(c_.IE) * uint64_t(D) || b.nbytes != a.nbytes || sa.nbytes != sb.nbytes || c_.IE % 32)
+        fail("deepseek_v41: " + p + "shared expert shapes");
+      w.sh13.N = 2 * c_.IE, w.sh13.K = D;
+      w.sh13.w = rt_.arena->alloc(size_t(a.nbytes + b.nbytes));
+      ck_.read(a, ptr(w.sh13.w));
+      ck_.read(b, static_cast<uint8_t*>(ptr(w.sh13.w)) + a.nbytes);
+      w.sh13.s = rt_.arena->alloc(size_t(sa.nbytes + sb.nbytes));
+      ck_.read(sa, ptr(w.sh13.s));
+      ck_.read(sb, static_cast<uint8_t*>(ptr(w.sh13.s)) + sa.nbytes);
+    }
     w.sh2 = mat8(p + "ffn.shared_experts.w2", D, c_.IE);
-    w.sh3 = mat8(p + "ffn.shared_experts.w3", c_.IE, D);
     w.x.resize(size_t(nE));
     const uint64_t wb = uint64_t(c_.IE) * uint64_t(D) / 2, sb = uint64_t(c_.IE) * uint64_t(D) / 32;
     for (int e = 0; e < nE; ++e) {
@@ -824,15 +858,18 @@ class Dsv4Model final : public NativeModel {
     H_ = F(T * 4 * D), XF_ = F(T * D);
     mixA_ = F(T * 24), mixF_[0] = F(T * 24), mixF_[1] = F(T * 24);
     SEL_ = F(T * K), RW_ = F(T * K);
+    PSEL_ = F(size_t(kPredRows) * 8), PRW_ = F(size_t(kPredRows) * 8);
     IMG_ = rt_.buffer(T);
-    xrow_ = F(T * K), wsc_ = F(T * K), amap_ = F(T * K);
+    xrow_ = F(2 * T * K), wsc_ = F(2 * T * K), amap_ = F(2 * T * K);  // two copies: pipelined rounds alternate
     IDX_ = F(T * size_t(c_.ITOPK));
     cstride_ = c_.cand_bs > 0 ? max_ctx_ / c_.cand_bs + 2 : 1;
     CAND_ = rt_.buffer(T * size_t(cstride_));
     const size_t nsub = (T + P - 1) / P + 1;
     tile_cap_ = 3 * int(A / 16 + size_t(c_.E) + 1);  // three tile lists (64, 32, 16 rows)
-    XGRP_ = rt_.buffer(nsub * size_t(2 * c_.E) * 24);
-    XTILE_ = rt_.buffer(nsub * size_t(tile_cap_) * 8);
+    nsub_cap_ = int(nsub);
+    XGRP_ = rt_.buffer(2 * nsub * size_t(2 * c_.E) * 24);
+    XTILE_ = rt_.buffer(2 * nsub * size_t(tile_cap_) * 8);
+    YT_ = F(T * D);  // a pipelined layer's MoE output, all rows
     const size_t ecols = size_t((c_.eng_max_n - 1) * c_.eng_heads), erow = ecols * size_t(c_.eng_hd + c_.eng_hd / 32);
     ERAW_[0] = rt_.buffer(T * erow), ERAW_[1] = rt_.buffer(T * erow);
     // sub-chunk scratch
@@ -853,7 +890,7 @@ class Dsv4Model final : public NativeModel {
     }
     XG_ = F(A * 2 * size_t(c_.IE)), XU_ = F(16), XH_ = F(A * size_t(c_.IE)), XP_ = F(A * D);
     HCP_ = F(P * size_t(4 * c_.D / 1024) * 25);
-    SG_ = F(P * size_t(c_.IE)), SU_ = F(P * size_t(c_.IE)), SH_ = F(P * size_t(c_.IE));
+    SG_ = F(P * 2 * size_t(c_.IE)), SU_ = F(16), SH_ = F(P * size_t(c_.IE));
     EE_ = F(P * ecols * size_t(c_.eng_hd));
     EKV_ = F(P * D * 5);
     XN_ = F(D * size_t(max_reads_)), LOG_ = F(size_t(c_.V) * size_t(max_reads_));
@@ -920,34 +957,81 @@ class Dsv4Model final : public NativeModel {
     double gpu_ms = 0;
     int flushes = 0;
     explicit Enc2(Runtime& r) : rt(r) { begin(); }
+    // ESPETERO_DS4_CONC=1: concurrent dispatch with a buffer barrier before every dispatch (experiment).
+    bool conc = env_on("ESPETERO_DS4_CONC");
     void begin() {
       cb = [rt.queue commandBufferWithUnretainedReferences];
-      e = [cb computeCommandEncoder];
+      e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
+    }
+    void bar() {
+      if (conc) [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+    // Commit and wait. Waits spin (a layer's command buffer is ~1 ms; a
+    // blocking wait wakes ~0.1-0.3 ms late, 40 times a token);
+    // ESPETERO_DS4_SPIN=0 blocks.
+    double wait_ms = 0, wake_ms = 0;
+    void submit_wait() {
+      [e endEncoding];
+      Residency::get().commit();
+      const double t0 = Enc::host_seconds();
+      [cb commit];
+      static const bool spin = !(std::getenv("ESPETERO_DS4_SPIN") && std::atoi(std::getenv("ESPETERO_DS4_SPIN")) == 0);
+      if (spin) {
+        while ([cb status] < MTLCommandBufferStatusCompleted) {
+          if (Enc::host_seconds() - t0 > 0.05) {  // long work: block
+            [cb waitUntilCompleted];
+            break;
+          }
+        }
+      } else {
+        [cb waitUntilCompleted];
+      }
+      const double t1 = Enc::host_seconds();
+      if ([cb status] != MTLCommandBufferStatusCompleted) {
+        NSError* err = [cb error];
+        fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
+      }
+      gpu_ms += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+      for (id<MTLCommandBuffer> c : chained) {  // completed before this one (ordered by events)
+        wait_cb(c);
+        gpu_ms += ([c GPUEndTime] - [c GPUStartTime]) * 1000.0;
+      }
+      chained.clear();
+      wait_ms += (t1 - t0) * 1000.0;
+      wake_ms += std::max(0.0, (t1 - [cb GPUEndTime]) * 1000.0);
+      ++flushes;
     }
     void flush() {
-      [e endEncoding];
-      Residency::get().commit();
-      [cb commit];
-      [cb waitUntilCompleted];
-      if ([cb status] != MTLCommandBufferStatusCompleted) {
-        NSError* err = [cb error];
-        fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
-      }
-      gpu_ms += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
-      ++flushes;
+      submit_wait();
       begin();
     }
-    void end() {
+    // Commit without waiting; the next command buffer waits on the GPU for this
+    // one (an event) so their work stays ordered. Returns the committed buffer.
+    id<MTLSharedEvent> ev = nil;
+    uint64_t evv = 0;
+    std::vector<id<MTLCommandBuffer>> chained;
+    id<MTLCommandBuffer> submit_chained() {
+      if (!ev) ev = [rt.dev newSharedEvent];
       [e endEncoding];
+      [cb encodeSignalEvent:ev value:++evv];
       Residency::get().commit();
       [cb commit];
-      [cb waitUntilCompleted];
-      if ([cb status] != MTLCommandBufferStatusCompleted) {
-        NSError* err = [cb error];
+      id<MTLCommandBuffer> sent = cb;
+      chained.push_back(sent);
+      cb = [rt.queue commandBufferWithUnretainedReferences];
+      [cb encodeWaitForEvent:ev value:evv];
+      e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
+      return sent;
+    }
+    void wait_cb(id<MTLCommandBuffer> c) {
+      [c waitUntilCompleted];
+      if ([c status] != MTLCommandBufferStatusCompleted) {
+        NSError* err = [c error];
         fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
       }
-      gpu_ms += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
-      ++flushes;
+    }
+    void end() {
+      submit_wait();
       e = nil;
     }
     // ESPETERO_DS4_PROFILE=1: every dispatch in its own command buffer, timed by kernel.
@@ -976,11 +1060,13 @@ class Dsv4Model final : public NativeModel {
     void raw(int i, const void* p, size_t n) { [e setBytes:p length:n atIndex:i]; }
     void groups(size_t x, size_t y, size_t z, size_t tx) {
       if (!x || !y || !z) return;
+      bar();
       [e dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
       timed();
     }
     void threads(size_t x, size_t y, size_t z, size_t tx, size_t ty = 1) {
       if (!x || !y || !z) return;
+      bar();
       [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
       timed();
     }
@@ -1041,6 +1127,40 @@ class Dsv4Model final : public NativeModel {
     E.bytes(1, p);
     const int B = mode == 2 ? 16 : 32;
     E.threads(size_t(rows) * size_t(K / B), 1, 1, 256);
+  }
+  static bool noquant() {
+    static const bool v = env_on("ESPETERO_DS4_NOQUANT");
+    return v;
+  }
+  // In place, one simdgroup per vector: RMSNorm (w non-null), RoPE on the last dims (npair > 0), fp8 rounding.
+  void vec_post(Enc2& E, id<MTLBuffer> x, size_t off, const Buf* w, id<MTLBuffer> posb, size_t poff, const Buf* invf,
+                int rows, int heads, int n, int stride, bool rope, bool inverse, bool q) {
+    struct {
+      int rows, heads, n, stride;
+      float eps;
+      int norm, npair, inverse, quant;
+    } p{rows, heads, n, stride, c_.eps, w ? 1 : 0, rope ? c_.RD / 2 : 0, inverse ? 1 : 0, q && !noquant() ? 1 : 0};
+    E.pipe("ds4_vec_post");
+    E.set(0, x, off);
+    E.set(1, w ? *w : invf_plain_);
+    E.set(2, posb, poff);
+    E.set(3, invf ? *invf : invf_plain_);
+    E.bytes(4, p);
+    E.groups(size_t((rows * heads + 7) / 8), 1, 1, 256);
+  }
+  void quant_copy(Enc2& E, id<MTLBuffer> src, size_t so, int sstride, id<MTLBuffer> dst, size_t dof, int dstride, int rows, int K) {
+    if (noquant()) {
+      if (sstride == K && dstride == K) return copy(E, src, so, dst, dof, size_t(rows) * size_t(K) * 4);
+      fail("deepseek_v41: strided copy without quantization");
+    }
+    struct {
+      int rows, K, sstride, dstride;
+    } p{rows, K, sstride, dstride};
+    E.pipe("ds4_quant_copy");
+    E.set(0, src, so);
+    E.set(1, dst, dof);
+    E.bytes(2, p);
+    E.threads(size_t(rows) * size_t(K / 32), 1, 1, 256);
   }
   void norm(Enc2& E, id<MTLBuffer> x, size_t off, const Buf& w, int rows, int heads, int n, int stride) {
     struct {
@@ -1119,10 +1239,10 @@ class Dsv4Model final : public NativeModel {
     E.groups(size_t(M), 1, 1, 256);
   }
   // H rows [r0, r0 + M) take Y (rows 0..M of the scratch) with post / comb from `mix`.
-  void hc_post(Enc2& E, id<MTLBuffer> mix, int r0, int M) {
+  void hc_post(Enc2& E, id<MTLBuffer> mix, int r0, int M, id<MTLBuffer> Ys = nil, size_t yso = 0) {
     E.pipe("ds4_hc_post");
     E.set(0, H_, hrow(r0));
-    E.set(1, Y_);
+    E.set(1, Ys ? Ys : Y_, Ys ? yso : 0);
     E.set(2, mix, size_t(r0) * 24 * 4);
     E.bytes(3, hcp());
     E.threads(size_t(c_.D), size_t(M), 1, 256);
@@ -1395,8 +1515,182 @@ class Dsv4Model final : public NativeModel {
   // Slots for this layer's experts `need` (sorted, distinct); missing ones are
   // read from the SSD into staging and copied into their slots by `E`
   // (flushing between staging rounds).
-  std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need) {
+  // ---- the expert cache across restarts: the cached experts, most recently
+  // used first, saved every minute while passes run; at load they are read
+  // back (sorted by file offset) so a restarted server starts warm.
+  // ESPETERO_DS4_WARM=0: start cold.
+  std::string warm_path_;
+  Clock::time_point warm_saved_ = Clock::now();
+  uint64_t warm_clock_ = 0;
+
+  void warm_save() {
+    if (warm_path_.empty() || xc_.clock == warm_clock_ || ms_since(warm_saved_) < 60000) return;
+    std::vector<std::pair<uint64_t, int32_t>> v;
+    for (int sl = 0; sl < xc_.n; ++sl)
+      if (xc_.key[size_t(sl)] >= 0) v.push_back({xc_.stamp[size_t(sl)], xc_.key[size_t(sl)]});
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    const std::string tmp = warm_path_ + ".tmp";
+    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+      const int32_t h[4] = {0x34445345 /* "ESD4" */, 1, c_.E, int32_t(v.size())};
+      bool ok = std::fwrite(h, sizeof h, 1, f) == 1;
+      for (const auto& e : v) ok = ok && std::fwrite(&e.second, 4, 1, f) == 1;
+      if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), warm_path_.c_str());
+    }
+    warm_saved_ = Clock::now();
+    warm_clock_ = xc_.clock;
+  }
+
+  void warm_load() {
+    if (warm_path_.empty() || (std::getenv("ESPETERO_DS4_WARM") && std::atoi(std::getenv("ESPETERO_DS4_WARM")) == 0)) return;
+    FILE* f = std::fopen(warm_path_.c_str(), "rb");
+    if (!f) return;
+    int32_t h[4] = {0, 0, 0, 0};
+    std::vector<int32_t> keys;
+    if (std::fread(h, sizeof h, 1, f) == 1 && h[0] == 0x34445345 && h[1] == 1 && h[2] == c_.E && h[3] > 0) {
+      keys.resize(size_t(h[3]));
+      if (std::fread(keys.data(), 4, keys.size(), f) != keys.size()) keys.clear();
+    }
+    std::fclose(f);
+    const int nl = c_.L + int(M_.size());
+    keys.erase(std::remove_if(keys.begin(), keys.end(), [&](int32_t k) { return k < 0 || k / c_.E >= nl || k % c_.E >= (k / c_.E < c_.L ? c_.E : c_.ds_E); }),
+               keys.end());
+    if (keys.size() > size_t(xc_.n)) keys.resize(size_t(xc_.n));  // the most recent ones
+    if (keys.empty()) return;
+    const auto t0 = Clock::now();
+    // stamps: the file's order (most recent first gets the newest stamp); reads sorted by layer for locality
+    std::vector<std::pair<int32_t, uint64_t>> ks;
+    for (size_t i = 0; i < keys.size(); ++i) ks.push_back({keys[i], uint64_t(keys.size() - i)});
+    std::sort(ks.begin(), ks.end());
+    xc_.clock = keys.size() + 1;
+    for (size_t b0 = 0; b0 < ks.size();) {
+      // one layer's experts at a time through expert_slots (staging rounds, GPU copies)
+      const int l = ks[b0].first / c_.E;
+      size_t b1 = b0;
+      std::vector<int> need;
+      while (b1 < ks.size() && ks[b1].first / c_.E == l) need.push_back(ks[b1++].first % c_.E);
+      const LayerW& lw = l < c_.L ? L_[size_t(l)] : M_[size_t(l - c_.L)];
+      Enc2 E(rt_);
+      const std::vector<int> sl = expert_slots(E, l, lw, need);
+      E.end();
+      for (size_t i = 0; i < sl.size(); ++i) xc_.stamp[size_t(sl[i])] = ks[b0 + i].second;
+      b0 = b1;
+    }
+    xc_.hits = xc_.misses = 0;
+    xc_.read_ms = xc_.read_gb = 0;
+    std::fprintf(stderr, "deepseek_v41: expert cache warmed with %zu experts (%.1f GB) in %.1f s\n", ks.size(),
+                 double(ks.size()) * double(xc_.slot_bytes) / 1e9, ms_since(t0) / 1e3);
+  }
+
+  // ---- prefetch: experts the next layer will probably need, read in the
+  // background while the GPU works (decode: the next layer's router applied to
+  // this layer's MoE input; long passes: every expert of the next layer).
+  // Their staging slots are consumed by expert_slots (a GPU copy instead of a
+  // read) and freed after the next flush.
+  struct Pref {
+    int key = -1;               // layer * E + expert; -1: free
+    std::atomic<int> state{0};  // 0 free, 1 reading, 2 ready, 3 failed
+    uint64_t age = 0;
+  };
+  std::unique_ptr<Pref[]> pf_;
+  int pf_n_ = 0;
+  id<MTLBuffer> pf_stage_ = nil;
+  std::unordered_map<int, int> pf_map_;
+  std::vector<int> pf_release_;
+  uint64_t pf_clock_ = 0, pf_issued_ = 0, pf_used_ = 0, pf_wasted_ = 0;
+  double pf_wait_ms_ = 0;
+  bool pf_on_ = !(std::getenv("ESPETERO_DS4_PREFETCH") && std::atoi(std::getenv("ESPETERO_DS4_PREFETCH")) == 0);
+
+  void pf_init(int n) {
+    pf_n_ = n;
+    pf_.reset(new Pref[size_t(n)]);
+    pf_stage_ = rt_.buffer(size_t(n) * xc_.slot_bytes);
+  }
+  // Slots whose copies the last flush executed become free.
+  void pf_collect() {
+    for (int i : pf_release_) pf_[size_t(i)].key = -1, pf_[size_t(i)].state.store(0);
+    pf_release_.clear();
+  }
+  void prefetch(int l, const LayerW& lw, const std::vector<int>& experts) {
+    if (!pf_n_) return;
     ExpertCache& x = xc_;
+    for (int e : experts) {
+      const int k = l * c_.E + e;
+      if (x.where[size_t(k)] >= 0 || pf_map_.count(k)) continue;
+      int best = -1;
+      uint64_t ba = UINT64_MAX;
+      for (int i = 0; i < pf_n_; ++i) {
+        const int st = pf_[size_t(i)].state.load();
+        if (st == 0) {
+          best = i;
+          break;
+        }
+        const bool releasing = std::find(pf_release_.begin(), pf_release_.end(), i) != pf_release_.end();
+        if ((st == 2 || st == 3) && !releasing && pf_[size_t(i)].age < ba) ba = pf_[size_t(i)].age, best = i;
+      }
+      if (best < 0) return;  // every slot is being read or copied
+      Pref& P = pf_[size_t(best)];
+      if (P.key >= 0) {
+        pf_map_.erase(P.key);
+        ++pf_wasted_;
+      }
+      P.key = k, P.age = ++pf_clock_;
+      P.state.store(1);
+      pf_map_[k] = best;
+      ++pf_issued_;
+      const XLoc loc = lw.x[size_t(e)];
+      const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
+      uint8_t* dst = static_cast<uint8_t*>([pf_stage_ contents]) + size_t(best) * x.slot_bytes;
+      const size_t wb = x.wbytes, sb = x.sbytes;
+      Pref* pp = &P;
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const size_t piece = size_t(1) << 20, np = (wb + piece - 1) / piece;
+        std::atomic<bool>* ok = new std::atomic<bool>(true);
+        dispatch_apply(np + 1, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) {
+          bool r;
+          if (i < np) r = pread_all(fd, dst + i * piece, std::min(piece, wb - i * piece), size_t(loc.w + i * piece));
+          else r = pread_all(fd, dst + wb, sb, size_t(loc.s));
+          if (!r) ok->store(false);
+        });
+        pp->state.store(ok->load() ? 2 : 3);
+        delete ok;
+      });
+    }
+  }
+
+  // Experts `es` of layer l from the SSD into staging slots [s0, s0 + es.size()).
+  void read_experts(int l, const LayerW& lw, const std::vector<int>& es, int s0) {
+    ExpertCache& x = xc_;
+    const auto t0 = Clock::now();
+    struct Job {
+      int fd;
+      uint8_t* dst;
+      size_t n;
+      uint64_t off;
+    };
+    std::vector<Job> jobs;
+    uint8_t* stage = static_cast<uint8_t*>([x.stage contents]);
+    const size_t piece = size_t(1) << 20;
+    for (size_t j = 0; j < es.size(); ++j) {
+      const XLoc& loc = lw.x[size_t(es[j])];
+      uint8_t* dst = stage + (size_t(s0) + j) * x.slot_bytes;
+      const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
+      for (size_t o = 0; o < x.wbytes; o += piece) jobs.push_back({fd, dst + o, std::min(piece, x.wbytes - o), loc.w + o});
+      jobs.push_back({fd, dst + x.wbytes, x.sbytes, loc.s});
+    }
+    std::atomic<bool> ok{true};
+    parallel_for(jobs.size(), [&](size_t i) {
+      if (!pread_all(jobs[i].fd, jobs[i].dst, jobs[i].n, size_t(jobs[i].off))) ok = false;
+    });
+    if (!ok) fail("deepseek_v41: expert read failed");
+    x.read_ms += ms_since(t0);
+    x.read_gb += double(es.size()) * double(x.slot_bytes) / 1e9;
+    (void)l;
+  }
+
+  // pending: misses are left to the caller (indices into need), their slots assigned but not loaded.
+  std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need, std::vector<size_t>* pending = nullptr) {
+    ExpertCache& x = xc_;
+    pf_collect();
     const uint64_t now = ++x.clock;
     std::vector<int> slot(need.size(), -1);
     std::vector<size_t> miss;
@@ -1430,6 +1724,36 @@ class Dsv4Model final : public NativeModel {
       x.where[size_t(k)] = best;
       x.stamp[size_t(best)] = now;
       slot[i] = best;
+    }
+    // misses a prefetch already brought (or is bringing): copies from its staging
+    {
+      std::vector<size_t> rest;
+      for (size_t i : miss) {
+        const int k = l * c_.E + need[i];
+        auto it = pf_map_.find(k);
+        if (it == pf_map_.end()) {
+          rest.push_back(i);
+          continue;
+        }
+        Pref& P = pf_[size_t(it->second)];
+        const auto tw = Clock::now();
+        while (P.state.load() == 1) std::this_thread::yield();
+        pf_wait_ms_ += ms_since(tw);
+        if (P.state.load() != 2) {
+          rest.push_back(i);
+          continue;
+        }
+        const Buf d = x.slot(slot[i]);
+        copy(E, pf_stage_, size_t(it->second) * x.slot_bytes, d.b, d.off, x.slot_bytes);
+        pf_release_.push_back(it->second);
+        pf_map_.erase(it);
+        ++pf_used_;
+      }
+      miss.swap(rest);
+    }
+    if (pending) {
+      *pending = miss;
+      return slot;
     }
     for (size_t b0 = 0; b0 < miss.size(); b0 += size_t(x.stage_n)) {
       const size_t b1 = std::min(miss.size(), b0 + size_t(x.stage_n));
@@ -1494,6 +1818,12 @@ class Dsv4Model final : public NativeModel {
   // draft: the DSpark layers over draft blocks (no slot state changes; the
   // drafts land in DTOK_).
   void forward(std::vector<Seg>& segs, bool draft = false) {
+    const auto tf0 = Clock::now();
+    struct Timer {
+      double& acc;
+      Clock::time_point t0;
+      ~Timer() { acc += ms_since(t0); }
+    } timer{fwd_ms_, tf0};
     const Cfg& c = c_;
     const int D = c.D;
     const std::vector<LayerW>& LW = draft ? M_ : L_;
@@ -1575,6 +1905,11 @@ class Dsv4Model final : public NativeModel {
     for (int l = 0; l < int(LW.size()); ++l) {
       const LayerW& w = LW[size_t(l)];
       const int K = w.topk, key = draft ? c.L + l : l;  // the expert cache's layer
+      const bool more = pf_on_ && !draft && l + 1 < int(LW.size());
+      // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
+      // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
+      static const bool pred_on = std::getenv("ESPETERO_DS4_PREDICT") && std::atoi(std::getenv("ESPETERO_DS4_PREDICT")) != 0;
+      const bool predict = more && pred_on && T <= kPredRows;
       // the draft head's view of this layer's input: the mean of the hc copies
       if (!draft && dspark_)
         for (size_t k = 0; k < c.ds_targets.size(); ++k)
@@ -1623,6 +1958,7 @@ class Dsv4Model final : public NativeModel {
         hc_mix(E, w.hcf_fn, w.hcf_base, w.hcf_scale, mixF_[cur], r0, M);
         hc_pre(E, mixA_, w.ffn_norm, XF_, size_t(r0) * size_t(D) * 4, r0, M);
         moe_route(E, w, r0, M);
+        if (predict) moe_route_to(E, LW[size_t(l + 1)], r0, M, PSEL_, PRW_);  // the next layer's router on this input
       }
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
@@ -1639,15 +1975,71 @@ class Dsv4Model final : public NativeModel {
           std::fwrite(sel, 4, size_t(T * K), f);
           std::fclose(f);
         }
-      const std::vector<int> slots = expert_slots(E, key, w, need);
+      // long passes overlap the misses' reads with the experts' GPU work (ESPETERO_DS4_PIPE=0: off)
+      static const bool pipe_on = !(std::getenv("ESPETERO_DS4_PIPE") && std::atoi(std::getenv("ESPETERO_DS4_PIPE")) == 0);
+      const bool pipe = pipe_on && !draft && T >= 256;
+      std::vector<size_t> pend;
+      const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr);
+      if (more) {  // the next layer's experts, read while the GPU works on this one
+        const LayerW& nw = LW[size_t(l + 1)];
+        std::vector<int> nx;
+        if (predict) {
+          std::vector<char> pu(size_t(nw.nE), 0);
+          const int32_t* ps = static_cast<const int32_t*>([PSEL_ contents]);
+          for (int i = 0; i < T * nw.topk; ++i)
+            if (ps[i] >= 0 && ps[i] < nw.nE) pu[size_t(ps[i])] = 1;
+          for (int e = 0; e < nw.nE; ++e)
+            if (pu[size_t(e)]) nx.push_back(e);
+        } else if (T >= 64) {
+          for (int e = 0; e < nw.nE; ++e) nx.push_back(e);
+        }
+        prefetch(key + 1, nw, nx);
+      }
       std::vector<int> slot_of(size_t(w.nE), -1);
       for (size_t i = 0; i < need.size(); ++i) slot_of[size_t(need[i])] = slots[i];
-      // ---- phase 3: shared and routed experts, per block
-      for (size_t ci = 0; ci < blks.size(); ++ci) {
-        const int r0 = blks[ci].r0, M = blks[ci].M;
-        moe_experts(E, w, int(ci), r0, M, slot_of);
-        if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
-        hc_post(E, mixF_[cur], r0, M);
+      if (!pipe) {
+        // ---- phase 3: shared and routed experts, per block
+        for (size_t ci = 0; ci < blks.size(); ++ci) {
+          const int r0 = blks[ci].r0, M = blks[ci].M;
+          moe_experts(E, w, int(ci), r0, M, slot_of);
+          if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
+          hc_post(E, mixF_[cur], r0, M);
+        }
+      } else {
+        // ---- phase 3, pipelined (long passes): the GPU computes the experts in
+        // memory while the host reads the missing ones, a round of staging at a
+        // time (two halves, tables in two copies); the rounds' output adds up in YT_.
+        const size_t yrow = size_t(D) * 4;
+        std::vector<char> in(size_t(w.nE), 0);
+        {
+          std::vector<char> miss_e(size_t(w.nE), 0);
+          for (size_t i : pend) miss_e[size_t(need[i])] = 1;
+          for (int e : need)
+            if (!miss_e[size_t(e)]) in[size_t(e)] = 1;
+        }
+        for (size_t ci = 0; ci < blks.size(); ++ci)
+          moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, true, YT_, size_t(blks[ci].r0) * yrow, 0);
+        id<MTLCommandBuffer> used[2] = {E.submit_chained(), nil};
+        const size_t RB = size_t(std::max(1, xc_.stage_n / 2));
+        int k = 1;
+        for (size_t b0 = 0; b0 < pend.size(); b0 += RB, ++k) {
+          const int par = k % 2;
+          if (used[par]) E.wait_cb(used[par]);  // its staging half and tables are free again
+          const size_t b1 = std::min(pend.size(), b0 + RB);
+          std::vector<int> es;
+          for (size_t j = b0; j < b1; ++j) es.push_back(need[pend[j]]);
+          read_experts(key, w, es, par * int(RB));
+          std::fill(in.begin(), in.end(), 0);
+          for (size_t j = b0; j < b1; ++j) {
+            const Buf d = xc_.slot(slots[pend[j]]);
+            copy(E, xc_.stage, (size_t(par) * RB + (j - b0)) * xc_.slot_bytes, d.b, d.off, xc_.slot_bytes);
+            in[size_t(need[pend[j]])] = 1;
+          }
+          for (size_t ci = 0; ci < blks.size(); ++ci)
+            moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, false, YT_, size_t(blks[ci].r0) * yrow, par);
+          used[par] = E.submit_chained();
+        }
+        for (size_t ci = 0; ci < blks.size(); ++ci) hc_post(E, mixF_[cur], blks[ci].r0, blks[ci].M, YT_, size_t(blks[ci].r0) * yrow);
       }
       prev = mixF_[cur];
       cur ^= 1;
@@ -1689,6 +2081,7 @@ class Dsv4Model final : public NativeModel {
     }
     E.end();
     gpu_ms_ += E.gpu_ms;
+    wait_ms_ += E.wait_ms, wake_ms_ += E.wake_ms;
     flushes_ += uint64_t(E.flushes);
     R = 0;
     for (Seg& g : segs) {
@@ -1704,6 +2097,7 @@ class Dsv4Model final : public NativeModel {
       }
     }
     ++dump_pass_;
+    warm_save();
   }
 
   int dump_pass_ = 0;
@@ -1723,20 +2117,15 @@ class Dsv4Model final : public NativeModel {
     const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD, M = bk.M;
     const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
     const size_t po = size_t(bk.r0) * 4;  // pos_ rows of this block
-    copy(E, X_, 0, XQ_, 0, size_t(M) * size_t(D) * 4);
-    quant(E, XQ_, 0, M, D, D, 0);
+    quant_copy(E, X_, 0, D, XQ_, 0, D, M, D);
     gemv8(E, w.wq_a, XQ_, D, QA_, QR, M);
-    norm(E, QA_, 0, w.q_norm, M, 1, QR, QR);
-    quant(E, QA_, 0, M, QR, QR, 0);
+    vec_post(E, QA_, 0, &w.q_norm, pos_, po, nullptr, M, 1, QR, QR, false, false, true);
     gemv8(E, w.wq_b, QA_, QR, Q_, HQ, M);
     rope(E, Q_, 0, pos_, po, invf, M, c.H, HD, HQ, false);
     gemv8(E, w.wkv, XQ_, D, KVp_, HD, M);
-    norm(E, KVp_, 0, w.kv_norm, M, 1, HD, HD);
-    rope(E, KVp_, 0, pos_, po, invf, M, 1, HD, HD, false);
-    quant(E, KVp_, 0, M, HD, HD, 0);
+    vec_post(E, KVp_, 0, &w.kv_norm, pos_, po, &invf, M, 1, HD, HD, true, false, true);
     for (Part& pt : bk.parts) attention_seq(E, w, l, segs[size_t(pt.seg)], bk.r0, pt, draft);
-    rope(E, Q_, 0, pos_, po, invf, M, c.H, HD, HQ, true);
-    quant(E, Q_, 0, M, HQ, HQ, 0);
+    vec_post(E, Q_, 0, nullptr, pos_, po, &invf, M, c.H, HD, HQ, true, true, true);
     gemv(E, 0, w.wo_a.w, w.wo_a.s, Q_, 0, HQ, OA_, 0, c.OG * c.OR, w.wo_a.N, w.wo_a.K, M, c.OR, w.wo_a.K);
     quant(E, OA_, 0, M, c.OG * c.OR, c.OG * c.OR, 0);
     gemv8(E, w.wo_b, OA_, c.OG * c.OR, Y_, D, M);
@@ -1926,29 +2315,56 @@ class Dsv4Model final : public NativeModel {
     E.groups(size_t(M), 1, 1, 32);
   }
 
+  // The routing of `w` for rows [r0, r0 + M) of XF_ into sel / rw (row stride w.topk).
+  void moe_route_to(Enc2& E, const LayerW& w, int r0, int M, id<MTLBuffer> sel, id<MTLBuffer> rw) {
+    gemvb(E, w.gate, XF_, c_.D, RL_, w.nE, M, size_t(r0) * size_t(c_.D) * 4);
+    struct {
+      int M, E, k;
+      float rs;
+    } p{M, w.nE, w.topk, c_.route_scale};
+    E.pipe("ds4_route");
+    E.set(0, RL_);
+    E.set(1, w.gate_bias);
+    E.set(2, sel, size_t(r0) * size_t(w.topk) * 4);
+    E.set(3, rw, size_t(r0) * size_t(w.topk) * 4);
+    E.bytes(4, p);
+    E.set(5, w.gate_bias_vl.b ? w.gate_bias_vl : w.gate_bias);
+    E.set(6, IMG_, size_t(r0));
+    E.groups(size_t(M), 1, 1, 32);
+  }
+
   // Shared and routed experts of rows [r0, r0 + M) into Y_ (sub-chunk ci; the
   // routing on the host; slot_of: each expert's cache slot for this layer).
-  void moe_experts(Enc2& E, const LayerW& w, int ci, int r0, int M, const std::vector<int>& slot_of) {
+  // subset: only these experts' rows (a pipelined layer's round); shared: the shared
+  // expert too (it writes the target, the routed rows add to it); Yb: the target
+  // rows (null: Y_); par: which copy of the host tables (rounds in flight alternate).
+  void moe_experts(Enc2& E, const LayerW& w, int ci, int r0, int M, const std::vector<int>& slot_of,
+                   const std::vector<char>* subset = nullptr, bool shared = true, id<MTLBuffer> Yb = nil, size_t ybo = 0,
+                   int par = 0) {
     const Cfg& c = c_;
     const int D = c.D, IE = c.IE, K = w.topk;
-    copy(E, XF_, size_t(r0) * size_t(D) * 4, XQ_, 0, size_t(M) * size_t(D) * 4);
-    quant(E, XQ_, 0, M, D, D, 0);
-    gemv8(E, w.sh1, XQ_, D, SG_, IE, M);
-    gemv8(E, w.sh3, XQ_, D, SU_, IE, M);
-    swiglu(E, SG_, SU_, SH_, M, IE, nil);
-    quant(E, SH_, 0, M, IE, IE, 0);
-    gemv8(E, w.sh2, SH_, IE, Y_, D, M);
+    id<MTLBuffer> Yt = Yb ? Yb : Y_;
+    quant_copy(E, XF_, size_t(r0) * size_t(D) * 4, D, XQ_, 0, D, M, D);
+    if (shared) {
+      gemv8(E, w.sh13, XQ_, D, SG_, 2 * IE, M);  // gate | up in one matrix
+      swiglu_q(E, SG_, 0, SG_, size_t(IE) * 4, 2 * IE, SH_, IE, M, IE, nil, 0);
+      gemv8(E, w.sh2, SH_, IE, Yt, D, M, 0, ybo);
+    }
     // assignments of the sub-chunk grouped by expert (tables at this sub-chunk's offsets)
     const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]) + size_t(r0) * size_t(K);
     const float* rw = static_cast<const float*>([RW_ contents]) + size_t(r0) * size_t(K);
-    const int A = M * K;
-    std::vector<int> order(static_cast<size_t>(A));
-    std::iota(order.begin(), order.end(), 0);
+    std::vector<int> order;
+    order.reserve(size_t(M * K));
+    for (int a = 0; a < M * K; ++a)
+      if (!subset || (*subset)[size_t(sel[a])]) order.push_back(a);
+    const int A = int(order.size());
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return sel[a] < sel[b]; });
-    const size_t ao = size_t(r0) * size_t(K);
+    const size_t ao = size_t(r0) * size_t(K) + size_t(par) * size_t(T_) * size_t(c.K);
     int32_t* xr = static_cast<int32_t*>([xrow_ contents]) + ao;
     float* ws = static_cast<float*>([wsc_ contents]) + ao;
     int32_t* am = static_cast<int32_t*>([amap_ contents]) + ao;
+    for (int a = 0; a < M * K; ++a) am[a] = -1;
+    if (A == 0) return;
     std::vector<int> need, start;
     for (int a = 0; a < A; ++a) {
       const int src = order[size_t(a)];
@@ -1964,7 +2380,7 @@ class Dsv4Model final : public NativeModel {
       uint64_t off;
       int32_t a0, n;
     };
-    const size_t go = size_t(ci) * size_t(2 * c.E) * sizeof(XGroup);
+    const size_t go = (size_t(par) * size_t(nsub_cap_) + size_t(ci)) * size_t(2 * c.E) * sizeof(XGroup);
     XGroup* grp = reinterpret_cast<XGroup*>(static_cast<uint8_t*>([XGRP_ contents]) + go);
     for (size_t i = 0; i < need.size(); ++i) {
       const int sl = slot_of[size_t(need[i])];
@@ -1973,7 +2389,7 @@ class Dsv4Model final : public NativeModel {
     // Many rows: the GEMM over tiles of 64, 32 or 16 rows of a group (tile lists per
     // size); a few (decode): the grouped GEMV.
     int nt[3] = {0, 0, 0};
-    const size_t to = size_t(ci) * size_t(tile_cap_) * 8;
+    const size_t to = (size_t(par) * size_t(nsub_cap_) + size_t(ci)) * size_t(tile_cap_) * 8;
     int32_t* tl[3];
     for (int q = 0; q < 3; ++q) tl[q] = reinterpret_cast<int32_t*>(static_cast<uint8_t*>([XTILE_ contents]) + to) + 2 * q * (tile_cap_ / 3);
     const bool tiled = M > gemm_min_;
@@ -2007,40 +2423,62 @@ class Dsv4Model final : public NativeModel {
         E.groups(size_t(rows / 64), size_t(nt[q]), 1, 128);
       }
       if (!tiled) {
-        E.pipe("ds4_xgemv");
+        // two rows per simdgroup (ds4_xgemv_b): 345 -> 419 GB/s gate/up, 236 -> 328 GB/s down; ESPETERO_DS4_XGEMV1=1: one
+        static const bool one = env_on("ESPETERO_DS4_XGEMV1");
+        auto q = xp;
+        q.nrow_tg = one ? 8 : 16;
+        E.pipe(one ? "ds4_xgemv" : "ds4_xgemv_b");
         for (int b = 0; b < 3; ++b) E.set(b, xc_.bufs[size_t(std::min<int>(b, int(xc_.bufs.size()) - 1))]);
         E.set(3, XGRP_, go);
         E.set(4, X);
         E.set(5, Y);
         E.set(6, xrow_, ao * 4);
-        E.bytes(7, xp);
-        E.groups(size_t((rows + xp.nrow_tg - 1) / xp.nrow_tg), need.size(), 1, 256);
+        E.bytes(7, q);
+        E.groups(size_t((rows + q.nrow_tg - 1) / q.nrow_tg), need.size(), 1, 256);
       }
     };
     xgemv(XQ_, XG_);
-    {
-      struct {
-        int rows, n, gs, us, os;
-        float lim;
-      } p{A, IE, 2 * IE, 2 * IE, IE, c.swiglu};
-      E.pipe("ds4_swiglu_w");
-      E.set(0, XG_);
-      E.set(1, XG_, size_t(IE) * 4);
-      E.set(2, XH_);
-      E.bytes(3, p);
-      E.set(4, wsc_, ao * 4);
-      E.threads(size_t(IE), size_t(A), 1, 256);
-    }
-    quant(E, XH_, 0, A, IE, IE, 0);
+    swiglu_q(E, XG_, 0, XG_, size_t(IE) * 4, 2 * IE, XH_, IE, A, IE, wsc_, ao * 4);
     xp = {D, IE, IE, D, xp.wbytes, xp.sbytes, 1, 8};
     xgemv(XH_, XP_);
     const int32_t p[2] = {D, K};
     E.pipe("ds4_moe_sum");
     E.set(0, XP_);
-    E.set(1, Y_);
+    E.set(1, Yt, ybo);
     E.set(2, amap_, ao * 4);
     E.bytes(3, p);
     E.threads(size_t(D), size_t(M), 1, 256);
+  }
+
+  // O = act_quant(swiglu(G, U) [* w[r]]): G / U rows of stride gus, O of stride os.
+  void swiglu_q(Enc2& E, id<MTLBuffer> G, size_t go, id<MTLBuffer> U, size_t uo, int gus, id<MTLBuffer> O, int os, int rows, int n,
+                id<MTLBuffer> w, size_t wo) {
+    if (noquant()) {  // development: unrounded
+      struct {
+        int rows, n, gs, us, os;
+        float lim;
+      } p{rows, n, gus, gus, os, c_.swiglu};
+      E.pipe(w ? "ds4_swiglu_w" : "ds4_swiglu");
+      E.set(0, G, go);
+      E.set(1, U, uo);
+      E.set(2, O);
+      E.bytes(3, p);
+      if (w) E.set(4, w, wo);
+      E.threads(size_t(n), size_t(rows), 1, 256);
+      return;
+    }
+    struct {
+      int rows, n, gs, us, os;
+      float lim;
+      int weighted;
+    } p{rows, n, gus, gus, os, c_.swiglu, w ? 1 : 0};
+    E.pipe("ds4_swiglu_q");
+    E.set(0, G, go);
+    E.set(1, U, uo);
+    E.set(2, O);
+    E.bytes(3, p);
+    E.set(4, w ? w : O, w ? wo : 0);
+    E.threads(size_t(rows) * size_t(n / 32), 1, 1, 256);
   }
 
   void swiglu(Enc2& E, id<MTLBuffer> G, id<MTLBuffer> U, id<MTLBuffer> O, int rows, int n, id<MTLBuffer>) {

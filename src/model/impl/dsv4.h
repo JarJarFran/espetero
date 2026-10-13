@@ -288,7 +288,7 @@ struct LayerW {
   Buf i_knorm;
   MatB gate;
   Buf gate_bias, gate_bias_vl;  // the VL bias picks the experts of image-span rows
-  Mat8 sh1, sh2, sh3;
+  Mat8 sh13, sh2;  // shared expert: [w1; w3] stacked, w2
   std::vector<XLoc> x;
   int eg = -1;  // Engram index, -1: none
   Mat8 e_wkv;

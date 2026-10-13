@@ -913,7 +913,10 @@ kernel void ds4_moe_sum(device const float* P [[buffer(0)]], device float* Y [[b
   const int d = int(g.x), m = int(g.y);
   if (d >= p.x) return;
   float s = Y[ulong(m) * ulong(p.x) + ulong(d)];
-  for (int i = 0; i < p.y; ++i) s += P[ulong(amap[m * p.y + i]) * ulong(p.x) + ulong(d)];
+  for (int i = 0; i < p.y; ++i) {
+    const int a = amap[m * p.y + i];
+    if (a >= 0) s += P[ulong(a) * ulong(p.x) + ulong(d)];  // -1: an expert of another round
+  }
   Y[ulong(m) * ulong(p.x) + ulong(d)] = s;
 }
 kernel void ds4_copy(device const uint4* src [[buffer(0)]], device uint4* dst [[buffer(1)]],
@@ -1305,4 +1308,156 @@ kernel void ds4_embed_rows(device const float* src [[buffer(0)]], device float* 
   if (d >= p.x || k >= p.y) return;
   const float v = src[ulong(k) * ulong(p.x) + ulong(d)];
   for (int s = 0; s < 4; ++s) H[(ulong(p.z + k) * 4 + ulong(s)) * ulong(p.x) + ulong(d)] = v;
+}
+
+// ds4_xgemv with two output rows per simdgroup step (twice the loads in flight;
+// the down projection's 1152-byte rows leave lanes idle otherwise).
+kernel void ds4_xgemv_b(device const uchar* P0 [[buffer(0)]], device const uchar* P1 [[buffer(1)]],
+                        device const uchar* P2 [[buffer(2)]], device const Ds4XGroup* G [[buffer(3)]],
+                        device const float* X [[buffer(4)]], device float* Y [[buffer(5)]],
+                        device const int* xrow [[buffer(6)]], constant Ds4XP& p [[buffer(7)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  const Ds4XGroup g = G[tg.y];
+  device const uchar* base = (g.part == 0 ? P0 : g.part == 1 ? P1 : P2) + g.off;
+  const int rows_out = p.mode == 0 ? 2 * p.N : p.N;
+  const int kb = p.K / 32, chunks = p.K / 32;
+  const ulong row_bytes = ulong(p.K / 2);
+  const int n_end = min(rows_out, int(tg.x + 1) * p.nrow_tg);
+  for (int r = int(tg.x) * p.nrow_tg + 2 * int(sg); r < n_end; r += 16) {
+    const int rr[2] = {r, min(r + 1, n_end - 1)};
+    device const uint4* wr[2];
+    device const uchar* S[2];
+    for (int q = 0; q < 2; ++q) {
+      int mat, n;
+      if (p.mode == 0) mat = rr[q] < p.N ? 0 : 2, n = rr[q] < p.N ? rr[q] : rr[q] - p.N;
+      else mat = 1, n = rr[q];
+      wr[q] = (device const uint4*)(base + ulong(mat) * p.wbytes + ulong(n) * row_bytes);
+      S[q] = base + 3 * p.wbytes + ulong(mat) * p.sbytes + ulong(n) * ulong(kb);
+    }
+    for (int m0 = 0; m0 < g.n; m0 += kDs4GemvM) {
+      const int mr = min(kDs4GemvM, g.n - m0);
+      float acc[2][kDs4GemvM];
+      for (int q = 0; q < 2; ++q)
+        for (int m = 0; m < kDs4GemvM; ++m) acc[q][m] = 0.0f;
+      for (int c = int(lane); c < chunks; c += 32) {
+        const uint4 w0 = wr[0][c], w1 = wr[1][c];
+        const float sc0 = ds4_e8m0(S[0][c]) * 16384.0f, sc1 = ds4_e8m0(S[1][c]) * 16384.0f;
+        for (int m = 0; m < kDs4GemvM; ++m) {
+          if (m >= mr) break;
+          const int a = g.a0 + m0 + m;
+          device const float4* xv = (device const float4*)(X + ulong(p.mode == 0 ? xrow[a] : a) * ulong(p.xs) + ulong(c * 32));
+          float s0 = 0.0f, s1 = 0.0f;
+          const uint ws0[4] = {w0.x, w0.y, w0.z, w0.w}, ws1[4] = {w1.x, w1.y, w1.z, w1.w};
+          for (int j = 0; j < 4; ++j)
+            for (int h = 0; h < 2; ++h) {
+              const float4 x4 = xv[2 * j + h];
+              const half2 a0 = ds4_e2m1x2(ws0[j] >> (16 * h)), b0 = ds4_e2m1x2(ws0[j] >> (16 * h + 8));
+              const half2 a1 = ds4_e2m1x2(ws1[j] >> (16 * h)), b1 = ds4_e2m1x2(ws1[j] >> (16 * h + 8));
+              s0 += float(a0.x) * x4.x + float(a0.y) * x4.y + float(b0.x) * x4.z + float(b0.y) * x4.w;
+              s1 += float(a1.x) * x4.x + float(a1.y) * x4.y + float(b1.x) * x4.z + float(b1.y) * x4.w;
+            }
+          acc[0][m] += s0 * sc0;
+          acc[1][m] += s1 * sc1;
+        }
+      }
+      for (int q = 0; q < 2; ++q) {
+        if (q == 1 && rr[1] == rr[0]) break;
+        for (int m = 0; m < kDs4GemvM; ++m) {
+          if (m >= mr) break;
+          const float v = simd_sum(acc[q][m]);
+          if (lane == 0) Y[ulong(g.a0 + m0 + m) * ulong(p.ys) + ulong(rr[q])] = v;
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused vector epilogues (decode passes are hundreds of small dispatches).
+// One simdgroup per vector of n (a multiple of 32): optional RMSNorm (weight),
+// RoPE on the last 2 * npair dims (adjacent pairs, partner via shuffle;
+// inverse: conjugate), optional fp8 rounding per 32 (act_quant). In place.
+struct Ds4VecP {
+  int rows, heads, n, stride;
+  float eps;
+  int norm, npair, inverse, quant;
+};
+kernel void ds4_vec_post(device float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                         device const int* pos [[buffer(2)]], device const float* inv_freq [[buffer(3)]],
+                         constant Ds4VecP& p [[buffer(4)]], uint gid [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  const int v = int(gid) * 8 + int(sg);
+  if (v >= p.rows * p.heads) return;
+  const int r = v / p.heads, h = v % p.heads;
+  device float* a = x + ulong(r) * ulong(p.stride) + ulong(h) * ulong(p.n);
+  float rs = 1.0f;
+  if (p.norm) {
+    float ss = 0.0f;
+    for (int i = int(lane); i < p.n; i += 32) ss += a[i] * a[i];
+    rs = rsqrt(simd_sum(ss) / float(p.n) + p.eps);
+  }
+  const int r0 = p.n - 2 * p.npair;
+  const float fpos = p.npair ? float(pos[r]) : 0.0f;
+  for (int i = int(lane); i < p.n; i += 32) {
+    float val = a[i];
+    if (p.norm) val = val * rs * w[i];
+    const float other = simd_shuffle_xor(val, ushort(1));
+    if (p.npair && i >= r0) {
+      const float ang = fpos * inv_freq[(i - r0) / 2];
+      const float c = precise::cos(ang), s = precise::sin(ang) * (p.inverse ? -1.0f : 1.0f);
+      val = (i & 1) == 0 ? val * c - other * s : other * s + val * c;
+    }
+    if (p.quant) {
+      const float amax = simd_max(fabs(val));
+      const float sc = ds4_pow2_ceil(max(amax, 1e-4f) * (1.0f / 448.0f));
+      val = ds4_round_e4m3(val / sc) * sc;
+    }
+    a[i] = val;
+  }
+}
+
+// dst rows = src rows rounded to the fp8 grid per 32 (act_quant of a copy).
+struct Ds4QCopyP {
+  int rows, K, sstride, dstride;
+};
+kernel void ds4_quant_copy(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                           constant Ds4QCopyP& p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  const int nb = p.K / 32;
+  if (int(gid) >= p.rows * nb) return;
+  const int r = int(gid) / nb, b = int(gid) % nb;
+  device const float* s = src + ulong(r) * ulong(p.sstride) + ulong(b * 32);
+  device float* d = dst + ulong(r) * ulong(p.dstride) + ulong(b * 32);
+  float v[32], amax = 0.0f;
+  for (int i = 0; i < 32; ++i) v[i] = s[i], amax = max(amax, fabs(v[i]));
+  const float sc = ds4_pow2_ceil(max(amax, 1e-4f) * (1.0f / 448.0f));
+  for (int i = 0; i < 32; ++i) d[i] = ds4_round_e4m3(v[i] / sc) * sc;
+}
+
+// SwiGLU (training clamps, optional row weight) then the fp8 rounding of its
+// output, one thread per 32 outputs: O = act_quant(silu(min(g, lim)) * clamp(u) * w[r]).
+struct Ds4SwiQP {
+  int rows, n, gs, us, os;
+  float lim;
+  int weighted;
+};
+kernel void ds4_swiglu_q(device const float* G [[buffer(0)]], device const float* U [[buffer(1)]],
+                         device float* O [[buffer(2)]], constant Ds4SwiQP& p [[buffer(3)]],
+                         device const float* w [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  const int nb = p.n / 32;
+  if (int(gid) >= p.rows * nb) return;
+  const int r = int(gid) / nb, b = int(gid) % nb;
+  const float rw = p.weighted ? w[r] : 1.0f;
+  float v[32], amax = 0.0f;
+  for (int i = 0; i < 32; ++i) {
+    float a = G[ulong(r) * ulong(p.gs) + ulong(b * 32 + i)], u = U[ulong(r) * ulong(p.us) + ulong(b * 32 + i)];
+    if (p.lim > 0.0f) {
+      u = clamp(u, -p.lim, p.lim);
+      a = min(a, p.lim);
+    }
+    v[i] = a / (1.0f + exp(-a)) * u * rw;
+    amax = max(amax, fabs(v[i]));
+  }
+  const float sc = ds4_pow2_ceil(max(amax, 1e-4f) * (1.0f / 448.0f));
+  for (int i = 0; i < 32; ++i) O[ulong(r) * ulong(p.os) + ulong(b * 32 + i)] = ds4_round_e4m3(v[i] / sc) * sc;
 }

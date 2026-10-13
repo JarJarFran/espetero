@@ -2816,6 +2816,11 @@ void Engine::step() {
         return;
       }
       passes_ += uint64_t(K);
+      if (xstream_) {  // expert-cache counters for /v1/stats
+        std::string x = model_->bench_json("xcache");
+        std::lock_guard<std::mutex> lk(xsnap_mu_);
+        xsnap_ = std::move(x);
+      }
       rows_ += uint64_t(st.rows);
       gpu_ms_ = gpu_ms_ + st.gpu_ms;
       if (trace)
