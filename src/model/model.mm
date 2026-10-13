@@ -10,6 +10,7 @@
 #include "impl/forest.h"
 #include "impl/load.h"
 #include "impl/qwen4_load.h"
+#include "impl/dsv4_model.h"
 #include "kernels_src.h"
 
 #include <fcntl.h>
@@ -54,6 +55,18 @@ json::Value ModelInfo::to_json() const {
 namespace {
 
 using namespace native;
+
+// Kernel source: embedded at build time; ESPETERO_KERNELS=<dir> loads the
+// .metal files from a directory instead (kernel development without a rebuild).
+std::string kernel_source_text() {
+  if (const char* dir = std::getenv("ESPETERO_KERNELS")) {
+    std::string out;
+    for (const std::string& f : list_files(dir, "", ".metal")) out += read_file(f) + "\n";
+    if (out.empty()) fail(std::string("no .metal files in ") + dir);
+    return out;
+  }
+  return std::string(espetero_kernels_metal, espetero_kernels_metal_len);
+}
 
 class MetalModel final : public NativeModel {
  public:
@@ -907,15 +920,7 @@ class MetalModel final : public NativeModel {
 
   // Kernel source: embedded at build time; ESPETERO_KERNELS=<dir> loads the
   // .metal files from a directory instead (kernel development without a rebuild).
-  static std::string kernel_source() {
-    if (const char* dir = std::getenv("ESPETERO_KERNELS")) {
-      std::string out;
-      for (const std::string& f : list_files(dir, "", ".metal")) out += read_file(f) + "\n";
-      if (out.empty()) fail(std::string("no .metal files in ") + dir);
-      return out;
-    }
-    return std::string(espetero_kernels_metal, espetero_kernels_metal_len);
-  }
+  static std::string kernel_source() { return kernel_source_text(); }
 
   // Build every pipeline the model can use, in parallel.
   void prewarm() {
@@ -995,6 +1000,14 @@ class MetalModel final : public NativeModel {
 
 std::unique_ptr<NativeModel> NativeModel::load(const std::string& path, const LoadOptions& options) {
   @autoreleasepool {
+    // DeepSeek-V4.1: a model of its own (impl/dsv4_model.h).
+    if (is_dir(path) && file_exists(path + "/config.json")) {
+      const json::Value cfg = json::parse(read_file(path + "/config.json"));
+      const json::Value* tc = cfg.get("text_config");
+      const std::string mt = tc && tc->is_object() ? tc->get_string("model_type", cfg.get_string("model_type", ""))
+                                                   : cfg.get_string("model_type", "");
+      if (mt.rfind("deepseek_v41", 0) == 0) return std::make_unique<native::ds4::Dsv4Model>(path, options, kernel_source_text());
+    }
     return std::make_unique<MetalModel>(path, options);
   }
 }

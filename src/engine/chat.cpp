@@ -751,8 +751,12 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
   if (g.sys_split > 0) g.sys_hash = fnv(g.sys_split);
   if (g.pre_split > 0) g.pre_hash = fnv(g.pre_split);
   // (Gemma 4's <|channel> is a special token: parsed as one, as the prompt was.)
-  const std::vector<int32_t> think = tok.encode(mk.think_prompt, mk.gemma);
-  job.reasoning_open = ids.size() >= think.size() && std::equal(think.begin(), think.end(), ids.end() - long(think.size()));
+  // DeepSeek-V4.1's template opens the block with "<think>", no newline.
+  for (const std::string& open : {mk.think_prompt, std::string("<think>")}) {
+    const std::vector<int32_t> think = tok.encode(open, mk.gemma);
+    job.reasoning_open = job.reasoning_open ||
+                         (!think.empty() && ids.size() >= think.size() && std::equal(think.begin(), think.end(), ids.end() - long(think.size())));
+  }
   g.prompt = std::move(ids);
   return job;
 }

@@ -438,6 +438,14 @@ Geometry geometry_from_config(const json::Value& root) {
                         : tc.get_double("partial_rotary_factor", 0.25);
   count_layers(g, int(tc.get_int("full_attention_interval", 4)), tc.get("layer_types"));
   const std::string mt = tc.get_string("model_type", root.get_string("model_type", ""));
+  if (starts_with(mt, "deepseek_v41")) {  // a model of its own (impl/dsv4.h): none of the Qwen3.5 checks
+    g.ds4 = true;
+    g.E = int(tc.get_int("n_routed_experts", 0));
+    g.k = int(tc.get_int("num_experts_per_tok", 0));
+    g.Ie = int(tc.get_int("moe_intermediate_size", 0));
+    g.known = g.D > 0 && g.L > 0 && g.V > 0;
+    return g;
+  }
   if (starts_with(mt, "qwen4_exp")) {
     g.q4 = true;
     g.hc = int(tc.get_int("hc_count", 4));
@@ -803,6 +811,12 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
       if (t.name == "language_model.model.embed_tokens.weight") f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
       if (t.name == "vision_tower.patch_embed.proj.weight") vision_tower = true;
+      if (f.geo.ds4) {  // DeepSeek-V4.1: experts and Engram tables stay on the SSD; no draft head or vision yet
+        if (contains(t.name, ".ffn.experts.") || contains(t.name, ".engram.embed.")) f.streamed += t.bytes;
+        else if (!starts_with(t.name, "mtp.") && !starts_with(t.name, "vision.") && !starts_with(t.name, "aligner."))
+          f.weights += t.dtype == "BF16" && t.shape.size() == 1 ? 2 * bytes : bytes;
+        continue;
+      }
       if (starts_with(t.name, "language_model.mtp.") || starts_with(t.name, "mtp.")) {
         // Flash-Next drafts with a drafter directory; the file's own mtp.* head is not loaded.
         if (f.geo.q4) continue;
@@ -920,6 +934,15 @@ Need need(const Footprint& f, const Plan& p) {
   const bool vision = p.vision && f.has_vision;
   n.weights = f.weights - (mtp ? 0 : f.mtp) - (vision ? 0 : f.vision);
   const Geometry& g = f.geo;
+  if (g.ds4) {
+    // Per slot: 40 window rings and the compressed caches (~3.3 KB a token);
+    // scratch: up to 1024 rows of activations and the index scores.
+    const int64_t slots = p.slots > 0 ? p.slots : 4;
+    n.pools = (slots + 1) * (int64_t(5) * 1024 * 1024 + int64_t(3300) * std::max(p.max_ctx, 1));
+    n.scratch = int64_t(1.6e9);
+    if (p.expert_cache_gb > 0) n.cache = int64_t(p.expert_cache_gb * 1e9);
+    return n;
+  }
   if (g.known && g.n_full + g.n_linear > 0) {
     const int64_t slot = g.slot_bytes(mtp), tok = g.kv_bytes_per_token(mtp);
     // The pools' floor (model.mm): 8 user slots at least (or --slots), KV for
