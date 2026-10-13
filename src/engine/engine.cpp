@@ -328,7 +328,10 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     end_ids.push_back(tok_->eos_id());
   for (const int id : I.end_ids)  // Gemma 4: the config's end-of-turn ids, e.g. <turn|>
     if (id >= 0 && std::find(end_ids.begin(), end_ids.end(), id) == end_ids.end()) end_ids.push_back(id);
-  if (I.vision) {
+  if (I.vision && I.vision_layout == "deepseek") {  // one placeholder per image; no start / end tokens of its own
+    image_token = I.image_token_id;
+    if (image_token < 0) throw std::runtime_error("vision model without an image token id");
+  } else if (I.vision) {
     image_token = tok_->token_id("<|image_pad|>");
     vision_start = tok_->token_id("<|vision_start|>");
     vision_end = tok_->token_id("<|vision_end|>");
@@ -668,6 +671,18 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
   if (w > vision::max_image_pixels() / h)
     throw RequestError(422, "image: " + std::to_string(w) + "x" + std::to_string(h) + " pixels is over the limit of " +
                                 std::to_string(vision::max_image_pixels()) + " pixels per image (--image-max-mp)");
+  const ModelInfo& I = model_->info();
+  if (I.vision_layout == "deepseek") {
+    int n = 0;
+    try {
+      const auto plan = vision::deepseek_plan(int(w), int(h), I.vision_patch, I.vision_merge, I.vision_max_tokens, I.vision_min_pixels);
+      n = vision::deepseek_run(plan[2], plan[3]);
+    } catch (const std::exception& e) {
+      throw RequestError(422, std::string("image: ") + e.what());
+    }
+    check_image_rows(n, I.max_rows);
+    return n;
+  }
   const vision::Spec spec = image_spec(max_pixels, min_pixels);
   int n = 0;
   try {
@@ -700,6 +715,22 @@ PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pix
   DecodeGate gate;
   vision::RGBImage rgb;
   if (!vision::decode_image(bytes, rgb, err)) throw RequestError(422, "image: " + err);
+  const ModelInfo& I = model_->info();
+  if (I.vision_layout == "deepseek") {  // the checkpoint's own planner and padding (detail levels do not apply)
+    vision::Prepared p;
+    try {
+      p = vision::preprocess_deepseek(rgb, I.vision_patch, I.vision_merge, I.vision_max_tokens, I.vision_min_pixels);
+    } catch (const std::exception& e) {
+      throw RequestError(422, std::string("image: ") + e.what());
+    }
+    PreparedImage out;
+    out.pixels = std::move(p.pixels);
+    out.grid_t = 1, out.grid_h = p.grid_h, out.grid_w = p.grid_w;
+    out.ntok = vision::deepseek_run((p.grid_h + I.vision_merge - 1) / I.vision_merge, (p.grid_w + I.vision_merge - 1) / I.vision_merge);
+    out.digest = hex(p.digest.data(), p.digest.size());
+    check_image_rows(out.ntok, I.max_rows);
+    return out;
+  }
   vision::Spec spec = image_spec(max_pixels, min_pixels);
   // Normalization from the processor config when the checkpoint has one.
   if (is_dir(opt_.model_path)) {
@@ -994,7 +1025,7 @@ json::Value Engine::decide(const json::Value& body) {
     plan.image_tokens = int(plan.prefix.size() - before + job->images.size());
     std::vector<int32_t> ps = plan.prefix;
     ps.insert(ps.end(), plan.stem.begin(), plan.stem.end());
-    job->positions = mrope_positions(ps, job->images);
+    if (model_->info().vision_layout != "deepseek") job->positions = mrope_positions(ps, job->images);
     for (const auto& im : job->images) job->digest += im.digest;
   }
   if (plan.max_prompt_tokens() + 1 > size_t(model_->info().max_ctx))
@@ -1182,7 +1213,7 @@ json::Value Engine::systemone(const json::Value& body) {
   job->rec = clef::encode(*tok_, *state, questions ? *questions : json::Value(), itoks, image_token, max_length,
                           has_max_state, max_state);
   const double encode_ms = ms_since(t_enc);
-  if (!job->images.empty()) job->positions = mrope_positions(job->rec.ids, job->images);
+  if (!job->images.empty() && model_->info().vision_layout != "deepseek") job->positions = mrope_positions(job->rec.ids, job->images);
   for (const PreparedImage& im : job->images) job->digest += im.digest;
   if (const json::Value* salt = body.get("cache_salt"); salt && salt->is_string()) {  // no sharing across salts
     job->digest.push_back('\0');

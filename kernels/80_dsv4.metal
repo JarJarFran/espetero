@@ -536,7 +536,7 @@ struct Ds4AttnP {
   int M, H, win, p0;
   int ratio;       // 0: window only
   int topk;        // index entries per row (0: dense compressed)
-  int n_comp;      // compressed entries cached (for dense)
+  int blockn;      // DSpark: every query sees the ring's positions [p0 - win, p0) and all blockn pass rows
   float scale;
 };
 // One key of the online softmax: running max mx, denominator l, output o.
@@ -564,9 +564,10 @@ kernel void ds4_attn(device const float* Q [[buffer(0)]], device const float* KV
     o[i] = 0.0f;
   }
   float mx = -1e30f, l = 0.0f;
-  const int w0 = max(0, ps - p.win + 1);
+  const int w0 = p.blockn ? max(0, p.p0 - p.win) : max(0, ps - p.win + 1);
+  const int wend = p.blockn ? p.p0 + p.blockn - 1 : ps;
   float kv[PL];
-  for (int t = w0; t <= ps; ++t) {
+  for (int t = w0; t <= wend; ++t) {
     if (t >= p.p0) {
       device const float4* k4 = (device const float4*)(KVp + ulong(t - p.p0) * HD + ulong(lane) * PL);
       for (int j = 0; j < PL / 4; ++j) {
@@ -817,10 +818,12 @@ struct Ds4RouteP {
   int M, E, k;
   float route_scale;
 };
-kernel void ds4_route(device const float* L [[buffer(0)]], device const float* bias [[buffer(1)]],
+kernel void ds4_route(device const float* L [[buffer(0)]], device const float* bias0 [[buffer(1)]],
                       device int* sel [[buffer(2)]], device float* wout [[buffer(3)]],
-                      constant Ds4RouteP& p [[buffer(4)]], uint m [[threadgroup_position_in_grid]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+                      constant Ds4RouteP& p [[buffer(4)]], device const float* bias_vl [[buffer(5)]],
+                      device const uchar* img [[buffer(6)]],  // rows inside an image span take the VL bias
+                      uint m [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  device const float* bias = img[m] ? bias_vl : bias0;
   constexpr int PER = 16;  // up to 512 experts
   float sc[PER], b[PER];
   for (int i = 0; i < PER; ++i) {
@@ -925,8 +928,10 @@ kernel void ds4_copy(device const uint4* src [[buffer(0)]], device uint4* dst [[
 // One threadgroup of 4 simdgroups x 32 per row... 256 threads, 2 simdgroups per copy.
 kernel void ds4_engram(device float* H [[buffer(0)]], device const float* KV [[buffer(1)]],
                        device const float* wqk [[buffer(2)]], constant Ds4HcP& p [[buffer(3)]],
+                       device const uchar* img [[buffer(4)]],  // image rows take no n-gram contribution
                        uint m [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  if (img[m]) return;
   threadgroup float red[8][3];
   threadgroup float gate[4];
   const int D = p.D;
@@ -1156,3 +1161,148 @@ static inline void ds4_xgemm_impl(device const uchar* P0, device const uchar* P1
 DS4_XGEMM(ds4_xgemm, 64)
 DS4_XGEMM(ds4_xgemm32, 32)
 DS4_XGEMM(ds4_xgemm16, 16)
+
+// ---------------------------------------------------------------------------
+// DSpark (the draft head) helpers.
+// The mean of the hc copies of residual rows (the draft head's view of a
+// target layer's input) into the slot's ring: out[(pos % 128) * nt + k] = mean_j H[row][j].
+struct Ds4MeanP {
+  int rows, D, nt, k;
+};
+kernel void ds4_hc_mean(device const float* H [[buffer(0)]], device const int* pos [[buffer(1)]],
+                        device float* out [[buffer(2)]], constant Ds4MeanP& p [[buffer(3)]],
+                        uint2 g [[thread_position_in_grid]]) {
+  const int d = int(g.x), r = int(g.y);
+  if (d >= p.D || r >= p.rows) return;
+  device const float* h = H + ulong(r) * ulong(4 * p.D) + ulong(d);
+  const float v = 0.25f * (h[0] + h[p.D] + h[2 * p.D] + h[3 * p.D]);
+  out[(ulong(pos[r] % 128) * ulong(p.nt) + ulong(p.k)) * ulong(p.D) + ulong(d)] = v;
+}
+
+// Markov head step i of a draft block: bias[v] = head[v] . embed[tok[i]]
+// (bf16 [V][R]), then tok[i + 1] = argmax_v(L[i][v] + bias[v]) (lowest id on ties).
+struct Ds4MarkovP {
+  int V, R, i;
+};
+kernel void ds4_markov_bias(device const ushort* emb [[buffer(0)]], device const ushort* head [[buffer(1)]],
+                            device const int* tok [[buffer(2)]], device float* bias [[buffer(3)]],
+                            constant Ds4MarkovP& p [[buffer(4)]], uint v [[thread_position_in_grid]]) {
+  if (int(v) >= p.V) return;
+  device const ushort* e = emb + ulong(tok[p.i]) * ulong(p.R);
+  device const ushort* h = head + ulong(v) * ulong(p.R);
+  float s = 0.0f;
+  for (int k = 0; k < p.R; ++k) s += bf2f(h[k]) * bf2f(e[k]);
+  bias[v] = s;
+}
+kernel void ds4_markov_argmax(device const float* L [[buffer(0)]], device const float* bias [[buffer(1)]],
+                              device int* tok [[buffer(2)]], constant Ds4MarkovP& p [[buffer(3)]],
+                              uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float bv[32];
+  threadgroup int bi[32];
+  device const float* l = L + ulong(p.i) * ulong(p.V);
+  float best = -INFINITY;
+  int id = INT_MAX;
+  for (int v = int(tid); v < p.V; v += 1024) {
+    const float x = l[v] + bias[v];
+    if (x > best) best = x, id = v;
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ob = simd_shuffle_xor(best, ushort(off));
+    const int oi = simd_shuffle_xor(id, ushort(off));
+    if (ob > best || (ob == best && oi < id)) best = ob, id = oi;
+  }
+  if (lane == 0) bv[sg] = best, bi[sg] = id;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float b = bv[0];
+    int ii = bi[0];
+    for (int q = 1; q < 32; ++q)
+      if (bv[q] > b || (bv[q] == b && bi[q] < ii)) b = bv[q], ii = bi[q];
+    tok[p.i + 1] = ii;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek ViT (images): bf16 GEMM with bias, GELU, the aligner's 3x3 unfold,
+// image rows into the residual, the VL router bias.
+struct Ds4GemmBP {
+  int M, N, K, xs, ys, accum, bias;
+};
+// Y (=|+=) X W^T + b; W bf16 [N][K]; grid (N / 64, ceil(M / 64)), 128 threads.
+kernel void ds4_gemm_bf16(device const ushort* W [[buffer(0)]], device const float* B [[buffer(1)]],
+                          device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
+                          constant Ds4GemmBP& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup bfloat As[kGT * kGKP], Bs[kGT * kGKP];
+  threadgroup float Cs[kGT * kGT];
+  const int n0 = int(tg.x) * kGT, m0 = int(tg.y) * kGT;
+  simdgroup_float8x8 acc[16];
+  for (int i = 0; i < 16; ++i) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  const int ar = int(tid) / 2, ac = (int(tid) % 2) * 16;
+  const bool arow = m0 + ar < p.M;
+  device const float* xa = X + ulong(min(m0 + ar, p.M - 1)) * ulong(p.xs) + ulong(ac);
+  device const ushort* wb = W + ulong(n0 + ar) * ulong(p.K) + ulong(ac);
+  for (int k0 = 0; k0 < p.K; k0 += kGK) {
+    for (int j = 0; j < 16; j += 4) {
+      const float4 v = arow ? *(device const float4*)(xa + k0 + j) : float4(0.0f);
+      As[ar * kGKP + ac + j] = bfloat(v.x);
+      As[ar * kGKP + ac + j + 1] = bfloat(v.y);
+      As[ar * kGKP + ac + j + 2] = bfloat(v.z);
+      As[ar * kGKP + ac + j + 3] = bfloat(v.w);
+    }
+    for (int j = 0; j < 16; ++j) Bs[ar * kGKP + ac + j] = as_type<bfloat>(wb[k0 + j]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ds4_gemm_core(As, Bs, acc, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const int sm = int(sg / 2) * 32, sn = int(sg % 2) * 32;
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) simdgroup_store(acc[i * 4 + j], Cs + (sm + 8 * i) * kGT + sn + 8 * j, kGT);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = int(tid); e < kGT * kGT; e += 128) {
+    const int r = e / kGT, c = e % kGT;
+    if (m0 + r >= p.M) continue;
+    const float v = Cs[e] + (p.bias ? B[n0 + c] : 0.0f);
+    device float* y = Y + ulong(m0 + r) * ulong(p.ys) + ulong(n0 + c);
+    *y = p.accum ? *y + v : v;
+  }
+}
+
+// erf (Abramowitz-Stegun 7.1.26, |error| < 1.5e-7) and the exact GELU.
+static inline float ds4_erf(float x) {
+  const float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
+  const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+  return copysign(y, x);
+}
+kernel void ds4_gelu(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+  if (i < n) x[i] = 0.5f * x[i] * (1.0f + ds4_erf(x[i] * 0.70710678118654752f));
+}
+kernel void ds4_h2f(device const half* a [[buffer(0)]], device float* b [[buffer(1)]], constant uint& n [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+  if (i < n) b[i] = float(a[i]);
+}
+
+// The aligner's input: the patch grid [nh][nw][C] padded to multiples of r with
+// zeros, r x r cells unfolded channel-major (F.unfold): out[l][c * r * r + ki * r + kj].
+struct Ds4UnfoldP {
+  int nh, nw, C, r, lh, lw;
+};
+kernel void ds4_unfold(device const float* X [[buffer(0)]], device float* O [[buffer(1)]], constant Ds4UnfoldP& p [[buffer(2)]],
+                       uint2 g [[thread_position_in_grid]]) {
+  const int j = int(g.x), l = int(g.y);
+  const int rr = p.r * p.r;
+  if (j >= p.C * rr || l >= p.lh * p.lw) return;
+  const int c = j / rr, ki = (j % rr) / p.r, kj = j % p.r;
+  const int y = (l / p.lw) * p.r + ki, x = (l % p.lw) * p.r + kj;
+  O[ulong(l) * ulong(p.C * rr) + ulong(j)] = (y < p.nh && x < p.nw) ? X[(ulong(y) * ulong(p.nw) + ulong(x)) * ulong(p.C) + ulong(c)] : 0.0f;
+}
+
+// Image spans into the residual: H[row][s][:] = src[k] (all hc copies) for k < n, rows row0 + k.
+kernel void ds4_embed_rows(device const float* src [[buffer(0)]], device float* H [[buffer(1)]], constant int3& p [[buffer(2)]],  // (D, n, row0)
+                           uint2 g [[thread_position_in_grid]]) {
+  const int d = int(g.x), k = int(g.y);
+  if (d >= p.x || k >= p.y) return;
+  const float v = src[ulong(k) * ulong(p.x) + ulong(d)];
+  for (int s = 0; s < 4; ++s) H[(ulong(p.z + k) * 4 + ulong(s)) * ulong(p.x) + ulong(d)] = v;
+}

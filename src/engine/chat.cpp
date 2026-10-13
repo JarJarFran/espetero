@@ -739,7 +739,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
       for (size_t j = 0; j < marks.size(); ++j) marks[j] += shift[j];
     }
     ids = engine.expand_images(ids, g.images);
-    g.positions = engine.mrope_positions(ids, g.images);
+    if (engine.info().vision_layout != "deepseek") g.positions = engine.mrope_positions(ids, g.images);  // DeepSeek: plain positions
     const int merge = engine.info().vision_merge;
     size_t k = 0;
     for (size_t i = 0; i < ids.size() && k < g.images.size();) {

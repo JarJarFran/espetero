@@ -7,6 +7,7 @@
 // layer's routing to bring the missing experts in from the SSD.
 #pragma once
 
+#include <array>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
@@ -41,6 +42,7 @@ class Dsv4Model final : public NativeModel {
       c_.L = std::min(c_.L, std::atoi(v));
     }
     no_engram_ = env_on("ESPETERO_DS4_NO_ENGRAM");
+    want_vision_ = o.vision;
     ck_.open(path, partial_);
     eng_ = read_engram_const(path + "/espetero_engram.bin", c_);
     max_ctx_ = std::max(256, o.max_ctx > 0 ? o.max_ctx : 32768);
@@ -105,7 +107,17 @@ class Dsv4Model final : public NativeModel {
     info_.commit = false;
     info_.hidden_states = false;
     info_.mtp = false;
-    info_.vision = false;
+    info_.vision = vision_;
+    if (vision_) {
+      info_.vision_layout = "deepseek";
+      info_.vision_patch = c_.v_patch;
+      info_.vision_merge = c_.v_down;
+      info_.vision_patch_dim = 3 * c_.v_patch * c_.v_patch;
+      info_.vision_temporal = 1;
+      info_.image_token_id = c_.image_token;
+      info_.vision_max_tokens = c_.v_max_tok;
+      info_.vision_min_pixels = c_.v_min_px;
+    }
     info_.load_ms = ms_since(t0);
     json::Value ex = json::Value::object();
     ex.set("expert_cache_slots", xc_.n);
@@ -230,31 +242,253 @@ class Dsv4Model final : public NativeModel {
     }
   }
 
+  // Decode chains. With the DSpark head, every round drafts a block per tree,
+  // verifies it with one pass of the target and keeps the drafts the target
+  // would have produced itself (its own tokens: argmax, or the position-keyed
+  // draw), so the output is the plain chain's; the slots end exactly `steps`
+  // tokens further, rejected rows rolled back. ESPETERO_DS4_SPEC=1 turns it on.
   void run_chain(const std::vector<TreeSpec>& first, int steps, int32_t* out, PassStats* stats) override {
-    std::vector<TreeSpec> cur = first;
-    std::vector<int32_t> tok(first.size());
-    PassStats total;
-    for (int j = 0; j < steps; ++j) {
-      for (size_t t = 0; t < cur.size(); ++t) {
-        if (j > 0) {
-          tok[t] = out[size_t(j - 1) * cur.size() + t];
-          cur[t].root = &tok[t];
-          cur[t].draw_pos0 = first[t].draw_pos0 + j;
+    @autoreleasepool {
+      const auto t0 = Clock::now();
+      const size_t n = first.size();
+      bool spec = dspark_;
+      for (const TreeSpec& t : first)
+        spec = spec && t.parent >= 0 && t.save == t.parent && t.root_len == 1 && t.n_leaves == 0;
+      int rows = 0;
+      if (!spec) {
+        std::vector<TreeSpec> cur = first;
+        std::vector<int32_t> tok(n);
+        for (int j = 0; j < steps; ++j) {
+          for (size_t t = 0; t < n; ++t) {
+            if (j > 0) {
+              tok[t] = out[size_t(j - 1) * n + t];
+              cur[t].root = &tok[t];
+              cur[t].draw_pos0 = first[t].draw_pos0 + j;
+            }
+            cur[t].out_argmax = nullptr;
+          }
+          out_.assign(n, Readout{});
+          run_trees(cur);
+          for (size_t t = 0; t < n; ++t) out[size_t(j) * n + t] = draw_token(cur[t], out_[t].logits.data(), cur[t].draw_pos0);
+          rows += int(n);
         }
-        cur[t].out_argmax = nullptr;
+      } else {
+        rows = spec_chain(first, steps, out);
       }
-      PassStats st;
-      run(cur, &st);
-      for (size_t t = 0; t < cur.size(); ++t) {
-        const Readout& r = out_[t];
-        out[size_t(j) * cur.size() + t] = cur[t].gpu_draw && r.sampled >= 0 ? r.sampled : r.argmax;
+      if (stats) {
+        stats->wall_ms = stats->gpu_ms = ms_since(t0);
+        stats->rows = rows;
+        stats->readouts = int(n) * steps;
       }
-      total.wall_ms += st.wall_ms;
-      total.gpu_ms += st.gpu_ms;
-      total.rows += st.rows;
-      total.readouts += st.readouts;
     }
-    if (stats) *stats = total;
+  }
+
+  // The target's token from a readout's logits: argmax, or the GPU draw's
+  // rule (top-k head, min-p, top-p, Gumbel noise keyed by seed, position, id).
+  int32_t draw_token(const TreeSpec& t, const float* L, int64_t pos) {
+    const int V = c_.V;
+    if (!(t.topk > 0 && t.gpu_draw)) {
+      int am = 0;
+      for (int i = 1; i < V; ++i)
+        if (L[i] > L[am]) am = i;
+      return am;
+    }
+    TreeSpec u = t;
+    u.draw_pos0 = pos;
+    u.out_argmax = nullptr, u.out_lse = nullptr, u.out_cand_logits = nullptr;
+    Readout r;
+    r.logits.assign(L, L + V);
+    finish_readout(u, r);
+    return r.sampled >= 0 ? r.sampled : r.argmax;
+  }
+
+  int spec_rounds_ = 0, spec_drafts_ = 0, spec_accepted_ = 0;
+  static bool spec_on() {
+    const char* v = std::getenv("ESPETERO_DS4_SPEC");
+    return v && std::atoi(v) != 0;
+  }
+
+  int spec_chain(const std::vector<TreeSpec>& first, int steps, int32_t* out) {
+    const size_t n = first.size();
+    const int B = c_.ds_block, V = c_.V;
+    std::vector<int> produced(n, 0);
+    std::vector<int32_t> cur(n);
+    for (size_t t = 0; t < n; ++t) cur[t] = first[t].root[0];
+    std::vector<std::vector<int32_t>> rowtok(n);
+    std::vector<std::vector<float>> lg(n);
+    int rows = 0;
+    while (true) {
+      std::vector<size_t> act;
+      for (size_t t = 0; t < n; ++t)
+        if (produced[t] < steps) act.push_back(t);
+      if (act.empty()) break;
+      // ---- drafts for the trees that can use some
+      std::vector<int> nd(n, 0);
+      std::vector<size_t> dr;
+      for (size_t t : act) {
+        nd[t] = std::min(B, steps - produced[t] - 1);
+        if (nd[t] > 0) dr.push_back(t);
+      }
+      std::vector<std::array<int32_t, 8>> d(n);
+      if (!dr.empty()) {
+        std::vector<Seq*> ss;
+        std::vector<int32_t> tk;
+        for (size_t t : dr) ss.push_back(&seq(first[t].parent)), tk.push_back(cur[t]);
+        const std::vector<std::array<int32_t, 8>> got = draft(ss, tk);
+        for (size_t i = 0; i < dr.size(); ++i) d[dr[i]] = got[i];
+      }
+      // ---- verification: [cur, drafts...] per tree, logits at every row
+      std::vector<Seg> segs;
+      std::vector<std::vector<uint8_t>> bak(n);
+      std::vector<std::vector<int32_t>> hist0(n);
+      for (size_t t : act) {
+        Seq& s = seq(first[t].parent);
+        rowtok[t].assign(1, cur[t]);
+        for (int j = 1; j <= nd[t]; ++j) rowtok[t].push_back(d[t][size_t(j)]);
+        lg[t].resize(size_t(1 + nd[t]) * size_t(V));
+        Seg g;
+        g.s = &s, g.toks = rowtok[t].data(), g.n = 1 + nd[t];
+        g.logits = lg[t].data(), g.nlog = 1 + nd[t], g.verify = nd[t] > 0;
+        if (g.verify) ring_backup(s, g.n, bak[t]);
+        hist0[t] = s.hist;
+        segs.push_back(g);
+      }
+      run_segments(segs);
+      for (size_t t : act) {
+        Seq& s = seq(first[t].parent);
+        const int R = 1 + nd[t], p0 = s.len - R;
+        int take = 0;
+        while (take < R) {
+          const int32_t y = draw_token(first[t], lg[t].data() + size_t(take) * size_t(V), first[t].draw_pos0 + produced[t] + take);
+          out[size_t(produced[t] + take) * n + t] = y;
+          cur[t] = y;
+          ++take;
+          if (produced[t] + take >= steps) break;
+          if (take >= R || rowtok[t][size_t(take)] != y) break;  // the next row was this draft: kept only if it matches
+        }
+        spec_drafts_ += nd[t];
+        spec_accepted_ += take - 1;
+        if (take < R) rollback(s, p0, R, take, bak[t], hist0[t], rowtok[t]);
+        produced[t] += take;
+        rows += R;
+      }
+      ++spec_rounds_;
+    }
+    return rows;
+  }
+
+  // Window ring rows a verification of `rows` rows will overwrite (every layer).
+  void ring_backup(const Seq& s, int rows, std::vector<uint8_t>& bak) {
+    const size_t rb = size_t(c_.HD) * 2, lb = size_t(c_.WIN) * rb;
+    bak.resize(size_t(c_.L) * size_t(rows) * rb);
+    const uint8_t* ring = static_cast<const uint8_t*>(ptr(s.ring));
+    for (int l = 0; l < c_.L; ++l)
+      for (int j = 0; j < rows; ++j)
+        std::memcpy(bak.data() + (size_t(l) * size_t(rows) + size_t(j)) * rb, ring + size_t(l) * lb + size_t((s.len + j) % c_.WIN) * rb, rb);
+  }
+
+  // Keep the first `keep` of a verification's `rows` rows (positions p0 ...):
+  // the ring rows of the others come back, the compressors' pending rows are
+  // those of the new end, the length and the n-gram history follow.
+  void rollback(Seq& s, int p0, int rows, int keep, const std::vector<uint8_t>& bak, const std::vector<int32_t>& hist0,
+                const std::vector<int32_t>& toks) {
+    const size_t rb = size_t(c_.HD) * 2, lb = size_t(c_.WIN) * rb, HD = size_t(c_.HD);
+    uint8_t* ring = static_cast<uint8_t*>(ptr(s.ring));
+    for (int l = 0; l < c_.L; ++l)
+      for (int j = keep; j < rows; ++j)
+        std::memcpy(ring + size_t(l) * lb + size_t((p0 + j) % c_.WIN) * rb, bak.data() + (size_t(l) * size_t(rows) + size_t(j)) * rb, rb);
+    const int end = p0 + keep;
+    for (size_t si = 0; si < src_ratio_.size(); ++si) {
+      const int r = src_ratio_[si];
+      if (r < 2) continue;
+      float* pend = static_cast<float*>(ptr(s.pend)) + si * 2 * 8 * HD;
+      const float* vp = static_cast<const float*>(ptr(s.vpend)) + si * 2 * 8 * HD;
+      for (int t = end - end % r; t < end; ++t) {  // the incomplete group's rows
+        if (t < p0) continue;  // from before the verification: still in place
+        std::memcpy(pend + size_t(t % r) * HD, vp + size_t(t - p0) * HD, HD * 4);
+        std::memcpy(pend + 8 * HD + size_t(t % r) * HD, vp + 8 * HD + size_t(t - p0) * HD, HD * 4);
+      }
+    }
+    s.len = end;
+    s.hist = hist0;
+    for (int j = 0; j < keep; ++j) s.hist.push_back(toks[size_t(j)]);
+    const size_t keep_h = size_t(std::max(0, eng_.max_n - 1));
+    if (s.hist.size() > keep_h) s.hist.erase(s.hist.begin(), s.hist.end() - long(keep_h));
+  }
+
+  // DSpark drafts for slots whose next token is tok[i] (not yet processed):
+  // the target states of the positions not yet in the draft rings enter them,
+  // then the draft layers run over [tok, noise ...] and the Markov head picks
+  // ds_block drafts. Returns [i][1 .. ds_block].
+  std::vector<std::array<int32_t, 8>> draft(const std::vector<Seq*>& ss, const std::vector<int32_t>& tok) {
+    const Cfg& c = c_;
+    const int D = c.D, HD = c.HD, nt = int(c.ds_targets.size()), B = c.ds_block;
+    // ---- the target states into the rings
+    {
+      int rows = 0;
+      struct Ins {
+        Seq* s;
+        int from, cnt, r0;
+      };
+      std::vector<Ins> ins;
+      float* dsx = static_cast<float*>([DSX_ contents]);
+      int32_t* dpos = static_cast<int32_t*>([DPOS_ contents]);
+      for (Seq* s : ss) {
+        const int i = s->len - 1;
+        const int from = std::max({s->ds_len, i - c.WIN + 1, 0});
+        const int cnt = i - from + 1;
+        if (cnt <= 0) continue;
+        if (rows + cnt > kDsRows) fail("deepseek_v41: too many draft states in one pass");
+        const float* mh = static_cast<const float*>(ptr(s->mh));
+        for (int q = 0; q < cnt; ++q) {
+          std::memcpy(dsx + size_t(rows + q) * size_t(nt) * size_t(D), mh + size_t((from + q) % 128) * size_t(nt) * size_t(D),
+                      size_t(nt) * size_t(D) * 4);
+          dpos[rows + q] = from + q;
+        }
+        ins.push_back({s, from, cnt, rows});
+        rows += cnt;
+      }
+      if (rows > 0) {
+        Enc2 E(rt_);
+        quant(E, DSX_, 0, rows, nt * D, nt * D, 0);
+        gemv8(E, ds_main_proj_, DSX_, nt * D, DSM_, D, rows);
+        norm(E, DSM_, 0, ds_main_norm_, rows, 1, D, D);
+        for (int k = 0; k < c.n_mtp; ++k) {
+          const LayerW& w = M_[size_t(k)];
+          copy(E, DSM_, 0, DSQ_, 0, size_t(rows) * size_t(D) * 4);
+          quant(E, DSQ_, 0, rows, D, D, 0);
+          gemv8(E, w.wkv, DSQ_, D, DKV_, HD, rows);
+          norm(E, DKV_, 0, w.kv_norm, rows, 1, HD, HD);
+          rope(E, DKV_, 0, DPOS_, 0, invf_plain_, rows, 1, HD, HD, false);
+          quant(E, DKV_, 0, rows, HD, HD, 0);
+          for (const Ins& in : ins)
+            store_half(E, DKV_, in.r0, HD, in.s->dsring, size_t(k) * size_t(c.WIN) * size_t(HD) * 2, in.cnt, HD, in.from, c.WIN);
+        }
+        E.end();
+        gpu_ms_ += E.gpu_ms;
+      }
+      for (Seq* s : ss) s->ds_len = s->len;
+    }
+    // ---- the draft blocks
+    std::vector<std::vector<int32_t>> blk(ss.size());
+    std::vector<std::vector<float>> dl(ss.size());
+    std::vector<Seg> segs;
+    int32_t* dt = static_cast<int32_t*>([DTOK_ contents]);
+    for (size_t i = 0; i < ss.size(); ++i) {
+      blk[i].assign(size_t(B), c.ds_noise);
+      blk[i][0] = tok[i];
+      dt[i * 8] = tok[i];
+      dl[i].resize(size_t(B) * size_t(c.V));
+      Seg g;
+      g.s = ss[i], g.toks = blk[i].data(), g.n = B, g.logits = dl[i].data(), g.nlog = B;
+      segs.push_back(g);
+    }
+    if (segs.size() * size_t(B) > size_t(max_reads_)) fail("deepseek_v41: too many draft blocks in one pass");
+    forward(segs, true);
+    std::vector<std::array<int32_t, 8>> res(ss.size());
+    for (size_t i = 0; i < ss.size(); ++i)
+      for (int j = 0; j <= B; ++j) res[i][size_t(j)] = dt[i * 8 + size_t(j)];
+    return res;
   }
 
   const float* logits(int tree, int readout) const override {
@@ -276,8 +510,25 @@ class Dsv4Model final : public NativeModel {
 
   void draft(const std::vector<DraftRequest>&, PassStats*) override { fail("deepseek_v41: no draft head yet"); }
   void commit(const std::vector<CommitRequest>&, PassStats*) override { fail("deepseek_v41: no verify-commit"); }
-  void encode_images(const std::vector<ImageRef>&, float*, PassStats*) override {
-    fail("deepseek_v41: images are not supported yet");
+  // The embedding rows of each image's run, back to back (float32 [run tokens][hidden]).
+  void encode_images(const std::vector<ImageRef>& images, float* out, PassStats* stats) override {
+    @autoreleasepool {
+      if (!vision_) fail("deepseek_v41: no vision tower loaded");
+      const auto t0 = Clock::now();
+      size_t o = 0;
+      for (const ImageRef& im : images) {
+        const int n = image_run(im.grid_h, im.grid_w);
+        const size_t bytes = size_t(n) * size_t(c_.D) * 4;
+        if (!IMGS_ || bytes > imgs_bytes_) {
+          imgs_bytes_ = std::max(imgs_bytes_, bytes * 2);
+          IMGS_ = rt_.buffer(imgs_bytes_);
+        }
+        encode_image(im, IMGS_, 0);
+        std::memcpy(out + o, [IMGS_ contents], bytes);
+        o += size_t(n) * size_t(c_.D);
+      }
+      if (stats) stats->wall_ms = stats->gpu_ms = ms_since(t0);
+    }
   }
   void set_profile(bool on) override { profile_ = on; }
   std::string profile_json() override {
@@ -289,6 +540,9 @@ class Dsv4Model final : public NativeModel {
     o.set("engram_read_ms", eng_read_ms_);
     o.set("gpu_ms", gpu_ms_);
     o.set("flushes", int64_t(flushes_));
+    o.set("spec_rounds", spec_rounds_);
+    o.set("spec_drafts", spec_drafts_);
+    o.set("spec_accepted", spec_accepted_);
     if (!prof_.empty()) {
       json::Value k = json::Value::object();
       for (const auto& [n, v] : prof_) k.set(n, v.first);
@@ -301,6 +555,7 @@ class Dsv4Model final : public NativeModel {
       xc_.hits = xc_.misses = 0;
       xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = 0;
       flushes_ = 0;
+      spec_rounds_ = spec_drafts_ = spec_accepted_ = 0;
       prof_.clear();
       return true;
     }
@@ -328,7 +583,11 @@ class Dsv4Model final : public NativeModel {
   Cfg c_;
   Ckpt ck_;
   EngramConst eng_;
-  std::vector<LayerW> L_;
+  std::vector<LayerW> L_, M_;  // the backbone's layers, the DSpark draft layers
+  bool dspark_ = false;
+  Mat8 ds_main_proj_;
+  Buf ds_main_norm_, ds_norm_;
+  MatB ds_mk_embed_, ds_mk_head_;
   Buf embed_, head_, norm_;
   Buf invf_plain_, invf_yarn_;
   ExpertCache xc_;
@@ -336,7 +595,8 @@ class Dsv4Model final : public NativeModel {
   ModelInfo info_;
   int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0, nuser_ = 0;
   static constexpr int kScratch = 4;
-  int max_reads_ = 32;  // segments (readouts) per pass
+  int max_reads_ = 64;  // logits rows per pass
+  static constexpr int kDsRows = 1024;  // target states entering the draft rings per draft pass
   size_t seq_bytes_ = 0;
   double engram_gb_ = 0;
   bool verbose_ = false, profile_ = false, partial_ = false, no_engram_ = false;
@@ -349,7 +609,7 @@ class Dsv4Model final : public NativeModel {
   // scratch (shared)
   id<MTLBuffer> ids_, pos_, gpos_, mix0_, H_, X_, XQ_, Y_, mixA_, mixF_[2], QA_, Q_, KVp_, OA_, CKV_, CSC_, LAT_, IK_, IQ_, IW_,
       ISC_, IDX_, BS_, CAND_, XGRP_, XTILE_, HCP_, RL_, SEL_, RW_, xrow_, yrow_, wsc_, amap_, ident_, ones_, XG_, XU_, XH_, XP_, SG_, SU_, SH_, EE_,
-      ERAW_[2], EKV_, XF_, XN_, LOG_;
+      ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, DSX_, DSM_, DSQ_, DKV_, DPOS_;
   size_t isc_floats_ = 0;
   int cstride_ = 1;
   int gemm_min_ = [] {  // rows from which the fp8 matrices and the experts use the GEMM kernels
@@ -396,6 +656,48 @@ class Dsv4Model final : public NativeModel {
     return m;
   }
 
+  // What every layer has: hyper-connections, attention projections, router,
+  // shared expert, routed experts' locations.
+  void load_layer(LayerW& w, const std::string& p, int nE, int topk) {
+    const int D = c_.D, W4 = 4 * D;
+    w.nE = nE, w.topk = topk;
+    w.attn_norm = vecf(p + "attn_norm.weight", size_t(D));
+    w.ffn_norm = vecf(p + "ffn_norm.weight", size_t(D));
+    w.hca_fn = raw(p + "hc_attn_fn", uint64_t(24) * W4 * 4);
+    w.hca_base = raw(p + "hc_attn_base", 24 * 4);
+    w.hca_scale = raw(p + "hc_attn_scale", 3 * 4);
+    w.hcf_fn = raw(p + "hc_ffn_fn", uint64_t(24) * W4 * 4);
+    w.hcf_base = raw(p + "hc_ffn_base", 24 * 4);
+    w.hcf_scale = raw(p + "hc_ffn_scale", 3 * 4);
+    w.q_norm = vecf(p + "attn.q_norm.weight", size_t(c_.QR));
+    w.kv_norm = vecf(p + "attn.kv_norm.weight", size_t(c_.HD));
+    w.sink = vecf(p + "attn.attn_sink", size_t(c_.H));
+    w.wq_a = mat8(p + "attn.wq_a", c_.QR, D);
+    w.wq_b = mat8(p + "attn.wq_b", c_.H * c_.HD, c_.QR);
+    w.wkv = mat8(p + "attn.wkv", c_.HD, D);
+    w.wo_a = mat8(p + "attn.wo_a", c_.OG * c_.OR, c_.H * c_.HD / c_.OG);
+    w.wo_b = mat8(p + "attn.wo_b", D, c_.OG * c_.OR);
+    w.gate = matb(p + "ffn.gate.weight", nE, D);
+    w.gate_bias = vecf(p + "ffn.gate.bias", size_t(nE));
+    w.gate_bias_vl = ck_.has(p + "ffn.gate.bias_vl") ? vecf(p + "ffn.gate.bias_vl", size_t(nE)) : w.gate_bias;
+    w.sh1 = mat8(p + "ffn.shared_experts.w1", c_.IE, D);
+    w.sh2 = mat8(p + "ffn.shared_experts.w2", D, c_.IE);
+    w.sh3 = mat8(p + "ffn.shared_experts.w3", c_.IE, D);
+    w.x.resize(size_t(nE));
+    const uint64_t wb = uint64_t(c_.IE) * uint64_t(D) / 2, sb = uint64_t(c_.IE) * uint64_t(D) / 32;
+    for (int e = 0; e < nE; ++e) {
+      const std::string q = p + "ffn.experts." + std::to_string(e) + ".";
+      const TInfo &a = ck_.at(q + "w1.weight"), &b = ck_.at(q + "w2.weight"), &cc = ck_.at(q + "w3.weight");
+      const TInfo &sa = ck_.at(q + "w1.scale"), &sb2 = ck_.at(q + "w2.scale"), &sc = ck_.at(q + "w3.scale");
+      if (a.nbytes != wb || b.nbytes != wb || cc.nbytes != wb || sa.nbytes != sb || sb2.nbytes != sb || sc.nbytes != sb)
+        fail("deepseek_v41: " + q + "* sizes do not match moe_intermediate_size");
+      if (a.file != b.file || a.file != cc.file || a.file != sa.file || b.off != a.off + wb || cc.off != b.off + wb ||
+          sb2.off != sa.off + sb || sc.off != sb2.off + sb)
+        fail("deepseek_v41: " + q + "* are not stored contiguously (w1, w2, w3); this layout is not supported yet");
+      w.x[size_t(e)] = XLoc{a.file, a.off, sa.off};
+    }
+  }
+
   void load_weights() {
     const auto t0 = Clock::now();
     const int D = c_.D;
@@ -429,23 +731,7 @@ class Dsv4Model final : public NativeModel {
           fail("deepseek_v41: layer " + std::to_string(l) + " compresses without a KV source of its ratio");
         w.src = cur_src;
       }
-      const int W4 = 4 * D;
-      w.attn_norm = vecf(p + "attn_norm.weight", size_t(D));
-      w.ffn_norm = vecf(p + "ffn_norm.weight", size_t(D));
-      w.hca_fn = raw(p + "hc_attn_fn", uint64_t(24) * W4 * 4);
-      w.hca_base = raw(p + "hc_attn_base", 24 * 4);
-      w.hca_scale = raw(p + "hc_attn_scale", 3 * 4);
-      w.hcf_fn = raw(p + "hc_ffn_fn", uint64_t(24) * W4 * 4);
-      w.hcf_base = raw(p + "hc_ffn_base", 24 * 4);
-      w.hcf_scale = raw(p + "hc_ffn_scale", 3 * 4);
-      w.q_norm = vecf(p + "attn.q_norm.weight", size_t(c_.QR));
-      w.kv_norm = vecf(p + "attn.kv_norm.weight", size_t(c_.HD));
-      w.sink = vecf(p + "attn.attn_sink", size_t(c_.H));
-      w.wq_a = mat8(p + "attn.wq_a", c_.QR, D);
-      w.wq_b = mat8(p + "attn.wq_b", c_.H * c_.HD, c_.QR);
-      w.wkv = mat8(p + "attn.wkv", c_.HD, D);
-      w.wo_a = mat8(p + "attn.wo_a", c_.OG * c_.OR, c_.H * c_.HD / c_.OG);
-      w.wo_b = mat8(p + "attn.wo_b", D, c_.OG * c_.OR);
+      load_layer(w, p, c_.E, c_.K);
       if (w.kv_src) {
         w.c_wkv = matb(p + "attn.compressor.wkv.weight", c_.HD, D);
         if (w.ratio > 1) w.c_wgate = matb(p + "attn.compressor.wgate.weight", c_.HD, D);
@@ -456,25 +742,6 @@ class Dsv4Model final : public NativeModel {
       if (w.idx_src) {
         w.i_wq_b = mat8(p + "attn.indexer.wq_b", c_.IH * c_.IHD, c_.QR);
         w.i_wproj = matb(p + "attn.indexer.weights_proj.weight", c_.IH, D);
-      }
-      w.gate = matb(p + "ffn.gate.weight", c_.E, D);
-      w.gate_bias = vecf(p + "ffn.gate.bias", size_t(c_.E));
-      w.sh1 = mat8(p + "ffn.shared_experts.w1", c_.IE, D);
-      w.sh2 = mat8(p + "ffn.shared_experts.w2", D, c_.IE);
-      w.sh3 = mat8(p + "ffn.shared_experts.w3", c_.IE, D);
-      // routed experts: where each one's codes and scales are
-      w.x.resize(size_t(c_.E));
-      const uint64_t wb = uint64_t(c_.IE) * uint64_t(D) / 2, sb = uint64_t(c_.IE) * uint64_t(D) / 32;
-      for (int e = 0; e < c_.E; ++e) {
-        const std::string q = p + "ffn.experts." + std::to_string(e) + ".";
-        const TInfo &a = ck_.at(q + "w1.weight"), &b = ck_.at(q + "w2.weight"), &cc = ck_.at(q + "w3.weight");
-        const TInfo &sa = ck_.at(q + "w1.scale"), &sb2 = ck_.at(q + "w2.scale"), &sc = ck_.at(q + "w3.scale");
-        if (a.nbytes != wb || b.nbytes != wb || cc.nbytes != wb || sa.nbytes != sb || sb2.nbytes != sb || sc.nbytes != sb)
-          fail("deepseek_v41: " + q + "* sizes do not match moe_intermediate_size");
-        if (a.file != b.file || a.file != cc.file || a.file != sa.file || b.off != a.off + wb || cc.off != b.off + wb ||
-            sb2.off != sa.off + sb || sc.off != sb2.off + sb)
-          fail("deepseek_v41: " + q + "* are not stored contiguously (w1, w2, w3); this layout is not supported yet");
-        w.x[size_t(e)] = XLoc{a.file, a.off, sa.off};
       }
       // Engram
       const auto eit = std::find(c_.engram_layers.begin(), c_.engram_layers.end(), l);
@@ -497,6 +764,29 @@ class Dsv4Model final : public NativeModel {
         engram_gb_ += double(tw.nbytes + ts.nbytes) / 1e9;
       }
     }
+    // DSpark draft head: window-only layers with their own experts, a projection of the
+    // target layers' states, the final norm and the Markov head (ESPETERO_DS4_DSPARK=0: off)
+    // Off by default: on a Mac whose experts come from the SSD, verifying a block
+    // reads several times the experts of one token and the head's drafts are
+    // accepted ~1 in 3, so decoding got slower (docs/deepseek_v41.md).
+    if (c_.n_mtp > 0 && c_.ds_block > 0 && !partial_ && ck_.has("mtp.0.main_proj.weight") && spec_on()) {
+      M_.resize(size_t(c_.n_mtp));
+      for (int k = 0; k < c_.n_mtp; ++k) {
+        const std::string p = "mtp." + std::to_string(k) + ".";
+        if (c_.ratio.size() > size_t(c_.L + k) && c_.ratio[size_t(c_.L + k)] != 0)
+          fail("deepseek_v41: DSpark layers with compressed attention are not supported");
+        load_layer(M_[size_t(k)], p, c_.ds_E, c_.ds_K);
+      }
+      const int nt = int(c_.ds_targets.size());
+      ds_main_proj_ = mat8("mtp.0.main_proj", D, nt * D);
+      ds_main_norm_ = vecf("mtp.0.main_norm.weight", size_t(D));
+      const std::string last = "mtp." + std::to_string(c_.n_mtp - 1) + ".";
+      ds_norm_ = vecf(last + "norm.weight", size_t(D));
+      ds_mk_embed_ = matb(last + "markov_head.embed.weight", c_.V, c_.ds_markov);
+      ds_mk_head_ = matb(last + "markov_head.head.weight", c_.V, c_.ds_markov);
+      dspark_ = true;
+    }
+    if (c_.v_layers > 0 && want_vision_ && !partial_ && ck_.has("vision.patch_embed.proj.weight")) load_vision();
     xc_.wbytes = size_t(3) * size_t(c_.IE) * size_t(c_.D) / 2;
     xc_.sbytes = size_t(3) * size_t(c_.IE) * size_t(c_.D) / 32;
     xc_.slot_bytes = xc_.wbytes + xc_.sbytes;
@@ -515,7 +805,7 @@ class Dsv4Model final : public NativeModel {
     for (int s = 0; s < x.n; s += x.per_buf) x.bufs.push_back(rt_.private_buffer(size_t(std::min(x.per_buf, x.n - s)) * x.slot_bytes));
     x.key.assign(size_t(x.n), -1);
     x.stamp.assign(size_t(x.n), 0);
-    x.where.assign(size_t(c_.L) * size_t(c_.E), -1);
+    x.where.assign(size_t(c_.L + c_.n_mtp) * size_t(c_.E), -1);  // (layer, expert); draft layers after the backbone
     x.stage_n = 48;
     x.stage = rt_.buffer(size_t(x.stage_n) * x.slot_bytes);
   }
@@ -534,6 +824,7 @@ class Dsv4Model final : public NativeModel {
     H_ = F(T * 4 * D), XF_ = F(T * D);
     mixA_ = F(T * 24), mixF_[0] = F(T * 24), mixF_[1] = F(T * 24);
     SEL_ = F(T * K), RW_ = F(T * K);
+    IMG_ = rt_.buffer(T);
     xrow_ = F(T * K), wsc_ = F(T * K), amap_ = F(T * K);
     IDX_ = F(T * size_t(c_.ITOPK));
     cstride_ = c_.cand_bs > 0 ? max_ctx_ / c_.cand_bs + 2 : 1;
@@ -566,6 +857,10 @@ class Dsv4Model final : public NativeModel {
     EE_ = F(P * ecols * size_t(c_.eng_hd));
     EKV_ = F(P * D * 5);
     XN_ = F(D * size_t(max_reads_)), LOG_ = F(size_t(c_.V) * size_t(max_reads_));
+    // DSpark: drafts per block, the Markov bias, the target states entering the draft rings
+    DTOK_ = F(size_t(max_reads_) * 8), MKB_ = F(size_t(c_.V));
+    const size_t dr = size_t(kDsRows), nt = std::max<size_t>(1, c_.ds_targets.size());
+    DSX_ = F(dr * nt * D), DSM_ = F(dr * D), DSQ_ = F(dr * D), DKV_ = F(dr * size_t(c_.HD)), DPOS_ = F(dr);
   }
 
   void alloc_seq(Seq& s) {
@@ -581,6 +876,11 @@ class Dsv4Model final : public NativeModel {
       seq_bytes_ += size_t(cap) * (HD + size_t(c_.IHD)) * 2;
     }
     s.pend = Buf(rt_.buffer(src_ratio_.size() * 2 * 8 * HD * 4));
+    s.vpend = Buf(rt_.buffer(src_ratio_.size() * 2 * 8 * HD * 4));
+    if (dspark_) {
+      s.dsring = Buf(rt_.buffer(size_t(c_.n_mtp) * size_t(c_.WIN) * HD * 2));
+      s.mh = Buf(rt_.buffer(size_t(128) * c_.ds_targets.size() * size_t(c_.D) * 4));
+    }
     reset(s);
   }
 
@@ -590,6 +890,7 @@ class Dsv4Model final : public NativeModel {
   }
   void reset(Seq& s) {
     s.len = 0;
+    s.ds_len = 0;
     s.hist.clear();
   }
   void fork(Seq& d, const Seq& s) {
@@ -604,6 +905,11 @@ class Dsv4Model final : public NativeModel {
       std::memcpy(ptr(d.idxk[i]), ptr(s.idxk[i]), n * size_t(c_.IHD) * 2);
     }
     std::memcpy(ptr(d.pend), ptr(s.pend), src_ratio_.size() * 2 * 8 * size_t(c_.HD) * 4);
+    d.ds_len = s.ds_len;
+    if (dspark_) {
+      std::memcpy(ptr(d.dsring), ptr(s.dsring), size_t(c_.n_mtp) * size_t(c_.WIN) * size_t(c_.HD) * 2);
+      std::memcpy(ptr(d.mh), ptr(s.mh), size_t(128) * c_.ds_targets.size() * size_t(c_.D) * 4);
+    }
   }
 
   // ---------------------------------------------------------------- encoding
@@ -667,6 +973,7 @@ class Dsv4Model final : public NativeModel {
     void bytes(int i, const T& v) {
       [e setBytes:&v length:sizeof(T) atIndex:i];
     }
+    void raw(int i, const void* p, size_t n) { [e setBytes:p length:n atIndex:i]; }
     void groups(size_t x, size_t y, size_t z, size_t tx) {
       if (!x || !y || !z) return;
       [e dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
@@ -821,18 +1128,229 @@ class Dsv4Model final : public NativeModel {
     E.threads(size_t(c_.D), size_t(M), 1, 256);
   }
 
+  // ---------------------------------------------------------------- vision
+  struct VBlk {
+    Buf n1, n2, qkv_w, qkv_b, wo_w, wo_b, w1, w2;
+  };
+  struct VisionW {
+    Buf pe_w, pe_b, norm, al_w1, al_b1, al_w2, al_b2, img_start, img_end, img_nl, inv_freq;
+    std::vector<VBlk> blocks;
+    int kpad = 0;  // patch length padded to a multiple of 32
+  } vis_;
+  bool vision_ = false, want_vision_ = true;
+  id<MTLBuffer> VP_ = nil, VX_, VXN_, VQKV_, VQh_, VKh_, VVh_, VOh_, VO_, VH_, VG_, VU_, VA1_, VA2_, VHW_, VSEG_, IMGS_ = nil, IMG_;
+  int vcap_ = 0, lcap_ = 0;  // patch rows and aligner rows the vision scratch holds
+  size_t imgs_bytes_ = 0;
+
+  void load_vision() {
+    const int VD = c_.v_dim, P = c_.v_patch, K = 3 * P * P;
+    vis_.kpad = (K + 31) / 32 * 32;
+    {  // patch embedding, columns zero-padded to kpad
+      const TInfo& t = ck_.at("vision.patch_embed.proj.weight");
+      std::vector<uint16_t> w(size_t(t.nbytes / 2)), wp(size_t(VD) * size_t(vis_.kpad), 0);
+      ck_.read(t, w.data());
+      for (int o = 0; o < VD; ++o) std::memcpy(wp.data() + size_t(o) * size_t(vis_.kpad), w.data() + size_t(o) * size_t(K), size_t(K) * 2);
+      vis_.pe_w = rt_.arena->copy(wp.data(), wp.size() * 2);
+    }
+    vis_.pe_b = vecf("vision.patch_embed.proj.bias", size_t(VD));
+    for (int b = 0; b < c_.v_layers; ++b) {
+      const std::string p = "vision.blocks." + std::to_string(b) + ".";
+      VBlk B;
+      B.n1 = vecf(p + "norm1.weight", size_t(VD));
+      B.n2 = vecf(p + "norm2.weight", size_t(VD));
+      B.qkv_w = raw(p + "attn.wqkv.weight", uint64_t(3 * VD) * uint64_t(VD) * 2);
+      B.qkv_b = vecf(p + "attn.wqkv.bias", size_t(3 * VD));
+      B.wo_w = raw(p + "attn.wo.weight", uint64_t(VD) * uint64_t(VD) * 2);
+      B.wo_b = vecf(p + "attn.wo.bias", size_t(VD));
+      B.w1 = raw(p + "mlp.w1.weight", uint64_t(2 * c_.v_inter) * uint64_t(VD) * 2);
+      B.w2 = raw(p + "mlp.w2.weight", uint64_t(VD) * uint64_t(c_.v_inter) * 2);
+      vis_.blocks.push_back(B);
+    }
+    vis_.norm = vecf("vision.norm.weight", size_t(VD));
+    const int r2 = c_.v_down * c_.v_down;
+    vis_.al_w1 = raw("aligner.w1.weight", uint64_t(c_.D) * uint64_t(VD * r2) * 2);
+    vis_.al_b1 = vecf("aligner.w1.bias", size_t(c_.D));
+    vis_.al_w2 = raw("aligner.w2.weight", uint64_t(c_.D) * uint64_t(c_.D) * 2);
+    vis_.al_b2 = vecf("aligner.w2.bias", size_t(c_.D));
+    vis_.img_start = vecf("image_start", size_t(c_.D));
+    vis_.img_end = vecf("image_end", size_t(c_.D));
+    vis_.img_nl = vecf("image_newline", size_t(c_.D));
+    {
+      const int rd = VD / c_.v_heads / 2;  // rotary dims per axis pair: inv_freq over rd
+      std::vector<float> f(size_t(rd / 2));
+      for (int i = 0; i < rd / 2; ++i) f[size_t(i)] = 1.0f / std::pow(float(c_.v_theta), float(2 * i) / float(rd));
+      vis_.inv_freq = rt_.arena->copy(f.data(), f.size() * 4);
+    }
+    if (VD % 64 || c_.D % 64 || (2 * c_.v_inter) % 64 || c_.v_inter % 32 || VD / c_.v_heads != 64)
+      fail("deepseek_v41: unsupported vision geometry");
+    vision_ = true;
+  }
+
+  // Tokens of an image's run for a patch grid of gh x gw.
+  int image_run(int gh, int gw) const {
+    const int lh = (gh + c_.v_down - 1) / c_.v_down, lw = (gw + c_.v_down - 1) / c_.v_down;
+    return lh * (lw + 1) + 2;
+  }
+
+  void gemm_bf16(Enc2& E, const Buf& W, const Buf* B, id<MTLBuffer> X, size_t xo, int xs, id<MTLBuffer> Y, size_t yo, int ys,
+                 int M, int N, int K, bool accum) {
+    struct {
+      int M, N, K, xs, ys, accum, bias;
+    } p{M, N, K, xs, ys, accum ? 1 : 0, B ? 1 : 0};
+    E.pipe("ds4_gemm_bf16");
+    E.set(0, W);
+    E.set(1, B ? *B : W);
+    E.set(2, X, xo);
+    E.set(3, Y, yo);
+    E.bytes(4, p);
+    E.groups(size_t(N / 64), size_t((M + 63) / 64), 1, 128);
+  }
+  void norm_eps(Enc2& E, id<MTLBuffer> x, const Buf& w, int rows, int n, float eps) {
+    struct {
+      int rows, heads, n, stride;
+      float eps;
+    } p{rows, 1, n, n, eps};
+    E.pipe("ds4_rmsnorm");
+    E.set(0, x);
+    E.set(1, w);
+    E.bytes(2, p);
+    E.groups(size_t((rows + 7) / 8), 1, 1, 256);
+  }
+
+  // The embedding rows of an image's run (image_run(gh, gw) rows of D floats)
+  // into dst at dst_off: the ViT over the patches, the 3 x 3 aligner, the
+  // learned start / newline / end rows around the aligner's rows.
+  void encode_image(const ImageRef& im, id<MTLBuffer> dst, size_t dst_off) {
+    const int VD = c_.v_dim, H = c_.v_heads, gh = im.grid_h, gw = im.grid_w, N = gh * gw, D = c_.D;
+    const int r = c_.v_down, lh = (gh + r - 1) / r, lw = (gw + r - 1) / r, L = lh * lw, I2 = 2 * c_.v_inter;
+    const int K = 3 * c_.v_patch * c_.v_patch;
+    if (N <= 0 || N > 16384) fail("deepseek_v41: image patch grid out of range");
+    if (N > vcap_ || L > lcap_) {
+      vcap_ = std::max(vcap_, N), lcap_ = std::max(lcap_, L);
+      auto F = [&](size_t n) { return rt_.buffer(n * 4); };
+      const size_t n = size_t(vcap_), l = size_t(lcap_);
+      VP_ = F(n * size_t(vis_.kpad)), VX_ = F(n * VD), VXN_ = F(n * VD), VQKV_ = F(n * 3 * VD);
+      VQh_ = rt_.buffer(n * VD * 2), VKh_ = rt_.buffer(n * VD * 2), VVh_ = rt_.buffer(n * VD * 2), VOh_ = rt_.buffer(n * VD * 2);
+      VO_ = F(n * VD), VH_ = F(n * size_t(I2)), VG_ = F(n * size_t(c_.v_inter));
+      VU_ = F(l * size_t(VD) * size_t(r * r)), VA1_ = F(l * size_t(D)), VA2_ = F(l * size_t(D));
+      VHW_ = rt_.buffer(n * 8), VSEG_ = rt_.buffer(n * 8);
+    }
+    {
+      float* vp = static_cast<float*>([VP_ contents]);
+      for (int i = 0; i < N; ++i) {
+        std::memcpy(vp + size_t(i) * size_t(vis_.kpad), im.pixels + size_t(i) * size_t(K), size_t(K) * 4);
+        std::memset(vp + size_t(i) * size_t(vis_.kpad) + K, 0, size_t(vis_.kpad - K) * 4);
+      }
+      int32_t* hw = static_cast<int32_t*>([VHW_ contents]);
+      int32_t* sg = static_cast<int32_t*>([VSEG_ contents]);
+      for (int i = 0; i < N; ++i) hw[2 * i] = i / gw, hw[2 * i + 1] = i % gw, sg[2 * i] = 0, sg[2 * i + 1] = N;
+    }
+    Enc2 E(rt_);
+    gemm_bf16(E, vis_.pe_w, &vis_.pe_b, VP_, 0, vis_.kpad, VX_, 0, VD, N, VD, vis_.kpad, false);
+    int bi = 0;
+    for (const VBlk& B : vis_.blocks) {
+      if (bi++ % 4 == 3) E.flush();  // command buffers of a few blocks (macOS aborts long ones)
+      copy(E, VX_, 0, VXN_, 0, size_t(N) * size_t(VD) * 4);
+      norm_eps(E, VXN_, B.n1, N, VD, 1e-6f);
+      gemm_bf16(E, B.qkv_w, &B.qkv_b, VXN_, 0, VD, VQKV_, 0, 3 * VD, N, 3 * VD, VD, false);
+      {
+        struct {
+          int N, H, HD;
+          float scale;
+        } pp{N, H, VD / H, 1.0f / std::sqrt(float(VD / H))};
+        E.pipe("vit_qkv_prep");
+        E.set(0, VQKV_);
+        E.set(1, VHW_);
+        E.set(2, vis_.inv_freq);
+        E.set(3, VQh_);
+        E.set(4, VKh_);
+        E.set(5, VVh_);
+        E.bytes(6, pp);
+        E.threads(size_t(VD / H / 2), size_t(H), size_t(N), 32, 1);
+        struct {
+          int N, H;
+        } ap{N, H};
+        E.pipe("vit_attention_64");
+        E.set(0, VQh_);
+        E.set(1, VKh_);
+        E.set(2, VVh_);
+        E.set(3, VSEG_);
+        E.set(4, VOh_);
+        E.bytes(5, ap);
+        E.groups(size_t(H), size_t((N + 31) / 32), 1, 128);
+        const uint32_t n = uint32_t(N * VD);
+        E.pipe("ds4_h2f");
+        E.set(0, VOh_);
+        E.set(1, VO_);
+        E.bytes(2, n);
+        E.threads(n, 1, 1, 256);
+      }
+      gemm_bf16(E, B.wo_w, &B.wo_b, VO_, 0, VD, VX_, 0, VD, N, VD, VD, true);
+      copy(E, VX_, 0, VXN_, 0, size_t(N) * size_t(VD) * 4);
+      norm_eps(E, VXN_, B.n2, N, VD, 1e-6f);
+      gemm_bf16(E, B.w1, nullptr, VXN_, 0, VD, VH_, 0, I2, N, I2, VD, false);
+      {
+        struct {
+          int rows, n, gs, us, os;
+          float lim;
+        } p{N, c_.v_inter, I2, I2, c_.v_inter, 0.0f};
+        E.pipe("ds4_swiglu");
+        E.set(0, VH_);
+        E.set(1, VH_, size_t(c_.v_inter) * 4);
+        E.set(2, VG_);
+        E.bytes(3, p);
+        E.threads(size_t(c_.v_inter), size_t(N), 1, 256);
+      }
+      gemm_bf16(E, B.w2, nullptr, VG_, 0, c_.v_inter, VX_, 0, VD, N, VD, c_.v_inter, true);
+    }
+    norm_eps(E, VX_, vis_.norm, N, VD, 1e-6f);
+    {
+      struct {
+        int nh, nw, C, r, lh, lw;
+      } up{gh, gw, VD, r, lh, lw};
+      E.pipe("ds4_unfold");
+      E.set(0, VX_);
+      E.set(1, VU_);
+      E.bytes(2, up);
+      E.threads(size_t(VD * r * r), size_t(L), 1, 256);
+    }
+    gemm_bf16(E, vis_.al_w1, &vis_.al_b1, VU_, 0, VD * r * r, VA1_, 0, D, L, D, VD * r * r, false);
+    {
+      const uint32_t n = uint32_t(L * D);
+      E.pipe("ds4_gelu");
+      E.set(0, VA1_);
+      E.bytes(1, n);
+      E.threads(n, 1, 1, 256);
+    }
+    // the run: [start] + (lw aligner rows + newline) x lh + [end]
+    const size_t row = size_t(D) * 4;
+    gemm_bf16(E, vis_.al_w2, &vis_.al_b2, VA1_, 0, D, VA2_, 0, D, L, D, D, false);
+    copy(E, vis_.img_start.b, vis_.img_start.off, dst, dst_off, row);
+    size_t o = dst_off + row;
+    for (int i = 0; i < lh; ++i) {
+      copy(E, VA2_, size_t(i) * size_t(lw) * row, dst, o, size_t(lw) * row);
+      o += size_t(lw) * row;
+      copy(E, vis_.img_nl.b, vis_.img_nl.off, dst, o, row);
+      o += row;
+    }
+    copy(E, vis_.img_end.b, vis_.img_end.off, dst, o, row);
+    E.end();
+    gpu_ms_ += E.gpu_ms;
+  }
+
   // ---------------------------------------------------------------- engram (host)
   // The pass's Engram rows as stored (fp8 codes, then e8m0 scales), read from
   // the SSD into ERAW_[g] ([T][cols][hd + hd / 32] bytes); the GPU dequantizes them.
-  void engram_gather(const Seq& s, const int32_t* toks, int T, int row0) {
+  void engram_gather(const Seq& s, const int32_t* toks, int T, int row0, const uint8_t* dead) {
     const auto t0 = Clock::now();
     const int nb = eng_.max_n - 1;
     const int ncol = nb * eng_.heads, hd = c_.eng_hd, rb = hd + hd / 32;
+    // compressed ids, -1 for tokens inside an image span (an n-gram never reaches across one)
     std::vector<int64_t> cid;
-    for (int32_t t : s.hist) cid.push_back(t >= 0 && t < eng_.vocab ? int64_t(eng_.map[size_t(t)]) : int64_t(eng_.pad));
+    for (int32_t t : s.hist) cid.push_back(t >= 0 && t < eng_.vocab ? int64_t(eng_.map[size_t(t)]) : -1);
     const int h0 = int(cid.size());
     for (int i = 0; i < T; ++i)
-      cid.push_back(toks[i] >= 0 && toks[i] < eng_.vocab ? int64_t(eng_.map[size_t(toks[i])]) : int64_t(eng_.pad));
+      cid.push_back(!dead[i] && toks[i] >= 0 && toks[i] < eng_.vocab ? int64_t(eng_.map[size_t(toks[i])]) : -1);
     for (int g = 0; g < int(c_.engram_layers.size()); ++g) {
       const LayerW* lw = nullptr;
       for (const LayerW& w : L_)
@@ -842,9 +1360,11 @@ class Dsv4Model final : public NativeModel {
       for (int i = 0; i < T; ++i) {
         const int64_t p = int64_t(s.len) + i;
         int64_t tk[8];
+        bool blocked = false;
         for (int sh = 0; sh < eng_.max_n; ++sh) {
           const int ci = h0 + i - sh;
-          tk[sh] = (p - sh < 0 || ci < 0) ? int64_t(eng_.pad) : cid[size_t(ci)];
+          blocked = blocked || p - sh < 0 || ci < 0 || cid[size_t(ci)] < 0;
+          tk[sh] = blocked ? int64_t(eng_.pad) : cid[size_t(ci)];
         }
         engram_rows(eng_, g, tk, rows.data() + size_t(i) * size_t(ncol));
       }
@@ -875,7 +1395,7 @@ class Dsv4Model final : public NativeModel {
   // Slots for this layer's experts `need` (sorted, distinct); missing ones are
   // read from the SSD into staging and copied into their slots by `E`
   // (flushing between staging rounds).
-  std::vector<int> expert_slots(Enc2& E, int l, const std::vector<int>& need) {
+  std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need) {
     ExpertCache& x = xc_;
     const uint64_t now = ++x.clock;
     std::vector<int> slot(need.size(), -1);
@@ -925,7 +1445,7 @@ class Dsv4Model final : public NativeModel {
       uint8_t* stage = static_cast<uint8_t*>([x.stage contents]);
       const size_t piece = size_t(1) << 20;  // 1 MB reads: ~8 GB/s from the internal SSD even for a few experts
       for (size_t j = b0; j < b1; ++j) {
-        const XLoc& loc = L_[size_t(l)].x[size_t(need[miss[j]])];
+        const XLoc& loc = lw.x[size_t(need[miss[j]])];
         uint8_t* dst = stage + (j - b0) * x.slot_bytes;
         const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
         for (size_t o = 0; o < x.wbytes; o += piece) jobs.push_back({fd, dst + o, std::min(piece, x.wbytes - o), loc.w + o});
@@ -956,7 +1476,10 @@ class Dsv4Model final : public NativeModel {
     Seq* s = nullptr;
     const int32_t* toks = nullptr;
     int n = 0;
-    float* logits = nullptr;  // the last row's logits, or null
+    float* logits = nullptr;  // logits of the last nlog rows ([nlog][V]), or null
+    int nlog = 1;
+    bool verify = false;      // a draft verification: keeps what a rollback needs
+    std::vector<ImageRef> imgs;  // image runs (row: from the segment's first row)
     int r0 = 0, p0 = 0;       // first row in the pass, first position
   };
   struct Part {
@@ -968,9 +1491,12 @@ class Dsv4Model final : public NativeModel {
     std::vector<Part> parts;
   };
 
-  void forward(std::vector<Seg>& segs) {
+  // draft: the DSpark layers over draft blocks (no slot state changes; the
+  // drafts land in DTOK_).
+  void forward(std::vector<Seg>& segs, bool draft = false) {
     const Cfg& c = c_;
-    const int D = c.D, K = c.K;
+    const int D = c.D;
+    const std::vector<LayerW>& LW = draft ? M_ : L_;
     int T = 0;
     for (Seg& g : segs) {
       g.r0 = T, g.p0 = g.s->len;
@@ -982,9 +1508,39 @@ class Dsv4Model final : public NativeModel {
       }
       T += g.n;
     }
-    if (T > T_ || segs.size() > size_t(max_reads_)) fail("deepseek_v41: pass too large");
-    if (!no_engram_)
-      for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0);
+    int nlog = 0;
+    for (const Seg& g : segs) nlog += g.logits ? g.nlog : 0;
+    if (T > T_ || nlog > max_reads_) fail("deepseek_v41: pass too large");
+    // images: their runs' embedding rows, and the flags of image-span rows (VL router bias, no n-grams)
+    uint8_t* img = static_cast<uint8_t*>([IMG_ contents]);
+    std::memset(img, 0, size_t(T));
+    struct Run {
+      int row, n;
+      size_t off;
+    };
+    std::vector<Run> runs;
+    {
+      size_t off = 0;
+      for (const Seg& g : segs)
+        for (const ImageRef& im : g.imgs) {
+          if (!vision_) fail("deepseek_v41: images need the vision tower");
+          const int n = image_run(im.grid_h, im.grid_w);
+          if (im.row < 0 || im.row + n > g.n) fail("deepseek_v41: image run outside its segment");
+          for (int i = 0; i < n; ++i)
+            if (g.toks[im.row + i] != c.image_token) fail("deepseek_v41: image run does not match its placeholder tokens");
+          if (!IMGS_ || off + size_t(n) * size_t(D) * 4 > imgs_bytes_) {
+            if (off > 0) fail("deepseek_v41: too many image rows in one pass");
+            imgs_bytes_ = std::max(imgs_bytes_, size_t(n) * size_t(D) * 4 * 2);
+            IMGS_ = rt_.buffer(imgs_bytes_);
+          }
+          encode_image(im, IMGS_, off);
+          runs.push_back({g.r0 + im.row, n, off});
+          std::memset(img + g.r0 + im.row, 1, size_t(n));
+          off += size_t(n) * size_t(D) * 4;
+        }
+    }
+    if (!no_engram_ && !draft)
+      for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0, img + g.r0);
     std::vector<Blk> blks;
     for (int r0 = 0; r0 < T; r0 += P_) {
       Blk bk;
@@ -1006,10 +1562,35 @@ class Dsv4Model final : public NativeModel {
       E.bytes(3, p);
       E.threads(size_t(D), size_t(T), 1, 256);
     }
+    for (const Run& rn : runs) {
+      const int32_t p[4] = {D, rn.n, rn.row, 0};
+      E.pipe("ds4_embed_rows");
+      E.set(0, IMGS_, rn.off);
+      E.set(1, H_);
+      E.raw(2, p, 16);
+      E.threads(size_t(D), size_t(rn.n), 1, 256);
+    }
     id<MTLBuffer> prev = mix0_;
     int cur = 0;
-    for (int l = 0; l < c.L; ++l) {
-      const LayerW& w = L_[size_t(l)];
+    for (int l = 0; l < int(LW.size()); ++l) {
+      const LayerW& w = LW[size_t(l)];
+      const int K = w.topk, key = draft ? c.L + l : l;  // the expert cache's layer
+      // the draft head's view of this layer's input: the mean of the hc copies
+      if (!draft && dspark_)
+        for (size_t k = 0; k < c.ds_targets.size(); ++k)
+          if (c.ds_targets[k] == l)
+            for (const Seg& g : segs) {
+              const int k0 = std::max(0, g.n - 128);
+              struct {
+                int rows, D, nt, k;
+              } mp{g.n - k0, D, int(c.ds_targets.size()), int(k)};
+              E.pipe("ds4_hc_mean");
+              E.set(0, H_, hrow(g.r0 + k0));
+              E.set(1, pos_, size_t(g.r0 + k0) * 4);
+              E.set(2, g.s->mh);
+              E.bytes(3, mp);
+              E.threads(size_t(D), size_t(g.n - k0), 1, 256);
+            }
       // ---- phase 1: Engram, attention, the MoE input and its routing, per block
       for (size_t ci = 0; ci < blks.size(); ++ci) {
         Blk& bk = blks[ci];
@@ -1031,39 +1612,40 @@ class Dsv4Model final : public NativeModel {
           E.set(1, EKV_);
           E.set(2, w.e_wqk);
           E.bytes(3, hcp());
+          E.set(4, IMG_, size_t(r0));
           E.groups(size_t(M), 1, 1, 256);
         }
         hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, mixA_, r0, M);
         hc_pre(E, prev, w.attn_norm, X_, 0, r0, M);
-        attention_block(E, l, bk, segs);
+        attention_block(E, w, l, bk, segs, draft);
         if (!dump_dir_.empty()) dump_rows(E, "a" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
         hc_post(E, mixA_, r0, M);
         hc_mix(E, w.hcf_fn, w.hcf_base, w.hcf_scale, mixF_[cur], r0, M);
         hc_pre(E, mixA_, w.ffn_norm, XF_, size_t(r0) * size_t(D) * 4, r0, M);
-        moe_route(E, l, r0, M);
+        moe_route(E, w, r0, M);
       }
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
-      std::vector<char> used(size_t(c.E), 0);
+      std::vector<char> used(size_t(w.nE), 0);
       for (int i = 0; i < T * K; ++i) {
-        if (sel[i] < 0 || sel[i] >= c.E) fail("deepseek_v41: bad routing");
+        if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
         used[size_t(sel[i])] = 1;
       }
       std::vector<int> need;
-      for (int e = 0; e < c.E; ++e)
+      for (int e = 0; e < w.nE; ++e)
         if (used[size_t(e)]) need.push_back(e);
       if (!dump_dir_.empty())
         if (FILE* f = std::fopen((dump_dir_ + "/p" + std::to_string(dump_pass_) + "_route" + std::to_string(l) + ".i32").c_str(), "wb")) {
           std::fwrite(sel, 4, size_t(T * K), f);
           std::fclose(f);
         }
-      const std::vector<int> slots = expert_slots(E, l, need);
-      std::vector<int> slot_of(size_t(c.E), -1);
+      const std::vector<int> slots = expert_slots(E, key, w, need);
+      std::vector<int> slot_of(size_t(w.nE), -1);
       for (size_t i = 0; i < need.size(); ++i) slot_of[size_t(need[i])] = slots[i];
       // ---- phase 3: shared and routed experts, per block
       for (size_t ci = 0; ci < blks.size(); ++ci) {
         const int r0 = blks[ci].r0, M = blks[ci].M;
-        moe_experts(E, l, int(ci), r0, M, slot_of);
+        moe_experts(E, w, int(ci), r0, M, slot_of);
         if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
         hc_post(E, mixF_[cur], r0, M);
       }
@@ -1074,21 +1656,51 @@ class Dsv4Model final : public NativeModel {
     // ---- logits of the segments' last rows
     int R = 0;
     for (const Seg& g : segs)
-      if (g.logits && head_.b) hc_pre(E, prev, norm_, XN_, size_t(R++) * size_t(D) * 4, g.r0 + g.n - 1, 1);
+      if (g.logits && head_.b) {
+        hc_pre(E, prev, draft ? ds_norm_ : norm_, XN_, size_t(R) * size_t(D) * 4, g.r0 + g.n - g.nlog, g.nlog);
+        R += g.nlog;
+      }
     if (R && head_.b) gemv(E, 2, Buf(head_), Buf{}, XN_, 0, D, LOG_, 0, c.V, c.V, D, R);
+    if (draft) {  // the Markov head picks the drafts one after another, on the GPU
+      int r = 0;
+      for (size_t i = 0; i < segs.size(); ++i) {
+        for (int j = 0; j < segs[i].nlog; ++j) {
+          const int32_t mp[3] = {c.V, c.ds_markov, j};
+          E.pipe("ds4_markov_bias");
+          E.set(0, ds_mk_embed_.w);
+          E.set(1, ds_mk_head_.w);
+          E.set(2, DTOK_, i * 8 * 4);
+          E.set(3, MKB_);
+          E.bytes(4, mp);
+          E.threads(size_t(c.V), 1, 1, 256);
+          E.pipe("ds4_markov_argmax");
+          E.set(0, LOG_, size_t(r) * size_t(c.V) * 4);
+          E.set(1, MKB_);
+          E.set(2, DTOK_, i * 8 * 4);
+          E.bytes(3, mp);
+          E.groups(1, 1, 1, 1024);
+        }
+        r += segs[i].nlog;
+      }
+      E.end();
+      gpu_ms_ += E.gpu_ms;
+      flushes_ += uint64_t(E.flushes);
+      return;
+    }
     E.end();
     gpu_ms_ += E.gpu_ms;
     flushes_ += uint64_t(E.flushes);
     R = 0;
     for (Seg& g : segs) {
-      for (int i = 0; i < g.n; ++i) g.s->hist.push_back(g.toks[i]);
+      for (int i = 0; i < g.n; ++i) g.s->hist.push_back(img[g.r0 + i] ? -1 : g.toks[i]);  // -1: no n-gram spans an image
       const size_t keep = size_t(std::max(0, eng_.max_n - 1));
       if (g.s->hist.size() > keep) g.s->hist.erase(g.s->hist.begin(), g.s->hist.end() - long(keep));
       g.s->len = g.p0 + g.n;
       if (g.logits) {
-        if (head_.b) std::memcpy(g.logits, static_cast<const float*>([LOG_ contents]) + size_t(R) * size_t(c.V), size_t(c.V) * 4);
-        else std::memset(g.logits, 0, size_t(c.V) * 4);
-        ++R;
+        const size_t n = size_t(g.nlog) * size_t(c.V);
+        if (head_.b) std::memcpy(g.logits, static_cast<const float*>([LOG_ contents]) + size_t(R) * size_t(c.V), n * 4);
+        else std::memset(g.logits, 0, n * 4);
+        R += g.nlog;
       }
     }
     ++dump_pass_;
@@ -1106,9 +1718,8 @@ class Dsv4Model final : public NativeModel {
 
   // Attention of a block: X_ in, Y_ out (scratch rows 0..M); the projections
   // over all rows, the sequence mixing per segment part.
-  void attention_block(Enc2& E, int l, Blk& bk, std::vector<Seg>& segs) {
+  void attention_block(Enc2& E, const LayerW& w, int l, Blk& bk, std::vector<Seg>& segs, bool draft) {
     const Cfg& c = c_;
-    const LayerW& w = L_[size_t(l)];
     const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD, M = bk.M;
     const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
     const size_t po = size_t(bk.r0) * 4;  // pos_ rows of this block
@@ -1123,7 +1734,7 @@ class Dsv4Model final : public NativeModel {
     norm(E, KVp_, 0, w.kv_norm, M, 1, HD, HD);
     rope(E, KVp_, 0, pos_, po, invf, M, 1, HD, HD, false);
     quant(E, KVp_, 0, M, HD, HD, 0);
-    for (Part& pt : bk.parts) attention_seq(E, l, *segs[size_t(pt.seg)].s, bk.r0, pt);
+    for (Part& pt : bk.parts) attention_seq(E, w, l, segs[size_t(pt.seg)], bk.r0, pt, draft);
     rope(E, Q_, 0, pos_, po, invf, M, c.H, HD, HQ, true);
     quant(E, Q_, 0, M, HQ, HQ, 0);
     gemv(E, 0, w.wo_a.w, w.wo_a.s, Q_, 0, HQ, OA_, 0, c.OG * c.OR, w.wo_a.N, w.wo_a.K, M, c.OR, w.wo_a.K);
@@ -1133,9 +1744,10 @@ class Dsv4Model final : public NativeModel {
 
   // The sequence mixing of one segment part: block rows [ro, ro + m) of `s`
   // at positions p0 ...: compressor, indexer, attention, window ring.
-  void attention_seq(Enc2& E, int l, Seq& s, int br0, Part& pt) {
+  // draft: a DSpark layer (its own ring of the target's states; the block's rows see each other).
+  void attention_seq(Enc2& E, const LayerW& w, int l, Seg& sg, int br0, Part& pt, bool draft) {
     const Cfg& c = c_;
-    const LayerW& w = L_[size_t(l)];
+    Seq& s = *sg.s;
     const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD;
     const int ro = pt.ro, M = pt.m, p0 = pt.p0, r0 = br0 + ro;  // r0: pass row of the part's first row
     const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
@@ -1179,6 +1791,14 @@ class Dsv4Model final : public NativeModel {
         quant(E, LAT_, ho, G, HD, HD, 2);
         store_half(E, LAT_, ro, HD, s.comp[size_t(si)], 0, G, HD, g0, 0);
       }
+      if (r > 1 && sg.verify)  // a verification keeps every row's compressor inputs (for a rollback)
+        for (int j = 0; j < M; ++j) {
+          const int vr = pt.p0 - sg.p0 + j;
+          if (vr >= 8) break;
+          const size_t vb = (size_t(si) * 2 * 8 + size_t(vr)) * size_t(HD) * 4;
+          copy(E, CKV_, ho + size_t(j) * size_t(HD) * 4, s.vpend.b, s.vpend.off + vb, size_t(HD) * 4);
+          copy(E, CSC_, ho + size_t(j) * size_t(HD) * 4, s.vpend.b, s.vpend.off + vb + 8 * size_t(HD) * 4, size_t(HD) * 4);
+        }
       if (r > 1) {  // the incomplete group's rows wait in the slot
         const int end = p0 + M, t0 = end - end % r;
         for (int t = std::max(t0, p0); t < end; ++t) {
@@ -1267,11 +1887,11 @@ class Dsv4Model final : public NativeModel {
       struct {
         int M, H, win, p0, ratio, topk, n_comp;
         float scale;
-      } ap{M, c.H, c.WIN, p0, w.ratio, w.ratio ? topk_mode : 0, 0, 1.0f / std::sqrt(float(HD))};
+      } ap{M, c.H, c.WIN, p0, w.ratio, w.ratio ? topk_mode : 0, draft ? M : 0, 1.0f / std::sqrt(float(HD))};
       E.pipe("ds4_attn");
       E.set(0, Q_, size_t(ro) * size_t(HQ) * 4);
       E.set(1, KVp_, ho);
-      E.set(2, s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2);
+      E.set(2, draft ? s.dsring : s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2);
       if (w.ratio > 0) E.set(3, s.comp[size_t(w.src)]);
       else E.set(3, s.ring);
       E.set(4, IDX_, io);
@@ -1281,35 +1901,36 @@ class Dsv4Model final : public NativeModel {
       E.bytes(8, ap);
       E.groups(size_t((c.H + 7) / 8), size_t(M), 1, 256);
     }
-    // ---- the window ring keeps the last WIN rows
+    // ---- the window ring keeps the last WIN rows (a draft block's rows are not kept)
+    if (draft) return;
     const int k0 = std::max(0, M - c.WIN);
     store_half(E, KVp_, ro + k0, HD, s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2, M - k0, HD, p0 + k0, c.WIN);
   }
 
   // Router of rows [r0, r0 + M): XF_ rows -> SEL_ / RW_ rows.
-  void moe_route(Enc2& E, int l, int r0, int M) {
+  void moe_route(Enc2& E, const LayerW& w, int r0, int M) {
     const Cfg& c = c_;
-    const LayerW& w = L_[size_t(l)];
-    gemvb(E, w.gate, XF_, c.D, RL_, c.E, M, size_t(r0) * size_t(c.D) * 4);
+    gemvb(E, w.gate, XF_, c.D, RL_, w.nE, M, size_t(r0) * size_t(c.D) * 4);
     struct {
       int M, E, k;
       float rs;
-    } p{M, c.E, c.K, c.route_scale};
+    } p{M, w.nE, w.topk, c.route_scale};
     E.pipe("ds4_route");
     E.set(0, RL_);
     E.set(1, w.gate_bias);
-    E.set(2, SEL_, size_t(r0) * size_t(c.K) * 4);
-    E.set(3, RW_, size_t(r0) * size_t(c.K) * 4);
+    E.set(2, SEL_, size_t(r0) * size_t(w.topk) * 4);
+    E.set(3, RW_, size_t(r0) * size_t(w.topk) * 4);
     E.bytes(4, p);
+    E.set(5, w.gate_bias_vl.b ? w.gate_bias_vl : w.gate_bias);
+    E.set(6, IMG_, size_t(r0));
     E.groups(size_t(M), 1, 1, 32);
   }
 
   // Shared and routed experts of rows [r0, r0 + M) into Y_ (sub-chunk ci; the
   // routing on the host; slot_of: each expert's cache slot for this layer).
-  void moe_experts(Enc2& E, int l, int ci, int r0, int M, const std::vector<int>& slot_of) {
+  void moe_experts(Enc2& E, const LayerW& w, int ci, int r0, int M, const std::vector<int>& slot_of) {
     const Cfg& c = c_;
-    const LayerW& w = L_[size_t(l)];
-    const int D = c.D, IE = c.IE, K = c.K;
+    const int D = c.D, IE = c.IE, K = w.topk;
     copy(E, XF_, size_t(r0) * size_t(D) * 4, XQ_, 0, size_t(M) * size_t(D) * 4);
     quant(E, XQ_, 0, M, D, D, 0);
     gemv8(E, w.sh1, XQ_, D, SG_, IE, M);
@@ -1448,6 +2069,13 @@ class Dsv4Model final : public NativeModel {
           continue;
         }
         const int m = std::min(g.n, T_ - rows);
+        if (m < g.n && !g.imgs.empty()) {
+          if (rows > 0) {  // the next pass, alone
+            rest.push_back(g);
+            continue;
+          }
+          fail("deepseek_v41: a prompt with images longer than a pass (" + std::to_string(T_) + " rows)");
+        }
         Seg h = g;
         h.n = m;
         if (m < g.n) {
@@ -1482,7 +2110,6 @@ class Dsv4Model final : public NativeModel {
     for (size_t i = 0; i < trees.size(); ++i) {
       const TreeSpec& t = trees[i];
       if (t.n_leaves > 0) fail("deepseek_v41: leaves are not supported");
-      if (t.images && t.n_images > 0) fail("deepseek_v41: images are not supported yet");
       if (t.root_len <= 0) fail("deepseek_v41: empty root");
       const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
       Plan& p = plan[i];
@@ -1492,6 +2119,12 @@ class Dsv4Model final : public NativeModel {
       p.first = t.save >= 0 ? save_len : t.root_len;
       Seg g;
       g.s = p.tgt, g.toks = t.root, g.n = p.first;
+      for (int k = 0; k < t.n_images; ++k) {  // each image goes with the segment that holds its run
+        const ImageRef& im = t.images[k];
+        const int n = image_run(im.grid_h, im.grid_w);
+        if (im.row + n <= p.first) g.imgs.push_back(im);
+        else if (im.row < p.first) fail("deepseek_v41: a checkpoint boundary splits an image");
+      }
       if (t.score_root && p.first == t.root_len) {
         out_[i].logits.resize(size_t(c_.V));
         g.logits = out_[i].logits.data();
@@ -1508,6 +2141,12 @@ class Dsv4Model final : public NativeModel {
         fork(*rest, *p.tgt);
         Seg g;
         g.s = rest, g.toks = t.root + p.first, g.n = t.root_len - p.first;
+        for (int k = 0; k < t.n_images; ++k)
+          if (t.images[k].row >= p.first) {
+            ImageRef im = t.images[k];
+            im.row -= p.first;
+            g.imgs.push_back(im);
+          }
         if (t.score_root) {
           out_[i].logits.resize(size_t(c_.V));
           g.logits = out_[i].logits.data();

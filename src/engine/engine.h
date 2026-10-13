@@ -125,7 +125,8 @@ struct PreparedImage {
   std::vector<float> pixels;
   int grid_t = 1, grid_h = 0, grid_w = 0;
   std::string digest;  // content hash (hex)
-  int tokens(int merge) const { return grid_t * grid_h * grid_w / (merge * merge); }
+  int ntok = 0;  // the run's tokens when the layout sets them (DeepSeek: start, rows + newlines, end)
+  int tokens(int merge) const { return ntok > 0 ? ntok : grid_t * grid_h * grid_w / (merge * merge); }
 };
 
 // A generation request in tokens.

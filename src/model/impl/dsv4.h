@@ -46,6 +46,13 @@ struct Cfg {
   int orig_len = 65536;
   int eng_heads = 8, eng_hd = 256, eng_max_n = 4;
   int bos = 0, eos = 1;
+  // DSpark draft head (mtp.* layers after the backbone)
+  int n_mtp = 0, ds_block = 0, ds_noise = 0, ds_E = 0, ds_K = 0, ds_markov = 0;
+  std::vector<int> ds_targets;
+  // vision (DeepSeek ViT + 3x3 aligner)
+  int v_layers = 0, v_dim = 1024, v_heads = 16, v_inter = 2816, v_patch = 14, v_down = 3, v_max_tok = 1024,
+      v_min_px = 295936, image_token = -1;
+  double v_theta = 10000;
   std::string score_func = "sqrtsoftplus";
 };
 
@@ -101,6 +108,25 @@ inline Cfg read_cfg(const json::Value& root) {
     c.beta_slow = rs->get_double("beta_slow", c.beta_slow);
     c.orig_len = int(rs->get_int("original_max_position_embeddings", c.orig_len));
   }
+  c.n_mtp = int(tc.get_int("num_nextn_predict_layers", 0));
+  c.ds_block = int(tc.get_int("dspark_block_size", 0));
+  c.ds_noise = int(tc.get_int("dspark_noise_token_id", 0));
+  c.ds_targets = ints("dspark_target_layer_ids");
+  c.ds_E = int(tc.get_int("dspark_n_routed_experts", c.E));
+  c.ds_K = int(tc.get_int("dspark_num_experts_per_tok", c.K));
+  c.ds_markov = int(tc.get_int("dspark_markov_rank", 256));
+  if (const json::Value* vc = root.get("vision_config"); vc && vc->is_object()) {
+    c.v_layers = int(vc->get_int("num_hidden_layers", 0));
+    c.v_dim = int(vc->get_int("hidden_size", c.v_dim));
+    c.v_heads = int(vc->get_int("num_attention_heads", c.v_heads));
+    c.v_inter = int(vc->get_int("intermediate_size", c.v_inter));
+    c.v_patch = int(vc->get_int("patch_size", c.v_patch));
+    c.v_down = int(vc->get_int("downsample_ratio", c.v_down));
+    c.v_max_tok = int(vc->get_int("max_image_tokens", c.v_max_tok));
+    c.v_min_px = int(vc->get_int("min_pixels", c.v_min_px));
+    c.v_theta = vc->get_double("rope_theta", c.v_theta);
+  }
+  c.image_token = int(root.get_int("image_token_id", -1));
   c.bos = int(root.get_int("bos_token_id", tc.get_int("bos_token_id", 0)));
   c.eos = int(root.get_int("eos_token_id", tc.get_int("eos_token_id", 1)));
   if (int(c.ratio.size()) < c.L) fail("deepseek_v41: compress_ratios has fewer entries than layers");
@@ -249,6 +275,7 @@ struct ETable {  // an Engram n-gram table: fp8 rows [rows, hd], e8m0 scales [ro
 };
 
 struct LayerW {
+  int nE = 0, topk = 0;     // routed experts and experts per token
   int ratio = 0, src = -1;  // compressed KV source index (0..), -1: none
   bool kv_src = false, idx_src = false, cand_src = false, uses_cand = false;
   Buf attn_norm, ffn_norm, hca_fn, hca_base, hca_scale, hcf_fn, hcf_base, hcf_scale;
@@ -260,7 +287,7 @@ struct LayerW {
   MatB i_wproj, i_wk;
   Buf i_knorm;
   MatB gate;
-  Buf gate_bias;
+  Buf gate_bias, gate_bias_vl;  // the VL bias picks the experts of image-span rows
   Mat8 sh1, sh2, sh3;
   std::vector<XLoc> x;
   int eg = -1;  // Engram index, -1: none
@@ -363,6 +390,11 @@ struct Seq {
   std::vector<int> cap;        // per KV source: entries
   Buf pend;                    // per ratio-2 source: kv [2][HD] | score [2][HD] float
   std::vector<int32_t> hist;   // the last eng_max_n - 1 token ids (oldest first)
+  // DSpark: the draft layers' window rings of the target's projected states,
+  // the target-layer means by position (ring of 128), the first position not
+  // yet in the draft rings; a verify pass's compressor rows (to roll back).
+  Buf dsring, mh, vpend;
+  int ds_len = 0;
 };
 
 }  // namespace espetero::native::ds4

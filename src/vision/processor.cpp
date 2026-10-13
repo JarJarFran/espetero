@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <tuple>
 #include <sstream>
 
 #include "../util/json.h"
@@ -183,6 +184,106 @@ Prepared preprocess(const RGBImage& image, const Spec& spec) {
                                    spec.max_pixels);
   if (w == image.width && h == image.height) return patchify(image, spec);
   return patchify(resize_bicubic(image, w, h), spec);
+}
+
+// ---- DeepSeek images -----------------------------------------------------------------
+
+namespace {
+
+// Python's round(): half to even.
+long py_round(double x) { return long(std::nearbyint(x)); }
+
+int64_t ds_tokens(int64_t lh, int64_t lw) { return lh * (lw + 1) + 2; }
+
+std::pair<int64_t, int64_t> ds_llm_grid(int64_t best_h, int64_t best_w, int patch, int down) {
+  return {int64_t(std::ceil(double(best_h / patch) / down)), int64_t(std::ceil(double(best_w / patch) / down))};
+}
+
+}  // namespace
+
+std::array<int, 4> deepseek_plan(int width, int height, int patch, int down, int max_tokens, int64_t min_pixels) {
+  if (width <= 0 || height <= 0 || patch <= 0 || down <= 0) throw std::invalid_argument("image: bad size");
+  int64_t w = width, h = height;
+  if (w * h < min_pixels) {  // plan_image_grid: scale small images up
+    const double ratio = std::sqrt(double(min_pixels) / double(w * h));
+    w = int64_t(double(w) * ratio), h = int64_t(double(h) * ratio);
+  }
+  int64_t best_w = int64_t(std::ceil(double(w) / patch)) * patch, best_h = int64_t(std::ceil(double(h) / patch)) * patch;
+  auto [lh, lw] = ds_llm_grid(best_h, best_w, patch, down);
+  if (ds_tokens(lh, lw) > max_tokens) {  // solve_resize_ratio
+    const double r = double(h) / double(w);
+    const double max_w = std::sqrt((max_tokens - 2) / r + 0.25) - 0.5, max_h = max_w * r;
+    const int64_t cell = int64_t(patch) * down;
+    if (max_w < 1.0) {
+      best_h = (max_tokens - 2) / 2 * cell, best_w = cell;
+    } else if (max_h < 1.0) {
+      best_h = cell, best_w = (max_tokens - 3) * cell;
+    } else {
+      const double beta = std::min(std::floor(max_w) * double(cell) / double(w), std::floor(max_h) * double(cell) / double(h));
+      best_h = int64_t(std::floor(double(h) * beta / patch)) * patch;
+      best_w = int64_t(std::floor(double(w) * beta / patch)) * patch;
+    }
+    std::tie(lh, lw) = ds_llm_grid(best_h, best_w, patch, down);
+    if (ds_tokens(lh, lw) > max_tokens || best_h <= 0 || best_w <= 0) throw std::invalid_argument("image: no plan fits the token budget");
+  }
+  return {int(best_h), int(best_w), int(lh), int(lw)};
+}
+
+Prepared preprocess_deepseek(const RGBImage& image, int patch, int down, int max_tokens, int64_t min_pixels) {
+  const auto plan = deepseek_plan(image.width, image.height, patch, down, max_tokens, min_pixels);
+  const int H = plan[0], W = plan[1];
+  // ImageOps.pad(image, (W, H), BICUBIC, color=(127, 127, 127), centering=(0.5, 0.5))
+  RGBImage canvas;
+  canvas.width = W, canvas.height = H;
+  canvas.rgb.assign(size_t(W) * size_t(H) * 3, 127);
+  const double im_ratio = double(image.width) / double(image.height), dest = double(W) / double(H);
+  if (im_ratio == dest) {
+    canvas = (image.width == W && image.height == H) ? image : resize_bicubic(image, W, H);
+  } else {
+    int nw = W, nh = H, x = 0, y = 0;
+    if (im_ratio > dest) {
+      nh = int(py_round(double(image.height) / double(image.width) * W));
+      y = int(py_round((H - nh) * 0.5));
+    } else {
+      nw = int(py_round(double(image.width) / double(image.height) * H));
+      x = int(py_round((W - nw) * 0.5));
+    }
+    nw = std::max(nw, 1), nh = std::max(nh, 1);
+    const RGBImage r = (nw == image.width && nh == image.height) ? image : resize_bicubic(image, nw, nh);
+    for (int yy = 0; yy < nh; ++yy) {
+      const int ty = y + yy;
+      if (ty < 0 || ty >= H) continue;
+      for (int xx = 0; xx < nw; ++xx) {
+        const int tx = x + xx;
+        if (tx < 0 || tx >= W) continue;
+        std::memcpy(&canvas.rgb[(size_t(ty) * size_t(W) + size_t(tx)) * 3], &r.rgb[(size_t(yy) * size_t(nw) + size_t(xx)) * 3], 3);
+      }
+    }
+  }
+  Prepared out;
+  const int gh = H / patch, gw = W / patch, K = 3 * patch * patch;
+  out.grid_t = 1, out.grid_h = gh, out.grid_w = gw;
+  out.pixels.resize(size_t(gh) * size_t(gw) * size_t(K));
+  auto bf16 = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  for (int py = 0; py < gh; ++py)
+    for (int px = 0; px < gw; ++px) {
+      float* o = out.pixels.data() + (size_t(py) * size_t(gw) + size_t(px)) * size_t(K);
+      for (int c = 0; c < 3; ++c)
+        for (int i = 0; i < patch; ++i)
+          for (int j = 0; j < patch; ++j) {
+            const uint8_t v = canvas.rgb[((size_t(py) * patch + size_t(i)) * size_t(W) + size_t(px) * patch + size_t(j)) * 3 + size_t(c)];
+            const float x = float(v) / 255.0f;
+            o[(size_t(c) * patch + size_t(i)) * patch + size_t(j)] = bf16((x - 0.5f) / 0.5f);
+          }
+    }
+  out.digest = digest(out.pixels.data(), out.pixels.size(), out.grid());
+  return out;
 }
 
 // ---- tokens and positions ---------------------------------------------------------

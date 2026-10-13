@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "../src/model/api.h"
+#include "../src/vision/vision.h"
 
 using namespace espetero;
 
@@ -74,6 +75,27 @@ int main(int argc, char** argv) {
       cmp(b2, bb);
       return 0;
     }
+    if (const char* ip = std::getenv("DS4_RUN_IMAGE")) {  // preprocess an image and dump its pixels and run embeddings
+      vision::RGBImage rgb;
+      std::string err;
+      if (!vision::load_rgb_file(ip, rgb, err)) throw std::runtime_error(err);
+      const ModelInfo& I = m->info();
+      vision::Prepared p = vision::preprocess_deepseek(rgb, I.vision_patch, I.vision_merge, I.vision_max_tokens, I.vision_min_pixels);
+      ImageRef r;
+      r.pixels = p.pixels.data(), r.grid_h = p.grid_h, r.grid_w = p.grid_w;
+      const int lh = (p.grid_h + 2) / 3, lw = (p.grid_w + 2) / 3, n = lh * (lw + 1) + 2;
+      std::vector<float> emb(size_t(n) * size_t(I.hidden));
+      auto t4 = std::chrono::steady_clock::now();
+      m->encode_images({r}, emb.data());
+      std::printf("image %dx%d -> patches %dx%d, run %d tokens, encoded in %.0f ms\n", rgb.width, rgb.height, p.grid_h, p.grid_w, n, ms(t4));
+      FILE* f = std::fopen("ds4_img_pixels.f32", "wb");
+      std::fwrite(p.pixels.data(), 4, p.pixels.size(), f);
+      std::fclose(f);
+      f = std::fopen("ds4_img_emb.f32", "wb");
+      std::fwrite(emb.data(), 4, emb.size(), f);
+      std::fclose(f);
+      return 0;
+    }
     const int s = m->slot_alloc();
     TreeSpec t;
     t.parent = -1;
@@ -104,6 +126,31 @@ int main(int argc, char** argv) {
       auto t2 = std::chrono::steady_clock::now();
       m->run({d});
       std::printf("forced %d -> %d  %.0f ms\n", f, arg, ms(t2));
+    }
+    if (const char* ch = std::getenv("DS4_RUN_CHAIN")) {  // gen tokens in chains of K steps (DSpark when available)
+      const int K = std::atoi(ch);
+      std::vector<int32_t> all;
+      int32_t cur = arg;
+      m->set_option("expert_stats_reset", 1);
+      auto t3 = std::chrono::steady_clock::now();
+      while (int(all.size()) < gen) {
+        TreeSpec d;
+        d.parent = s;
+        d.save = s;
+        d.root = &cur;
+        d.root_len = 1;
+        d.score_root = true;
+        std::vector<int32_t> o(static_cast<size_t>(K));
+        m->run_chain({d}, K, o.data());
+        for (int32_t x : o) all.push_back(x);
+        cur = o.back();
+      }
+      const double ms3 = ms(t3);
+      std::printf("chain K=%d: %zu tokens in %.1f s = %.2f tok/s\n%s\ntokens:", K, all.size(), ms3 / 1e3, all.size() / (ms3 / 1e3),
+                  m->profile_json().c_str());
+      for (int32_t x : all) std::printf(" %d", x);
+      std::printf("\n");
+      return 0;
     }
     std::vector<int32_t> out;
     for (int i = 0; i < gen; ++i) {
