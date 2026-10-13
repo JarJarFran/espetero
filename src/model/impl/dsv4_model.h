@@ -57,7 +57,7 @@ class Dsv4Model final : public NativeModel {
     const double wgb = double(rt_.arena->total()) / 1e9;
     alloc_scratch();
     // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each
-    int nslots = o.slots > 0 ? o.slots : 4;
+    int nslots = o.slots > 0 ? o.slots : 6;
     nuser_ = nslots;
     seqs_.resize(size_t(nslots) + size_t(kScratch));  // scratch slots after the user ones: trees that save nothing
     for (Seq& s : seqs_) alloc_seq(s);
@@ -103,7 +103,8 @@ class Dsv4Model final : public NativeModel {
     info_.weight_bytes = rt_.arena->total();
     info_.kv_bytes = seq_bytes_ * size_t(nslots);
     info_.slot_state_bytes = seq_bytes_;
-    info_.leaves = false;
+    info_.leaves = true;
+    info_.prompt_lookup = false;  // drafts verified as leaves read several tokens' experts from the SSD
     info_.commit = false;
     info_.hidden_states = false;
     info_.mtp = false;
@@ -230,7 +231,6 @@ class Dsv4Model final : public NativeModel {
   void run(const std::vector<TreeSpec>& trees, PassStats* stats) override {
     @autoreleasepool {
       const auto t0 = Clock::now();
-      out_.assign(trees.size(), Readout{});
       run_trees(trees);
       int rows = 0;
       for (const TreeSpec& t : trees) rows += t.root_len;
@@ -267,9 +267,8 @@ class Dsv4Model final : public NativeModel {
             }
             cur[t].out_argmax = nullptr;
           }
-          out_.assign(n, Readout{});
           run_trees(cur);
-          for (size_t t = 0; t < n; ++t) out[size_t(j) * n + t] = draw_token(cur[t], out_[t].logits.data(), cur[t].draw_pos0);
+          for (size_t t = 0; t < n; ++t) out[size_t(j) * n + t] = draw_token(cur[t], out_[t].back().logits.data(), cur[t].draw_pos0);
           rows += int(n);
         }
       } else {
@@ -492,13 +491,13 @@ class Dsv4Model final : public NativeModel {
   }
 
   const float* logits(int tree, int readout) const override {
-    if (readout != 0) fail("deepseek_v41: one readout per tree");
-    return out_.at(size_t(tree)).logits.data();
+    return out_.at(size_t(tree)).at(size_t(readout)).logits.data();
   }
   TopK topk(int tree, int readout) const override {
     TopK r;
     if (readout != 0) return r;
-    const Readout& o = out_.at(size_t(tree));
+    if (size_t(tree) >= out_.size() || size_t(readout) >= out_[size_t(tree)].size()) return r;
+    const Readout& o = out_[size_t(tree)][size_t(readout)];
     r.ids = o.tk_ids.data();
     r.x = o.tk_x.data();
     r.n = int(o.tk_ids.size());
@@ -594,13 +593,13 @@ class Dsv4Model final : public NativeModel {
   std::vector<Seq> seqs_;
   ModelInfo info_;
   int P_ = 1024, T_ = 16384, max_ctx_ = 32768, tile_cap_ = 0, nuser_ = 0;
-  static constexpr int kScratch = 4;
+  static constexpr int kScratch = 8;  // trees without a slot, and leaves (in rounds)
   int max_reads_ = 64;  // logits rows per pass
   static constexpr int kDsRows = 1024;  // target states entering the draft rings per draft pass
   size_t seq_bytes_ = 0;
   double engram_gb_ = 0;
   bool verbose_ = false, profile_ = false, partial_ = false, no_engram_ = false;
-  std::vector<Readout> out_;
+  std::vector<std::vector<Readout>> out_;  // [tree][readout]: leaves first, then the root
   std::map<std::string, std::pair<double, int>> prof_;
   double eng_read_ms_ = 0, gpu_ms_ = 0;
   uint64_t flushes_ = 0;
@@ -2097,9 +2096,11 @@ class Dsv4Model final : public NativeModel {
   // shared passes, then the remainders (rows after save_len) likewise.
   void run_trees(const std::vector<TreeSpec>& trees) {
     struct Plan {
-      Seq* tgt = nullptr;
+      Seq* tgt = nullptr;   // the slot holding parent + root (or the parent itself when there is no root)
+      Seq* base = nullptr;  // the state after the whole root: where leaves start
       int first = 0;
     };
+    out_.assign(trees.size(), {});
     std::vector<Plan> plan(trees.size());
     size_t scratch = size_t(nuser_);
     auto take_scratch = [&]() -> Seq* {
@@ -2109,14 +2110,21 @@ class Dsv4Model final : public NativeModel {
     std::vector<Seg> a;
     for (size_t i = 0; i < trees.size(); ++i) {
       const TreeSpec& t = trees[i];
-      if (t.n_leaves > 0) fail("deepseek_v41: leaves are not supported");
-      if (t.root_len <= 0) fail("deepseek_v41: empty root");
-      const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
+      if (t.commit_chain > 0) fail("deepseek_v41: no verify-commit");
+      if (t.root_len <= 0 && t.n_leaves <= 0) fail("deepseek_v41: empty tree");
+      out_[i].resize(size_t(std::max(0, t.n_leaves)) + (t.score_root ? 1 : 0));
       Plan& p = plan[i];
+      if (t.root_len <= 0) {  // leaves straight off the parent
+        if (t.parent < 0) fail("deepseek_v41: leaves without a root need a parent");
+        p.tgt = p.base = &seq(t.parent);
+        continue;
+      }
+      const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
       p.tgt = t.save >= 0 ? &seq(t.save) : t.work >= 0 ? &seq(t.work) : take_scratch();
       if (t.parent >= 0) fork(*p.tgt, seq(t.parent));
       else reset(*p.tgt);
       p.first = t.save >= 0 ? save_len : t.root_len;
+      p.base = p.tgt;
       Seg g;
       g.s = p.tgt, g.toks = t.root, g.n = p.first;
       for (int k = 0; k < t.n_images; ++k) {  // each image goes with the segment that holds its run
@@ -2126,8 +2134,9 @@ class Dsv4Model final : public NativeModel {
         else if (im.row < p.first) fail("deepseek_v41: a checkpoint boundary splits an image");
       }
       if (t.score_root && p.first == t.root_len) {
-        out_[i].logits.resize(size_t(c_.V));
-        g.logits = out_[i].logits.data();
+        Readout& r = out_[i].back();
+        r.logits.resize(size_t(c_.V));
+        g.logits = r.logits.data();
       }
       a.push_back(g);
     }
@@ -2136,9 +2145,11 @@ class Dsv4Model final : public NativeModel {
     for (size_t i = 0; i < trees.size(); ++i) {
       const TreeSpec& t = trees[i];
       Plan& p = plan[i];
+      if (t.root_len <= 0) continue;
       if (p.first < t.root_len) {
         Seq* rest = (t.work >= 0 && &seq(t.work) != p.tgt) ? &seq(t.work) : take_scratch();
         fork(*rest, *p.tgt);
+        p.base = rest;
         Seg g;
         g.s = rest, g.toks = t.root + p.first, g.n = t.root_len - p.first;
         for (int k = 0; k < t.n_images; ++k)
@@ -2148,8 +2159,9 @@ class Dsv4Model final : public NativeModel {
             g.imgs.push_back(im);
           }
         if (t.score_root) {
-          out_[i].logits.resize(size_t(c_.V));
-          g.logits = out_[i].logits.data();
+          Readout& r = out_[i].back();
+          r.logits.resize(size_t(c_.V));
+          g.logits = r.logits.data();
         }
         b.push_back(g);
       } else if (t.work >= 0 && &seq(t.work) != p.tgt) {
@@ -2157,8 +2169,40 @@ class Dsv4Model final : public NativeModel {
       }
     }
     run_segments(b);
+    // ---- leaves: each continues its tree's root in a scratch slot of its own, never seeing the others
+    struct Leaf {
+      size_t tree;
+      int k;
+    };
+    std::vector<Leaf> leaves;
     for (size_t i = 0; i < trees.size(); ++i)
-      if (trees[i].score_root && !out_[i].logits.empty()) finish_readout(trees[i], out_[i]);
+      for (int k = 0; k < trees[i].n_leaves; ++k) leaves.push_back({i, k});
+    for (size_t l0 = 0; l0 < leaves.size();) {
+      std::vector<Seg> c;
+      size_t sc = scratch;
+      int rows = 0;
+      size_t l1 = l0;
+      for (; l1 < leaves.size() && sc < seqs_.size(); ++l1) {
+        const TreeSpec& t = trees[leaves[l1].tree];
+        const int k = leaves[l1].k;
+        const int n = t.leaf_offsets[k + 1] - t.leaf_offsets[k];
+        if (n <= 0) fail("deepseek_v41: empty leaf");
+        if (!c.empty() && (rows + n > T_ || int(c.size()) >= max_reads_)) break;
+        Seq* s = &seqs_[sc++];
+        fork(*s, *plan[leaves[l1].tree].base);
+        Readout& r = out_[leaves[l1].tree][size_t(k)];
+        r.logits.resize(size_t(c_.V));
+        Seg g;
+        g.s = s, g.toks = t.leaf_tokens + t.leaf_offsets[k], g.n = n, g.logits = r.logits.data();
+        c.push_back(g);
+        rows += n;
+      }
+      run_segments(c);
+      l0 = l1;
+    }
+    for (size_t i = 0; i < trees.size(); ++i)
+      for (size_t r = 0; r < out_[i].size(); ++r)
+        if (!out_[i][r].logits.empty()) finish_readout(trees[i], out_[i][r], int(r));
   }
 
   static uint64_t tk_mix(uint64_t x) {
@@ -2175,7 +2219,10 @@ class Dsv4Model final : public NativeModel {
     return float(x >> 40) * 0x1.0p-24f + 0x1.0p-25f;
   }
 
-  void finish_readout(const TreeSpec& t, Readout& o) {
+  // Readout ri of tree t (leaves first, then the root).
+  void finish_readout(const TreeSpec& t, Readout& o, int ri = 0) {
+    const bool leaf = ri < t.n_leaves;
+    const int64_t pos = t.draw_pos0 + (leaf ? int64_t(t.leaf_offsets[ri + 1] - t.leaf_offsets[ri]) : 0);
     const int V = c_.V;
     const float* L = o.logits.data();
     int am = 0;
@@ -2186,8 +2233,8 @@ class Dsv4Model final : public NativeModel {
     double se = 0;
     for (int i = 0; i < V; ++i) se += std::exp(double(L[i] - mx));
     o.lse = float(double(mx) + std::log(se));
-    if (t.out_argmax) t.out_argmax[0] = am;
-    if (t.out_lse) t.out_lse[0] = o.lse;
+    if (t.out_argmax) t.out_argmax[ri] = am;
+    if (t.out_lse) t.out_lse[ri] = o.lse;
     const int K = std::min(32, std::max(t.topk, t.topk_min));
     if (K > 0) {
       const float it = (t.topk > 0 && t.temperature > 0) ? 1.0f / t.temperature : 1.0f;
@@ -2234,16 +2281,15 @@ class Dsv4Model final : public NativeModel {
         int sampled = o.tk_ids[0];
         for (int q = 0; q < std::max(keep, 1); ++q) {
           if (!(pr[q] > 0.0f)) continue;
-          const float g = -std::log(-std::log(tk_uniform(t.seed, uint64_t(t.draw_pos0), uint64_t(int64_t(o.tk_ids[size_t(q)])))));
+          const float g = -std::log(-std::log(tk_uniform(t.seed, uint64_t(pos), uint64_t(int64_t(o.tk_ids[size_t(q)])))));
           const float sc = std::log(pr[q]) + g;
           if (sc > best) best = sc, sampled = o.tk_ids[size_t(q)];
         }
         o.sampled = sampled;
       }
     }
-    if (t.out_cand_logits && t.cand_offsets && t.cand_ids) {
-      for (int j = t.cand_offsets[0]; j < t.cand_offsets[1]; ++j) t.out_cand_logits[j] = L[t.cand_ids[j]];
-    }
+    if (leaf && t.out_cand_logits && t.cand_offsets && t.cand_ids)
+      for (int j = t.cand_offsets[ri]; j < t.cand_offsets[ri + 1]; ++j) t.out_cand_logits[j] = L[t.cand_ids[j]];
   }
 };
 

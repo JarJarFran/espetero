@@ -317,7 +317,7 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   const ModelInfo& I = model_->info();
   // Models without multi-branch passes (Qwen4-Exp so far): no prompt-lookup
   // drafts (verified as leaves) and no decision trees.
-  if (!I.leaves) opt_.prompt_lookup = false;
+  if (!I.leaves || !I.prompt_lookup) opt_.prompt_lookup = false;
   if (opt_.draft_tokens < 0) opt_.draft_tokens = I.draft_default > 0 ? I.draft_default : 5;
 
   for (const char* t : {"<|im_end|>", "<|endoftext|>", "<|end_of_text|>", "<|eot_id|>"}) {
@@ -369,7 +369,9 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   if (template_ && I.leaves && !clef_) {
     dp_ = std::make_unique<DecisionPrompts>();
     dp_->labels = make_labels(*tok_);
-    const std::string image_block = I.vision ? tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end}) : "";
+    const std::string image_block = !I.vision ? ""
+                                    : vision_start < 0 ? tok_->decode(std::vector<int32_t>{image_token})  // DeepSeek: one placeholder
+                                                       : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
     if (!header_.empty()) {
@@ -3073,12 +3075,14 @@ void Engine::step() {
     t.cand_ids = j->cand_ids.data();
     t.out_cand_logits = j->cand_logits.data();
     t.out_lse = j->lse.data();
-    if (!j->positions.empty()) {
-      // Explicit M-RoPE positions for the root; images only when their rows
+    if (!j->positions.empty() || !j->images.empty()) {
+      // Explicit M-RoPE positions for the root (layouts that have them); images only when their rows
       // are computed here (a checkpoint hit already holds them).
       const size_t start = size_t(j->cached);
-      j->root_pos.assign(j->positions.begin() + long(start * 3), j->positions.begin() + long((start + j->root.size()) * 3));
-      t.root_pos = j->root_pos.data();
+      if (!j->positions.empty()) {
+        j->root_pos.assign(j->positions.begin() + long(start * 3), j->positions.begin() + long((start + j->root.size()) * 3));
+        t.root_pos = j->root_pos.data();
+      }
       if (j->cache_state != "hit") {
         int g = 0;
         j->irefs.clear();
@@ -3222,9 +3226,11 @@ void Engine::step() {
     t.root = s->root.data();
     t.root_len = int(s->root.size());
     t.mtp = s->mtp;
-    if (!s->req.positions.empty()) {
-      s->root_pos.assign(s->req.positions.begin() + long(size_t(s->done) * 3), s->req.positions.begin() + long(size_t(end) * 3));
-      t.root_pos = s->root_pos.data();
+    if (!s->req.positions.empty() || !s->req.image_rows.empty()) {  // DeepSeek images come without M-RoPE positions
+      if (!s->req.positions.empty()) {
+        s->root_pos.assign(s->req.positions.begin() + long(size_t(s->done) * 3), s->req.positions.begin() + long(size_t(end) * 3));
+        t.root_pos = s->root_pos.data();
+      }
       s->irefs.clear();
       for (size_t g = 0; g < s->req.image_rows.size(); ++g) {
         const int r0 = s->req.image_rows[g];

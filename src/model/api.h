@@ -64,6 +64,7 @@ struct ModelInfo {
   size_t weight_bytes = 0, kv_bytes = 0, state_bytes = 0, slot_state_bytes = 0;
   bool vision = false, mtp = false;
   bool leaves = true;  // multi-branch passes (draft leaves, decision trees)
+  bool prompt_lookup = true;  // the engine may verify prompt-lookup drafts as leaves
   bool commit = false;  // verify-commit: TreeSpec::commit_chain + NativeModel::commit
   bool hidden_states = true;  // TreeSpec::out_hidden readouts (not Qwen4-Exp yet)
   int draft_default = 0;  // MTP drafts per pass when --draft is not given (0: the engine's default, 5)
