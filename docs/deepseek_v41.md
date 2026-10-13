@@ -134,7 +134,10 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
   reads several times one token's experts from the SSD, so a chain decoded at
   1.45 tok/s against 3.1 tok/s plain (12 GB expert cache). The draft rings, the
   target-layer states and the rollback of rejected rows are in `dsv4_model.h`.
-* Not yet: leaves (decisions, prompt-lookup drafts).
+* **Leaves** (the decisions API, `/v1/decisions`): each leaf continues its
+  tree's root in a scratch slot of its own (forked from the root's state), all
+  leaves of a step in shared passes. Prompt-lookup drafts stay off for this
+  model (`ModelInfo::prompt_lookup`): verifying them reads more experts.
 
 ## 4. Chat template
 
