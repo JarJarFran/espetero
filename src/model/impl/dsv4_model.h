@@ -71,7 +71,8 @@ class Dsv4Model final : public NativeModel {
       double gb = o.expert_cache_gb;
       if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) gb = std::atof(v);
       if (gb <= 0) {
-        gb = std::min({ws - mine - 4e9, double(ram) - mine - 26e9, sys_avail - mine - 12e9}) / 1e9;
+        // what the GPU working set allows, keeping ~14 GB of the Mac for macOS, apps and the file cache
+        gb = std::min({ws - mine - 3e9, double(ram) - mine - 14e9, sys_avail - mine - 6e9}) / 1e9;
         if (gb < 20)
           std::fprintf(stderr, "deepseek_v41: only %.1f GB of memory available for the expert cache (%.1f GB free "
                                "before loading): every token will read most experts from the SSD\n", gb, sys_avail / 1e9);
