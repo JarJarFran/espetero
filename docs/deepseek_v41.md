@@ -103,7 +103,17 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
   After each layer's routing the missing experts are read with parallel 1 MB
   `pread`s (`F_NOCACHE`, ≈ 8 GB/s from the internal SSD) straight into their
   slots; long passes pipeline reads with the GPU (shared events), decode
-  prefetches the next layer's likely experts. The hottest slots are saved at
+  prefetches the next layer's likely experts.
+  **Streaming** (long passes): a layer over ≥ 256 rows uses nearly every
+  expert, so its experts need no routing: a reader thread reads the coming
+  layers' missing experts in layer order, two layers ahead of the GPU, while
+  the GPU runs attention and the MoE of the layers before; the MoE takes them
+  as they arrive. A pass needs more experts (~14 K) than the cache holds, so
+  while streaming the cache evicts first what this pass streamed in for layers
+  it is done with: the coming layers' cached experts and the decode working set
+  stay (LRU evicted both, and decoding after a long prompt lost hits).
+  `ESPETERO_DS4_STREAM=0`: off. A pass holds up to 32 K rows (~140 KB of
+  scratch per row), so prompts up to the context run as one pass. The hottest slots are saved at
   exit and read back at start (`ESPETERO_DS4_WARM=0` skips it).
   Eviction: `ESPETERO_DS4_TRACE=FILE` records every access and
   `tools/dsv4_xsim.py` replays policies on it. On a mixed trace (decodes and a
@@ -179,12 +189,16 @@ coefficients, which is what `hc_pre` with the previous layer's `f_pre` does),
 Engram at layers 1 and 14 and DSpark with a confidence head. Measured on the
 M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
 
-* **Prefill** is bound by expert reads: every layer of a long prompt touches all
-  384 experts, ~190 GB per pass beyond the cache. CED (§3) removed half the GPU
-  work; left: (1) passes of 16,384 rows split longer prompts and read every
-  expert again per pass (19.8 K tokens: 377 GB); (2) reads and GPU overlap only
-  in part (19.8 K tokens: reads 64 s, GPU 65 s, prefill 108 s); reading the next
-  layer's experts during the current layer's attention would approach ~70 s.
+* **Prefill**: every layer of a long prompt touches all 384 experts. Measured
+  (server, warm cache):
+
+  | prompt | before | CED | + streaming, 32 K-row passes, pass-aware eviction |
+  |:--|:--|:--|:--|
+  | 4.5 K tokens | 46.3 s | 38.4 s | 30.6 s (146 tok/s; 202 GB read at 7.1 GB/s) |
+  | 19.7 K tokens | 149.8 s | 107.5 s | 69.9 s (282 tok/s; GPU 57 s, reads 29 s) |
+
+  Short prompts are now bound by the SSD, long ones by the GPU's prefill
+  kernels.
   DeepSeek's decoder bounded replay (128 rows per decoder layer, approximate,
   trained for) would save ~24 K decoder rows more; not adopted.
 * **Decode** (~10 tok/s): GPU ~46 ms per token, expert reads ~53 ms (19 misses
@@ -223,4 +237,14 @@ Development switches: `ESPETERO_DS4_LAYERS=n` (first n layers, no head),
 `ESPETERO_DS4_NO_ENGRAM=1`, `ESPETERO_DS4_NOQUANT=1`, `ESPETERO_DS4_DUMP=dir`,
 `ESPETERO_DS4_PROFILE=1` (per-kernel GPU times), `ESPETERO_DS4_GEMM_MIN`,
 `ESPETERO_DS4_SUB`, `ESPETERO_DS4_ROWS`, `ESPETERO_DS4_PREFETCH=0`,
-`ESPETERO_DS4_WARM=0`, `ESPETERO_DS4_TRACE=file`, `ESPETERO_DS4_CED=0`, `ESPETERO_EXPERT_CACHE_GB`.
+`ESPETERO_DS4_WARM=0`, `ESPETERO_DS4_TRACE=file`, `ESPETERO_DS4_CED=0`, `ESPETERO_DS4_STREAM=0`,
+`ESPETERO_DS4_PIPE=0`, `ESPETERO_EXPERT_CACHE_GB`.
+
+Determinism: a pass is bit-reproducible except that the pipelined MoE of long
+passes adds a row's expert outputs in an order that depends on which experts
+were cached, and the activation roundings amplify that last bit into ~0.5 on
+the logits. Exact comparisons (e.g. a change that must not alter results) run
+`build/dsv4_run` with `ESPETERO_DS4_PREFETCH=0 ESPETERO_DS4_PIPE=0
+ESPETERO_DS4_GEMM_MIN=1000000`: CED, streaming, chunked prompts and two
+sequences per pass all give bit-identical logits that way. (`make` builds only
+`build/espetero`; `make build/dsv4_run` for the driver.)

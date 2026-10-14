@@ -715,7 +715,6 @@ kernel void ds4_topk(device const float* S [[buffer(0)]], device int* out [[buff
                      uint m [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup int red[32];
-  threadgroup atomic_int cnt;
   device const float* s = S + ulong(m) * ulong(p.stride);
   device int* o = out + ulong(m) * ulong(p.k);
   const int nvis = min(p.ncols, (pos[m] + 1) / p.ratio);
@@ -736,13 +735,22 @@ kernel void ds4_topk(device const float* S [[buffer(0)]], device int* out [[buff
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tot >= p.k) t = cand;
   }
-  if (tid == 0) atomic_store_explicit(&cnt, 0, memory_order_relaxed);
+  // the entries above the threshold in position order (attention sums them in this order, so it must not
+  // depend on thread timing): each thread a contiguous range, its place from a scan of the counts
+  const int chunk = (nvis + 1023) / 1024, j0 = int(tid) * chunk, j1 = min(nvis, j0 + chunk);
+  int c = 0;
+  for (int j = j0; j < j1; ++j) c += ds4_key(s[j]) > t ? 1 : 0;
+  const int pre = simd_prefix_exclusive_sum(c);
+  if (lane == 31) red[sg] = pre + c;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int j = int(tid); j < nvis; j += 1024)
-    if (ds4_key(s[j]) > t) o[atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed)] = j;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  int at = pre;
+  for (uint q = 0; q < sg; ++q) at += red[q];
+  for (int j = j0; j < j1; ++j)
+    if (ds4_key(s[j]) > t) o[at++] = j;
+  threadgroup_barrier(mem_flags::mem_device);
   if (tid == 0) {  // ties, lowest positions first
-    int n = atomic_load_explicit(&cnt, memory_order_relaxed);
+    int n = 0;
+    for (int q = 0; q < 32; ++q) n += red[q];
     for (int j = 0; j < nvis && n < p.k; ++j)
       if (ds4_key(s[j]) == t) o[n++] = j;
     for (; n < p.k; ++n) o[n] = -1;

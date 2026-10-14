@@ -8,6 +8,9 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
@@ -51,7 +54,9 @@ class Dsv4Model final : public NativeModel {
     // of a GPU sub-chunk (P_).
     P_ = 1024;
     if (const char* v = std::getenv("ESPETERO_DS4_SUB")) P_ = std::clamp(std::atoi(v), 8, 4096);
-    T_ = std::min(max_ctx_, std::max(16384, o.max_rows));
+    // A pass reads nearly every expert of its layers: a prompt in two passes reads them twice (~190 GB). 32 K
+    // rows (~140 KB of scratch each) cost 2.3 GB of expert cache next to 16 K: +0.5 misses per decoded token.
+    T_ = std::min(max_ctx_, std::max(32768, o.max_rows));
     if (const char* v = std::getenv("ESPETERO_DS4_ROWS")) T_ = std::clamp(std::atoi(v), 1, max_ctx_);
     P_ = std::min(P_, T_);
     load_weights();
@@ -140,7 +145,16 @@ class Dsv4Model final : public NativeModel {
     info_.extra = ex;
   }
 
-  ~Dsv4Model() override = default;
+  ~Dsv4Model() override {
+    if (st_th_.joinable()) {
+      {
+        std::lock_guard<std::mutex> lk(st_mu_);
+        st_stop_ = true;
+      }
+      st_cv_.notify_all();
+      st_th_.join();
+    }
+  }
 
   const ModelInfo& info() const override { return info_; }
 
@@ -555,6 +569,9 @@ class Dsv4Model final : public NativeModel {
     o.set("wait_ms", wait_ms_);    // host time waiting for command buffers (GPU time + launch + wake-up)
     o.set("wake_ms", wake_ms_);    // from each command buffer's end to the host noticing
     o.set("forward_ms", fwd_ms_);  // wall time inside passes
+    o.set("stream_issued", int64_t(st_issued_));
+    o.set("stream_gb", double(st_bytes_.load()) / 1e9);
+    o.set("stream_ms", double(st_us_.load()) / 1e3);
     o.set("prefetch_issued", int64_t(pf_issued_));
     o.set("prefetch_used", int64_t(pf_used_));
     o.set("prefetch_wasted", int64_t(pf_wasted_));
@@ -869,6 +886,7 @@ class Dsv4Model final : public NativeModel {
     x.key.assign(size_t(x.n), -1);
     x.stamp.assign(size_t(x.n), 0);
     x.pref.assign(size_t(x.n), 0);
+    x.spass.assign(size_t(x.n), 0);
     x.loading.reset(new std::atomic<int>[size_t(x.n)]);
     for (int i = 0; i < x.n; ++i) x.loading[size_t(i)].store(0);
     x.where.assign(size_t(c_.L + c_.n_mtp) * size_t(c_.E), -1);  // (layer, expert); draft layers after the backbone
@@ -1648,20 +1666,128 @@ class Dsv4Model final : public NativeModel {
   // The least recently used slot not used by this layer (stamp `now`) and not being read.
   // (Offline simulations on a trace of real traffic, ESPETERO_DS4_TRACE + tools/dsv4_xsim.py: ARC, SLRU and
   // decayed-frequency policies come within a few percent of LRU, and frequency with a long memory is far worse.)
+  // In a streamed pass, first the experts this pass streamed in for layers it is done with: a pass cycles
+  // through more experts than the cache holds, and LRU would evict the coming layers' cached experts (and
+  // what decoding uses) to make room for ones the pass needs no more.
   int evict_slot(uint64_t now) {
     ExpertCache& x = xc_;
-    int best = -1;
-    double bs = 1e300;
+    int best = -1, done = -1;
+    double bs = 1e300, ds = 1e300;
     for (int sl = 0; sl < x.n; ++sl) {
       if (x.key[size_t(sl)] < 0) return sl;
       if (x.stamp[size_t(sl)] == now || x.loading[size_t(sl)].load() == 1) continue;
+      const int kl = x.key[size_t(sl)] / c_.E;
+      if (kl >= prot_lo_ && kl <= prot_hi_) continue;  // a streamed pass's window
       const double v = double(x.stamp[size_t(sl)]);
       if (v < bs) bs = v, best = sl;
+      if (prot_lo_ >= 0 && kl < prot_lo_ && x.spass[size_t(sl)] == x.pass && v < ds) ds = v, done = sl;
     }
+    if (done >= 0) best = done;
     if (best < 0) fail("deepseek_v41: expert cache too small for one layer");
     x.where[size_t(x.key[size_t(best)])] = -1;
     x.key[size_t(best)] = -1;
     return best;
+  }
+
+  // ---- streaming (long passes): a layer over many rows uses nearly every expert, so its experts need no
+  // routing to be known. The main thread gives the coming layers' missing experts their slots (it alone
+  // touches the cache's tables) and a reader thread reads them in layer order, up to kStreamAhead layers
+  // ahead of the GPU; the slots of the layer at hand and of the streamed ones are not evicted
+  // (prot_lo_..prot_hi_), and the MoE takes the experts as they arrive. The SSD reads while the GPU runs
+  // attention and the MoE of the layers before. ESPETERO_DS4_STREAM=0: off.
+  static constexpr int kStreamAhead = 2;     // layers read ahead of the one at hand
+  static constexpr int kStreamRows = 256;    // rows from which a layer counts as using every expert
+  static constexpr size_t kStreamBatch = 8;  // experts per batch of reads (their flags drop together)
+  struct SJob {
+    int fd;
+    uint8_t* dst;
+    uint64_t w, s;
+    std::atomic<int>* flag;
+  };
+  std::thread st_th_;
+  std::mutex st_mu_;
+  std::condition_variable st_cv_;
+  std::deque<SJob> st_q_;
+  bool st_stop_ = false;
+  std::atomic<uint64_t> st_bytes_{0}, st_us_{0};
+  int prot_lo_ = -1, prot_hi_ = -2;  // expert-cache layers whose slots stay
+  int st_next_ = 0;                  // the next layer of the pass to stream
+  uint64_t st_issued_ = 0;
+
+  void st_loop() {
+    for (;;) {
+      std::vector<SJob> b;
+      {
+        std::unique_lock<std::mutex> lk(st_mu_);
+        st_cv_.wait(lk, [&] { return st_stop_ || !st_q_.empty(); });
+        if (st_q_.empty()) return;
+        while (!st_q_.empty() && b.size() < kStreamBatch) b.push_back(st_q_.front()), st_q_.pop_front();
+      }
+      const auto t0 = Clock::now();
+      const size_t wb = xc_.wbytes, sb = xc_.sbytes, piece = size_t(1) << 20, np = (wb + piece - 1) / piece + 1;
+      std::vector<std::atomic<char>> ok(b.size());
+      for (auto& o : ok) o.store(1);
+      parallel_for(b.size() * np, [&](size_t i) {
+        const SJob& j = b[i / np];
+        const size_t q = i % np;
+        const bool r = q + 1 < np ? pread_all(j.fd, j.dst + q * piece, std::min(piece, wb - q * piece), size_t(j.w + q * piece))
+                                  : pread_all(j.fd, j.dst + wb, sb, size_t(j.s));
+        if (!r) ok[i / np].store(0);
+      });
+      for (size_t i = 0; i < b.size(); ++i) b[i].flag->store(ok[i].load() ? 0 : 2);
+      st_bytes_ += uint64_t(b.size()) * uint64_t(xc_.slot_bytes);
+      st_us_ += uint64_t(ms_since(t0) * 1000.0);
+    }
+  }
+
+  // Streams the dense layers of the pass up to layer `upto` (dense[l]: the layer uses every expert).
+  void stream_to(int upto, const std::vector<char>& dense, const std::vector<LayerW>& LW) {
+    ExpertCache& x = xc_;
+    const uint64_t now = x.clock;
+    std::vector<SJob> jobs;
+    for (; st_next_ <= upto && st_next_ < int(LW.size()); ++st_next_) {
+      const int l = st_next_;
+      prot_hi_ = l;
+      if (!dense[size_t(l)]) continue;
+      const LayerW& lw = LW[size_t(l)];
+      for (int e = 0; e < lw.nE; ++e) {
+        const int k = l * c_.E + e;
+        if (x.where[size_t(k)] >= 0) continue;
+        const int sl = evict_slot(now);
+        if (x.pref[size_t(sl)]) ++pf_wasted_;
+        x.key[size_t(sl)] = k;
+        x.where[size_t(k)] = sl;
+        x.stamp[size_t(sl)] = now;
+        x.pref[size_t(sl)] = 1;
+        x.spass[size_t(sl)] = x.pass;
+        x.loading[size_t(sl)].store(1);
+        ++st_issued_;
+        const XLoc& loc = lw.x[size_t(e)];
+        const int fd = ck_.fds_nc[size_t(loc.file)] >= 0 ? ck_.fds_nc[size_t(loc.file)] : ck_.fds[size_t(loc.file)];
+        jobs.push_back({fd, x.host_ptr(sl), loc.w, loc.s, &x.loading[size_t(sl)]});
+      }
+    }
+    if (jobs.empty()) return;
+    if (!st_th_.joinable()) st_th_ = std::thread([this] { st_loop(); });
+    {
+      std::lock_guard<std::mutex> lk(st_mu_);
+      for (const SJob& j : jobs) st_q_.push_back(j);
+    }
+    st_cv_.notify_one();
+  }
+
+  // Waits until a slot's read (prefetch or stream) is over; false: it failed (the slot is free to read again).
+  bool wait_slot(int sl) {
+    if (xc_.loading[size_t(sl)].load() == 1) {
+      const auto tw = Clock::now();
+      while (xc_.loading[size_t(sl)].load() == 1) std::this_thread::yield();
+      pf_wait_ms_ += ms_since(tw);
+    }
+    if (xc_.loading[size_t(sl)].load() == 2) {
+      xc_.loading[size_t(sl)].store(0);
+      return false;
+    }
+    return true;
   }
 
   // ---- prefetch: experts the next layer will probably need, read in the
@@ -1716,7 +1842,8 @@ class Dsv4Model final : public NativeModel {
   // misses' slots (LRU), read here unless `pending` takes them (indices into
   // need: assigned but not read). Prefetched slots still loading are waited for.
   std::vector<int> expert_slots(Enc2& E, int l, const LayerW& lw, const std::vector<int>& need, std::vector<size_t>* pending = nullptr,
-                                const std::vector<int>* rows = nullptr) {  // rows: how many rows use each needed expert (for the trace)
+                                const std::vector<int>* rows = nullptr,  // rows: how many rows use each needed expert (for the trace)
+                                std::vector<size_t>* waiting = nullptr) {  // waiting: experts still being read for us, not waited for here
     (void)E;
     ExpertCache& x = xc_;
     const uint64_t now = ++x.clock;
@@ -1732,6 +1859,14 @@ class Dsv4Model final : public NativeModel {
       const int k = l * c_.E + need[i];
       const int s = x.where[size_t(k)];
       if (s >= 0) {
+        if (waiting && x.loading[size_t(s)].load() == 1) {  // the pass's streamer still reading it: the MoE rounds wait
+          if (x.pref[size_t(s)]) x.pref[size_t(s)] = 0, ++pf_used_;
+          slot[i] = s;
+          x.stamp[size_t(s)] = now;
+          ++x.hits;
+          waiting->push_back(i);
+          continue;
+        }
         if (x.loading[size_t(s)].load() == 1) {  // a prefetch still reading it
           const auto tw = Clock::now();
           while (x.loading[size_t(s)].load() == 1) std::this_thread::yield();
@@ -1899,6 +2034,14 @@ class Dsv4Model final : public NativeModel {
       for (int o : rows_out[size_t(l - dec0)]) n += o;
       return n;
     };
+    // ---- the layers whose experts stream ahead of the GPU (stream_to)
+    static const bool stream_on = !(std::getenv("ESPETERO_DS4_STREAM") && std::atoi(std::getenv("ESPETERO_DS4_STREAM")) == 0);
+    std::vector<char> dense(LW.size(), 0);
+    bool streaming = false;
+    st_next_ = 0, prot_lo_ = -1, prot_hi_ = -2;
+    if (stream_on && !draft && xc_.n >= (kStreamAhead + 3) * c.E + 64)
+      for (int l = 0; l < int(LW.size()); ++l)
+        if (full_rows(l) >= kStreamRows) dense[size_t(l)] = 1, streaming = true;
     Enc2 E(rt_);
     if (profile_ || env_on("ESPETERO_DS4_PROFILE")) E.prof = &prof_;
     {
@@ -1923,6 +2066,7 @@ class Dsv4Model final : public NativeModel {
     for (int l = 0; l < int(LW.size()); ++l) {
       const LayerW& w = LW[size_t(l)];
       const int K = w.topk, key = draft ? c.L + l : l;  // the expert cache's layer
+      if (streaming) prot_lo_ = std::max(0, l - 1), stream_to(l + kStreamAhead, dense, LW);  // l - 1: its MoE may still run
       std::vector<Blk> fsub, ksub;  // a decoder layer's blocks: rows with outputs, rows with window latents only
       if (dec0 >= 0 && l >= dec0) {
         std::vector<int> flo(segs.size()), fhi(segs.size()), klo(segs.size());
@@ -1937,7 +2081,7 @@ class Dsv4Model final : public NativeModel {
       }
       std::vector<Blk>& fb = dec0 >= 0 && l >= dec0 ? fsub : blks;
       const int Tf = full_rows(l);
-      const bool more = pf_on_ && !draft && l + 1 < int(LW.size());
+      const bool more = pf_on_ && !draft && l + 1 < int(LW.size()) && !dense[size_t(std::min(l + 1, int(LW.size()) - 1))];
       // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
       // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
       static const bool pred_on = std::getenv("ESPETERO_DS4_PREDICT") && std::atoi(std::getenv("ESPETERO_DS4_PREDICT")) != 0;
@@ -2015,8 +2159,8 @@ class Dsv4Model final : public NativeModel {
       // long passes overlap the misses' reads with the experts' GPU work (ESPETERO_DS4_PIPE=0: off)
       static const bool pipe_on = !(std::getenv("ESPETERO_DS4_PIPE") && std::atoi(std::getenv("ESPETERO_DS4_PIPE")) == 0);
       const bool pipe = pipe_on && !draft && Tf >= 256;
-      std::vector<size_t> pend;
-      const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr, &nrows);
+      std::vector<size_t> pend, waiting;
+      const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr, &nrows, pipe && streaming ? &waiting : nullptr);
       if (more) {  // the next layer's experts, read while the GPU works on this one
         const LayerW& nw = LW[size_t(l + 1)];
         std::vector<int> nx;
@@ -2051,6 +2195,7 @@ class Dsv4Model final : public NativeModel {
         {
           std::vector<char> miss_e(size_t(w.nE), 0);
           for (size_t i : pend) miss_e[size_t(need[i])] = 1;
+          for (size_t i : waiting) miss_e[size_t(need[i])] = 1;
           for (int e : need)
             if (!miss_e[size_t(e)]) in[size_t(e)] = 1;
         }
@@ -2058,16 +2203,21 @@ class Dsv4Model final : public NativeModel {
           moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, true, YT_, size_t(fb[ci].r0) * yrow, 0);
         id<MTLCommandBuffer> used[2] = {E.submit_chained(), nil};
         const size_t RB = size_t(std::max(1, xc_.stage_n));
+        // rounds: the streamed experts as they arrive (in the reader's order), then the misses, read here
+        std::vector<std::pair<size_t, bool>> todo;
+        for (size_t i : waiting) todo.push_back({i, true});
+        for (size_t i : pend) todo.push_back({i, false});
         int k = 1;
-        for (size_t b0 = 0; b0 < pend.size(); b0 += RB, ++k) {
+        for (size_t b0 = 0; b0 < todo.size(); b0 += RB, ++k) {
           const int par = k % 2;
           if (used[par]) E.wait_cb(used[par]);  // its host tables are free again
-          const size_t b1 = std::min(pend.size(), b0 + RB);
+          const size_t b1 = std::min(todo.size(), b0 + RB);
           std::vector<std::pair<int, int>> es;
           std::fill(in.begin(), in.end(), 0);
           for (size_t j = b0; j < b1; ++j) {
-            es.push_back({need[pend[j]], slots[pend[j]]});
-            in[size_t(need[pend[j]])] = 1;
+            const size_t i = todo[j].first;
+            if (!todo[j].second || !wait_slot(slots[i])) es.push_back({need[i], slots[i]});
+            in[size_t(need[i])] = 1;
           }
           read_slots(w, es);  // straight into the slots, while the GPU runs the earlier rounds
           for (size_t ci = 0; ci < fb.size(); ++ci)
@@ -2080,6 +2230,7 @@ class Dsv4Model final : public NativeModel {
       cur ^= 1;
       if (!dump_dir_.empty()) dump_rows(E, "h" + std::to_string(l), H_, size_t(T) * 4 * size_t(D));
     }
+    prot_lo_ = -1, prot_hi_ = -2;
     // ---- logits of the segments' last rows
     int R = 0;
     for (const Seg& g : segs)

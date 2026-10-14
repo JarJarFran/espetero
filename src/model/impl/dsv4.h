@@ -376,6 +376,7 @@ struct ExpertCache {
   bool locked = false;           // locked with mlock
   std::vector<uint8_t> pref;     // slot -> filled by a prefetch, not used yet
   uint64_t pass = 0;              // forward passes (the access trace's clock)
+  std::vector<uint64_t> spass;    // slot -> the pass whose streamer read it (0: none)
   std::unique_ptr<std::atomic<int>[]> loading;  // slot -> 0 ready, 1 being read, 2 read failed
   int stage_n = 0;               // experts per pipelined round
   // stats
