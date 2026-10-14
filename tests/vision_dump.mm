@@ -6,12 +6,16 @@
 // little-endian float32 files beside a JSON index, for
 // tools/vision_fidelity.py (which runs mlx-vlm on the same files).
 //
-//   build/vision_dump <MLX model dir> <out dir> <max_pixels> <image> [<image> ...]
+//   build/vision_dump <MLX model dir | .gguf> <out dir> <max_pixels> <image> [<image> ...]
+//
+// (A .gguf model takes its mmproj next to it; its processor geometry comes
+// from the loaded model: Gemma 4 only.)
 //
 // Writes <out>/<i>.pixels.f32 ([rows, 3*temporal*patch*patch]),
 // <out>/<i>.emb.f32 ([tokens, hidden]) and <out>/index.json.
 #include <sys/stat.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -40,9 +44,10 @@ int main(int argc, char** argv) {
   if (std::getenv("ESPETERO_NO_EXIF")) vision::set_exif_orientation(false);  // the reference server's decode
   const long long max_pixels = std::atoll(argv[3]);
   ::mkdir(out.c_str(), 0755);
+  const bool gguf = model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0;
   vision::Spec spec;
   try {
-    spec = vision::spec_from_model_dir(model, max_pixels);
+    if (!gguf) spec = vision::spec_from_model_dir(model, max_pixels);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "spec: %s\n", e.what());
     return 1;
@@ -57,7 +62,16 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "the model has no vision tower\n");
     return 1;
   }
+  if (gguf) {
+    if (I.family != "gemma4") {
+      std::fprintf(stderr, "GGUF: Gemma 4 only (the processor geometry of other mmproj files is not read here)\n");
+      return 1;
+    }
+    spec.set_gemma4(max_pixels, I.vision_patch, I.vision_merge);
+  }
   json::Value index = json::Value::array();
+  std::vector<vision::Prepared> all;   // every image, for the batched check below
+  std::vector<std::vector<float>> embs;
   for (int i = 4; i < argc; ++i) {
     const std::string path = argv[i];
     vision::RGBImage img;
@@ -94,11 +108,42 @@ int main(int argc, char** argv) {
     e.set("row_dim", int64_t(spec.row_dim()));
     e.set("tokens", int64_t(tokens));
     e.set("hidden", int64_t(I.hidden));
-    e.set("gpu_ms", st.gpu_ms);
+    e.set("gpu_ms", st.gpu_ms);  // the last command buffer only when the tower commits per block (>= 2048 patches)
+    e.set("wall_ms", st.wall_ms);
     e.set("stem", std::to_string(i - 4));
     index.push_back(e);
-    std::printf("%s: grid %dx%dx%d, %d tokens, tower %.1f ms\n", path.c_str(), p.grid_t, p.grid_h, p.grid_w, tokens,
-                st.gpu_ms);
+    std::printf("%s: grid %dx%dx%d, %d tokens, tower %.1f ms (wall %.1f ms)\n", path.c_str(), p.grid_t, p.grid_h, p.grid_w,
+                tokens, st.gpu_ms, st.wall_ms);
+    all.push_back(p);
+    embs.push_back(std::move(emb));
+  }
+  // The same images in one call (one batched tower pass, as a prompt with
+  // several images runs): each image's embeddings against its own run.
+  if (all.size() > 1) {
+    std::vector<ImageRef> refs;
+    size_t total = 0;
+    for (const vision::Prepared& p : all) {
+      ImageRef r;
+      r.pixels = p.pixels.data();
+      r.grid_t = p.grid_t;
+      r.grid_h = p.grid_h;
+      r.grid_w = p.grid_w;
+      refs.push_back(r);
+      total += size_t(p.tokens(spec.merge)) * size_t(I.hidden);
+    }
+    std::vector<float> batch(total);
+    m->encode_images(refs, batch.data());
+    size_t off = 0;
+    for (size_t i = 0; i < embs.size(); ++i) {
+      const auto& e = embs[i];
+      double worst = 0, scale = 0;
+      for (size_t k = 0; k < e.size(); ++k) {
+        worst = std::max(worst, std::fabs(double(batch[off + k]) - double(e[k])));
+        scale = std::max(scale, std::fabs(double(e[k])));
+      }
+      off += e.size();
+      std::printf("image %zu batched with the others vs alone: max |diff| %.3g (max |value| %.3g)\n", i, worst, scale);
+    }
   }
   json::Value root = json::Value::object();
   root.set("model", model);

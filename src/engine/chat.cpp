@@ -632,9 +632,6 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
     ids = tok.encode(text);
   }
   GenRequest& g = job.gen;
-  // Gemma 4 runs text only so far: its vision tower is not loaded.
-  if (!urls.empty() && chat_markers(engine).gemma)
-    throw RequestError(422, "images are not supported for Gemma 4 yet: Espetero runs it text only");
   fetch_remote_images(engine, urls);
   if (!urls.empty()) {
     // Each image's token run from its header: a prompt that cannot fit the
@@ -654,7 +651,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
       size_t k = 0;
       for (size_t i = 0; i < ids.size() && k < g.images.size(); ++i)
         if (ids[i] == engine.image_token) {
-          const int extra = g.images[k++].tokens(engine.info().vision_merge) - 1;
+          const int extra = g.images[k++].tokens(engine.info().vision_merge) - 1 + engine.image_wrap();
           for (size_t j = 0; j < marks.size(); ++j)
             if (marks[j] > int(i)) shift[j] += extra;
         }
@@ -713,14 +710,14 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
     if (img_end < int(ids.size()) && (g.split < 0 || img_end < g.split) && img_end > g.sys_split) g.img_split = img_end;
   }
   // Instruction boundary: just before the first image (and its
-  // <|vision_start|>), when the user turn has at least 32 tokens of its own
-  // text there. Requests with the same system prompt and instructions share
-  // everything up to here: instructions placed before the photo are computed
-  // once for a whole set of photos.
+  // <|vision_start|>, Gemma 4: <|image>), when the user turn has at least 32
+  // tokens of its own text there. Requests with the same system prompt and
+  // instructions share everything up to here: instructions placed before the
+  // photo are computed once for a whole set of photos.
   g.pre_split = -1;
   if (!g.image_rows.empty()) {
     int p = g.image_rows[0];
-    const int32_t vs = tok.token_id("<|vision_start|>");
+    const int32_t vs = engine.vision_start;
     if (vs >= 0 && p > 0 && ids[size_t(p - 1)] == vs) --p;
     if (p - std::max(g.sys_split, 0) >= 32 && p > g.sys_split && (g.split < 0 || p < g.split)) g.pre_split = p;
   }

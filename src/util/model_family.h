@@ -29,14 +29,14 @@ inline bool gguf_arch_supported(std::string_view a) { return a == "qwen35" || a 
 inline std::string unsupported_mlx(const std::string& path, const std::string& model_type) {
   return path + ": model_type '" + model_type + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
-         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; text only) and Cloudflare "
+         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B) and Cloudflare "
          "Clef classifiers";
 }
 
 inline std::string unsupported_gguf(const std::string& path, const std::string& arch) {
   return path + ": GGUF architecture '" + arch + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen35, qwen35moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
-         "Ornith 1.5) and Gemma 4 (gemma4: 31B, 26B-A4B; text only); Qwen3.8-Flash-Next (qwen4_exp) and Cloudflare "
+         "Ornith 1.5) and Gemma 4 (gemma4: 31B, 26B-A4B); Qwen3.8-Flash-Next (qwen4_exp) and Cloudflare "
          "Clef classifiers run from MLX directories";
 }
 

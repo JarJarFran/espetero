@@ -24,11 +24,22 @@ safetensors or llama.cpp `qwen35` / `qwen35moe` GGUF, with the Qwen3-VL vision
 tower and the MTP draft head; **Qwen3.8-Flash-Next** (`qwen4_exp`, architecture in
 [qwen4_exp.md](qwen4_exp.md)) from MLX, with its experts streamed from the SSD
 when the model does not fit in memory; and **Gemma 4** (`gemma4`, 31B dense
-and 26B-A4B MoE, text only) from MLX or llama.cpp `gemma4` GGUF: an
+and 26B-A4B MoE) from MLX or llama.cpp `gemma4` GGUF: an
 attention-only decoder whose sliding-window layers keep their last 1024
 positions in a ring of KV blocks per sequence slot (slot state, copied on
 forks) while its global layers use the paged pool (`src/model/impl/gemma.h`,
-`kernels/80_gemma.metal`).
+`kernels/80_gemma.metal`), with its vision tower (`gemma4_vision`, from the
+MLX directory or a `gemma4v` mmproj; `src/model/impl/gemma_vision.h`,
+`kernels/85_gemma_vision.metal`): 27 RMSNorm blocks with q / k / v norms,
+a 2D RoPE and a GeGLU MLP over 16-pixel patches, 3x3 average pooling to at
+most 280 soft tokens per image (the standard budget), standardization and the
+`embed_vision` projection. The images of a pass share one tower batch, each
+starting at a multiple of 64 patch rows (the attention's query tile), so an
+image's soft tokens are the same bits whatever else the pass holds. The soft
+tokens replace their rows after the embedding scale, and in the
+sliding-window layers they attend to their whole image (the image's later
+rows too: `desc.w` in the tree mask; the global layers stay causal, as in
+transformers).
 
 ## Layers
 
@@ -36,7 +47,7 @@ forks) while its global layers use the paged pool (`src/model/impl/gemma.h`,
 src/util/json.*        JSON values, parser, Python-exact json.dumps
 src/tok/               byte-level BPE tokenizer (HF tokenizer.json or GGUF vocab), token-identical to HF
 src/tmpl/              Jinja2 interpreter for the model's own chat_template.jinja
-src/vision/            image decode (ImageIO), Pillow-exact bicubic, Qwen-VL patches, M-RoPE
+src/vision/            image decode (ImageIO), Pillow-exact bicubic, Qwen-VL and Gemma 4 patches, M-RoPE
 src/http/              HTTP/1.1 server with SSE streaming
 src/model/api.h        pure C++ interface of the native model (forests, slots, drafts)
 src/model/model.mm     the only Objective-C++ translation unit: Metal runtime + model

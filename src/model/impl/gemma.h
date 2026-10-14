@@ -27,7 +27,7 @@ struct G4TileRec {
   int32_t tree, r0, k0, k1, part, last, b0, pad;
 };
 struct G4AttnParamsHost {
-  int32_t H, Hkv, q_ld, kv_ld, bt, window, ring, pad;
+  int32_t H, Hkv, q_ld, kv_ld, bt, window, ring, bidi;
   uint64_t kv_base;
 };
 struct G4PrepParamsHost {
@@ -200,8 +200,10 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     // combine then reads records of G heads per KV head).
     const bool dec = g.G <= 8 && g4_dec(m, A.trees.size(), [&](size_t i) { return A.trees[i].M; });
     const int groups = dec ? g.hkv : g.hkv * g.split;
+    // Image soft tokens see their whole image (desc.w) in the layers m.g4_bidi names.
+    const int bidi = m.g4_bidi == 2 || (m.g4_bidi == 1 && sliding) ? 1 : 0;
     const G4AttnParamsHost ap{c.H, groups, c.H * g.hd, g.hkv * g.hd, K.bt, sliding ? c.window : 0,
-                              sliding ? m.ring_blocks : 0, 0, uint64_t(K.layer_base(layer_k))};
+                              sliding ? m.ring_blocks : 0, bidi, uint64_t(K.layer_base(layer_k))};
     std::vector<size_t> cut{0};
     if (split_rk > 0 && !dec && !P.chained && !m.chain_active && M >= 64) {
       size_t acc = 0;

@@ -77,7 +77,8 @@ struct ModelInfo {
 
 // An image whose vision-tower embeddings replace root rows
 // [row, row + grid_t * grid_h * grid_w / merge^2). `pixels`: the processor's
-// patch rows (Qwen2/3-VL order), float32.
+// patch rows, float32 (Qwen2/3-VL: merge-window order; Gemma 4: raster order
+// of the patch grid, values in [0, 1], merge = the pooling kernel).
 struct ImageRef {
   const float* pixels = nullptr;
   int grid_t = 1, grid_h = 0, grid_w = 0;

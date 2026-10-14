@@ -484,6 +484,69 @@ class GGUFVisionSource : public WeightSource {
   mutable std::unordered_map<std::string, std::vector<float>> owned_;
 };
 
+// Gemma 4's mmproj (llama.cpp clip, projector gemma4v) under mlx-vlm's
+// gemma4 names (vision_tower.*, embed_vision.*), so load_gemma_vision reads
+// it like an MLX directory. The patch embedding stays llama.cpp's conv kernel
+// [D, C, P, P] (the loader permutes its columns).
+class GGUFGemmaVisionSource : public WeightSource {
+ public:
+  explicit GGUFGemmaVisionSource(const std::string& path) : f_(path) {
+    const std::string proj = f_.get_string("clip.vision.projector_type", f_.get_string("clip.projector_type", ""));
+    if (proj != "gemma4v") fail(path + ": mmproj projector '" + proj + "' is not gemma4v (Gemma 4 vision)");
+  }
+  const GGUFFile& file() const { return f_; }
+  std::string describe() const override { return "mmproj:" + f_.path(); }
+  bool has(const std::string& name) const override {
+    std::string g;
+    return map(name, g) && f_.find(g) != nullptr;
+  }
+  TensorView tensor(const std::string& name) const override {
+    std::string g;
+    if (!map(name, g)) fail("no mmproj name for " + name);
+    const GGUFFile::Tensor* t = f_.find(g);
+    if (!t) fail("missing mmproj tensor " + g + " (" + name + ")");
+    return gguf_view(f_, *t, name);
+  }
+
+ private:
+  static bool map(const std::string& name, std::string& out) {
+    static const std::map<std::string, std::string> fixed = {
+        {"vision_tower.patch_embedder.input_proj.weight", "v.patch_embd.weight"},
+        {"vision_tower.patch_embedder.position_embedding_table", "v.position_embd.weight"},
+        {"vision_tower.std_bias", "v.std_bias"},
+        {"vision_tower.std_scale", "v.std_scale"},
+        {"embed_vision.embedding_projection.weight", "mm.input_projection.weight"},
+    };
+    static const std::vector<std::pair<std::string, std::string>> suffix = {
+        {".input_layernorm.weight", ".ln1.weight"},
+        {".post_attention_layernorm.weight", ".attn_post_norm.weight"},
+        {".pre_feedforward_layernorm.weight", ".ln2.weight"},
+        {".post_feedforward_layernorm.weight", ".ffn_post_norm.weight"},
+        {".self_attn.q_proj.linear.weight", ".attn_q.weight"},
+        {".self_attn.k_proj.linear.weight", ".attn_k.weight"},
+        {".self_attn.v_proj.linear.weight", ".attn_v.weight"},
+        {".self_attn.o_proj.linear.weight", ".attn_out.weight"},
+        {".self_attn.q_norm.weight", ".attn_q_norm.weight"},
+        {".self_attn.k_norm.weight", ".attn_k_norm.weight"},
+        {".mlp.gate_proj.linear.weight", ".ffn_gate.weight"},
+        {".mlp.up_proj.linear.weight", ".ffn_up.weight"},
+        {".mlp.down_proj.linear.weight", ".ffn_down.weight"},
+    };
+    static const std::string B = "vision_tower.encoder.layers.";
+    auto it = fixed.find(name);
+    if (it != fixed.end()) return out = it->second, true;
+    if (name.compare(0, B.size(), B) != 0) return false;
+    const size_t dot = name.find('.', B.size());
+    if (dot == std::string::npos) return false;
+    const std::string blk = name.substr(B.size(), dot - B.size()), rest = name.substr(dot);
+    for (const auto& [mlx, gg] : suffix)
+      if (rest == mlx) return out = "v.blk." + blk + gg, true;
+    return false;
+  }
+
+  GGUFFile f_;
+};
+
 // ---------------------------------------------------------------- blocks
 // Conversion of one row of ggml blocks into engine codes (nibbles packed
 // eight per little-endian word, or bytes) and per-group half scale/bias, with

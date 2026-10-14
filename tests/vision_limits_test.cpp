@@ -304,6 +304,57 @@ void test_real_files() {
   set_max_image_pixels(kDefaultMaxImagePixels);
 }
 
+// Gemma 4's processor: target sizes of transformers' get_aspect_ratio_preserving_size
+// (values computed with transformers 5.17), the soft-token budgets, the patch
+// row layout and the <|image> / <image|> expansion.
+void test_gemma() {
+  struct Case {
+    int h, w, tokens, th, tw;
+  };
+  const Case cases[] = {{480, 640, 280, 672, 912},   {512, 512, 280, 768, 768},    {900, 300, 280, 1344, 432},
+                        {72, 96, 280, 672, 912},     {1, 5000, 280, 48, 13440},    {5000, 1, 280, 13440, 48},
+                        {30, 4000, 280, 48, 9264},   {3024, 4032, 70, 336, 432},   {3024, 4032, 1120, 1344, 1824},
+                        {1080, 1920, 560, 816, 1488}, {100, 100, 140, 528, 528},   {7, 7, 280, 768, 768}};
+  for (const Case& c : cases) {
+    Spec s;
+    s.set_gemma4(1003520);
+    s.soft_tokens = c.tokens;
+    const auto [h, w] = gemma_resize(c.h, c.w, s);
+    check(h == c.th && w == c.tw, "gemma_resize " + size_str(c.w, c.h) + " at " + std::to_string(c.tokens) + ": " +
+                                      size_str(w, h) + ", expected " + size_str(c.tw, c.th));
+    const auto g = grid_for(c.h, c.w, s);
+    check(g[0] == 1 && g[1] == c.th / 16 && g[2] == c.tw / 16 && image_tokens(g, s.merge) <= c.tokens,
+          "gemma grid_for " + size_str(c.w, c.h));
+  }
+  check(gemma_soft_tokens(1003520) == 280 && gemma_soft_tokens(262144) == 70 && gemma_soft_tokens(4014080) == 1120 &&
+            gemma_soft_tokens(645120) == 280 && gemma_soft_tokens(645119) == 140 && gemma_soft_tokens(1000) == 70,
+        "gemma soft-token budgets");
+  // Patch rows: raster order, columns (y, x, channel), byte * float32(1/255).
+  RGBImage img;
+  img.width = 96;
+  img.height = 48;
+  img.rgb.resize(size_t(96) * 48 * 3);
+  for (size_t i = 0; i < img.rgb.size(); ++i) img.rgb[i] = uint8_t((i * 7) % 251);
+  Spec s;
+  s.set_gemma4(1003520);
+  const Prepared p = patchify(img, s);
+  check(p.grid_t == 1 && p.grid_h == 3 && p.grid_w == 6 && p.pixels.size() == size_t(18) * 768, "gemma patchify grid");
+  bool same = true;
+  for (int r = 0; r < 18; ++r)
+    for (int y = 0; y < 16; ++y)
+      for (int x = 0; x < 16; ++x)
+        for (int ch = 0; ch < 3; ++ch) {
+          const int py = (r / 6) * 16 + y, px = (r % 6) * 16 + x;
+          const float want = float(img.rgb[(size_t(py) * 96 + size_t(px)) * 3 + size_t(ch)]) * float(1 / 255.0);
+          same = same && p.pixels[size_t(r) * 768 + size_t((y * 16 + x) * 3 + ch)] == want;
+        }
+  check(same, "gemma patch rows (y, x, channel)");
+  const std::vector<int32_t> ids = expand_image_tokens({2, s.image_token_id, 7}, {{1, 6, 6}}, s);
+  std::vector<int32_t> want = {2, s.vision_start_id, s.image_token_id, s.image_token_id, s.image_token_id,
+                               s.image_token_id, s.vision_end_id, 7};
+  check(ids == want, "gemma image expansion (<|image> + 4 soft tokens + <image|>)");
+}
+
 }  // namespace
 
 int main() {
@@ -314,6 +365,8 @@ int main() {
   test_cap();
   std::printf("real files\n");
   test_real_files();
+  std::printf("gemma 4 processor\n");
+  test_gemma();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

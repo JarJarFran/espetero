@@ -130,19 +130,33 @@ stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; text only) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B) and Cloudflare Clef classifiers
 ```
 
-Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models, text
-only: a request with an image gets a 422 (`images are not supported for Gemma
-4 yet`), and so does `tool_choice` `required` or a named function (its calls
-are not in the `<tool_call><function=...>` format the forced call writes;
-`auto` and `none` work, and the model's `<|tool_call>call:NAME{...}` calls
-come back as OpenAI `tool_calls`). Its per-layer-embedding models (E2B, E4B)
-are refused at load. Thinking follows the template: `enable_thinking: true`
-(or Anthropic's `thinking`) opens the thought channel, whose text comes back
-as `reasoning_content`; with `response_format` the grammar applies after the
-channel closes. Its sliding-window layers keep their last 1024 positions in a
+Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models with their
+vision tower: from the MLX directory when it has `vision_tower.*` tensors (the
+mlx-community files do), or with a GGUF from the `gemma4v` projector next to
+it (`mmproj-*.gguf`, or `--mmproj PATH`; `--mmproj none` or `--no-vision`
+for text only). An image is resized as transformers' Gemma 4 processor does
+it (aspect ratio kept, sides multiples of 48 pixels, small images enlarged:
+the same pixels byte for byte) to at most 280 soft tokens at the standard
+budget; a pixel budget (`--image-pixels`, `--image-detail`, a request's
+`detail`) maps to the processor's own steps, the largest of 70, 140, 280,
+560 and 1,120 tokens whose 2,304 pixels per token fit it (`low` 70,
+`standard` 280, `high` and `max` 1,120); the
+tower takes about 0.44 s per image at the standard budget on an M1 Max (a
+4:3 photo: 2,394 patches, 266 soft tokens). In the prompt each image is `<|image>`, its soft tokens and `<image|>`, and
+the soft tokens attend to their whole image in the sliding-window layers
+(transformers' semantics; the global layers stay causal,
+`ESPETERO_G4_BIDI=all` applies it to every layer as mlx-vlm 0.7.1 does,
+`none` keeps every layer causal). `tool_choice` `required` or a named
+function gets a 422 (its calls are not in the `<tool_call><function=...>`
+format the forced call writes; `auto` and `none` work, and the model's
+`<|tool_call>call:NAME{...}` calls come back as OpenAI `tool_calls`). Its
+per-layer-embedding models (E2B, E4B) are refused at load. Thinking follows
+the template: `enable_thinking: true` (or Anthropic's `thinking`) opens the
+thought channel, whose text comes back as `reasoning_content`; with
+`response_format` the grammar applies after the channel closes. Its sliding-window layers keep their last 1024 positions in a
 ring per sequence slot (about 0.84 GB per slot for the 31B, 0.21 GB for the
 26B-A4B), and only the global layers' K/V grow with the context (80 KB per
 token for the 31B), so the automatic plan gives fewer slots and more context
@@ -580,6 +594,39 @@ One image must fit one pass: raise `--max-rows` for very large photos (a 12 MP
 photo is ~11,800 tokens). EXIF orientation is applied (as `transformers`'
 `load_image` does). Known difference: integers beyond the int64 range in a JSON
 state are rendered as floats.
+
+### Gemma 4 decision models (a base plus LoRA)
+
+Decision models published as Gemma 4 plus adapters (for example
+`autotrust/GEV-26B-Decide` and `autotrust/JEV-Gemma4-26B-A4B`: the
+Gemma-4-26B-A4B-it weights, a PEFT LoRA and a 24-slot decision head) are
+converted once into an MLX directory with the LoRA merged and the head as the
+LM head's rows of its verbalizer tokens:
+
+```
+python -I tools/gemma4_lora_convert.py ~/.cache/huggingface/hub/models--autotrust--GEV-26B-Decide/snapshots/<rev> \
+    ~/models/gemma4/GEV-26B-Decide-mlx-8bit   # 8-bit group-64 decoder, bf16 embedding / LM head / vision (~30 GB)
+espetero serve --model ~/models/gemma4/GEV-26B-Decide-mlx-8bit
+```
+
+The converter (mlx on the CPU, about 2 minutes and 15 GB of memory for the
+26B-A4B) merges `adapter/` (lora_alpha / r times B·A) into the attention and
+dense MLP matrices, writes the embedding with the rows of
+`judge_config.json`'s verbalizer ids replaced by `head.safetensors` as an
+untied `language_model.lm_head.weight` (without `head.safetensors` it takes
+the head from an `lm_head` LoRA, `--lm-head-lora`), quantizes the decoder
+matrices (`--bits`, `--group`) and copies `decision_head.json` (the head's
+bias and slot layout) and `calibration*.json` (per-kind temperatures) beside
+the weights. Its `chat_template.jinja` is the decision prompt's raw template
+(`--template bare`: the message contents concatenated, an image part as
+`<|image|>`, `<bos>` first unless the text starts with it; the model's own
+template stays as `chat_template.orig.jinja`). A decision is then one chat
+request whose user message is `[kind] … [state] … [question] … [options] …
+[decision]:` (text and image parts) with `"score": {"continuation": "A",
+"ids": [[the kind's verbalizer ids]]}`: `timings.score.ids_logprobs[0]`
+holds their log-probabilities at the answer position, and the option
+probabilities are softmax((logprob + bias) / temperature) over the kind's
+slots, as the release's own server reads them.
 
 ### Limits for untrusted clients
 

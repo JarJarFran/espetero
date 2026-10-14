@@ -802,7 +802,8 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
       if (starts_with(t.name, "language_model.lm_head.")) lm_head = true;
       if (t.name == "language_model.model.embed_tokens.weight") f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
-      if (t.name == "vision_tower.patch_embed.proj.weight") vision_tower = true;
+      if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight")
+        vision_tower = true;  // Qwen3-VL, Gemma 4
       if (starts_with(t.name, "language_model.mtp.") || starts_with(t.name, "mtp.")) {
         // Flash-Next drafts with a drafter directory; the file's own mtp.* head is not loaded.
         if (f.geo.q4) continue;
@@ -811,7 +812,7 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         f.streamed += t.bytes;  // read from the SSD (expert cache, n-gram rows)
         continue;
       }
-      if (starts_with(t.name, "vision_tower.")) f.vision += bytes;
+      if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.")) f.vision += bytes;
       f.weights += bytes;
     }
   }

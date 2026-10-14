@@ -600,11 +600,18 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   if (ends_with(path, ".gguf")) {
     GGUFSource text(path);
     m.format = "gguf";
-    if (text.file().get_string("general.architecture", "") == "gemma4") {  // Text only so far
+    if (text.file().get_string("general.architecture", "") == "gemma4") {
       if (!mtp.empty() && mtp != "none") fail("--mtp: Gemma 4 has no drafting head (prompt lookup drafts only)");
-      if (!mmproj.empty() && mmproj != "none") fail("--mmproj: Gemma 4 vision is not supported yet (text only)");
       m.cfg = config_from_gemma_gguf(text.file());
       load_gemma(m, text);
+      if (want_vision && mmproj != "none") {
+        if (mmproj.empty()) mmproj = find_mmproj(path);
+        if (!mmproj.empty()) {
+          GGUFGemmaVisionSource vsrc(mmproj);
+          const VisionConfig vc = vision_from_gemma_gguf(vsrc.file(), m.cfg.D);
+          if (vc.present) load_gemma_vision(m, vsrc, vc);
+        }
+      }
       return;
     }
     m.cfg = config_from_gguf(text.file());
@@ -626,7 +633,7 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   }
   SafetensorsSource src(path);
   if (const std::string other = family::mlx_check(path, src.config()); !other.empty()) fail(other);
-  {  // Gemma 4: text only so far (no drafting head; images are refused by the engine)
+  {  // Gemma 4 (no drafting head), with its vision tower when the checkpoint has one
     const json::Value& cfg = src.config();
     const json::Value* tc = cfg.get("text_config");
     if (is_gemma4_type(cfg.get_string("model_type", "")) ||
@@ -635,6 +642,10 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       m.format = "mlx";
       m.cfg = config_from_gemma(cfg);
       load_gemma(m, src);
+      if (want_vision && src.has("vision_tower.patch_embedder.input_proj.weight")) {
+        const VisionConfig vc = vision_from_gemma(cfg, m.cfg.D);
+        if (vc.present) load_gemma_vision(m, src, vc);
+      }
       return;
     }
   }

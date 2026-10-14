@@ -47,11 +47,6 @@ clean:
 $(BUILD)/bench_native: tests/bench_native.mm $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
-# Teacher-forced logits and greedy generations for given token ids (Gemma 4
-# parity against mlx-lm, tests/ref/gemma4_ref.py).
-$(BUILD)/logits_dump: tests/logits_dump.mm $(BUILD)/model.o $(BUILD)/json.o
-	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
-
 # ---- modules (plain C++ unless noted)
 TOK_SRC    := $(wildcard src/tok/*.cpp)
 TMPL_SRC   := $(wildcard src/tmpl/*.cpp)
@@ -198,4 +193,10 @@ dist: $(BUILD)/espetero
 	@echo "$(BUILD)/$(DIST).tar.gz"
 
 $(BUILD)/vision_dump: tests/vision_dump.mm $(BUILD)/model.o $(BUILD)/json.o $(VISION_OBJS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
+
+# Teacher-forced logits and greedy generations for given token ids (Gemma 4
+# parity against mlx-lm, tests/ref/gemma4_ref.py; with images against mlx-vlm,
+# tests/ref/gemma4_vision_ref.py).
+$(BUILD)/logits_dump: tests/logits_dump.mm $(BUILD)/model.o $(BUILD)/json.o $(VISION_OBJS)
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@

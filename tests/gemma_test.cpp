@@ -2,8 +2,10 @@
 // Copyright (c) 2026 Francisco José García Barbero
 
 // Gemma 4 support without a GPU: config.json parsing (dense, MoE, the
-// refused per-layer-embedding models) and the tool-call parser of its chat
-// format. The forward pass is checked against mlx-lm by tests/ref/gemma4_ref.py.
+// refused per-layer-embedding models, the vision tower) and the tool-call
+// parser of its chat format. The forward pass is checked against mlx-lm by
+// tests/ref/gemma4_ref.py, with images against mlx-vlm by
+// tests/ref/gemma4_vision_ref.py.
 #include <cstdio>
 #include <string>
 
@@ -126,8 +128,38 @@ void tool_tests() {
 
 }  // namespace
 
+// The vision_config of the 26B-A4B and 31B checkpoints (gemma4_vision).
+void vision_config_tests() {
+  const char* kVision = R"({"model_type": "gemma4", "text_config": {"hidden_size": 2816},
+    "vision_config": {"model_type": "gemma4_vision", "hidden_size": 1152, "intermediate_size": 4304,
+    "num_hidden_layers": 27, "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 72,
+    "hidden_activation": "gelu_pytorch_tanh", "patch_size": 16, "pooling_kernel_size": 3,
+    "position_embedding_size": 10240, "rms_norm_eps": 1e-06, "standardize": true, "use_clipped_linears": false,
+    "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"}}})";
+  native::VisionConfig v = native::vision_from_gemma(json::parse(kVision), 2816);
+  check(v.present && v.gemma && v.depth == 27 && v.D == 1152 && v.I == 4304 && v.heads == 16, "vision: sizes");
+  check(v.patch == 16 && v.merge == 3 && v.tps == 1 && v.patch_dim() == 768 && v.n_pos == 10240, "vision: patches");
+  check(v.standardize && v.rope_theta == 100.0 && v.out == 2816 && v.Ip() == 4352, "vision: standardize, rope, width");
+  bool ok = true;
+  try {
+    v.validate(2816);
+  } catch (...) {
+    ok = false;
+  }
+  check(ok && v.hd == 72, "vision: validates (head dim 72)");
+  ok = false;
+  try {
+    native::vision_from_gemma(json::parse(R"({"vision_config": {"use_clipped_linears": true}})"), 2816);
+  } catch (...) {
+    ok = true;
+  }
+  check(ok, "vision: clipped linears refused");
+  check(!native::vision_from_gemma(json::parse(kDense), 5376).present, "vision: absent without a vision_config");
+}
+
 int main() {
   config_tests();
+  vision_config_tests();
   tool_tests();
   if (failures) {
     std::fprintf(stderr, "gemma_test: %d failures\n", failures);

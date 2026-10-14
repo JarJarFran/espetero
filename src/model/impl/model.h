@@ -250,17 +250,24 @@ struct Embed {
   Buf codes, s, z;
 };
 
+// Qwen3-VL: norm1 / norm2 LayerNorms, qkv, proj, fc1, fc2. Gemma 4:
+// n1w input_layernorm, n2w pre_feedforward_layernorm, post_attn / post_ffn
+// the post norms, qn / kn the q / k head norms; qkv the fused q, k, v
+// projections, proj o_proj, fc1 the interleaved gate / up (GeGLU), fc2 down.
 struct VBlock {
   Buf n1w, n1b, n2w, n2b;
+  Buf post_attn, post_ffn, qn, kn;
   HW qkv, proj, fc1, fc2;
 };
 
 struct Vision {
   VisionConfig c;
   HW patch, m1, m2;
-  Buf pos;  // fp32 [n_pos, D]
+  Buf pos;  // fp32 [n_pos, D] (Gemma 4: [2][n_pos][D], the column then the row table)
   std::vector<VBlock> blocks;
   Buf mnw, mnb, inv_freq;
+  Buf std_bias, std_scale;  // Gemma 4 (standardize)
+  Mat proj;                 // Gemma 4: embed_vision's projection to the language model's width
 };
 
 struct VScratch {
@@ -508,6 +515,11 @@ struct Model : Runtime {
   int route_nsl = 0;         // parallel route: K slices per column block (0: (K/64 + 7) / 8, at most 8)
   bool attn_vec = false;     // with attn_gqa off: decode attention of single-row trees on the GEMV-style kernel (measured neutral, off)
   bool attn_gqa = true;      // decode attention of single-row trees with the GQA group as the MMA rows (attn_decode_gqa, g4_attention_dec)
+  // Gemma 4 images: the layers where an image's soft tokens attend to each
+  // other (use_bidirectional_attention "vision"): 1 the sliding-window
+  // layers (transformers' create_masks_for_vision_model; global layers stay
+  // causal), 2 every layer (mlx-vlm 0.7.1), 0 none (causal).
+  int g4_bidi = 1;
   bool route_fin1 = true;    // parallel route: barrier-free single-simdgroup finalize
   bool route_in_gemv = true; // parallel route: the finalize folded into the gate/up GEMV prologue (single row)
   int route_sync = 2;        // parallel route: 0 last arriver with fences, 1 without (diagnostic), 2 two dispatches

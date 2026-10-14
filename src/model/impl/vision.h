@@ -48,11 +48,12 @@ inline void ensure_vscratch(Model& m, int rows) {
   v.rows = R;
 }
 
-// One image of a pass: its patch rows in the vision batch and the decoder rows
-// its merged tokens replace.
+// One image of a pass: its patch rows in the vision batch, its merged tokens
+// in the tower's output and the decoder rows they replace.
 struct ImageJob {
   const ImageRef* im = nullptr;
   int patch0 = 0, n_patch = 0, dst_row0 = 0;
+  int tok0 = 0, n_tok = 0;
 };
 
 // Per-patch metadata in the processor's merge-window order: bilinear taps of
@@ -212,23 +213,34 @@ inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
 }
 
 // Validate the images of one tree whose root starts at absolute row `base`
-// (root_len < 0: encode-only, tokens are laid out back to back).
+// (root_len < 0: encode-only, tokens are laid out back to back). `merge`:
+// the tower's merge window (Qwen3-VL 2) or pooling kernel (Gemma 4: 3, one
+// frame per image); a grid's tokens are its patches / merge^2. `align`: the
+// first patch row of each image is a multiple of it (Gemma 4: 64, the
+// attention's query tile, so an image's rows are computed exactly as when it
+// is alone in the pass; the rows between images are padding).
 inline void collect_images(const ImageRef* images, int n, int root_len, int base, int& n_patch,
-                           std::vector<ImageJob>& jobs) {
+                           std::vector<ImageJob>& jobs, int merge = 2, int align = 1) {
   if (n < 0 || (n > 0 && !images)) fail("invalid images");
+  int n_tok = 0;
+  for (const ImageJob& J : jobs) n_tok += J.n_tok;
   for (int i = 0; i < n; ++i) {
     const ImageRef& im = images[i];
-    if (!im.pixels || im.grid_t < 1 || im.grid_h < 2 || im.grid_w < 2 || im.grid_h % 2 || im.grid_w % 2)
+    if (!im.pixels || im.grid_t < 1 || im.grid_h < merge || im.grid_w < merge || im.grid_h % merge ||
+        im.grid_w % merge || (merge != 2 && im.grid_t != 1))
       fail("invalid image grid");
     ImageJob J;
     J.im = &im;
+    n_patch = (n_patch + align - 1) / align * align;
     J.patch0 = n_patch;
     J.n_patch = im.grid_t * im.grid_h * im.grid_w;
-    const int n_tok = J.n_patch / 4;
-    if (root_len >= 0 && (im.row < 0 || im.row + n_tok > root_len))
+    J.n_tok = J.n_patch / (merge * merge);
+    J.tok0 = n_tok;
+    if (root_len >= 0 && (im.row < 0 || im.row + J.n_tok > root_len))
       fail("image rows must lie inside the root segment");
-    J.dst_row0 = root_len >= 0 ? base + im.row : n_patch / 4;
+    J.dst_row0 = root_len >= 0 ? base + im.row : n_tok;
     n_patch += J.n_patch;
+    n_tok += J.n_tok;
     jobs.push_back(J);
   }
 }

@@ -157,6 +157,90 @@ inline void g4_rope_tables(Model& m) {
   m.inv_freq_g = m.arena->copy(fg.data(), fg.size() * 4);
 }
 
+// A dense fp16 host copy of a matrix in any format (quantized ones expanded).
+inline Buf g4v_f16(Model& m, Arena& tmp, const WeightSource& src, const std::string& name, int out, int in) {
+  return as_f16(tmp, host_mat(m, tmp, src, name, out, in));
+}
+
+// The Gemma 4 vision tower and embed_vision (gemma_vision.h runs them), by
+// mlx-vlm's gemma4 names (vision_tower.*, embed_vision.*); GGUF mmproj files
+// are read through GGUFGemmaVisionSource, which maps the same names. The
+// tower's matrices become fp16, the projection keeps its format.
+inline void load_gemma_vision(Model& m, const WeightSource& src, VisionConfig c) {
+  c.validate(m.cfg.D);
+  const std::string v = "vision_tower.", e = v + "encoder.layers.";
+  const int D = c.D, pd = c.patch_dim();
+  Arena tmp(m.dev);
+  {
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    // input_proj: [D, (y, x, channel)] (MLX), or llama.cpp's conv kernel [D, C, P, P].
+    const std::string pn = v + "patch_embedder.input_proj.weight";
+    const TensorView pw = src.tensor(pn);
+    Buf ph;
+    if (pw.shape.size() == 4) {
+      std::vector<int> perm(static_cast<size_t>(pd));
+      const int P = c.patch, C = c.in_ch;
+      for (int y = 0; y < P; ++y)
+        for (int x = 0; x < P; ++x)
+          for (int ch = 0; ch < C; ++ch) perm[size_t((y * P + x) * C + ch)] = (ch * P + y) * P + x;
+      ph = f16_from_view(tmp, pw, D, pd, &perm);
+    } else {
+      ph = g4v_f16(m, tmp, src, pn, D, pd);
+    }
+    m.vis.patch = repack_dense(m, enc, ph, D, pd);
+    HostMat proj = host_mat(m, tmp, src, "embed_vision.embedding_projection.weight", c.out, D);
+    m.vis.proj = finish(m, enc, tmp, proj);
+    [enc endEncoding];
+    commit_wait(cb);
+  }
+  m.vis.pos = vec(m, src, v + "patch_embedder.position_embedding_table", size_t(2) * size_t(c.n_pos) * size_t(D));
+  if (c.standardize) {
+    m.vis.std_bias = vec(m, src, v + "std_bias", size_t(D));
+    m.vis.std_scale = vec(m, src, v + "std_scale", size_t(D));
+  }
+  for (int i = 0; i < c.depth; ++i) {
+    Arena btmp(m.dev);
+    const std::string b = e + std::to_string(i) + ".";
+    VBlock B;
+    B.n1w = vec(m, src, b + "input_layernorm.weight", size_t(D));
+    B.post_attn = vec(m, src, b + "post_attention_layernorm.weight", size_t(D));
+    B.n2w = vec(m, src, b + "pre_feedforward_layernorm.weight", size_t(D));
+    B.post_ffn = vec(m, src, b + "post_feedforward_layernorm.weight", size_t(D));
+    B.qn = vec(m, src, b + "self_attn.q_norm.weight", size_t(c.hd));
+    B.kn = vec(m, src, b + "self_attn.k_norm.weight", size_t(c.hd));
+    // q, k, v as one [3D, D] matrix.
+    Buf qkv = btmp.alloc(size_t(3) * D * D * 2);
+    const char* names[3] = {"q_proj", "k_proj", "v_proj"};
+    for (int k = 0; k < 3; ++k) {
+      const Buf w = g4v_f16(m, btmp, src, b + "self_attn." + names[k] + ".linear.weight", D, D);
+      std::memcpy((uint8_t*)ptr(qkv) + size_t(k) * D * D * 2, ptr(w), size_t(D) * D * 2);
+    }
+    const Buf o = g4v_f16(m, btmp, src, b + "self_attn.o_proj.linear.weight", D, D);
+    const Buf g = g4v_f16(m, btmp, src, b + "mlp.gate_proj.linear.weight", c.I, D);
+    const Buf u = g4v_f16(m, btmp, src, b + "mlp.up_proj.linear.weight", c.I, D);
+    const Buf dn = g4v_f16(m, btmp, src, b + "mlp.down_proj.linear.weight", D, c.I);
+    const Buf gu = interleave8_f16(btmp, g, u, c.I, D);
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    B.qkv = repack_dense(m, enc, qkv, 3 * D, D);
+    B.proj = repack_dense(m, enc, o, D, D);
+    B.fc1 = repack_dense(m, enc, gu, 2 * c.I, D);
+    B.fc1.act = 1;  // GeGLU (tanh GELU gate)
+    B.fc2 = repack_dense(m, enc, dn, D, c.I);
+    [enc endEncoding];
+    commit_wait(cb);
+    m.vis.blocks.push_back(B);
+  }
+  // 2D RoPE: hd / 4 frequencies per axis, theta^(-2i / (hd / 2)).
+  const int nf = c.hd / 4;
+  std::vector<float> f(static_cast<size_t>(nf));
+  for (int i = 0; i < nf; ++i) f[size_t(i)] = float(1.0 / std::pow(c.rope_theta, double(2 * i) / double(2 * nf)));
+  m.vis.inv_freq = m.arena->copy(f.data(), f.size() * 4);
+  c.present = true;
+  m.vis.c = c;
+}
+
 inline void load_gemma(Model& m, const WeightSource& src) {
   Config& c = m.cfg;
   c.validate();

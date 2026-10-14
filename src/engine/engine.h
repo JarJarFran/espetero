@@ -250,8 +250,14 @@ class Engine {
   // (real text averages 3 to 5): 413 before it is rendered or tokenized.
   void check_text_size(size_t bytes, const std::string& what) const;
   bool has_vision() const { return model_->info().vision; }
-  // Image token ids (vision models).
+  // Image token ids (vision models). Qwen3-VL: <|image_pad|> runs inside the
+  // template's <|vision_start|> ... <|vision_end|>; Gemma 4: <|image|> runs
+  // that the expansion wraps in <|image> ... <image|> (vision_start / end),
+  // as its processor does, with plain positions (no M-RoPE).
   int32_t image_token = -1, vision_start = -1, vision_end = -1;
+  bool gemma_vision() const { return model_->info().vision && model_->info().family == "gemma4"; }
+  // Tokens an image's run takes beside its soft tokens (Gemma 4: the <|image> / <image|> pair).
+  int image_wrap() const { return gemma_vision() ? 2 : 0; }
   std::vector<int32_t> end_ids;  // tokens that end a generation
 
   // ---- decisions (blocking; thread-safe)
@@ -303,10 +309,12 @@ class Engine {
   // tokens (an unknown run, -1, counts as its placeholder); 422 like
   // expand_images when placeholders and images differ in number.
   size_t expanded_length(const std::vector<int32_t>& ids, const std::vector<int>& runs) const;
-  // M-RoPE positions of a token list with expanded image runs.
+  // M-RoPE positions of a token list with expanded image runs (empty for
+  // Gemma 4: its images take plain positions).
   std::vector<int32_t> mrope_positions(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images,
                                        int* next_pos = nullptr) const;
-  // Replace each image placeholder token by the image's token run.
+  // Replace each image placeholder token by the image's token run (Gemma 4:
+  // <|image> + the soft tokens + <image|>).
   std::vector<int32_t> expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const;
 
   json::Value stats() const;

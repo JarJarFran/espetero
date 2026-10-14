@@ -35,28 +35,66 @@ class Value;
 
 namespace espetero::vision {
 
+// Gemma 4's soft-token budget for a pixel budget: the largest of 70, 140,
+// 280, 560 and 1120 whose patches (tokens * pool^2 * patch^2 pixels) fit in
+// max_pixels, at least 70. Espetero's standard budget (1,003,520 pixels)
+// gives 280, the processor's own default.
+inline int gemma_soft_tokens(int64_t max_pixels, int patch = 16, int pool = 3) {
+  int n = 70;
+  for (int t : {140, 280, 560, 1120})
+    if (int64_t(t) * pool * pool * patch * patch <= max_pixels) n = t;
+  return n;
+}
+
 // Processor parameters. Defaults are Qwen3.5's; the image budget defaults to
 // 131072 pixels (the reference servers' choice, far below Qwen's own).
+//
+// Gemma 4 (kind kGemma4, transformers' Gemma4ImageProcessor): the image is
+// resized, aspect ratio kept, to the largest size of at most
+// soft_tokens * merge^2 patches with sides multiples of merge * patch
+// (small images are enlarged), its bytes rescaled to [0, 1] (no
+// normalization) and cut into patch rows in raster order with columns
+// (y, x, channel). `merge` holds the tower's pooling kernel (3), so
+// image_tokens() counts soft tokens; `temporal` is 1.
 struct Spec {
+  static constexpr int kQwenVL = 0, kGemma4 = 1;
+  int kind = kQwenVL;
   int patch = 16;     // vision_config.patch_size
   int temporal = 2;   // vision_config.temporal_patch_size
-  int merge = 2;      // vision_config.spatial_merge_size
+  int merge = 2;      // vision_config.spatial_merge_size (Gemma 4: pooling_kernel_size)
   float mean[3] = {0.5f, 0.5f, 0.5f};  // image_mean (rounded to float32 like numpy)
   float std[3] = {0.5f, 0.5f, 0.5f};   // image_std
   int64_t min_pixels = 65536;
   int64_t max_pixels = 131072;
+  int soft_tokens = 280;              // Gemma 4: max_soft_tokens
   int32_t image_token_id = 248056;
-  int32_t vision_start_id = 248053;
-  int32_t vision_end_id = 248054;
+  int32_t vision_start_id = 248053;   // Gemma 4: <|image> (boi)
+  int32_t vision_end_id = 248054;     // Gemma 4: <image|> (eoi)
 
   int factor() const { return patch * merge; }
   int row_dim() const { return 3 * temporal * patch * patch; }
   // The reference couples the budget: min_pixels = min(65536, max_pixels).
+  // Gemma 4: the soft-token budget those pixels allow.
   void set_budget(int64_t max_px) {
     max_pixels = max_px;
     min_pixels = max_px < 65536 ? max_px : 65536;
+    soft_tokens = gemma_soft_tokens(max_px, patch, merge);
+  }
+  // The Gemma 4 geometry (patch 16, pooling 3, rescale only) for this budget.
+  void set_gemma4(int64_t max_px, int patch_size = 16, int pool = 3) {
+    kind = kGemma4;
+    patch = patch_size;
+    merge = pool;
+    temporal = 1;
+    for (int c = 0; c < 3; ++c) mean[c] = 0.0f, std[c] = 1.0f;
+    set_budget(max_px);
   }
 };
+
+// Gemma 4's get_aspect_ratio_preserving_size: (height, width) of the
+// resized image under spec (kind kGemma4). Throws std::invalid_argument
+// where the reference raises.
+std::pair<int, int> gemma_resize(int height, int width, const Spec& spec);
 
 // Spec from a Hugging Face checkpoint's parsed config.json and (optional)
 // preprocessor_config.json / processor_config.json, like VisionSpec.from_model.
@@ -73,7 +111,7 @@ struct RGBImage {
   std::vector<uint8_t> rgb;  // width * height * 3
 };
 
-// Patch rows for one image, as the Qwen2/3-VL processor produces them.
+// Patch rows for one image, as the Qwen2/3-VL (or Gemma 4) processor produces them.
 struct Prepared {
   std::vector<float> pixels;  // [grid_t*grid_h*grid_w, 3*temporal*patch*patch]
   int grid_t = 1, grid_h = 0, grid_w = 0;
@@ -168,7 +206,8 @@ int image_tokens(std::array<int, 3> grid, int merge = 2);
 std::array<int, 3> grid_for(int height, int width, const Spec& spec);
 
 // Each image_token_id placeholder in `ids` becomes the image's merged-token
-// run (the engine's _expand). Throws when placeholders and grids differ.
+// run (the engine's _expand); Gemma 4: <|image> + the soft tokens + <image|>,
+// as its processor expands them. Throws when placeholders and grids differ.
 std::vector<int32_t> expand_image_tokens(const std::vector<int32_t>& ids,
                                          const std::vector<std::array<int, 3>>& grids,
                                          const Spec& spec);

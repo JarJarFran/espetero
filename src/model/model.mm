@@ -249,6 +249,8 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_ROUTE_FIN1")) m.route_fin1 = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ATTN_VEC")) m.attn_vec = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ATTN_GQA")) m.attn_gqa = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_G4_BIDI"))
+      m.g4_bidi = std::string(v) == "all" ? 2 : std::string(v) == "none" ? 0 : 1;
     if (const char* v = std::getenv("ESPETERO_QSA")) m.qsa = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GEMM_CFGS")) m.tune.n_cfgs = std::max(1, std::min(kGemmConfigs, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_ROUTE_IN_GEMV")) m.route_in_gemv = *v == '1';
@@ -755,16 +757,19 @@ class MetalModel final : public NativeModel {
       const auto t0 = Clock::now();
       std::vector<ImageJob> jobs;
       int n_patch = 0;
-      collect_images(images.data(), int(images.size()), -1, 0, n_patch, jobs);
+      collect_images(images.data(), int(images.size()), -1, 0, n_patch, jobs, m.vis.c.merge, m.vis.c.gemma ? kG4vAlign : 1);
       if (!n_patch) return;
       ensure_vscratch(m, n_patch);
-      prepare_images(m, jobs);
-      const int n_tok = n_patch / 4;
+      if (m.vis.c.gemma) prepare_images_g4(m, jobs);
+      else prepare_images(m, jobs);
+      int n_tok = 0;
+      for (const ImageJob& J : jobs) n_tok += J.n_tok;
       id<MTLBuffer> dst = m.buffer(size_t(n_tok) * size_t(m.vis.c.out) * 4);
       m.dispatches = 0;
       id<MTLCommandBuffer> cb = [m.queue commandBufferWithUnretainedReferences];
       Enc E(m, cb);
-      encode_vision(m, E, n_patch, dst);
+      if (m.vis.c.gemma) encode_vision_g4(m, E, n_patch, n_tok, dst);
+      else encode_vision(m, E, n_patch, dst);
       cb = E.finish();
       commit_wait(cb);
       std::memcpy(out, [dst contents], size_t(n_tok) * size_t(m.vis.c.out) * 4);
@@ -789,6 +794,7 @@ class MetalModel final : public NativeModel {
     else if (name == "route_fin1") m_.route_fin1 = value != 0;
     else if (name == "attn_vec") m_.attn_vec = value != 0;
     else if (name == "attn_gqa") m_.attn_gqa = value != 0;
+    else if (name == "g4_bidi") m_.g4_bidi = std::max(0, std::min(2, value));
     else if (name == "attn_dec") m_.attn_vec = value == 1, m_.attn_gqa = value == 2;  // single-row attention: 0 MMA tiles, 1 vec, 2 gqa
     else if (name == "route_in_gemv") m_.route_in_gemv = value != 0;
     else if (name == "gemv_max_m") m_.tune.gemv_max_m = std::max(1, std::min(m_.fma34 ? 4 : kGemvInstM, value));
@@ -952,7 +958,14 @@ class MetalModel final : public NativeModel {
     // the vector one (opt-in, ESPETERO_ATTN_VEC) would need 37 KB of threadgroup memory at G = 12.
     if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_vec_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
     if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_gqa_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
-    if (m.vis.c.present) {
+    if (m.vis.c.present && m.vis.c.gemma) {  // gemma_vision.h
+      for (const char* k : {"rmsnorm", "g4v_pos_add", "g4v_pool", "g4_post_attn", "g4_post_ffn", "scatter_rows_f32"})
+        list.push_back({k, 0});
+      list.push_back({"g4v_qkv_prep" + std::to_string(m.vis.c.hd), 0});
+      list.push_back({"vit_attention2_" + std::to_string(m.vis.c.hd), 0});
+      for (const char* t : {"8x8", "16x4", "32x4"})
+        for (const char* e : {"store", "geglu"}) list.push_back({std::string("hgemm_") + t + "_" + e, 0});
+    } else if (m.vis.c.present) {
       for (const char* k : {"layernorm", "vit_pos_add", "vit_qkv_prep"}) list.push_back({k, 0});
       list.push_back({"vit_attention2_" + std::to_string(m.vis.c.hd), 0});  // the default variant (vision.h)
       for (const char* t : {"8x8", "16x4", "32x4"})

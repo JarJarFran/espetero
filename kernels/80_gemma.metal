@@ -125,6 +125,9 @@ template [[host_name("g4_attn_prep512")]] kernel void g4_attn_prep<512>(
 // ring (p.ring blocks from tree.table: key j in block (j / bt) % ring);
 // global layers read the paged block list. Cached keys are at positions
 // 0..P-1 (Gemma has no M-RoPE grids); batch keys at their rows' positions.
+// With p.bidi an image's soft-token rows also see the image's later rows
+// (desc.w: the end of the row's image, 0 outside images): Gemma 4's
+// bidirectional attention within an image, AND-ed with the window.
 // ---------------------------------------------------------------------------
 struct G4AttnParams {
   int H;      // query heads
@@ -134,7 +137,7 @@ struct G4AttnParams {
   int bt;     // tokens per KV block
   int window; // sliding window (0: none)
   int ring;   // blocks per slot ring (sliding layers), 0: block lists
-  int pad;
+  int bidi;   // image rows see their whole image (desc.w)
   ulong kv_base;  // half offset of this layer's region
 };
 
@@ -209,25 +212,26 @@ kernel void g4_attention(
   float m_run = -INFINITY;
   float l_run = 0.0f;
 
-  int anc_max = 0, seg_min = 1 << 30;
+  int anc_max = 0, seg_min = 1 << 30, k_last = r_last;  // k_last: the last batch key a row of the tile sees
   for (int r = tile.r0; r <= tree.base + r_last; ++r) {
     const int4 dr = desc[r];
     anc_max = max(anc_max, dr.z);
     seg_min = min(seg_min, dr.x);
+    if (p.bidi) k_last = max(k_last, dr.w - 1);
   }
 
   const ulong blk_halves = ulong(p.bt) * p.kv_ld;
   device const half* kvl = kv + p.kv_base;
   const int n_slot_blocks = (tile.k1 - tile.k0 + BK - 1) / BK;
   const int bb0 = tile.last ? tile.b0 / BK : 0;
-  const int n_batch_blocks = tile.last ? max(0, (r_last + BK) / BK - bb0) : 0;
+  const int n_batch_blocks = tile.last ? max(0, (k_last + BK) / BK - bb0) : 0;
   for (int blk = 0; blk < n_slot_blocks + n_batch_blocks; ++blk) {
     const bool in_slot = blk < n_slot_blocks;
     const int j0 = in_slot ? tile.k0 + blk * BK : (bb0 + blk - n_slot_blocks) * BK;
-    const int j_end = in_slot ? tile.k1 : r_last + 1;
+    const int j_end = in_slot ? tile.k1 : k_last + 1;
     if (!in_slot) {
       const bool anc_vis = j0 < anc_max;
-      const bool own_vis = (j0 + BK - 1 >= seg_min) && (j0 <= r_last);
+      const bool own_vis = (j0 + BK - 1 >= seg_min) && (j0 <= k_last);
       if (!anc_vis && !own_vis) continue;
     }
     for (int c = int(tid); c < BK * C8 * 2; c += NT) {
@@ -274,7 +278,7 @@ kernel void g4_attention(
         UNROLL for (int o = 0; o < NSG; ++o) v += xs[hg * NSG + o][fm][kc];  // same order in every simdgroup
         const int j = j0 + kc;
         bool vis = row_ok && j < j_end;
-        if (!in_slot) vis = vis && ((j < d.z) || (j >= d.x && j <= rr));
+        if (!in_slot) vis = vis && ((j < d.z) || (j >= d.x && (j <= rr || (p.bidi && j < d.w))));
         if (p.window > 0 && vis) vis = qpos - (in_slot ? j : pos[tree.base + j].x) < p.window;
         sv[kf * 2 + e] = vis ? v : -INFINITY;
       }

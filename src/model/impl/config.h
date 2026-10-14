@@ -127,18 +127,33 @@ struct Config {
   }
 };
 
+// The vision tower: Qwen3-VL's (LayerNorm blocks, learned interpolated
+// position table, 2x2 merger) or Gemma 4's (`gemma`: RMSNorm blocks with
+// q / k / v norms and a GeGLU MLP, two learned position tables (column, row)
+// of n_pos entries, 2D RoPE, pool x pool average pooling, standardization
+// and the embed_vision projection; gemma_vision.h). For Gemma `merge` is the
+// pooling kernel (3) and `tps` 1, so patch_dim() is a patch's 3 * patch^2
+// pixels and a grid's tokens are its patches / merge^2.
 struct VisionConfig {
   bool present = false;
+  bool gemma = false;
   int depth = 0, D = 0, I = 0, heads = 0, hd = 0, out = 0;
   int patch = 16, tps = 2, merge = 2, in_ch = 3, n_pos = 0, side = 0;
   float eps = 1e-6f;
+  double rope_theta = 100.0;  // Gemma 4: the 2D RoPE base
+  bool standardize = false;   // Gemma 4: (x - std_bias) * std_scale after pooling
   int patch_dim() const { return in_ch * tps * patch * patch; }
   int Ip() const { return (I + 63) / 64 * 64; }
 
   void validate(int text_hidden) {
     hd = heads ? D / heads : 0;
-    side = int(std::lround(std::sqrt(double(n_pos))));
     if (hd != 64 && hd != 72 && hd != 80) fail("unsupported vision head size " + std::to_string(hd));
+    if (gemma) {
+      if (merge < 1 || tps != 1 || D % 64 || I % 8 || out != text_hidden || n_pos < 1 || hd % 4 || depth < 1)
+        fail("unsupported Gemma 4 vision geometry");
+      return;
+    }
+    side = int(std::lround(std::sqrt(double(n_pos))));
     if (merge != 2 || side * side != n_pos || D % 64 || out != text_hidden || tps != 2)
       fail("unsupported vision geometry");
   }
@@ -340,6 +355,37 @@ inline VisionConfig vision_from_mlx(const json::Value& root) {
   return v;
 }
 
+// Gemma 4's vision_config (gemma4_vision): mlx-vlm's VisionConfig defaults
+// where a key is missing.
+inline VisionConfig vision_from_gemma(const json::Value& root, int text_hidden) {
+  VisionConfig v;
+  const json::Value* vcp = root.get("vision_config");
+  if (!vcp || !vcp->is_object()) return v;
+  const json::Value& vc = *vcp;
+  const std::string act = vc.get_string("hidden_activation", vc.get_string("hidden_act", "gelu_pytorch_tanh"));
+  if (act != "gelu_pytorch_tanh") fail("unsupported Gemma 4 vision activation " + act);
+  if (vc.get_bool("use_clipped_linears", false))
+    fail("Gemma 4 vision towers with clipped linears (use_clipped_linears) are not supported");
+  v.gemma = true;
+  v.depth = int(vc.get_int("num_hidden_layers", 16));
+  v.D = int(vc.get_int("hidden_size", 768));
+  v.I = int(vc.get_int("intermediate_size", 3072));
+  v.heads = int(vc.get_int("num_attention_heads", 12));
+  if (vc.get_int("num_key_value_heads", v.heads) != v.heads) fail("Gemma 4 vision: grouped KV heads are not supported");
+  if (const json::Value* hd = vc.get("head_dim"); hd && hd->is_int() && hd->as_int() * v.heads != v.D)
+    fail("Gemma 4 vision: head_dim x heads differs from the hidden size");
+  v.out = text_hidden;
+  v.patch = int(vc.get_int("patch_size", 16));
+  v.tps = 1;
+  v.merge = int(vc.get_int("pooling_kernel_size", 3));
+  v.n_pos = int(vc.get_int("position_embedding_size", 10240));
+  v.eps = float(vc.get_double("rms_norm_eps", 1e-6));
+  v.standardize = vc.get_bool("standardize", false);
+  if (const json::Value* rp = vc.get("rope_parameters"); rp && rp->is_object()) v.rope_theta = rp->get_double("rope_theta", 100.0);
+  v.present = v.depth > 0;
+  return v;
+}
+
 // ---------------------------------------------------------------- GGUF
 inline Config config_from_gguf(const GGUFFile& f) {
   const std::string arch = f.get_string("general.architecture", "qwen35");
@@ -453,6 +499,29 @@ inline Config config_from_gemma_gguf(const GGUFFile& f) {
     c.eos_ids.push_back(c.eos_token_id);
   std::sort(c.eos_ids.begin(), c.eos_ids.end());
   return c;
+}
+
+// Gemma 4's mmproj (llama.cpp clip, projector gemma4v).
+inline VisionConfig vision_from_gemma_gguf(const GGUFFile& f, int text_hidden) {
+  VisionConfig v;
+  if (!f.get_int("clip.has_vision_encoder", 0)) return v;
+  v.gemma = true;
+  v.depth = int(f.get_int("clip.vision.block_count", 0));
+  v.D = int(f.get_int("clip.vision.embedding_length", 0));
+  v.I = int(f.get_int("clip.vision.feed_forward_length", 0));
+  v.heads = int(f.get_int("clip.vision.attention.head_count", 0));
+  v.out = int(f.get_int("clip.vision.projection_dim", 0));
+  if (v.out != text_hidden) fail("mmproj: projection width differs from the model's hidden size");
+  v.patch = int(f.get_int("clip.vision.patch_size", 16));
+  v.tps = 1;
+  v.merge = 3;  // llama.cpp's gemma4v pools 3 x 3 patches (the HF configs' pooling_kernel_size)
+  v.eps = float(f.get_float("clip.vision.attention.layer_norm_epsilon", 1e-6));
+  const GGUFFile::Tensor* pos = f.find("v.position_embd.weight");
+  if (!pos || pos->dims.size() != 3 || pos->dims[2] != 2) fail("mmproj: Gemma 4 position tables missing");
+  v.n_pos = int(pos->dims[1]);
+  v.standardize = f.find("v.std_bias") != nullptr;
+  v.present = v.depth > 0;
+  return v;
 }
 
 inline VisionConfig vision_from_gguf(const GGUFFile& f) {

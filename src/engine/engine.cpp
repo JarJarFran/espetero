@@ -329,9 +329,10 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   for (const int id : I.end_ids)  // Gemma 4: the config's end-of-turn ids, e.g. <turn|>
     if (id >= 0 && std::find(end_ids.begin(), end_ids.end(), id) == end_ids.end()) end_ids.push_back(id);
   if (I.vision) {
-    image_token = tok_->token_id("<|image_pad|>");
-    vision_start = tok_->token_id("<|vision_start|>");
-    vision_end = tok_->token_id("<|vision_end|>");
+    const bool g4 = I.family == "gemma4";
+    image_token = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
+    vision_start = tok_->token_id(g4 ? "<|image>" : "<|vision_start|>");
+    vision_end = tok_->token_id(g4 ? "<image|>" : "<|vision_end|>");
     if (image_token < 0 || vision_start < 0 || vision_end < 0)
       throw std::runtime_error("vision model without image tokens in its vocabulary");
   }
@@ -366,7 +367,12 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   if (template_ && I.leaves && !clef_) {
     dp_ = std::make_unique<DecisionPrompts>();
     dp_->labels = make_labels(*tok_);
-    const std::string image_block = I.vision ? tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end}) : "";
+    // The image's place in the prompt as the template writes it (Gemma 4: the
+    // <|image|> placeholder alone; expand_images adds its <|image> / <image|>).
+    const std::string image_block =
+        !I.vision ? ""
+        : gemma_vision() ? tok_->decode(std::vector<int32_t>{image_token})
+                         : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
     if (!header_.empty()) {
@@ -648,6 +654,13 @@ static void check_image_rows(int tokens, int max_rows) {
 vision::Spec Engine::image_spec(int64_t max_pixels, int64_t min_pixels) const {
   vision::Spec spec;
   const ModelInfo& I = model_->info();
+  if (gemma_vision()) {  // the soft-token budget the pixel budget allows (vision::gemma_soft_tokens)
+    spec.set_gemma4(max_pixels > 0 ? max_pixels : opt_.image_max_pixels, I.vision_patch, I.vision_merge);
+    spec.image_token_id = image_token;
+    spec.vision_start_id = vision_start;
+    spec.vision_end_id = vision_end;
+    return spec;
+  }
   spec.patch = I.vision_patch;
   spec.merge = I.vision_merge;
   spec.temporal = I.vision_temporal;
@@ -684,7 +697,7 @@ size_t Engine::expanded_length(const std::vector<int32_t>& ids, const std::vecto
   for (int32_t t : ids) {
     if (t == image_token && image_token >= 0) {
       if (g >= runs.size()) throw RequestError(422, "more image placeholders than images");
-      n += size_t(std::max(1, runs[g++]));
+      n += size_t(std::max(1, runs[g++])) + size_t(image_wrap());
     } else {
       ++n;
     }
@@ -701,8 +714,9 @@ PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pix
   vision::RGBImage rgb;
   if (!vision::decode_image(bytes, rgb, err)) throw RequestError(422, "image: " + err);
   vision::Spec spec = image_spec(max_pixels, min_pixels);
-  // Normalization from the processor config when the checkpoint has one.
-  if (is_dir(opt_.model_path)) {
+  // Normalization from the processor config when the checkpoint has one
+  // (Gemma 4 rescales only).
+  if (is_dir(opt_.model_path) && !gemma_vision()) {
     for (const char* name : {"/preprocessor_config.json", "/processor_config.json"}) {
       const std::string txt = read_text(opt_.model_path + name);
       if (txt.empty()) continue;
@@ -742,7 +756,9 @@ std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, cons
   for (int32_t t : ids) {
     if (t == image_token && image_token >= 0) {
       if (g >= images.size()) throw RequestError(422, "more image placeholders than images");
+      if (image_wrap()) out.push_back(vision_start);
       out.insert(out.end(), size_t(images[g].tokens(merge)), t);
+      if (image_wrap()) out.push_back(vision_end);
       ++g;
     } else {
       out.push_back(t);
@@ -754,6 +770,10 @@ std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, cons
 
 std::vector<int32_t> Engine::mrope_positions(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images,
                                              int* next_pos) const {
+  if (gemma_vision()) {
+    if (next_pos) *next_pos = int(ids.size());
+    return {};
+  }
   std::vector<int32_t> pos(ids.size() * 3);
   const int merge = model_->info().vision_merge;
   int nxt = 0;
@@ -991,7 +1011,7 @@ json::Value Engine::decide(const json::Value& body) {
     const size_t before = plan.prefix.size();
     plan.prefix = expand_images(plan.prefix, job->images);
     plan.images = int(job->images.size());
-    plan.image_tokens = int(plan.prefix.size() - before + job->images.size());
+    plan.image_tokens = int(plan.prefix.size() - before + job->images.size() * size_t(1 - image_wrap()));
     std::vector<int32_t> ps = plan.prefix;
     ps.insert(ps.end(), plan.stem.begin(), plan.stem.end());
     job->positions = mrope_positions(ps, job->images);
@@ -3042,12 +3062,15 @@ void Engine::step() {
     t.cand_ids = j->cand_ids.data();
     t.out_cand_logits = j->cand_logits.data();
     t.out_lse = j->lse.data();
-    if (!j->positions.empty()) {
-      // Explicit M-RoPE positions for the root; images only when their rows
-      // are computed here (a checkpoint hit already holds them).
+    if (!j->images.empty()) {
+      // Explicit M-RoPE positions for the root (Qwen3-VL; Gemma 4 has none);
+      // images only when their rows are computed here (a checkpoint hit
+      // already holds them).
       const size_t start = size_t(j->cached);
-      j->root_pos.assign(j->positions.begin() + long(start * 3), j->positions.begin() + long((start + j->root.size()) * 3));
-      t.root_pos = j->root_pos.data();
+      if (!j->positions.empty()) {
+        j->root_pos.assign(j->positions.begin() + long(start * 3), j->positions.begin() + long((start + j->root.size()) * 3));
+        t.root_pos = j->root_pos.data();
+      }
       if (j->cache_state != "hit") {
         int g = 0;
         j->irefs.clear();
@@ -3191,9 +3214,11 @@ void Engine::step() {
     t.root = s->root.data();
     t.root_len = int(s->root.size());
     t.mtp = s->mtp;
-    if (!s->req.positions.empty()) {
-      s->root_pos.assign(s->req.positions.begin() + long(size_t(s->done) * 3), s->req.positions.begin() + long(size_t(end) * 3));
-      t.root_pos = s->root_pos.data();
+    if (!s->req.images.empty()) {
+      if (!s->req.positions.empty()) {  // M-RoPE (Qwen3-VL; Gemma 4's images take plain positions)
+        s->root_pos.assign(s->req.positions.begin() + long(size_t(s->done) * 3), s->req.positions.begin() + long(size_t(end) * 3));
+        t.root_pos = s->root_pos.data();
+      }
       s->irefs.clear();
       for (size_t g = 0; g < s->req.image_rows.size(); ++g) {
         const int r0 = s->req.image_rows[g];

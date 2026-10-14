@@ -3,11 +3,15 @@
 //
 // smart_resize is translated from Hugging Face transformers
 // (models/qwen2_vl/image_processing_qwen2_vl.py, Copyright 2024 The Qwen team,
-// Alibaba Group and the HuggingFace Inc. team); Apache License 2.0, see THIRD_PARTY_NOTICES.md.
+// Alibaba Group and the HuggingFace Inc. team) and gemma_resize from
+// get_aspect_ratio_preserving_size (models/gemma4/image_processing_gemma4.py,
+// Copyright 2026 the HuggingFace Team); Apache License 2.0, see THIRD_PARTY_NOTICES.md.
 
 // Qwen2/3-VL image processor: smart_resize, rescale + normalise, temporal
 // duplication and patch rows in merge-window order; image token expansion
-// and M-RoPE positions. Mirrors jevfire/metal/vision.py.
+// and M-RoPE positions. Mirrors jevfire/metal/vision.py. Gemma 4: the
+// aspect-preserving resize of transformers' Gemma4ImageProcessor and its
+// raster-order patch rows (gemma_resize, patchify_gemma).
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
@@ -30,6 +34,16 @@ namespace espetero::vision {
 Spec spec_from_config(const json::Value& cfg, const json::Value* pre, int64_t max_pixels) {
   Spec s;
   s.set_budget(max_pixels);
+  const json::Value* vcp = cfg.get("vision_config");
+  if (cfg.get_string("model_type", "") == "gemma4" ||
+      (vcp && vcp->is_object() && vcp->get_string("model_type", "") == "gemma4_vision")) {
+    s.set_gemma4(max_pixels, vcp && vcp->is_object() ? int(vcp->get_int("patch_size", 16)) : 16,
+                 vcp && vcp->is_object() ? int(vcp->get_int("pooling_kernel_size", 3)) : 3);
+    s.image_token_id = int32_t(cfg.get_int("image_token_id", 258880));
+    s.vision_start_id = int32_t(cfg.get_int("boi_token_id", 255999));
+    s.vision_end_id = int32_t(cfg.get_int("eoi_token_id", 258882));
+    return s;
+  }
   if (const json::Value* vc = cfg.get("vision_config"); vc && vc->is_object()) {
     s.patch = int(vc->get_int("patch_size", s.patch));
     s.temporal = int(vc->get_int("temporal_patch_size", s.temporal));
@@ -100,9 +114,90 @@ std::pair<int, int> smart_resize(int height, int width, int factor, int64_t min_
   return {int(h_bar), int(w_bar)};
 }
 
+// ---- Gemma 4 resize ----------------------------------------------------------------
+
+std::pair<int, int> gemma_resize(int height, int width, const Spec& spec) {
+  if (height <= 0 || width <= 0) throw std::invalid_argument("gemma_resize: sizes must be positive");
+  const int64_t max_patches = int64_t(spec.soft_tokens) * spec.merge * spec.merge;
+  const double target_px = double(max_patches) * spec.patch * spec.patch;
+  const double factor = std::sqrt(target_px / (double(height) * double(width)));
+  const int side = spec.merge * spec.patch;
+  int64_t th = int64_t(std::floor(factor * height / side)) * side;
+  int64_t tw = int64_t(std::floor(factor * width / side)) * side;
+  if (th == 0 && tw == 0) throw std::invalid_argument("Attempting to resize to a 0 x 0 image");
+  const int64_t max_side = (max_patches / (spec.merge * spec.merge)) * side;
+  if (th == 0) {
+    th = side;
+    tw = std::min<int64_t>(int64_t(std::floor(double(width) / height)) * side, max_side);
+  } else if (tw == 0) {
+    tw = side;
+    th = std::min<int64_t>(int64_t(std::floor(double(height) / width)) * side, max_side);
+  }
+  if (double(th) * double(tw) > target_px)
+    throw std::invalid_argument("Resizing exceeds the image's patch budget");
+  return {int(th), int(tw)};
+}
+
+// Patch rows in raster order (row-major over the patch grid), each row the
+// patch's pixels as (y, x, channel), rescaled like numpy: byte * float32(1/255).
+static Prepared patchify_gemma(const RGBImage& img, const Spec& spec) {
+  const int ps = spec.patch, side = spec.patch * spec.merge;
+  const int h = img.height, w = img.width;
+  if (h <= 0 || w <= 0 || h % side || w % side)
+    throw std::invalid_argument("preprocess: image size is not a multiple of patch * pooling");
+  float lut[256];
+  const float inv255 = float(1 / 255.0);
+  for (int v = 0; v < 256; v++) lut[v] = float(v) * inv255;
+  Prepared out;
+  out.grid_t = 1;
+  out.grid_h = h / ps;
+  out.grid_w = w / ps;
+  const size_t dim = size_t(3) * ps * ps;
+  out.pixels.resize(size_t(out.grid_h) * out.grid_w * dim);
+  struct Ctx {
+    const RGBImage* img;
+    const float* lut;
+    float* dst;
+    int ps, gw, w;
+    size_t dim;
+  } ctx{&img, lut, out.pixels.data(), ps, out.grid_w, w, dim};
+  const int n_rows = out.grid_h * out.grid_w;
+  auto rows = [](const Ctx& c, int r0, int r1) {
+    const uint8_t* src = c.img->rgb.data();
+    for (int r = r0; r < r1; r++) {
+      const int ph = r / c.gw, pw = r % c.gw;
+      float* row = c.dst + size_t(r) * c.dim;
+      for (int py = 0; py < c.ps; py++) {
+        const uint8_t* s = src + (size_t(ph * c.ps + py) * c.w + size_t(pw) * c.ps) * 3;
+        float* d = row + size_t(py) * c.ps * 3;
+        for (int k = 0; k < c.ps * 3; k++) d[k] = c.lut[s[k]];
+      }
+    }
+  };
+  const int chunks = n_rows >= 256 ? std::min(16, n_rows / 64) : 1;
+  if (chunks <= 1) {
+    rows(ctx, 0, n_rows);
+  } else {
+    struct Job {
+      Ctx* ctx;
+      decltype(rows)* fn;
+      int n, chunks;
+    } job{&ctx, &rows, n_rows, chunks};
+    dispatch_apply_f(size_t(chunks), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job,
+                     [](void* p, size_t i) {
+                       auto* j = static_cast<Job*>(p);
+                       (*j->fn)(*j->ctx, int(int64_t(j->n) * i / j->chunks),
+                                int(int64_t(j->n) * (i + 1) / j->chunks));
+                     });
+  }
+  out.digest = digest(out.pixels.data(), out.pixels.size(), out.grid());
+  return out;
+}
+
 // ---- normalise + patchify ---------------------------------------------------------
 
 Prepared patchify(const RGBImage& img, const Spec& spec) {
+  if (spec.kind == Spec::kGemma4) return patchify_gemma(img, spec);
   const int ps = spec.patch, tps = spec.temporal, ms = spec.merge;
   if (ps <= 0 || tps <= 0 || ms <= 0) throw std::invalid_argument("preprocess: bad spec");
   const int h = img.height, w = img.width;
@@ -179,8 +274,9 @@ Prepared patchify(const RGBImage& img, const Spec& spec) {
 }
 
 Prepared preprocess(const RGBImage& image, const Spec& spec) {
-  const auto [h, w] = smart_resize(image.height, image.width, spec.factor(), spec.min_pixels,
-                                   spec.max_pixels);
+  const auto [h, w] = spec.kind == Spec::kGemma4
+                          ? gemma_resize(image.height, image.width, spec)
+                          : smart_resize(image.height, image.width, spec.factor(), spec.min_pixels, spec.max_pixels);
   if (w == image.width && h == image.height) return patchify(image, spec);
   return patchify(resize_bicubic(image, w, h), spec);
 }
@@ -193,7 +289,9 @@ int image_tokens(std::array<int, 3> grid, int merge) {
 
 std::array<int, 3> grid_for(int height, int width, const Spec& spec) {
   if (spec.patch <= 0) throw std::invalid_argument("preprocess: bad spec");
-  const auto [h, w] = smart_resize(height, width, spec.factor(), spec.min_pixels, spec.max_pixels);
+  const auto [h, w] = spec.kind == Spec::kGemma4
+                          ? gemma_resize(height, width, spec)
+                          : smart_resize(height, width, spec.factor(), spec.min_pixels, spec.max_pixels);
   return {1, h / spec.patch, w / spec.patch};  // patchify's grid_t, grid_h, grid_w
 }
 
@@ -209,7 +307,9 @@ std::vector<int32_t> expand_image_tokens(const std::vector<int32_t>& ids,
       continue;
     }
     if (g >= grids.size()) throw std::invalid_argument("Image placeholders and images differ in number");
+    if (spec.kind == Spec::kGemma4) out.push_back(spec.vision_start_id);
     out.insert(out.end(), size_t(std::max(0, image_tokens(grids[g], spec.merge))), t);
+    if (spec.kind == Spec::kGemma4) out.push_back(spec.vision_end_id);
     g++;
   }
   if (g != grids.size()) throw std::invalid_argument("Image placeholders and images differ in number");

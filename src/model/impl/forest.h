@@ -1562,6 +1562,7 @@ inline void xpool_rollback(Model& m) {
 }  // namespace espetero::native
 
 #include "gemma.h"
+#include "gemma_vision.h"
 
 namespace espetero::native {
 
@@ -1725,11 +1726,25 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // Images: patch rows are batched across trees in tree order.
   std::vector<ImageJob> jobs;
   int n_patch = 0;
-  for (const TreePlan& T : trees) collect_images(T.spec->images, T.spec->n_images, T.Tr, T.base, n_patch, jobs);
+  for (const TreePlan& T : trees)
+    collect_images(T.spec->images, T.spec->n_images, T.Tr, T.base, n_patch, jobs, m.vis.c.present ? m.vis.c.merge : 2,
+                   m.vis.c.gemma ? kG4vAlign : 1);
+  int n_soft = 0;
   if (n_patch) {
     ensure_vscratch(m, n_patch);
-    prepare_images(m, jobs);
+    if (m.vis.c.gemma) prepare_images_g4(m, jobs);
+    else prepare_images(m, jobs);
+    for (const ImageJob& J : jobs) n_soft += J.n_tok;
   }
+  // Gemma 4: a checkpoint inside an image's soft tokens would keep rows that
+  // attended to the image's later rows (bidirectional within the image).
+  if (c.gemma)
+    for (const ImageJob& J : jobs)
+      for (const TreePlan& T : trees)
+        if (J.dst_row0 >= T.base && J.dst_row0 < T.base + T.Tr) {
+          const int r0 = J.dst_row0 - T.base, r1 = r0 + J.n_tok;
+          if (T.dst && T.save_len > r0 && T.save_len < r1) fail("a checkpoint may not end inside an image");
+        }
   ensure_scratch(m, std::max(M, 1), std::max(N, 1));
   Scratch& s = m.sc;
   bool any_mtp = false;
@@ -1815,6 +1830,14 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       desc[r * 4 + 2] = 0;
       desc[r * 4 + 3] = 0;
     }
+    // Gemma 4: an image's soft tokens see each other (desc.w = the end of
+    // the row's image, relative; 0 outside images).
+    if (c.gemma)
+      for (int i = 0; i < b.n_images; ++i) {
+        const ImageRef& im = b.images[i];
+        const int n_tok = im.grid_t * im.grid_h * im.grid_w / (m.vis.c.merge * m.vis.c.merge);
+        for (int j = im.row; j < im.row + n_tok && j < T.Tr; ++j) desc[(T.base + j) * 4 + 3] = im.row + n_tok;
+      }
     T.next_root = pmax + 1;
     T.next_save = pmax_save + 1;
     if (T.N > T.NL) last[T.readout_base + T.NL] = T.base + T.Tr - 1;  // root readout
@@ -2126,8 +2149,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.wr(s.h);
     E.threads(MTLSizeMake(size_t(c.D / 8), size_t(M), 1), MTLSizeMake(size_t(std::min(c.D / 8, 256)), 1, 1));
   }
-  if (n_patch) encode_vision(m, E, n_patch, s.h);
-  if (c.gemma) {  // Gemma 4: embeddings times sqrt(D)
+  if (n_patch && !c.gemma) encode_vision(m, E, n_patch, s.h);
+  if (c.gemma) {  // Gemma 4: embeddings times sqrt(D); the soft tokens are written after it
     const uint32_t n4 = uint32_t(size_t(M) * size_t(c.D) / 4);
     E.pipe("g4_scale_rows");
     E.set(0, s.h);
@@ -2136,6 +2159,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.rd(s.h);
     E.wr(s.h);
     E.threads(MTLSizeMake(n4, 1, 1), MTLSizeMake(256, 1, 1));
+    if (n_patch) encode_vision_g4(m, E, n_patch, n_soft, s.h);
   }
 
   const int C = c.C();
