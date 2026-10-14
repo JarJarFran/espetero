@@ -632,6 +632,7 @@ class Dsv4Model final : public NativeModel {
       ISC_, IDX_, BS_, CAND_, XGRP_, XTILE_, HCP_, RL_, SEL_, RW_, xrow_, yrow_, wsc_, amap_, ident_, ones_, XG_, XU_, XH_, XP_, SG_, SU_, SH_, EE_,
       ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, DSX_, DSM_, DSQ_, DKV_, DPOS_, PSEL_, PRW_, YT_;
   static constexpr int kPredRows = 16;  // passes up to this many rows predict the next layer's experts
+  static constexpr int kMaxSegs = 64;   // segments per pass whose CED rows may split a block
   size_t isc_floats_ = 0;
   int cstride_ = 1;
   int gemm_min_ = [] {  // rows from which the fp8 matrices and the experts use the GEMM kernels
@@ -896,7 +897,7 @@ class Dsv4Model final : public NativeModel {
     IDX_ = F(T * size_t(c_.ITOPK));
     cstride_ = c_.cand_bs > 0 ? max_ctx_ / c_.cand_bs + 2 : 1;
     CAND_ = rt_.buffer(T * size_t(cstride_));
-    const size_t nsub = (T + P - 1) / P + 1;
+    const size_t nsub = (T + P - 1) / P + 1 + size_t(kMaxSegs);  // CED layers split blocks at segments' unused rows
     tile_cap_ = 3 * int(A / 16 + size_t(c_.E) + 1);  // three tile lists (64, 32, 16 rows)
     nsub_cap_ = int(nsub);
     XGRP_ = rt_.buffer(2 * nsub * size_t(2 * c_.E) * 24);
@@ -1791,7 +1792,6 @@ class Dsv4Model final : public NativeModel {
   };
   struct Part {
     int seg = 0, ro = 0, m = 0, p0 = 0;  // block rows [ro, ro + m) of segment seg, at positions p0 ...
-    int topk = 0;                        // index entries per row for the current compressed layers (0: dense)
   };
   struct Blk {
     int r0 = 0, M = 0;
@@ -1861,10 +1861,44 @@ class Dsv4Model final : public NativeModel {
       bk.r0 = r0, bk.M = std::min(P_, T - r0);
       for (size_t i = 0; i < segs.size(); ++i) {
         const int a0 = std::max(r0, segs[i].r0), a1 = std::min(r0 + bk.M, segs[i].r0 + segs[i].n);
-        if (a0 < a1) bk.parts.push_back(Part{int(i), a0 - r0, a1 - a0, segs[i].p0 + (a0 - segs[i].r0), 0});
+        if (a0 < a1) bk.parts.push_back(Part{int(i), a0 - r0, a1 - a0, segs[i].p0 + (a0 - segs[i].r0)});
       }
       blks.push_back(std::move(bk));
     }
+    // ---- Causal encoder-decoder (DeepSeek-V4.1 report, 2.2): the layers from the last KV source on
+    // (the decoder) take their compressed entries and index keys from that source's input, the
+    // encoder's output; each keeps only a window ring of its own. So a decoder layer runs over a
+    // segment's last rows only: those whose outputs the next layer reads (rows_out) and, before
+    // them, the WIN - 1 rows they attend to, for their window latents only (rows_kv); the source
+    // layer also compresses every row. Exact: each row whose output is used sees what a full pass
+    // shows it. Prefill of N tokens: 20 N + ~24 K decoder rows instead of 40 N. ESPETERO_DS4_CED=0: off.
+    static const bool ced_on = !(std::getenv("ESPETERO_DS4_CED") && std::atoi(std::getenv("ESPETERO_DS4_CED")) == 0);
+    int dec0 = -1;
+    if (ced_on && !draft) {
+      for (int l = 0; l < int(LW.size()); ++l)
+        if (LW[size_t(l)].kv_src) dec0 = l;
+      for (int l = std::max(0, dec0); l < int(LW.size()); ++l)
+        if (LW[size_t(l)].eg >= 0) dec0 = -1;  // Engram in the decoder would need every row
+    }
+    std::vector<std::vector<int>> rows_out, rows_kv;  // [layer - dec0][segment]: trailing rows
+    if (dec0 >= 0) {
+      rows_out.assign(LW.size() - size_t(dec0), std::vector<int>(segs.size()));
+      rows_kv = rows_out;
+      for (size_t i = 0; i < segs.size(); ++i) {
+        int o = segs[i].logits ? std::min(segs[i].n, segs[i].nlog) : 0;
+        for (int l = int(LW.size()) - 1; l >= dec0; --l) {
+          const int k = std::min(segs[i].n, std::max(c.WIN, o + c.WIN - 1));  // the ring keeps the last WIN
+          rows_out[size_t(l - dec0)][i] = o, rows_kv[size_t(l - dec0)][i] = k;
+          o = k;
+        }
+      }
+    }
+    auto full_rows = [&](int l) {
+      if (dec0 < 0 || l < dec0) return T;
+      int n = 0;
+      for (int o : rows_out[size_t(l - dec0)]) n += o;
+      return n;
+    };
     Enc2 E(rt_);
     if (profile_ || env_on("ESPETERO_DS4_PROFILE")) E.prof = &prof_;
     {
@@ -1889,6 +1923,20 @@ class Dsv4Model final : public NativeModel {
     for (int l = 0; l < int(LW.size()); ++l) {
       const LayerW& w = LW[size_t(l)];
       const int K = w.topk, key = draft ? c.L + l : l;  // the expert cache's layer
+      std::vector<Blk> fsub, ksub;  // a decoder layer's blocks: rows with outputs, rows with window latents only
+      if (dec0 >= 0 && l >= dec0) {
+        std::vector<int> flo(segs.size()), fhi(segs.size()), klo(segs.size());
+        for (size_t i = 0; i < segs.size(); ++i) {
+          const int n = segs[i].n;
+          fhi[i] = n, flo[i] = n - rows_out[size_t(l - dec0)][i];
+          klo[i] = l == dec0 ? 0 : n - rows_kv[size_t(l - dec0)][i];
+        }
+        fsub = sub_blocks(blks, segs, flo, fhi);
+        ksub = sub_blocks(blks, segs, klo, flo);
+        if (int(fsub.size()) > nsub_cap_) fail("deepseek_v41: too many blocks in a decoder layer");
+      }
+      std::vector<Blk>& fb = dec0 >= 0 && l >= dec0 ? fsub : blks;
+      const int Tf = full_rows(l);
       const bool more = pf_on_ && !draft && l + 1 < int(LW.size());
       // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
       // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
@@ -1911,8 +1959,12 @@ class Dsv4Model final : public NativeModel {
               E.threads(size_t(D), size_t(g.n - k0), 1, 256);
             }
       // ---- phase 1: Engram, attention, the MoE input and its routing, per block
-      for (size_t ci = 0; ci < blks.size(); ++ci) {
-        Blk& bk = blks[ci];
+      for (Blk& kb : ksub) {
+        hc_pre(E, prev, w.attn_norm, X_, 0, kb.r0, kb.M);
+        attention_kv(E, w, l, kb, segs);
+      }
+      for (size_t ci = 0; ci < fb.size(); ++ci) {
+        Blk& bk = fb[ci];
         const int r0 = bk.r0, M = bk.M;
         if (w.eg >= 0) {
           const int ncol = (c.eng_max_n - 1) * c.eng_heads, Ke = w.e_wkv.K;
@@ -1947,10 +1999,11 @@ class Dsv4Model final : public NativeModel {
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
       std::vector<int> used(size_t(w.nE), 0);
-      for (int i = 0; i < T * K; ++i) {
-        if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
-        ++used[size_t(sel[i])];
-      }
+      for (const Blk& bk : fb)
+        for (int i = bk.r0 * K; i < (bk.r0 + bk.M) * K; ++i) {
+          if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
+          ++used[size_t(sel[i])];
+        }
       std::vector<int> need, nrows;
       for (int e = 0; e < w.nE; ++e)
         if (used[size_t(e)]) need.push_back(e), nrows.push_back(used[size_t(e)]);
@@ -1961,7 +2014,7 @@ class Dsv4Model final : public NativeModel {
         }
       // long passes overlap the misses' reads with the experts' GPU work (ESPETERO_DS4_PIPE=0: off)
       static const bool pipe_on = !(std::getenv("ESPETERO_DS4_PIPE") && std::atoi(std::getenv("ESPETERO_DS4_PIPE")) == 0);
-      const bool pipe = pipe_on && !draft && T >= 256;
+      const bool pipe = pipe_on && !draft && Tf >= 256;
       std::vector<size_t> pend;
       const std::vector<int> slots = expert_slots(E, key, w, need, pipe ? &pend : nullptr, &nrows);
       if (more) {  // the next layer's experts, read while the GPU works on this one
@@ -1974,7 +2027,7 @@ class Dsv4Model final : public NativeModel {
             if (ps[i] >= 0 && ps[i] < nw.nE) pu[size_t(ps[i])] = 1;
           for (int e = 0; e < nw.nE; ++e)
             if (pu[size_t(e)]) nx.push_back(e);
-        } else if (T >= 64) {
+        } else if (full_rows(l + 1) >= 64) {
           for (int e = 0; e < nw.nE; ++e) nx.push_back(e);
         }
         prefetch(key + 1, nw, nx);
@@ -1983,8 +2036,8 @@ class Dsv4Model final : public NativeModel {
       for (size_t i = 0; i < need.size(); ++i) slot_of[size_t(need[i])] = slots[i];
       if (!pipe) {
         // ---- phase 3: shared and routed experts, per block
-        for (size_t ci = 0; ci < blks.size(); ++ci) {
-          const int r0 = blks[ci].r0, M = blks[ci].M;
+        for (size_t ci = 0; ci < fb.size(); ++ci) {
+          const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts(E, w, int(ci), r0, M, slot_of);
           if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
           hc_post(E, mixF_[cur], r0, M);
@@ -2001,8 +2054,8 @@ class Dsv4Model final : public NativeModel {
           for (int e : need)
             if (!miss_e[size_t(e)]) in[size_t(e)] = 1;
         }
-        for (size_t ci = 0; ci < blks.size(); ++ci)
-          moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, true, YT_, size_t(blks[ci].r0) * yrow, 0);
+        for (size_t ci = 0; ci < fb.size(); ++ci)
+          moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, true, YT_, size_t(fb[ci].r0) * yrow, 0);
         id<MTLCommandBuffer> used[2] = {E.submit_chained(), nil};
         const size_t RB = size_t(std::max(1, xc_.stage_n));
         int k = 1;
@@ -2017,11 +2070,11 @@ class Dsv4Model final : public NativeModel {
             in[size_t(need[pend[j]])] = 1;
           }
           read_slots(w, es);  // straight into the slots, while the GPU runs the earlier rounds
-          for (size_t ci = 0; ci < blks.size(); ++ci)
-            moe_experts(E, w, int(ci), blks[ci].r0, blks[ci].M, slot_of, &in, false, YT_, size_t(blks[ci].r0) * yrow, par);
+          for (size_t ci = 0; ci < fb.size(); ++ci)
+            moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, false, YT_, size_t(fb[ci].r0) * yrow, par);
           used[par] = E.submit_chained();
         }
-        for (size_t ci = 0; ci < blks.size(); ++ci) hc_post(E, mixF_[cur], blks[ci].r0, blks[ci].M, YT_, size_t(blks[ci].r0) * yrow);
+        for (size_t ci = 0; ci < fb.size(); ++ci) hc_post(E, mixF_[cur], fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow);
       }
       prev = mixF_[cur];
       cur ^= 1;
@@ -2113,19 +2166,56 @@ class Dsv4Model final : public NativeModel {
     gemv8(E, w.wo_b, OA_, c.OG * c.OR, Y_, D, M);
   }
 
-  // The sequence mixing of one segment part: block rows [ro, ro + m) of `s`
-  // at positions p0 ...: compressor, indexer, attention, window ring.
-  // draft: a DSpark layer (its own ring of the target's states; the block's rows see each other).
-  void attention_seq(Enc2& E, const LayerW& w, int l, Seg& sg, int br0, Part& pt, bool draft) {
+  // Rows of a decoder layer whose outputs nothing reads (CED, see forward): only their window
+  // latents, which later rows attend to, and at the KV source the compressed entries and index keys.
+  void attention_kv(Enc2& E, const LayerW& w, int l, Blk& bk, std::vector<Seg>& segs) {
+    const Cfg& c = c_;
+    const int D = c.D, HD = c.HD, M = bk.M;
+    const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
+    const size_t po = size_t(bk.r0) * 4;
+    quant_copy(E, X_, 0, D, XQ_, 0, D, M, D);
+    gemv8(E, w.wkv, XQ_, D, KVp_, HD, M);
+    vec_post(E, KVp_, 0, &w.kv_norm, pos_, po, &invf, M, 1, HD, HD, true, false, true);
+    for (Part& pt : bk.parts) {
+      Seg& sg = segs[size_t(pt.seg)];
+      if (w.ratio > 0 && w.kv_src) compress_seq(E, w, sg, bk.r0, pt);
+      const int k0 = std::max(0, pt.m - c.WIN);
+      store_half(E, KVp_, pt.ro + k0, HD, sg.s->ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2, pt.m - k0, HD, pt.p0 + k0, c.WIN);
+    }
+  }
+
+  // The rows of `bks` in [lo[i], hi[i]) of each segment i (rows from the segment's first), as
+  // blocks of contiguous rows on the same grid: a part ends where the full pass's part ends.
+  static std::vector<Blk> sub_blocks(const std::vector<Blk>& bks, const std::vector<Seg>& segs, const std::vector<int>& lo,
+                                     const std::vector<int>& hi) {
+    std::vector<Blk> out;
+    for (const Blk& bk : bks) {
+      Blk cur;
+      for (const Part& pt : bk.parts) {
+        const Seg& g = segs[size_t(pt.seg)];
+        const int a0 = std::max(bk.r0 + pt.ro, g.r0 + lo[size_t(pt.seg)]), a1 = std::min(bk.r0 + pt.ro + pt.m, g.r0 + hi[size_t(pt.seg)]);
+        if (a0 >= a1) continue;
+        if (cur.M > 0 && cur.r0 + cur.M != a0) out.push_back(std::move(cur)), cur = Blk{};
+        if (cur.M == 0) cur.r0 = a0;
+        cur.parts.push_back(Part{pt.seg, a0 - cur.r0, a1 - a0, g.p0 + (a0 - g.r0)});
+        cur.M = a1 - cur.r0;
+      }
+      if (cur.M > 0) out.push_back(std::move(cur));
+    }
+    return out;
+  }
+
+  // The compressed entries and index keys of a KV source layer for one segment part
+  // (X_ rows in, the slot's compressed and index-key caches out).
+  void compress_seq(Enc2& E, const LayerW& w, Seg& sg, int br0, const Part& pt) {
     const Cfg& c = c_;
     Seq& s = *sg.s;
-    const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD;
-    const int ro = pt.ro, M = pt.m, p0 = pt.p0, r0 = br0 + ro;  // r0: pass row of the part's first row
+    const int D = c.D, HD = c.HD;
+    const int ro = pt.ro, M = pt.m, p0 = pt.p0, r0 = br0 + ro;
     const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
     const size_t po = size_t(r0) * 4;
     const size_t xo = size_t(ro) * size_t(D) * 4, ho = size_t(ro) * size_t(HD) * 4;
-    int& topk_mode = pt.topk;
-    if (w.ratio > 0 && w.kv_src) {
+    {
       const int r = w.ratio, si = w.src;
       const int g0 = p0 / r, G = (p0 + M) / r - g0;
       if (G > s.cap[size_t(si)] - g0) fail("deepseek_v41: compressed KV full");
@@ -2180,6 +2270,23 @@ class Dsv4Model final : public NativeModel {
         }
       }
     }
+  }
+
+  // The sequence mixing of one segment part: block rows [ro, ro + m) of `s`
+  // at positions p0 ...: compressor, indexer, attention, window ring.
+  // draft: a DSpark layer (its own ring of the target's states; the block's rows see each other).
+  void attention_seq(Enc2& E, const LayerW& w, int l, Seg& sg, int br0, Part& pt, bool draft) {
+    const Cfg& c = c_;
+    Seq& s = *sg.s;
+    const int D = c.D, HD = c.HD, QR = c.QR, HQ = c.H * c.HD;
+    const int ro = pt.ro, M = pt.m, p0 = pt.p0, r0 = br0 + ro;  // r0: pass row of the part's first row
+    const Buf& invf = w.ratio ? invf_yarn_ : invf_plain_;
+    const size_t po = size_t(r0) * 4;
+    const size_t xo = size_t(ro) * size_t(D) * 4, ho = size_t(ro) * size_t(HD) * 4;
+    // index entries per row (top-k), or 0: every visible entry. Decided by the part's last row, so the index
+    // source and the layers reusing its selection agree (a layer's parts end on the same rows as the source's).
+    const int topk_mode = w.ratio > 0 && (p0 + M) / w.ratio > c.ITOPK ? c.ITOPK : 0;
+    if (w.ratio > 0 && w.kv_src) compress_seq(E, w, sg, br0, pt);
     const size_t io = size_t(r0) * size_t(c.ITOPK) * 4;  // IDX_ rows of this part
     if (w.ratio > 0 && w.idx_src) {
       const int r = w.ratio, si = w.src;
@@ -2248,9 +2355,6 @@ class Dsv4Model final : public NativeModel {
           E.groups(size_t(mr), 1, 1, 1024);
           if (m0 + mr < M) E.flush();  // ISC_ is reused by the next rows
         }
-        topk_mode = c.ITOPK;
-      } else {
-        topk_mode = 0;
       }
     }
     // ---- attention over the window and the compressed entries
