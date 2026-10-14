@@ -141,8 +141,7 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
   layer runs over its last rows only: layer 39 over the rows read out (the
   logits) plus 127 rows of window latents, each layer below over what the next
   one needs plus 127 (layer 20: the last ~2.5 K rows, and the compressor over all).
-  Exact (with the activation roundings off, logits agree with a full pass to
-  float noise; with them, both move by the roundings' own chaos), unlike
+  Exact (bit-identical logits with the deterministic settings of §9), unlike
   DeepSeek's serving, which replays only the last 128 rows through the decoder
   and trained the model for that approximation. Prefill of 4.5 K tokens: 46.3 →
   38.4 s; of 19.8 K tokens: 150 → 108 s (GPU 118 → 65 s). `ESPETERO_DS4_CED=0`: off.
