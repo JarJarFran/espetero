@@ -623,8 +623,10 @@ class Dsv4Model final : public NativeModel {
     o.set("spec_verify_ms", spec_verify_ms_);
     if (!prof_.empty()) {
       json::Value k = json::Value::object();
-      for (const auto& [n, v] : prof_) k.set(n, v.first);
+      json::Value kn = json::Value::object();
+      for (const auto& [n, v] : prof_) k.set(n, v.first), kn.set(n, int64_t(v.second));
       o.set("kernels_ms", k);
+      o.set("kernels_n", kn);
     }
     return json::dump(o);
   }
@@ -1190,7 +1192,8 @@ class Dsv4Model final : public NativeModel {
     }
     static const char* names[4] = {"ds4_gemv_f8", "ds4_gemv_f4", "ds4_gemv_bf16", "ds4_gemv_f32"};
     E.pipe(names[fmt]);
-    const int nrow = 8;
+    static const bool g1 = env_on("ESPETERO_DS4_GEMV1");  // one output row per simdgroup always
+    const int nrow = fmt == 0 && M == 1 && !grp && !g1 ? 32 : 8;  // one row of X: 4 output rows per simdgroup
     GemvP p{N, K, M, xs, ys, grp, gstr, accum ? 1 : 0, xrow ? 1 : 0, nrow};
     E.set(0, W);
     E.set(1, S.b ? S : W);
@@ -2185,6 +2188,21 @@ class Dsv4Model final : public NativeModel {
       }
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
+      static const char* dumpx = std::getenv("ESPETERO_DS4_DUMPX");  // MoE inputs and routes, for routing predictors
+      if (dumpx && !draft) {
+        const std::string b = std::string(dumpx) + "/l" + std::to_string(l);
+        if (FILE* f = std::fopen((b + ".x16").c_str(), "wb")) {  // XF_ rows as fp16
+          std::vector<uint16_t> h(size_t(T) * size_t(D));
+          const float* xf = static_cast<const float*>([XF_ contents]);
+          for (size_t i = 0; i < h.size(); ++i) h[i] = std::bit_cast<uint16_t>(_Float16(xf[i]));
+          std::fwrite(h.data(), 2, h.size(), f);
+          std::fclose(f);
+        }
+        if (FILE* f = std::fopen((b + ".sel").c_str(), "wb")) {
+          std::fwrite(sel, 4, size_t(T) * size_t(K), f);
+          std::fclose(f);
+        }
+      }
       std::vector<int> used(size_t(w.nE), 0);
       for (const Blk& bk : fb)
         for (int i = bk.r0 * K; i < (bk.r0 + bk.M) * K; ++i) {
@@ -2569,7 +2587,10 @@ class Dsv4Model final : public NativeModel {
         int M, H, win, p0, ratio, topk, n_comp;
         float scale;
       } ap{M, c.H, c.WIN, p0, w.ratio, w.ratio ? topk_mode : 0, draft ? M : 0, 1.0f / std::sqrt(float(HD))};
-      E.pipe("ds4_attn");
+      // a few rows (decode): the keys split across a threadgroup per head (ESPETERO_DS4_ATTN1=1: one simdgroup per head)
+      static const bool one = env_on("ESPETERO_DS4_ATTN1");
+      const bool split = !draft && !one && M <= 4;
+      E.pipe(split ? "ds4_attn_split" : "ds4_attn");
       E.set(0, Q_, size_t(ro) * size_t(HQ) * 4);
       E.set(1, KVp_, ho);
       E.set(2, draft ? s.dsring : s.ring, size_t(l) * size_t(c.WIN) * size_t(HD) * 2);
@@ -2580,7 +2601,8 @@ class Dsv4Model final : public NativeModel {
       E.set(6, Q_, size_t(ro) * size_t(HQ) * 4);  // in place: each simdgroup reads its query before writing
       E.set(7, pos_, po);
       E.bytes(8, ap);
-      E.groups(size_t((c.H + 7) / 8), size_t(M), 1, 256);
+      if (split) E.groups(size_t(c.H), size_t(M), 1, 256);
+      else E.groups(size_t((c.H + 7) / 8), size_t(M), 1, 256);
     }
     // ---- the window ring keeps the last WIN rows (a draft block's rows are not kept)
     if (draft) return;

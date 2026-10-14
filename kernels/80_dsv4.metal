@@ -126,6 +126,52 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
   const int chunks = p.K / E;
   const ulong row_bytes = FMT == 0 ? ulong(p.K) : FMT == 1 ? ulong(p.K / 2) : FMT == 2 ? ulong(p.K) * 2 : ulong(p.K) * 4;
   const int n_end = min(p.N, int(tg.x + 1) * p.nrow_tg);
+  if (mr == 1 && !p.grp && FMT == 0 && p.nrow_tg == 32) {
+    // one row of X (decode): each simdgroup takes 4 output rows at once, so a chunk of X is read once for
+    // all four (one row per simdgroup re-read X, 4x the fp8 weight bytes, for every output row)
+    constexpr int NR = 4;
+    device const float* x0 = xr[0];
+    for (int nb = int(tg.x) * p.nrow_tg + int(sg); nb < n_end; nb += 8 * NR) {
+      float acc[NR];
+      device const uint4* wr[NR];
+      for (int k = 0; k < NR; ++k) {
+        acc[k] = 0.0f;
+        wr[k] = (device const uint4*)(W + ulong(min(nb + 8 * k, n_end - 1)) * row_bytes);
+      }
+      for (int c = int(lane); c < chunks; c += 32) {
+        device const float4* xv = (device const float4*)(x0 + c * E);
+        float xs[E];
+        for (int j = 0; j < E / 4; ++j) {
+          const float4 x4 = xv[j];
+          xs[4 * j] = x4.x, xs[4 * j + 1] = x4.y, xs[4 * j + 2] = x4.z, xs[4 * j + 3] = x4.w;
+        }
+        uint4 w[NR];
+        for (int k = 0; k < NR; ++k) w[k] = wr[k][c];
+        for (int k = 0; k < NR; ++k) {
+          const int n = min(nb + 8 * k, n_end - 1);
+          const float sc = ds4_e8m0(S[ulong(n / 32) * ulong(kb) + ulong(c / 2)]) * 256.0f;
+          const uint ws[4] = {w[k].x, w[k].y, w[k].z, w[k].w};
+          float s = 0.0f;
+          for (int j = 0; j < 4; ++j) {
+            const half2 a = ds4_e4m3x2(ws[j]), b = ds4_e4m3x2(ws[j] >> 16);
+            s += float(a.x) * xs[4 * j] + float(a.y) * xs[4 * j + 1] + float(b.x) * xs[4 * j + 2] + float(b.y) * xs[4 * j + 3];
+          }
+          acc[k] += s * sc;
+        }
+      }
+      for (int k = 0; k < NR; ++k) {
+        const int n = nb + 8 * k;
+        const float s = simd_sum(acc[k]);
+        if (lane == 0 && n < n_end) {
+          const int yi = p.idx ? yrow[m0] : m0;
+          const float v = p.idx ? s * ysc[m0] : s;
+          device float* y = Y + ulong(yi) * ulong(p.ys) + ulong(n);
+          *y = p.accum ? *y + v : v;
+        }
+      }
+    }
+    return;
+  }
   for (int n = int(tg.x) * p.nrow_tg + int(sg); n < n_end; n += 8) {
     device const uint4* wr = (device const uint4*)(W + ulong(n) * row_bytes);
     const int xoff = p.grp ? (n / p.grp) * p.gstr : 0;
@@ -605,6 +651,76 @@ kernel void ds4_attn(device const float* Q [[buffer(0)]], device const float* KV
   l += exp(sink[h] - mx);
   device float* out = O + (ulong(m) * ulong(p.H) + ulong(h)) * HD + ulong(lane) * PL;
   for (int i = 0; i < PL; ++i) out[i] = o[i] / l;
+}
+
+// The same attention for a few rows (decode): a threadgroup per (head, row) whose 8 simdgroups take every
+// 8th key each, their partial softmaxes merged in threadgroup memory (ds4_attn runs a head's ~640 keys one
+// after another on one simdgroup, 8 threadgroups for a decoded token).
+kernel void ds4_attn_split(device const float* Q [[buffer(0)]], device const float* KVp [[buffer(1)]],
+                           device const half* ring [[buffer(2)]], device const half* comp [[buffer(3)]],
+                           device const int* idx [[buffer(4)]], device const float* sink [[buffer(5)]],
+                           device float* O [[buffer(6)]], device const int* pos [[buffer(7)]],
+                           constant Ds4AttnP& p [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int HD = 512, PL = 16, NS = 8;
+  threadgroup float smx[NS], sl[NS];
+  threadgroup float so[NS * HD];
+  const int h = int(tg.x), m = int(tg.y);
+  const int ps = pos[m];
+  device const float* q = Q + (ulong(m) * ulong(p.H) + ulong(h)) * HD + ulong(lane) * PL;
+  float qv[PL], o[PL], kv[PL];
+  for (int i = 0; i < PL; ++i) {
+    qv[i] = q[i] * p.scale;
+    o[i] = 0.0f;
+  }
+  float mx = -1e30f, l = 0.0f;
+  const int w0 = max(0, ps - p.win + 1), nw = ps - w0 + 1;
+  const int nvis = p.ratio > 0 ? (ps + 1) / p.ratio : 0;
+  const int nc = p.ratio > 0 ? (p.topk ? p.topk : nvis) : 0;
+  device const int* ix = idx + ulong(m) * ulong(max(p.topk, 1));
+  for (int i = int(sg); i < nw + nc; i += NS) {
+    if (i < nw) {
+      const int t = w0 + i;
+      if (t >= p.p0) {
+        device const float4* k4 = (device const float4*)(KVp + ulong(t - p.p0) * HD + ulong(lane) * PL);
+        for (int j = 0; j < PL / 4; ++j) {
+          const float4 v = k4[j];
+          kv[4 * j] = v.x, kv[4 * j + 1] = v.y, kv[4 * j + 2] = v.z, kv[4 * j + 3] = v.w;
+        }
+      } else {
+        device const half4* k4 = (device const half4*)(ring + ulong(t % p.win) * HD + ulong(lane) * PL);
+        for (int j = 0; j < PL / 4; ++j) {
+          const float4 v = float4(k4[j]);
+          kv[4 * j] = v.x, kv[4 * j + 1] = v.y, kv[4 * j + 2] = v.z, kv[4 * j + 3] = v.w;
+        }
+      }
+    } else {
+      const int j = p.topk ? ix[i - nw] : i - nw;
+      if (j < 0 || j >= nvis) continue;
+      device const half4* k4 = (device const half4*)(comp + ulong(j) * HD + ulong(lane) * PL);
+      for (int u = 0; u < PL / 4; ++u) {
+        const float4 v = float4(k4[u]);
+        kv[4 * u] = v.x, kv[4 * u + 1] = v.y, kv[4 * u + 2] = v.z, kv[4 * u + 3] = v.w;
+      }
+    }
+    float s = 0.0f;
+    for (int u = 0; u < PL; ++u) s += qv[u] * kv[u];
+    ds4_attn_step(mx, l, o, simd_sum(s), kv);
+  }
+  for (int i = 0; i < PL; ++i) so[int(sg) * HD + int(lane) * PL + i] = o[i];
+  if (lane == 0) smx[sg] = mx, sl[sg] = l;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float M = -1e30f;
+  for (int s2 = 0; s2 < NS; ++s2) M = max(M, smx[s2]);
+  float L = exp(sink[h] - M), f[NS];
+  for (int s2 = 0; s2 < NS; ++s2) f[s2] = exp(smx[s2] - M), L += sl[s2] * f[s2];
+  device float* out = O + (ulong(m) * ulong(p.H) + ulong(h)) * HD;
+  for (int d = int(tid); d < HD; d += 256) {
+    float v = 0.0f;
+    for (int s2 = 0; s2 < NS; ++s2) v += so[s2 * HD + d] * f[s2];
+    out[d] = v / L;
+  }
 }
 
 // Copy rows of fp32 into a half ring / cache: dst[(base + r) % mod (or base + r)] = src[r].

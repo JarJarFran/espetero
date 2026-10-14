@@ -200,11 +200,27 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   kernels.
   DeepSeek's decoder bounded replay (128 rows per decoder layer, approximate,
   trained for) would save ~24 K decoder rows more; not adopted.
-* **Decode** (~10 tok/s): GPU ~46 ms per token, expert reads ~53 ms (19 misses
-  of 18.8 MB). Eviction policies cannot do much (LRU 19 misses per token,
-  Belady 9.2, §3 Experts); fewer misses need knowing the next experts earlier
-  (trained routing predictors, SpecPrefetch-style, keep the native router and
-  so the output). The GPU part is ~2x a bandwidth bound of ~12 GB per token.
+* **Decode** (~10.2 tok/s): expert reads ~56 ms per token (20 misses of
+  18.8 MB at ~6.7 GB/s) and GPU ~42 ms, one after the other. GPU per token,
+  1285 dispatches: the dense fp8 GEMVs (~5.5 GB) and the experts (4.5 GB) run
+  near the memory's bandwidth; attention took 8 ms because a decoded token gave
+  it 8 threadgroups (one simdgroup walking a head's ~640 keys):
+  `ds4_attn_split` (≤ 4 rows) gives each head a threadgroup whose simdgroups
+  split the keys, 1.2 ms (GPU 46 → 42 ms per token). One-row fp8 GEMVs compute
+  4 output rows per simdgroup (`ESPETERO_DS4_GEMV1=1`: one), ~0.5 ms. Merging
+  the mHC kernels (DeepSeek's Mega-mHC) would save ~240 dispatches per token,
+  a few ms at most. Overlapping a layer's miss reads with its cached experts'
+  GPU work (the pipelined MoE for one row) changed nothing measurable.
+* **Predicting the next layer's experts** (to read them while the GPU works) does
+  not pay here: `ESPETERO_DS4_DUMPX=dir` dumps each layer's MoE input and routes,
+  `tools/dsv4_route_predict.py` measures predictors and `tools/dsv4_prefetch_sim.py`
+  replays a per-layer LRU cache with prefetching. The next layer's router on this
+  layer's MoE input finds 57–81 % of the routed experts in its top 6 (a ridge
+  regression trained on 13 K rows does no better), but prefetching its top 6
+  raises the experts read per token from 23.6 to 42.8 to cut those still
+  missing to 13.8, and the SSD is the bottleneck: the GPU's ~42 ms per token
+  hide only ~15 reads. One prefetch per layer at most: 27.4 read, 18.9 missing,
+  and a prefetch has ~1 ms of GPU work to hide a 2.8 ms read.
 * **DSpark** (`ESPETERO_DS4_SPEC=1`) with the 95 GB cache: lossless (same text).
   Verifying every draft: 46 % accepted, 7.1 tok/s against ~10 plain. The
   confidence head (`mtp.2.confidence_head.proj`: w · [the last DSpark layer's
@@ -240,7 +256,8 @@ Development switches: `ESPETERO_DS4_LAYERS=n` (first n layers, no head),
 `ESPETERO_DS4_PROFILE=1` (per-kernel GPU times), `ESPETERO_DS4_GEMM_MIN`,
 `ESPETERO_DS4_SUB`, `ESPETERO_DS4_ROWS`, `ESPETERO_DS4_PREFETCH=0`,
 `ESPETERO_DS4_WARM=0`, `ESPETERO_DS4_TRACE=file`, `ESPETERO_DS4_CED=0`, `ESPETERO_DS4_STREAM=0`,
-`ESPETERO_DS4_PIPE=0`, `ESPETERO_EXPERT_CACHE_GB`.
+`ESPETERO_DS4_PIPE=0`, `ESPETERO_DS4_ATTN1=1`, `ESPETERO_DS4_GEMV1=1`, `ESPETERO_DS4_DUMPX=dir`,
+`ESPETERO_EXPERT_CACHE_GB`.
 
 Determinism: a pass is bit-reproducible except that the pipelined MoE of long
 passes adds a row's expert outputs in an order that depends on which experts
