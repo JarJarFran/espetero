@@ -456,6 +456,12 @@ class Engine {
   // The release's image processor limits (processor_config.json size.shortest_edge / longest_edge),
   // the default image budget of Clef requests (0: unknown, the engine's own default).
   int64_t clef_min_pixels_ = 0, clef_max_pixels_ = 0;
+  // Clef-Omni (a Qwen3-Omni thinker backbone): the release's own record encoding
+  // (each image block followed by "\n"), default max_length, and the largest
+  // budget media_kwargs may ask (its processor's limit, above the default budget).
+  bool clef_omni_ = false;
+  int clef_max_length_ = 16384;
+  int64_t clef_limit_pixels_ = 0;
   // Frees the least recently used Clef prefix other than those in `keep`; false when none is left.
   bool clef_evict_prefix(const std::vector<int>& keep);
   std::deque<std::shared_ptr<Seq>> waiting_;

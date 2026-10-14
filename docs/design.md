@@ -52,7 +52,17 @@ last hidden state (`hidden_head.safetensors` beside the weights,
 `src/engine/hidden_head.*`) run a chat request's prompt as a Clef record
 runs (alone in its passes, the image prefix cached) and read the last row's
 final-normed state in fp32 from the residual stream
-(`TreeSpec::out_last_hidden`).
+(`TreeSpec::out_last_hidden`). The **Qwen3-Omni thinker** (`qwen3_omni_moe`, the
+backbone of Cloudflare's Clef-Omni decision model; images and text, no audio)
+runs from an MLX directory written by `tools/clef_convert.py`: 48 layers of
+full attention (GQA 32 / 4, 128-dim heads with q / k RMSNorms and interleaved
+M-RoPE over the whole head) and 128 routed experts (top 8, renormalized, no
+shared expert), whose vision tower adds DeepStack features (the merged rows
+of blocks 8, 16 and 24) to the image rows after the first three layers. Its
+layers reuse Gemma 4's forest attention kernels instantiated for 128-dim heads
+(q pre-scaled by 1/sqrt(128), no window), `g4_route` with unit expert scales
+and the grouped MoE GEMVs (`src/model/impl/qwen3_omni.h`,
+`kernels/82_qwen3_omni.metal`).
 
 ## Layers
 

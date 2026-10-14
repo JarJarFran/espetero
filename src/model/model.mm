@@ -335,9 +335,10 @@ class MetalModel final : public NativeModel {
     I.hidden_states = !m.cfg.q4;  // run_forest refuses out_hidden for qwen4_exp
     {  // Verify-commit (ESPETERO_COMMIT=0: accepted drafts re-run as roots, as before)
       const char* v = std::getenv("ESPETERO_COMMIT");
-      I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma;  // Qwen4-Exp too; not Gemma 4
+      I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma && !m.cfg.q3moe;  // Qwen4-Exp too; not Gemma 4, Qwen3-Omni
     }
     I.end_ids = m.cfg.eos_ids;  // Gemma 4: <eos>, <turn|>, <|tool_response>
+    if (m.cfg.q3moe) I.family = "qwen3_omni_moe";
     if (m.cfg.gemma) {
       I.family = "gemma4";
       I.kv_heads = c.Hkv_g;  // the paged pool's (global layers'); the sliding layers' rings are slot state
@@ -913,7 +914,7 @@ class MetalModel final : public NativeModel {
       for (const Mat& r : L.in_proj) gemm_pipelines(r, list, m.fma34);
       for (const Mat* x : {&L.gate_up, &L.gate, &L.up, &L.down, &L.out, &L.router, &L.shared_gate, &L.index_qk})
         gemm_pipelines(*x, list, m.fma34);
-      if (L.moe && !m.cfg.gemma) {
+      if (L.moe && !m.cfg.gemma && !m.cfg.q3moe) {
         moe_pipelines(m, L, list);  // the passes' own choice per layer (formats may differ by layer)
         for (const char* k : {"moe_topk", "moe_sort", "moe_combine"}) list.push_back({k, 0});
         if (!L.router.dense) list.push_back({"moe_route" + std::to_string(L.router.q.bits), L.router.q.fc()});
@@ -942,6 +943,7 @@ class MetalModel final : public NativeModel {
     }
     gemm_pipelines(m.lm_head, list, m.fma34);
     if (m.cfg.gemma) g4_pipelines(m, list);
+    if (m.cfg.q3moe) q3m_pipelines(m, list);
     for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "conv_prep", "conv_state_save",
                           "gated_rmsnorm", "attn_prep", "attention_combine", "kv_save", "kv_copy_blocks",
                           "gather_rows_f32", "gather_rows_f16", "scatter_rows_f32", "lse_rows", "argmax_rows",

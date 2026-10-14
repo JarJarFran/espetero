@@ -56,6 +56,7 @@ inline void ensure_vscratch(Model& m, int rows) {
   v.hw = m.buffer(size_t(R) * 8);
   v.seg = m.buffer(size_t(R) * 8);
   v.dst_rows = m.buffer(size_t(R / 4) * 4);
+  if (!c.deepstack.empty()) v.ds = m.buffer(c.deepstack.size() * size_t(R / 4) * size_t(c.out) * 4);
   v.rows = R;
 }
 
@@ -122,7 +123,9 @@ inline void prepare_images(Model& m, const std::vector<ImageJob>& jobs) {
 }
 
 // Vision tower over every image of the pass (patch rows concatenated); the
-// merged tokens overwrite their placeholder rows of `h`.
+// merged tokens overwrite their placeholder rows of `h`. DeepStack towers
+// (Qwen3-Omni) also leave merger j's output of block c.deepstack[j] in
+// v.ds ([j][P / 4][out], the decoder adds it to the same rows).
 inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
   const VisionConfig& c = m.vis.c;
   VScratch& v = m.vs;
@@ -207,6 +210,14 @@ inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
     layernorm(E, v.x, B.n2w, B.n2b, v.xn, P, D, c.eps);
     gemm_h(E, B.fc1, v.xn, 0, D, v.act, 0, c.Ip(), P, 2);
     gemm_h(E, B.fc2, v.act, 0, c.Ip(), v.x, 0, D, P, 1);
+    // DeepStack merger: LayerNorm over each merged row (4 consecutive patch rows), fc1 + GELU, fc2.
+    for (size_t j = 0; j < c.deepstack.size(); ++j) {
+      if (c.deepstack[j] != bi - 1) continue;
+      const VMerger& DM = m.vis.ds[j];
+      layernorm(E, v.x, DM.nw, DM.nb, v.xn, P / 4, Dm, c.eps);
+      gemm_h(E, DM.fc1, v.xn, 0, Dm, v.mact, 0, Dm, P / 4, 3);
+      gemm_h(E, DM.fc2, v.mact, 0, Dm, v.ds, j * size_t(P / 4) * size_t(c.out) * 4, c.out, P / 4, 0);
+    }
   }
   layernorm(E, v.x, m.vis.mnw, m.vis.mnb, v.xn, P, D, c.eps);
   gemm_h(E, m.vis.m1, v.xn, 0, Dm, v.mact, 0, Dm, P / 4, 3);

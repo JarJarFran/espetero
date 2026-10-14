@@ -58,6 +58,11 @@ struct Config {
   float softcap = 0.0f, embed_scale = 1.0f;
   std::vector<bool> swa;
   std::vector<int> eos_ids;  // every end-of-turn id the checkpoint names (Gemma: <eos>, <turn|>, <|tool_response>)
+  // Qwen3-Omni thinker (`qwen3_omni_moe`; qwen3_omni.h): full attention in
+  // every layer (head dim HD, rotated whole by interleaved M-RoPE, q/k
+  // RMSNorms), E experts of width Ie, k per token, no shared expert;
+  // DeepStack features of the vision tower added after the first layers.
+  bool q3moe = false;
 
   int W() const { return hc * D; }  // residual width per token
   int C() const { return 2 * Hk * Dk + Hv * Dv; }
@@ -153,6 +158,7 @@ struct VisionConfig {
   float ln_eps = 1e-5f;
   bool chw = false;  // unified: a token's pixels by (channel, y, x), as llama.cpp's gemma4uv weights take them
 
+  std::vector<int> deepstack;  // blocks whose output feeds a DeepStack merger (Qwen3-Omni), in order
   int patch_dim() const { return in_ch * tps * patch * patch; }
   int unified_dim() const { return in_ch * patch * patch * merge * merge; }
   int Ip() const { return (I + 63) / 64 * 64; }
@@ -174,6 +180,9 @@ struct VisionConfig {
     side = int(std::lround(std::sqrt(double(n_pos))));
     if (merge != 2 || side * side != n_pos || D % 64 || out != text_hidden || tps != 2)
       fail("unsupported vision geometry");
+    for (size_t j = 0; j < deepstack.size(); ++j)
+      if (deepstack[j] < 0 || deepstack[j] >= depth || (j > 0 && deepstack[j] <= deepstack[j - 1]))
+        fail("unsupported vision geometry (deepstack_visual_indexes)");
   }
 };
 
@@ -380,13 +389,17 @@ inline Config config_from_gemma(const json::Value& root) {
   return c;
 }
 
-inline VisionConfig vision_from_mlx(const json::Value& root) {
+// deepstack: the decoder adds DeepStack features (qwen3_omni.h); other
+// families refuse towers that have them.
+inline VisionConfig vision_from_mlx(const json::Value& root, bool deepstack = false) {
   VisionConfig v;
   const json::Value* vcp = root.get("vision_config");
   if (!vcp || !vcp->is_object()) return v;
   const json::Value& vc = *vcp;
-  if (const json::Value* ds = vc.get("deepstack_visual_indexes"); ds && ds->is_array() && ds->size())
-    fail("vision towers with deepstack features are not supported");
+  if (const json::Value* ds = vc.get("deepstack_visual_indexes"); ds && ds->is_array() && ds->size()) {
+    if (!deepstack) fail("vision towers with deepstack features are not supported");
+    for (const auto& n : ds->as_array()) v.deepstack.push_back(int(n.as_int()));
+  }
   const std::string act = vc.get_string("hidden_act", "gelu_pytorch_tanh");
   if (act != "gelu_pytorch_tanh") fail("unsupported vision activation " + act);
   v.depth = int(vc.get_int("depth", 0));

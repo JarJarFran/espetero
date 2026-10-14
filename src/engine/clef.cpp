@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Francisco José García Barbero
 //
-// Derived from joint_schema_model.py of Cloudflare's Clef release
-// (https://huggingface.co/Cloudflare/clef-flash), licensed under the Apache
-// License, Version 2.0; translated to C++ and modified (see THIRD_PARTY_NOTICES.md).
+// Derived from joint_schema_model.py of Cloudflare's Clef releases
+// (https://huggingface.co/Cloudflare/clef-flash, https://huggingface.co/Cloudflare/clef-omni),
+// licensed under the Apache License, Version 2.0; translated to C++ and modified
+// (see THIRD_PARTY_NOTICES.md).
 // This file is licensed under the Apache License, Version 2.0
 // (third_party/apache-2.0/LICENSE-2.0.txt).
 
@@ -295,7 +296,7 @@ bool is_release(const std::string& dir) {
 
 Record encode(const Tokenizer& tok, const json::Value& state, const json::Value& questions,
               const std::vector<int>& image_tokens, int32_t image_token, int max_length, bool has_max_state,
-              int max_state_tokens) {
+              int max_state_tokens, bool newline_per_image) {
   if (!questions.is_object() || questions.as_object().size() == 0) invalid("at least one question is required");
   Record r;
   std::vector<int32_t> schema = tok.encode("\n\nSCHEMA FIELDS:\n");
@@ -349,9 +350,11 @@ Record encode(const Tokenizer& tok, const json::Value& state, const json::Value&
   const std::vector<int32_t> suffix =
       tok.encode("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:");
   if (!image_tokens.empty()) {
+    // Clef: IMAGE_PLACEHOLDER * n + "\n"; Clef-Omni: (IMAGE_PLACEHOLDER + "\n") * n.
     std::string media;
-    for (size_t i = 0; i < image_tokens.size(); ++i) media += "<|vision_start|><|image_pad|><|vision_end|>";
-    media += "\n";
+    for (size_t i = 0; i < image_tokens.size(); ++i)
+      media += newline_per_image ? "<|vision_start|><|image_pad|><|vision_end|>\n" : "<|vision_start|><|image_pad|><|vision_end|>";
+    if (!newline_per_image) media += "\n";
     size_t g = 0;
     for (int32_t t : tok.encode(media)) {
       if (t == image_token) {

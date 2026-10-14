@@ -260,6 +260,13 @@ struct VBlock {
   HW qkv, proj, fc1, fc2;
 };
 
+// A DeepStack merger (Qwen3-Omni): LayerNorm over the 2x2 merged rows
+// (4 D wide, after the shuffle), fc1 + GELU, fc2 to the decoder width.
+struct VMerger {
+  Buf nw, nb;
+  HW fc1, fc2;
+};
+
 struct Vision {
   VisionConfig c;
   HW patch, m1, m2;
@@ -272,12 +279,14 @@ struct Vision {
   // and biases (fp32); `patch` is patch_dense with its bias, `pos` the
   // position table fp32 [n_pos][2][D].
   Buf ln1w, ln1b, ln2w, ln2b, ln3w, ln3b;
+  std::vector<VMerger> ds;  // one per c.deepstack block
 };
 
 struct VScratch {
   int rows = 0;
   id<MTLBuffer> pix, x, xn, qkv, q, k, v, o, act, mact, out;
   id<MTLBuffer> pidx, pw, hw, seg, dst_rows;
+  id<MTLBuffer> ds;  // DeepStack features [n][merged rows][out] fp32 (Qwen3-Omni)
 };
 
 // Multi-token prediction head (HF mtp.*, GGUF nextn): one full-attention

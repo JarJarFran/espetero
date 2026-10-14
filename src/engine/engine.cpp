@@ -345,12 +345,31 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   // Clef releases: a joint schema head next to the backbone answers
   // /v1/systemone (and /v1/decisions) from the final hidden states.
   if (is_dir(path) && clef::is_release(path)) {
-    if (I.format == "gguf" || !I.leaves) throw std::runtime_error("Clef heads need a Qwen3.5 MLX-layout backbone");
+    if (I.format == "gguf" || !I.leaves)
+      throw std::runtime_error("Clef heads need an MLX-layout backbone (Qwen3.5 or the Qwen3-Omni thinker: tools/clef_convert.py)");
     clef_ = clef::Head::load(path);
     if (clef_->hidden() != I.hidden) throw std::runtime_error("Clef head width differs from the backbone's hidden size");
+    // Clef-Omni's joint_schema_model.py: images in IMAGE_SIZE = 65,536 to 1,048,576 pixels (its
+    // processor's own limits are 3,136 to 12,845,056, what media_kwargs may still ask), decoded
+    // without EXIF transposition (PIL Image.open(...).convert("RGB")), "\n" after each image
+    // block, records of up to 64,000 tokens.
+    clef_omni_ = I.family == "qwen3_omni_moe";
+    if (clef_omni_) {
+      clef_min_pixels_ = 65536;
+      clef_max_pixels_ = 1048576;
+      clef_max_length_ = 64000;
+      vision::set_exif_orientation(false);  // a Clef model serves nothing else
+      try {  // the processor's limit, the largest budget media_kwargs may ask
+        json::Value pc = json::parse(read_text(path + "/processor_config.json"));
+        if (const json::Value* ip = pc.get("image_processor"); ip && ip->is_object()) pc = *ip;
+        if (const json::Value* sz = pc.get("size"); sz && sz->is_object()) clef_limit_pixels_ = sz->get_int("longest_edge", 0);
+      } catch (...) {
+      }
+    }
     // The release resizes images with its own processor limits (Qwen2VLImageProcessor: 65,536 to
     // 16,777,216 pixels for the Clef releases), not Espetero's ~1 MP chat budget.
     for (const char* name : {"/processor_config.json", "/preprocessor_config.json"}) {
+      if (clef_omni_) break;
       try {
         const std::string txt = read_text(path + name);
         if (txt.empty()) continue;
@@ -366,6 +385,7 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
       } catch (...) {
       }
     }
+    if (clef_limit_pixels_ < clef_max_pixels_) clef_limit_pixels_ = clef_max_pixels_;
   }
 
   // A hidden-state decision head next to the weights (hidden_head.h): chat
@@ -1151,6 +1171,10 @@ json::Value Engine::systemone(const json::Value& body) {
   if (const json::Value* v = body.get("videos");
       v && !v->is_null() && !(v->is_array() && v->size() == 0) && !(v->is_bool() && !v->as_bool()))
     throw RequestError(422, "videos are not supported");
+  // Clef-Omni records may carry audio (its thinker's audio encoder is not converted).
+  if (const json::Value* a = body.get("audio");
+      clef_omni_ && a && !a->is_null() && !(a->is_array() && a->size() == 0) && !(a->is_bool() && !a->as_bool()))
+    throw RequestError(422, "audio is not supported (Espetero runs Clef-Omni on images and text)");
   auto job = std::make_shared<ClefJob>();
   // Image budget: by default the release's own processor limits; image_detail picks Espetero's levels
   // (standard ~1 MP, low, high, max) instead; media_kwargs (min_pixels / max_pixels, or size
@@ -1171,7 +1195,7 @@ json::Value Engine::systemone(const json::Value& body) {
     // operator's ceiling when it has none): a larger max_pixels only admits
     // bigger images, a larger min_pixels upscales small ones (4e9 made a 64x64
     // image 63,264 pixels wide). Smaller values pass as the processor takes them.
-    const int64_t hi = clef_max_pixels_ > 0 ? clef_max_pixels_ : std::min(ceiling, opt_.image_detail_max);
+    const int64_t hi = clef_limit_pixels_ > 0 ? clef_limit_pixels_ : std::min(ceiling, opt_.image_detail_max);
     if (mx > 0) px = std::min(mx, hi);
     if (mn > 0) min_px = std::min(mn, hi);
   }
@@ -1192,7 +1216,7 @@ json::Value Engine::systemone(const json::Value& body) {
     }
   }
   const ModelInfo& I = model_->info();
-  const int max_length = int(std::min<int64_t>(body.get_int("max_length", 16384), I.max_ctx));
+  const int max_length = int(std::min<int64_t>(body.get_int("max_length", clef_max_length_), I.max_ctx));
   if (!urls.empty()) {
     // The image runs alone, read from the headers, must leave room in
     // max_length (the record holds every one of them, plus the system prompt
@@ -1213,7 +1237,7 @@ json::Value Engine::systemone(const json::Value& body) {
   const int max_state = has_max_state ? int(ms->as_int()) : 0;
   const auto t_enc = Clock::now();
   job->rec = clef::encode(*tok_, *state, questions ? *questions : json::Value(), itoks, image_token, max_length,
-                          has_max_state, max_state);
+                          has_max_state, max_state, clef_omni_);
   const double encode_ms = ms_since(t_enc);
   if (!job->images.empty()) job->positions = mrope_positions(job->rec.ids, job->images);
   for (const PreparedImage& im : job->images) job->digest += im.digest;

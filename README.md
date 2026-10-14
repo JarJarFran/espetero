@@ -34,7 +34,7 @@ Greedy decoding with thinking off. *Decode*: 8 short prompts, 512 new tokens eac
 † Another app used the GPU during this run (5 to 33 % of the run's time on the GPU), which can slow the engine down.
 ¹ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF.
 ² TensorFold's native engine has no backend for the Qwen3.6 mixture-of-experts or Gemma 4 checkpoints yet, and it serves images only with `--vision`, which these runs did not pass.
-³ Espetero runs Gemma 4 text only so far.
+³ Not measured: these runs used Espetero 0.1.0, which ran Gemma 4 text only.
 
 ## Quick start
 

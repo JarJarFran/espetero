@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Gemma 4 vision**: chat requests with images on Gemma 4 26B-A4B and 31B, from MLX directories and from llama.cpp GGUF with a `gemma4v` mmproj. The processor follows transformers' Gemma4 processor (70 to 1120 soft tokens by image budget; 280 at the standard budget); image tokens attend to their whole image in the sliding-window layers, as transformers and vLLM build the mask; the images of a pass give the same soft tokens as each one alone. `tools/gemma4_lora_convert.py` merges a decision LoRA (for example `autotrust/GEV-26B-Decide`) into an 8-bit MLX directory.
+- **Gemma 4 unified (12B)**: `gemma4_unified` with its encoder-free vision embedder (one soft token per 48x48-pixel block), from MLX directories and BF16 GGUF + mmproj (`tools/gemma4_unified_convert.py` converts both). Decision heads over the last hidden state (`"head": {"slots": n}` on chat completions and completions; `akhilaaa3/Jev-Omni`) and a raw prompt mode with per-part checkpoints (`chat_template_kwargs.raw_prompt`; `EldanRing/Winnow-12B`'s letter labels through the score read-out).
+- **Qwen3-Omni thinker**: `qwen3_omni_moe` (Qwen3-Omni-30B-A3B's thinker with its DeepStack vision tower) on the Clef path: `Cloudflare/clef-omni` converts with `tools/clef_convert.py` and answers `/v1/systemone` and `/v1/decisions` with images and text; audio and video get a 422.
+
 ## 0.1.1 (2026-10-12)
 
 - Automatic slots grow to `--users` (concurrent requests) when the memory budget allows, beside the KV of two full contexts. Gemma 4 31B, whose slots carry the sliding-window rings (0.84 GB each), had 8 slots: with 16 requests at once the second 8 waited for the first 8 (now 16 slots: first token about 10x sooner, 40 % more tokens per second in total). With the default 64 users, Qwen3.8-27B goes from 48 to 64 slots and from 218K to 157K tokens of KV.
