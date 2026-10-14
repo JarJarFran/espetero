@@ -142,10 +142,28 @@ struct VisionConfig {
   float eps = 1e-6f;
   double rope_theta = 100.0;  // Gemma 4: the 2D RoPE base
   bool standardize = false;   // Gemma 4: (x - std_bias) * std_scale after pooling
+  // Gemma 4 unified (gemma4_unified_vision; gemma_vision.h): no tower. Each
+  // soft token is one merge x merge block of patches (48 x 48 pixels) through
+  // LayerNorm, a dense projection to D = mm_embed_dim, LayerNorm, the
+  // factorized position table (n_pos = mm_posemb_size entries per axis),
+  // LayerNorm (ln_eps each), then the RMSNorm (eps) and the embed_vision
+  // projection. `patch` and `merge` keep the processor's 16-pixel patches
+  // and its 3 x 3 grouping, so grids and token counts are Gemma 4's.
+  bool unified = false;
+  float ln_eps = 1e-5f;
+  bool chw = false;  // unified: a token's pixels by (channel, y, x), as llama.cpp's gemma4uv weights take them
+
   int patch_dim() const { return in_ch * tps * patch * patch; }
+  int unified_dim() const { return in_ch * patch * patch * merge * merge; }
   int Ip() const { return (I + 63) / 64 * 64; }
 
   void validate(int text_hidden) {
+    if (unified) {
+      if (!gemma || tps != 1 || merge < 1 || D % 64 || D > 4096 || unified_dim() % 64 || out != text_hidden || n_pos < 1)
+        fail("unsupported Gemma 4 unified vision geometry");
+      hd = 0;
+      return;
+    }
     hd = heads ? D / heads : 0;
     if (hd != 64 && hd != 72 && hd != 80) fail("unsupported vision head size " + std::to_string(hd));
     if (gemma) {
@@ -229,7 +247,12 @@ inline Config config_from_mlx(const json::Value& root) {
 // checkpoint, read as mlx-lm 0.32's gemma4_text.ModelArgs reads it (its
 // defaults where a key is missing). Per-layer input embeddings and KV-shared
 // layers (the E2B/E4B models) are refused here: the decoder does not run them.
-inline bool is_gemma4_type(const std::string& t) { return t == "gemma4" || t == "gemma4_text"; }
+// gemma4_unified (the 12B with the encoder-free vision embedder) has the
+// same decoder; its config may give the global layers' geometry as
+// transformers 5.17's per_layer_config instead of global_head_dim.
+inline bool is_gemma4_type(const std::string& t) {
+  return t == "gemma4" || t == "gemma4_text" || t == "gemma4_unified" || t == "gemma4_unified_text";
+}
 
 inline Config config_from_gemma(const json::Value& root) {
   const json::Value* tcp = root.get("text_config");
@@ -315,6 +338,31 @@ inline Config config_from_gemma(const json::Value& root) {
     c.swa.push_back(s);
     s ? ++c.n_swa : ++c.n_full;
   }
+  // per_layer_config {"5": {"head_dim": 512, "num_key_value_heads": 1}, ...}:
+  // the global layers' head size and KV heads (one geometry for all of them;
+  // the sliding layers keep head_dim and num_key_value_heads).
+  if (const json::Value* plc = tc.get("per_layer_config"); plc && plc->is_object() && plc->size()) {
+    int hd = 0, hkv = 0;
+    const json::Object& o = plc->as_object();
+    for (size_t e = 0; e < o.size(); ++e) {
+      const std::string& key = o.keys[e];
+      const json::Value& v = o.vals[e];
+      int li = -1;
+      try {
+        li = std::stoi(key);
+      } catch (...) {
+      }
+      if (li < 0 || li >= c.L || !v.is_object()) fail("Gemma 4 per_layer_config: invalid entry '" + key + "'");
+      if (c.swa[size_t(li)]) fail("Gemma 4 per_layer_config: overrides of sliding layers are not supported");
+      const int h = int(v.get_int("head_dim", c.HD)), k = int(v.get_int("num_key_value_heads", c.Hkv));
+      if ((hd && h != hd) || (hkv && k != hkv)) fail("Gemma 4 per_layer_config: global layers of different geometry");
+      hd = h;
+      hkv = k;
+    }
+    c.HDg = hd;
+    c.Hkv_g = hkv;
+    c.rot_g = int(double(c.HDg) * prf_g) / 2 * 2;
+  }
   // End tokens: config.json's eos_token_id (a list for the instruction-tuned models) and text_config's.
   auto add_eos = [&](const json::Value* e) {
     if (!e) return;
@@ -355,6 +403,26 @@ inline VisionConfig vision_from_mlx(const json::Value& root) {
   return v;
 }
 
+// Gemma 4 unified's vision_config (gemma4_unified_vision): transformers'
+// defaults where a key is missing. model_patch_size must be patch_size x
+// pooling_kernel_size (as transformers checks).
+inline VisionConfig vision_from_gemma_unified(const json::Value& vc, int text_hidden) {
+  VisionConfig v;
+  v.gemma = v.unified = true;
+  v.patch = int(vc.get_int("patch_size", 16));
+  v.merge = int(vc.get_int("pooling_kernel_size", 3));
+  v.tps = 1;
+  if (vc.get_int("model_patch_size", int64_t(v.patch) * v.merge) != int64_t(v.patch) * v.merge)
+    fail("Gemma 4 unified vision: model_patch_size is not patch_size x pooling_kernel_size");
+  v.D = int(vc.get_int("mm_embed_dim", 3840));
+  if (vc.get_int("output_proj_dims", v.D) != v.D) fail("Gemma 4 unified vision: output_proj_dims differs from mm_embed_dim");
+  v.n_pos = int(vc.get_int("mm_posemb_size", 1120));
+  v.eps = float(vc.get_double("rms_norm_eps", 1e-6));
+  v.out = text_hidden;
+  v.present = true;
+  return v;
+}
+
 // Gemma 4's vision_config (gemma4_vision): mlx-vlm's VisionConfig defaults
 // where a key is missing.
 inline VisionConfig vision_from_gemma(const json::Value& root, int text_hidden) {
@@ -362,6 +430,8 @@ inline VisionConfig vision_from_gemma(const json::Value& root, int text_hidden) 
   const json::Value* vcp = root.get("vision_config");
   if (!vcp || !vcp->is_object()) return v;
   const json::Value& vc = *vcp;
+  if (vc.get_string("model_type", "") == "gemma4_unified_vision" || root.get_string("model_type", "") == "gemma4_unified")
+    return vision_from_gemma_unified(vc, text_hidden);
   const std::string act = vc.get_string("hidden_activation", vc.get_string("hidden_act", "gelu_pytorch_tanh"));
   if (act != "gelu_pytorch_tanh") fail("unsupported Gemma 4 vision activation " + act);
   if (vc.get_bool("use_clipped_linears", false))
@@ -501,10 +571,26 @@ inline Config config_from_gemma_gguf(const GGUFFile& f) {
   return c;
 }
 
-// Gemma 4's mmproj (llama.cpp clip, projector gemma4v).
+// Gemma 4's mmproj (llama.cpp clip, projector gemma4v; gemma4uv: the
+// unified 12B's embedder, which has no blocks).
 inline VisionConfig vision_from_gemma_gguf(const GGUFFile& f, int text_hidden) {
   VisionConfig v;
   if (!f.get_int("clip.has_vision_encoder", 0)) return v;
+  if (f.get_string("clip.vision.projector_type", "") == "gemma4uv") {
+    v.gemma = v.unified = v.chw = true;
+    v.D = int(f.get_int("clip.vision.embedding_length", 0));
+    v.out = int(f.get_int("clip.vision.projection_dim", 0));
+    if (v.out != text_hidden) fail("mmproj: projection width differs from the model's hidden size");
+    v.patch = int(f.get_int("clip.vision.patch_size", 16));
+    v.tps = 1;
+    v.merge = 3;  // the HF configs' pooling_kernel_size: 48-pixel patches
+    v.eps = float(f.get_float("clip.vision.attention.layer_norm_epsilon", 1e-6));
+    const GGUFFile::Tensor* pos = f.find("v.position_embd.weight");
+    if (!pos || pos->dims.size() != 3 || pos->dims[2] != 2) fail("mmproj: Gemma 4 unified position table missing");
+    v.n_pos = int(pos->dims[1]);
+    v.present = true;
+    return v;
+  }
   v.gemma = true;
   v.depth = int(f.get_int("clip.vision.block_count", 0));
   v.D = int(f.get_int("clip.vision.embedding_length", 0));

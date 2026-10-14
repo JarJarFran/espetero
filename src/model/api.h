@@ -119,6 +119,11 @@ struct TreeSpec {
   // float32 [root_len][hidden] (Clef joint heads). Disables last-layer
   // pruning for the pass; not supported for qwen4_exp.
   float* out_hidden = nullptr;
+  // The final-normed hidden state of the root's last row, float32 [hidden],
+  // computed on the CPU from the pass's fp32 residual (hidden-state decision
+  // heads: no fp16 rounding of the LM head's input). Disables last-layer
+  // pruning for the pass, as out_hidden does.
+  float* out_last_hidden = nullptr;
   // > 0: the top-`topk` (<= 32) scaled logits x = logit / temperature of every
   // readout, their ids, the maximum and the full-vocabulary sum of exp(x - max),
   // computed on the GPU (NativeModel::topk).

@@ -28,6 +28,7 @@
 #include "clef.h"
 #include "decisions.h"
 #include "grammar.h"
+#include "hidden_head.h"
 
 namespace espetero {
 
@@ -174,6 +175,10 @@ struct Engine::ClefJob {
   int cached = 0;                  // prefix rows served from the cache
   std::vector<int32_t> positions;  // [ids][3] M-RoPE positions (images only)
   std::vector<float> hidden;       // [ids][hidden] final-normed backbone states
+  // Hidden-state heads (Engine::head): no per-row states, the last row's
+  // final-normed state in fp32 instead.
+  bool rows = true;
+  std::vector<float> last;
   // Pass arrays.
   std::vector<int32_t> root_pos;
   std::vector<ImageRef> irefs;
@@ -361,6 +366,14 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
       } catch (...) {
       }
     }
+  }
+
+  // A hidden-state decision head next to the weights (hidden_head.h): chat
+  // requests with "head" read it instead of generating.
+  if (is_dir(path) && !clef_ && HiddenHead::present(path)) {
+    if (!I.hidden_states) throw std::runtime_error("hidden_head: this model's hidden states cannot be read out");
+    head_ = HiddenHead::load(path);
+    if (head_->hidden() != I.hidden) throw std::runtime_error("hidden_head: its width differs from the model's hidden size");
   }
 
   // Decisions: labels, the prompt builder and the shared header checkpoint.
@@ -1388,10 +1401,52 @@ bool Engine::clef_evict_prefix(const std::vector<int>& keep) {
   return true;
 }
 
+// ---------------------------------------------------------------- hidden-state heads
+int Engine::head_slots() const { return head_ ? head_->slots() : 0; }
+
+Engine::HeadResult Engine::head(const GenRequest& g, int slots) {
+  if (!head_) throw RequestError(422, "head: this model has no hidden-state head (hidden_head.safetensors)");
+  if (slots < 1 || slots > head_->slots())
+    throw RequestError(422, "head.slots: 1 to " + std::to_string(head_->slots()));
+  if (g.prompt.empty()) throw RequestError(422, "empty prompt");
+  const ModelInfo& I = model_->info();
+  auto job = std::make_shared<ClefJob>();
+  job->rec.ids = g.prompt;
+  // The image prefix (system prompt, instructions and images) is shared by every question about the same images.
+  job->rec.prefix_tokens = g.img_split > 0 && !g.images.empty() ? g.img_split : 0;
+  job->images = g.images;
+  job->positions = g.positions;
+  for (const PreparedImage& im : g.images) job->digest += im.digest;
+  job->rows = false;
+  job->last.assign(size_t(I.hidden), 0.0f);
+  job->queued = Clock::now();
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stop_) throw RequestError(503, "engine is shutting down");
+    clef_jobs_.push_back(job);
+  }
+  cv_.notify_all();
+  {
+    std::unique_lock<std::mutex> lk(job->mu);
+    job->cv.wait(lk, [&] { return job->done; });
+    if (!job->error.empty()) throw RequestError(job->error_status, job->error);
+  }
+  HeadResult r;
+  r.logits = head_->logits(job->last.data(), slots);
+  r.cached = job->cached;
+  r.passes = job->passes;
+  r.gpu_ms = job->gpu_ms;
+  r.run_ms = job->run_ms;
+  r.queue_ms = std::chrono::duration<double, std::milli>(job->started - job->queued).count();
+  decisions_done_ += 1;
+  return r;
+}
+
 // Scheduler thread: the whole sequence through the backbone, in passes of at
 // most prefill_chunk rows (an image run never straddles two; one larger than
 // that gets a pass of up to max_rows), each continuing the previous one's
-// state; every row's final-normed state is read out.
+// state; every row's final-normed state is read out (head jobs: the last
+// row's, in fp32).
 void Engine::run_clef(ClefJob& j) {
   j.started = Clock::now();
   const ModelInfo& I = model_->info();
@@ -1399,7 +1454,7 @@ void Engine::run_clef(ClefJob& j) {
   const int chunk = std::max(64, std::min(I.max_rows, opt_.prefill_chunk));
   if (L > I.max_ctx)  // nothing is generated: the record itself may fill the window
     throw RequestError(422, "Request exceeds the model context window (" + std::to_string(I.max_ctx) + " tokens)");
-  j.hidden.assign(size_t(L) * size_t(D), 0.0f);
+  if (j.rows) j.hidden.assign(size_t(L) * size_t(D), 0.0f);
   std::vector<std::pair<int, int>> runs;  // image rows [first, last) per image
   for (int i = 0; i < L && runs.size() < j.images.size();) {
     if (j.rec.ids[size_t(i)] == image_token) {
@@ -1422,8 +1477,9 @@ void Engine::run_clef(ClefJob& j) {
   int cache_slot = -1;  // the cached checkpoint this request continues (never freed here)
   if (P > 0) {
     for (ClefPrefix& c : clef_prefixes_)
-      if (c.digest == j.digest && int(c.tokens.size()) == P && std::equal(c.tokens.begin(), c.tokens.end(), j.rec.ids.begin())) {
-        std::copy(c.hidden.begin(), c.hidden.end(), j.hidden.begin());
+      if (c.digest == j.digest && int(c.tokens.size()) == P && std::equal(c.tokens.begin(), c.tokens.end(), j.rec.ids.begin()) &&
+          (!j.rows || c.hidden.size() == size_t(P) * size_t(D))) {
+        if (j.rows) std::copy(c.hidden.begin(), c.hidden.end(), j.hidden.begin());
         c.used = ++clock_;
         cache_slot = parent = c.slot;
         done = j.cached = P;
@@ -1483,7 +1539,8 @@ void Engine::run_clef(ClefJob& j) {
           t.images = j.irefs.data();
           t.n_images = int(j.irefs.size());
         }
-        t.out_hidden = j.hidden.data() + size_t(done) * size_t(D);
+        if (j.rows) t.out_hidden = j.hidden.data() + size_t(done) * size_t(D);
+        if (end == L && !j.last.empty()) t.out_last_hidden = j.last.data();
         model_->run({t}, &st);
       } catch (...) {
         if (slot >= 0) model_->slot_free(slot);
@@ -1500,7 +1557,7 @@ void Engine::run_clef(ClefJob& j) {
         c.tokens.assign(j.rec.ids.begin(), j.rec.ids.begin() + P);
         c.digest = j.digest;
         c.slot = slot;
-        c.hidden.assign(j.hidden.begin(), j.hidden.begin() + long(P) * D);
+        if (j.rows) c.hidden.assign(j.hidden.begin(), j.hidden.begin() + long(P) * D);
         c.used = ++clock_;
         clef_prefixes_.push_back(std::move(c));
         cache_slot = slot;
@@ -2228,9 +2285,10 @@ void Engine::step() {
       it = cache_.erase(it);
     }
   }
-  // ---- Clef requests: one at a time, alone in their passes (Clef
-  // models serve nothing else). The head runs on the caller's thread.
-  if (clef_) {
+  // ---- Clef requests and hidden-state head requests: one at a time, alone
+  // in their passes (Clef models serve nothing else). The head runs on the
+  // caller's thread.
+  if (clef_ || head_) {
     std::shared_ptr<ClefJob> cj;
     {
       std::lock_guard<std::mutex> lk(mu_);

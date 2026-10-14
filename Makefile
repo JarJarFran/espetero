@@ -90,8 +90,8 @@ LIB_OBJS := $(filter-out $(BUILD)/obj/server/%,$(OBJS))
 $(BUILD)/decisions_test: tests/decisions_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
-# Gemma 4 without a GPU: config parsing and its tool-call format.
-$(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/json.o
+# Gemma 4 without a GPU: config parsing, its tool-call format, hidden-state heads.
+$(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/obj/engine/hidden_head.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
 $(BUILD)/topk_test: tests/topk_test.mm $(BUILD)/model.o $(BUILD)/json.o $(BUILD)/obj/engine/sampling.o

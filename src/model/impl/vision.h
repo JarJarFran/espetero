@@ -28,6 +28,17 @@ inline void ensure_vscratch(Model& m, int rows) {
   if (rows <= v.rows) return;
   const VisionConfig& c = m.vis.c;
   const int R = std::max(rows, std::max(1024, v.rows * 3 / 2));
+  if (c.unified) {  // Gemma 4 unified: `rows` are soft tokens (gemma_vision.h)
+    v.qkv = m.buffer(size_t(R) * size_t(c.unified_dim()) * 4);  // fp32 pixel rows
+    v.pix = m.buffer(size_t(R) * size_t(m.vis.patch.kp) * 2);
+    v.x = m.buffer(size_t(R) * size_t(c.D) * 4);
+    v.xn = m.buffer(size_t(R) * size_t(c.D) * 2);
+    v.out = m.buffer(size_t(R) * size_t(c.out) * 4);
+    v.hw = m.buffer(size_t(R) * 8);
+    v.dst_rows = m.buffer(size_t(R) * 4);
+    v.rows = R;
+    return;
+  }
   v.pix = m.buffer(size_t(R) * size_t(m.vis.patch.kp) * 2);
   v.x = m.buffer(size_t(R) * size_t(c.D) * 4);
   v.xn = m.buffer(size_t(R) * size_t(c.D) * 2);

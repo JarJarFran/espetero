@@ -368,6 +368,13 @@ Geometry gemma_geometry(const json::Value& root, const json::Value& tc) {
   g.Hkv_g = k_eq_v && gkv && gkv->is_number() ? int(gkv->as_double()) : g.Hkv;
   g.V = int(root.get_int("vocab_size", tc.get_int("vocab_size", 262144)));
   g.window = int(tc.get_int("sliding_window", 512));
+  // per_layer_config (gemma4_unified, transformers 5.17): the global layers' head size and KV heads.
+  if (const json::Value* plc = tc.get("per_layer_config"); plc && plc->is_object())
+    for (const json::Value& v : plc->as_object().vals)
+      if (v.is_object()) {
+        g.HDg = int(v.get_int("head_dim", g.HDg));
+        g.Hkv_g = int(v.get_int("num_key_value_heads", g.Hkv_g));
+      }
   if (tc.get_bool("enable_moe_block", false)) {
     g.E = int(tc.get_int("num_experts", 0));
     g.k = int(tc.get_int("top_k_experts", 0));
@@ -411,7 +418,8 @@ Geometry geometry_from_config(const json::Value& root) {
   const json::Value& tc = tcp && tcp->is_object() ? *tcp : root;
   {
     const std::string top = root.get_string("model_type", ""), text = tc.get_string("model_type", "");
-    if (top == "gemma4" || top == "gemma4_text" || text == "gemma4" || text == "gemma4_text") return gemma_geometry(root, tc);
+    for (const char* t : {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"})
+      if (top == t || text == t) return gemma_geometry(root, tc);
   }
   g.D = int(tc.get_int("hidden_size", 0));
   g.I = int(tc.get_int("intermediate_size", 0));
@@ -802,8 +810,9 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
       if (starts_with(t.name, "language_model.lm_head.")) lm_head = true;
       if (t.name == "language_model.model.embed_tokens.weight") f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
-      if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight")
-        vision_tower = true;  // Qwen3-VL, Gemma 4
+      if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight" ||
+          t.name == "vision_embedder.patch_dense.weight")
+        vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified
       if (starts_with(t.name, "language_model.mtp.") || starts_with(t.name, "mtp.")) {
         // Flash-Next drafts with a drafter directory; the file's own mtp.* head is not loaded.
         if (f.geo.q4) continue;
@@ -812,7 +821,9 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         f.streamed += t.bytes;  // read from the SSD (expert cache, n-gram rows)
         continue;
       }
-      if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.")) f.vision += bytes;
+      if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.") ||
+          starts_with(t.name, "vision_embedder."))
+        f.vision += bytes;
       f.weights += bytes;
     }
   }

@@ -41,6 +41,9 @@ struct ChatJob {
   // Keywords of a non-strict json_schema the reply does not enforce
   // (reported in the response as structured_output.unenforced).
   std::vector<std::string> unenforced;
+  // "head": the hidden-state head's first head_slots logits instead of a
+  // reply (0: a reply); see head_response.
+  int head_slots = 0;
 };
 
 constexpr int kMaxChoices = 16;     // n above this: 422
@@ -82,8 +85,14 @@ struct ChoiceResult {
   ChatEvent last;
 };
 // A whole (non-streamed) chat or completions response: every choice run;
-// `client_gone` (optional) stops them.
+// `client_gone` (optional) stops them. A "head" job gets head_response.
 json::Value respond(Engine& engine, const ChatJob& job, const std::function<bool()>& client_gone = nullptr);
+
+// The response to a "head" request: no reply ("content": ""), and "head":
+// {"slots", "logits", "probabilities"} with the hidden-state head's logits
+// of the first `slots` slots (hidden_head.h) for the prompt's last token and
+// their softmax.
+json::Value head_response(Engine& engine, const ChatJob& job);
 
 // Whole-response bodies.
 json::Value chat_response(const Engine& engine, const ChatJob& job, const std::vector<ChoiceResult>& choices);

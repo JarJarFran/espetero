@@ -38,6 +38,7 @@
 namespace espetero {
 
 class Tokenizer;
+class HiddenHead;
 namespace tmpl {
 class Template;
 }
@@ -272,6 +273,19 @@ class Engine {
   // Clef head: fields become noul / choice questions; the response keeps decide()'s format.
   json::Value clef_decide(const json::Value& request);
 
+  // ---- hidden-state heads (blocking, thread-safe; hidden_head.h): the logits
+  // of the first `slots` slots of the model's head for the final-normed state
+  // of the prompt's last token. The prompt (with its images) runs alone in
+  // its passes without generating; its image prefix (up to
+  // GenRequest::img_split) is cached as a Clef request's is.
+  struct HeadResult {
+    std::vector<float> logits;
+    int cached = 0, passes = 0;
+    double gpu_ms = 0, run_ms = 0, queue_ms = 0;
+  };
+  HeadResult head(const GenRequest& request, int slots);
+  int head_slots() const;  // 0: no head
+
   // ---- generation (thread-safe): the stream starts filling immediately
   std::shared_ptr<GenStream> generate(GenRequest request);
   // N generations of one prompt (OpenAI's n), its prefill computed once:
@@ -425,6 +439,7 @@ class Engine {
   std::deque<std::shared_ptr<DecisionJob>> decisions_;
   std::deque<std::shared_ptr<ClefJob>> clef_jobs_;
   std::unique_ptr<clef::Head> clef_;
+  std::unique_ptr<HiddenHead> head_;
   // Clef image prefixes (scheduler thread): the system prompt and the media
   // block of recent requests with images, as a checkpoint slot plus their
   // final-normed hidden rows, so the next request about the same images

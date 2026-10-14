@@ -609,7 +609,8 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
         if (!mmproj.empty()) {
           GGUFGemmaVisionSource vsrc(mmproj);
           const VisionConfig vc = vision_from_gemma_gguf(vsrc.file(), m.cfg.D);
-          if (vc.present) load_gemma_vision(m, vsrc, vc);
+          if (vc.present && vc.unified) load_gemma_unified_vision(m, vsrc, vc);
+          else if (vc.present) load_gemma_vision(m, vsrc, vc);
         }
       }
       return;
@@ -645,6 +646,10 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       if (want_vision && src.has("vision_tower.patch_embedder.input_proj.weight")) {
         const VisionConfig vc = vision_from_gemma(cfg, m.cfg.D);
         if (vc.present) load_gemma_vision(m, src, vc);
+      } else if (want_vision && src.has("vision_embedder.patch_dense.weight")) {  // gemma4_unified
+        const VisionConfig vc = vision_from_gemma(cfg, m.cfg.D);
+        if (!vc.unified) fail("vision_embedder.* tensors without a gemma4_unified vision_config");
+        load_gemma_unified_vision(m, src, vc);
       }
       return;
     }

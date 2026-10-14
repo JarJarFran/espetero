@@ -25,6 +25,19 @@
 // embedding scale (they are not multiplied by sqrt(D), as the reference
 // scatters them into the scaled embeddings). The loader is
 // load_gemma_vision (gemma_load.h).
+//
+// Gemma 4 unified (gemma4_unified_vision, transformers'
+// Gemma4UnifiedVisionEmbedder, see THIRD_PARTY_NOTICES.md) has no tower:
+// each soft token is one 48 x 48 pixel block (pool x pool patches), its
+// values in [0, 1] as (y, x, channel) and rounded to bf16 as the
+// checkpoint's dtype rounds them, and
+//
+//   e = patch_dense(LayerNorm1(pixels)) (bias), LayerNorm2, + pos[col][0] + pos[row][1],
+//       LayerNorm3 (pos_norm), embedding = embedding_projection(rmsnorm(e))
+//
+// with (col, row) the block's place in the pooled grid. Every token is
+// computed alone (no attention), so a pass's images need no alignment. The
+// loader is load_gemma_unified_vision.
 #pragma once
 
 namespace espetero::native {
@@ -241,6 +254,83 @@ inline void encode_vision_g4(Model& m, Enc& E, int P, int n_tok, id<MTLBuffer> h
   E.wr(h);
   E.threads(MTLSizeMake(size_t(c.out / 4), size_t(n_tok), 1), MTLSizeMake(64, 1, 1));
   if (flush_every) E.flush();  // the language model's layers start a new command buffer
+  E.phase[0] = 0;
+}
+
+// ---------------------------------------------------------------- unified
+// Per soft token u of the pass: its fp32 pixel row ([n_tok][3 * (pool * patch)^2]
+// in v.qkv: (y, x, channel), or (channel, y, x) for a gemma4uv mmproj), its
+// (column, row) in v.hw and its decoder row in v.dst_rows.
+// The processor's rows are 16-pixel patches in raster order (gemma_vision's
+// layout); a token gathers its pool x pool block of them.
+inline void prepare_images_g4u(Model& m, const std::vector<ImageJob>& jobs) {
+  VScratch& v = m.vs;
+  const VisionConfig& c = m.vis.c;
+  const int P = c.patch, k = c.merge, S = P * k, pd = c.unified_dim(), pp = c.patch_dim();
+  int32_t* hw = static_cast<int32_t*>([v.hw contents]);
+  int32_t* dst = static_cast<int32_t*>([v.dst_rows contents]);
+  float* pix = static_cast<float*>([v.qkv contents]);
+  for (const ImageJob& J : jobs) {
+    const int gw = J.im->grid_w, tw = gw / k;
+    const float* src = J.im->pixels;
+    for (int t = 0; t < J.n_tok; ++t) {
+      hw[2 * (J.tok0 + t) + 0] = t % tw;
+      hw[2 * (J.tok0 + t) + 1] = t / tw;
+      dst[J.tok0 + t] = J.dst_row0 + t;
+    }
+    parallel_for(size_t(J.n_tok), [&](size_t t) {
+      const int ty = int(t) / tw, tx = int(t) % tw;
+      float* d = pix + (size_t(J.tok0) + t) * size_t(pd);
+      for (int Y = 0; Y < S; ++Y)
+        for (int X = 0; X < S; ++X) {
+          const float* s = src + (size_t(k * ty + Y / P) * size_t(gw) + size_t(k * tx + X / P)) * size_t(pp) +
+                           size_t((Y % P) * P + X % P) * 3;
+          for (int ch = 0; ch < 3; ++ch) d[c.chw ? (ch * S + Y) * S + X : (Y * S + X) * 3 + ch] = bf16_round(s[ch]);
+        }
+    });
+  }
+}
+
+struct G4uNormParamsHost {
+  int32_t D;
+  float ln_eps, eps;
+  int32_t pad;
+};
+
+// The unified embedder over the pass's n_tok soft tokens; the projected
+// embeddings overwrite their rows of `h`.
+inline void encode_vision_g4u(Model& m, Enc& E, int n_tok, id<MTLBuffer> h) {
+  const VisionConfig& c = m.vis.c;
+  VScratch& v = m.vs;
+  const int D = c.D, pd = c.unified_dim();
+  std::snprintf(E.phase, sizeof(E.phase), "vision, %d soft tokens", n_tok);
+  layernorm(E, v.qkv, m.vis.ln1w, m.vis.ln1b, v.pix, n_tok, pd, c.ln_eps);
+  gemm_h(E, m.vis.patch, v.pix, 0, m.vis.patch.kp, v.x, 0, D, n_tok, 0);
+  {
+    const G4uNormParamsHost np{D, c.ln_eps, c.eps, 0};
+    E.pipe("g4u_embed_norm");
+    E.set(0, v.x);
+    E.set(1, m.vis.ln2w);
+    E.set(2, m.vis.ln2b);
+    E.set(3, m.vis.pos);
+    E.set(4, v.hw);
+    E.set(5, m.vis.ln3w);
+    E.set(6, m.vis.ln3b);
+    E.set(7, v.xn);
+    E.bytes(8, np);
+    E.rd(v.x);
+    E.wr(v.xn);
+    E.groups(MTLSizeMake(size_t(n_tok), 1, 1), MTLSizeMake(256, 1, 1));
+  }
+  gemm(E, m.tune, m.vis.proj, v.xn, 0, D, v.out, 0, c.out, n_tok, 0);
+  E.pipe("scatter_rows_f32");
+  E.set(0, v.out);
+  E.set(1, h);
+  E.set(2, v.dst_rows);
+  E.bytes(3, c.out);
+  E.rd(v.out);
+  E.wr(h);
+  E.threads(MTLSizeMake(size_t(c.out / 4), size_t(n_tok), 1), MTLSizeMake(64, 1, 1));
   E.phase[0] = 0;
 }
 

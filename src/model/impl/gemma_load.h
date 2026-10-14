@@ -241,6 +241,53 @@ inline void load_gemma_vision(Model& m, const WeightSource& src, VisionConfig c)
   m.vis.c = c;
 }
 
+// The Gemma 4 unified embedder (gemma_vision.h runs it) by mlx-vlm's
+// gemma4_unified names (vision_embedder.*, embed_vision.*); a gemma4uv mmproj
+// through GGUFGemmaVisionSource. patch_dense becomes fp16 with its bias, the
+// projection keeps its format. The position table is [n_pos][2][D] (MLX) or
+// [2][n_pos][D] (llama.cpp), stored [n_pos][2][D].
+inline void load_gemma_unified_vision(Model& m, const WeightSource& src, VisionConfig c) {
+  c.validate(m.cfg.D);
+  const std::string v = "vision_embedder.";
+  const int D = c.D, pd = c.unified_dim(), n = c.n_pos;
+  m.vis.ln1w = vec(m, src, v + "patch_ln1.weight", size_t(pd));
+  m.vis.ln1b = vec(m, src, v + "patch_ln1.bias", size_t(pd));
+  m.vis.ln2w = vec(m, src, v + "patch_ln2.weight", size_t(D));
+  m.vis.ln2b = vec(m, src, v + "patch_ln2.bias", size_t(D));
+  m.vis.ln3w = vec(m, src, v + "pos_norm.weight", size_t(D));
+  m.vis.ln3b = vec(m, src, v + "pos_norm.bias", size_t(D));
+  {
+    const TensorView pt = src.tensor(v + "pos_embedding");
+    std::vector<float> p = src.floats(v + "pos_embedding", size_t(2) * size_t(n) * size_t(D));
+    // llama.cpp's [2][n_pos][D] (a GGUF view flattens it to [2 n_pos, D]).
+    if (pt.shape == std::vector<int64_t>{2, n, D} || pt.shape == std::vector<int64_t>{2 * int64_t(n), D}) {
+      std::vector<float> q(p.size());
+      for (int i = 0; i < n; ++i)
+        for (int a = 0; a < 2; ++a)
+          std::memcpy(&q[(size_t(i) * 2 + size_t(a)) * size_t(D)], &p[(size_t(a) * size_t(n) + size_t(i)) * size_t(D)],
+                      size_t(D) * 4);
+      p.swap(q);
+    } else if (pt.shape != std::vector<int64_t>{n, 2, D}) {
+      fail(v + "pos_embedding: expected [" + std::to_string(n) + ", 2, " + std::to_string(D) + "]");
+    }
+    m.vis.pos = m.arena->copy(p.data(), p.size() * 4);
+  }
+  Arena tmp(m.dev);
+  id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+  const std::vector<float> bias = src.floats(v + "patch_dense.bias", size_t(D));
+  m.vis.patch = repack_dense(m, enc, g4v_f16(m, tmp, src, v + "patch_dense.weight", D, pd), D, pd, &bias);
+  m.vis.proj = finish(m, enc, tmp, host_mat(m, tmp, src, "embed_vision.embedding_projection.weight", c.out, D));
+  [enc endEncoding];
+  commit_wait(cb);
+  c.present = true;
+  m.vis.c = c;
+  // Image soft tokens attend to their whole image in every layer, as
+  // transformers' Gemma4UnifiedModel builds its masks (and llama.cpp
+  // decodes gemma4uv images); ESPETERO_G4_BIDI still overrides it.
+  m.g4_bidi = 2;
+}
+
 inline void load_gemma(Model& m, const WeightSource& src) {
   Config& c = m.cfg;
   c.validate();

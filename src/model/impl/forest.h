@@ -1630,7 +1630,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     T.NL = b.n_leaves;
     T.N = T.NL + (b.score_root ? 1 : 0);
     if (b.score_root && T.Tr == 0) fail("score_root needs root tokens");
-    if (b.out_hidden && T.Tr == 0) fail("out_hidden needs root tokens");
+    if ((b.out_hidden || b.out_last_hidden) && T.Tr == 0) fail("out_hidden needs root tokens");
     int leaf_rows = 0, max_leaf = 0;
     if (T.NL > 0) {
       const bool cands = b.cand_offsets != nullptr;
@@ -1728,13 +1728,14 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   int n_patch = 0;
   for (const TreePlan& T : trees)
     collect_images(T.spec->images, T.spec->n_images, T.Tr, T.base, n_patch, jobs, m.vis.c.present ? m.vis.c.merge : 2,
-                   m.vis.c.gemma ? kG4vAlign : 1);
+                   m.vis.c.gemma && !m.vis.c.unified ? kG4vAlign : 1);
   int n_soft = 0;
+  for (const ImageJob& J : jobs) n_soft += J.n_tok;
   if (n_patch) {
-    ensure_vscratch(m, n_patch);
-    if (m.vis.c.gemma) prepare_images_g4(m, jobs);
+    ensure_vscratch(m, m.vis.c.unified ? n_soft : n_patch);
+    if (m.vis.c.unified) prepare_images_g4u(m, jobs);
+    else if (m.vis.c.gemma) prepare_images_g4(m, jobs);
     else prepare_images(m, jobs);
-    for (const ImageJob& J : jobs) n_soft += J.n_tok;
   }
   // Gemma 4: a checkpoint inside an image's soft tokens would keep rows that
   // attended to the image's later rows (bidirectional within the image).
@@ -1777,7 +1778,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   }
   // Hidden-state readouts (Clef heads) need every row's final state too.
   bool any_hidden = false;
-  for (const TreeSpec& b : specs) any_hidden = any_hidden || b.out_hidden != nullptr;
+  for (const TreeSpec& b : specs) any_hidden = any_hidden || b.out_hidden != nullptr || b.out_last_hidden != nullptr;
   if (any_hidden && c.q4) fail("hidden-state readouts are not supported for qwen4_exp");
   // MTP needs every root row's final hidden state: no last-layer pruning.
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
@@ -2159,7 +2160,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.rd(s.h);
     E.wr(s.h);
     E.threads(MTLSizeMake(n4, 1, 1), MTLSizeMake(256, 1, 1));
-    if (n_patch) encode_vision_g4(m, E, n_patch, n_soft, s.h);
+    if (n_patch && m.vis.c.unified) encode_vision_g4u(m, E, n_soft, s.h);
+    else if (n_patch) encode_vision_g4(m, E, n_patch, n_soft, s.h);
   }
 
   const int C = c.C();
@@ -3398,7 +3400,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     if (T.N && T.spec->topk_min > 0) topk_k = std::max(topk_k, std::min(32, T.spec->topk_min));
   }
   s.tk_k = topk_k;
-  if (any_hidden) {  // every row's final-normed state; trees copy their root rows out below
+  bool any_rows = false;  // out_hidden: every row's final-normed state, copied out per tree below
+  for (const TreeSpec& b : specs) any_rows = any_rows || b.out_hidden != nullptr;
+  if (any_rows) {
     if (s.hid_rows < M) {
       s.hid = m.buffer(sizeof(uint16_t) * size_t(M) * size_t(c.D));
       s.hid_rows = M;
@@ -3967,6 +3971,14 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // ---- outputs
   if (any_hidden)
     for (const TreePlan& T : trees) {
+      if (T.spec->out_last_hidden) {  // rmsnorm(h) * final_norm of the last root row, in double
+        const float* h = static_cast<const float*>([s.h contents]) + size_t(T.base + T.Tr - 1) * size_t(c.D);
+        const float* w = static_cast<const float*>(ptr(m.final_norm));
+        double ss = 0;
+        for (int i = 0; i < c.D; ++i) ss += double(h[i]) * double(h[i]);
+        const double inv = 1.0 / std::sqrt(ss / double(c.D) + double(c.eps));
+        for (int i = 0; i < c.D; ++i) T.spec->out_last_hidden[i] = float(double(h[i]) * inv * double(w[i]));
+      }
       if (!T.spec->out_hidden) continue;
       const __fp16* src = static_cast<const __fp16*>([s.hid contents]) + size_t(T.base) * size_t(c.D);
       float* dst = T.spec->out_hidden;

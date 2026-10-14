@@ -487,12 +487,15 @@ class GGUFVisionSource : public WeightSource {
 // Gemma 4's mmproj (llama.cpp clip, projector gemma4v) under mlx-vlm's
 // gemma4 names (vision_tower.*, embed_vision.*), so load_gemma_vision reads
 // it like an MLX directory. The patch embedding stays llama.cpp's conv kernel
-// [D, C, P, P] (the loader permutes its columns).
+// [D, C, P, P] (the loader permutes its columns). gemma4uv (the unified
+// 12B's embedder) maps to mlx-vlm's gemma4_unified names (vision_embedder.*);
+// its position table stays [2][n_pos][D] (the loader reads either order).
 class GGUFGemmaVisionSource : public WeightSource {
  public:
   explicit GGUFGemmaVisionSource(const std::string& path) : f_(path) {
     const std::string proj = f_.get_string("clip.vision.projector_type", f_.get_string("clip.projector_type", ""));
-    if (proj != "gemma4v") fail(path + ": mmproj projector '" + proj + "' is not gemma4v (Gemma 4 vision)");
+    if (proj != "gemma4v" && proj != "gemma4uv")
+      fail(path + ": mmproj projector '" + proj + "' is not gemma4v or gemma4uv (Gemma 4 vision)");
   }
   const GGUFFile& file() const { return f_; }
   std::string describe() const override { return "mmproj:" + f_.path(); }
@@ -516,6 +519,15 @@ class GGUFGemmaVisionSource : public WeightSource {
         {"vision_tower.std_bias", "v.std_bias"},
         {"vision_tower.std_scale", "v.std_scale"},
         {"embed_vision.embedding_projection.weight", "mm.input_projection.weight"},
+        {"vision_embedder.patch_ln1.weight", "v.patch_norm.1.weight"},
+        {"vision_embedder.patch_ln1.bias", "v.patch_norm.1.bias"},
+        {"vision_embedder.patch_dense.weight", "v.patch_embd.weight"},
+        {"vision_embedder.patch_dense.bias", "v.patch_embd.bias"},
+        {"vision_embedder.patch_ln2.weight", "v.patch_norm.2.weight"},
+        {"vision_embedder.patch_ln2.bias", "v.patch_norm.2.bias"},
+        {"vision_embedder.pos_embedding", "v.position_embd.weight"},
+        {"vision_embedder.pos_norm.weight", "v.patch_norm.3.weight"},
+        {"vision_embedder.pos_norm.bias", "v.patch_norm.3.bias"},
     };
     static const std::vector<std::pair<std::string, std::string>> suffix = {
         {".input_layernorm.weight", ".ln1.weight"},

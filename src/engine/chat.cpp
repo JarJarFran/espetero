@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -440,6 +441,20 @@ static void score_options(Engine& engine, const json::Value& body, ChatJob& job)
   if (job.n > 1) invalid("n: one choice with score (the continuation is given)");
 }
 
+// {"head": {"slots": n}} (or true: every slot): the hidden-state head's
+// logits for the prompt's last token instead of a reply (hidden_head.h).
+static void head_options(Engine& engine, const json::Value& body, ChatJob& job) {
+  const json::Value* h = body.get("head");
+  if (!h || h->is_null() || (h->is_bool() && !h->as_bool())) return;
+  const int S = engine.head_slots();
+  if (!S) invalid("head: this model has no hidden-state head (hidden_head.safetensors next to its weights)");
+  if (!h->is_bool() && !h->is_object()) invalid("head: true or an object {\"slots\": n}");
+  job.head_slots = h->is_object() ? int(num(*h, "slots", S, 1, S)) : S;
+  if (!job.gen.forced.empty()) invalid("head: not with score");
+  if (job.n > 1) invalid("n: one choice with head");
+  if (job.stream) invalid("head: not with stream (the response is one object)");
+}
+
 ChatJob prepare_chat(Engine& engine, const json::Value& body) {
   if (!body.is_object()) invalid("request body must be a JSON object");
   if (!engine.chat_template()) invalid("this model has no chat template");
@@ -448,6 +463,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
   job.created = now_s();
   sampling_options(body, job, 1024, engine.sampling_defaults());
   score_options(engine, body, job);
+  head_options(engine, body, job);
   parse_response_format(body.get("response_format"));  // its shape, before the prompt is rendered
   // tool_choice: "auto" (the default); "none": the prompt is rendered without
   // the tools, so no call is parsed; allowed_tools: only those are rendered;
@@ -535,6 +551,8 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
           json::Value t = json::Value::object();
           t.set("type", "image");
           parts.push_back(std::move(t));
+        } else if (type == "input_audio" || type == "audio" || type == "video" || type == "video_url") {
+          invalid("unsupported content part '" + type + "': audio and video input are not supported (text and images only)");
         } else {
           invalid("unsupported content part '" + type + "'");
         }
@@ -763,6 +781,7 @@ ChatJob prepare_completion(Engine& engine, const json::Value& body) {
   job.created = now_s();
   sampling_options(body, job, 16, engine.sampling_defaults());
   score_options(engine, body, job);
+  head_options(engine, body, job);
   job.echo = parse_bool(body.get("echo"), false);
   if (job.echo && job.gen.logprobs >= 0) invalid("logprobs: not with echo (the prompt tokens' log-probabilities are not computed)");
   {
@@ -1089,7 +1108,63 @@ void run_choices(Engine& engine, const ChatJob& job, const std::function<bool(in
   if (error) std::rethrow_exception(error);
 }
 
+json::Value head_response(Engine& engine, const ChatJob& job) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const Engine::HeadResult r = engine.head(job.gen, job.head_slots);
+  const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  double mx = -INFINITY, sum = 0;
+  for (float x : r.logits) mx = std::max(mx, double(x));
+  std::vector<double> p(r.logits.size());
+  for (size_t i = 0; i < p.size(); ++i) sum += (p[i] = std::exp(double(r.logits[i]) - mx));
+  json::Value logits = json::Value::array(), probs = json::Value::array();
+  for (size_t i = 0; i < p.size(); ++i) {
+    logits.push_back(double(r.logits[i]));
+    probs.push_back(p[i] / sum);
+  }
+  json::Value choice = json::Value::object();
+  choice.set("index", 0);
+  if (job.chat) {
+    json::Value msg = json::Value::object();
+    msg.set("role", "assistant");
+    msg.set("content", "");
+    choice.set("message", std::move(msg));
+  } else {
+    choice.set("text", job.echo ? job.prompt_text : "");
+  }
+  choice.set("logprobs", json::Value());
+  choice.set("finish_reason", "stop");
+  json::Value choices = json::Value::array();
+  choices.push_back(std::move(choice));
+  json::Value out = json::Value::object();
+  out.set("id", job.id);
+  out.set("object", job.chat ? "chat.completion" : "text_completion");
+  out.set("created", job.created);
+  out.set("model", engine.model_name());
+  out.set("choices", std::move(choices));
+  json::Value usage = json::Value::object();
+  usage.set("prompt_tokens", int64_t(job.gen.prompt.size()));
+  usage.set("completion_tokens", 0);
+  usage.set("total_tokens", int64_t(job.gen.prompt.size()));
+  json::Value details = json::Value::object();
+  details.set("cached_tokens", r.cached);
+  usage.set("prompt_tokens_details", std::move(details));
+  out.set("usage", std::move(usage));
+  json::Value head = json::Value::object();
+  head.set("slots", job.head_slots);
+  head.set("logits", std::move(logits));
+  head.set("probabilities", std::move(probs));
+  out.set("head", std::move(head));
+  json::Value t = json::Value::object();
+  t.set("total_ms", std::round(total_ms * 1000) / 1000);
+  t.set("queue_ms", std::round(r.queue_ms * 1000) / 1000);
+  t.set("gpu_ms", std::round(r.gpu_ms * 1000) / 1000);
+  t.set("passes", r.passes);
+  out.set("timings", std::move(t));
+  return out;
+}
+
 json::Value respond(Engine& engine, const ChatJob& job, const std::function<bool()>& client_gone) {
+  if (job.head_slots > 0) return head_response(engine, job);
   std::vector<ChoiceResult> choices(size_t(std::max(1, job.n)));
   run_choices(engine, job, [&](int i, const ChatEvent& ev) {
     ChoiceResult& c = choices[size_t(i)];

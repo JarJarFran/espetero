@@ -268,6 +268,10 @@ struct Vision {
   Buf mnw, mnb, inv_freq;
   Buf std_bias, std_scale;  // Gemma 4 (standardize)
   Mat proj;                 // Gemma 4: embed_vision's projection to the language model's width
+  // Gemma 4 unified (no blocks): patch_ln1, patch_ln2 and pos_norm weights
+  // and biases (fp32); `patch` is patch_dense with its bias, `pos` the
+  // position table fp32 [n_pos][2][D].
+  Buf ln1w, ln1b, ln2w, ln2b, ln3w, ln3b;
 };
 
 struct VScratch {

@@ -35,8 +35,11 @@ Spec spec_from_config(const json::Value& cfg, const json::Value* pre, int64_t ma
   Spec s;
   s.set_budget(max_pixels);
   const json::Value* vcp = cfg.get("vision_config");
-  if (cfg.get_string("model_type", "") == "gemma4" ||
-      (vcp && vcp->is_object() && vcp->get_string("model_type", "") == "gemma4_vision")) {
+  // Gemma 4 unified (gemma4_unified_vision): the same processor; its
+  // embedder takes each 3 x 3 block of these patches as one 48-pixel patch.
+  const std::string mt = cfg.get_string("model_type", "");
+  const std::string vmt = vcp && vcp->is_object() ? vcp->get_string("model_type", "") : "";
+  if (mt == "gemma4" || mt == "gemma4_unified" || vmt == "gemma4_vision" || vmt == "gemma4_unified_vision") {
     s.set_gemma4(max_pixels, vcp && vcp->is_object() ? int(vcp->get_int("patch_size", 16)) : 16,
                  vcp && vcp->is_object() ? int(vcp->get_int("pooling_kernel_size", 3)) : 3);
     s.image_token_id = int32_t(cfg.get_int("image_token_id", 258880));

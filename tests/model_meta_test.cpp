@@ -113,7 +113,8 @@ static bool contains(const std::string& s, const std::string& x) { return s.find
 static void test_family() {
   std::printf("supported families\n");
   // Every model_type that loads today passes.
-  for (const char* t : {"qwen3_5", "qwen3_5_moe", "qwen3_5_mtp", "qwen4_exp", "qwen4_exp_mtp", "gemma4", "gemma4_text"}) {
+  for (const char* t : {"qwen3_5", "qwen3_5_moe", "qwen3_5_mtp", "qwen4_exp", "qwen4_exp_mtp", "gemma4", "gemma4_text",
+                        "gemma4_unified", "gemma4_unified_text"}) {
     const std::string d = dir_with(std::string("ok_") + t, std::string("{\"model_type\": \"") + t + "\"}");
     CHECK(error_of(d).empty());
   }
@@ -130,7 +131,8 @@ static void test_family() {
   const std::string e = error_of(llama);
   CHECK(contains(e, llama + ": model_type 'llama4' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family (qwen3_5, "
                             "qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), "
-                            "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B) and Cloudflare Clef classifiers"));
+                            "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B) and Cloudflare Clef "
+                            "classifiers"));
   // Other Gemma generations are not Gemma 4.
   CHECK(contains(error_of(dir_with("no_gemma3", "{\"model_type\": \"gemma3\"}")), "model_type 'gemma3' is not supported"));
   for (const char* t : {"qwen3", "qwen3_vl", "qwen3_moe", "llama", "qwen2_5_vl"})
@@ -153,7 +155,7 @@ static void test_family() {
   const std::string g = Gguf().s("general.architecture", "llama").ints("x.sections", 4).file("g.gguf");
   CHECK(contains(error_of(g), g + ": GGUF architecture 'llama' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family "
                                  "(qwen35, qwen35moe:"));
-  CHECK(contains(error_of(g), "and Gemma 4 (gemma4: 31B, 26B-A4B)"));
+  CHECK(contains(error_of(g), "and Gemma 4 (gemma4: 31B, 26B-A4B, 12B)"));
   CHECK(contains(error_of(g), "Cloudflare Clef classifiers run from MLX directories"));
   write(g_root + "/fake.gguf", "this is not a gguf file at all");
   CHECK(contains(error_of(g_root + "/fake.gguf"), "not a GGUF file"));

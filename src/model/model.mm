@@ -757,18 +757,21 @@ class MetalModel final : public NativeModel {
       const auto t0 = Clock::now();
       std::vector<ImageJob> jobs;
       int n_patch = 0;
-      collect_images(images.data(), int(images.size()), -1, 0, n_patch, jobs, m.vis.c.merge, m.vis.c.gemma ? kG4vAlign : 1);
+      collect_images(images.data(), int(images.size()), -1, 0, n_patch, jobs, m.vis.c.merge,
+                     m.vis.c.gemma && !m.vis.c.unified ? kG4vAlign : 1);
       if (!n_patch) return;
-      ensure_vscratch(m, n_patch);
-      if (m.vis.c.gemma) prepare_images_g4(m, jobs);
-      else prepare_images(m, jobs);
       int n_tok = 0;
       for (const ImageJob& J : jobs) n_tok += J.n_tok;
+      ensure_vscratch(m, m.vis.c.unified ? n_tok : n_patch);
+      if (m.vis.c.unified) prepare_images_g4u(m, jobs);
+      else if (m.vis.c.gemma) prepare_images_g4(m, jobs);
+      else prepare_images(m, jobs);
       id<MTLBuffer> dst = m.buffer(size_t(n_tok) * size_t(m.vis.c.out) * 4);
       m.dispatches = 0;
       id<MTLCommandBuffer> cb = [m.queue commandBufferWithUnretainedReferences];
       Enc E(m, cb);
-      if (m.vis.c.gemma) encode_vision_g4(m, E, n_patch, n_tok, dst);
+      if (m.vis.c.unified) encode_vision_g4u(m, E, n_tok, dst);
+      else if (m.vis.c.gemma) encode_vision_g4(m, E, n_patch, n_tok, dst);
       else encode_vision(m, E, n_patch, dst);
       cb = E.finish();
       commit_wait(cb);
@@ -958,7 +961,10 @@ class MetalModel final : public NativeModel {
     // the vector one (opt-in, ESPETERO_ATTN_VEC) would need 37 KB of threadgroup memory at G = 12.
     if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_vec_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
     if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_gqa_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
-    if (m.vis.c.present && m.vis.c.gemma) {  // gemma_vision.h
+    if (m.vis.c.present && m.vis.c.unified) {  // gemma_vision.h (unified)
+      for (const char* k : {"layernorm", "g4u_embed_norm", "scatter_rows_f32"}) list.push_back({k, 0});
+      for (const char* t : {"8x8", "16x4", "32x4"}) list.push_back({std::string("hgemm_") + t + "_store", 0});
+    } else if (m.vis.c.present && m.vis.c.gemma) {  // gemma_vision.h
       for (const char* k : {"rmsnorm", "g4v_pos_add", "g4v_pool", "g4_post_attn", "g4_post_ffn", "scatter_rows_f32"})
         list.push_back({k, 0});
       list.push_back({"g4v_qkv_prep" + std::to_string(m.vis.c.hd), 0});

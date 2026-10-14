@@ -39,7 +39,20 @@ image's soft tokens are the same bits whatever else the pass holds. The soft
 tokens replace their rows after the embedding scale, and in the
 sliding-window layers they attend to their whole image (the image's later
 rows too: `desc.w` in the tree mask; the global layers stay causal, as in
-transformers).
+transformers). The unified 12B (`gemma4_unified`, from MLX or a `gemma4`
+GGUF with its `gemma4uv` mmproj) has the same decoder (global layers of one
+512-wide KV head: 16 query heads per KV head) and no tower: its embedder
+(`encode_vision_g4u`) turns each 48×48-pixel block into one soft token
+with a LayerNorm, the 6912 -> 3840 patch projection, a LayerNorm, the
+factorized position table (a column and a row entry), a LayerNorm, the
+weightless RMSNorm and `embed_vision`, every token on its own (no
+alignment); its image tokens see their whole image in every layer, as
+transformers' `Gemma4UnifiedModel` builds the masks. Decision heads over the
+last hidden state (`hidden_head.safetensors` beside the weights,
+`src/engine/hidden_head.*`) run a chat request's prompt as a Clef record
+runs (alone in its passes, the image prefix cached) and read the last row's
+final-normed state in fp32 from the residual stream
+(`TreeSpec::out_last_hidden`).
 
 ## Layers
 
