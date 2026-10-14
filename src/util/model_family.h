@@ -7,8 +7,9 @@
 //   MLX config.json model_type (or text_config.model_type): the Qwen3.5
 //   family (qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text, qwen3_5_mtp:
 //   Qwen3.5, Qwen3.6, Qwen3.8, their finetunes and Clef backbones),
-//   Qwen3.8-Flash-Next (qwen4_exp, qwen4_exp_text; qwen4_exp_mtp drafters) and
-//   Gemma 4 (gemma4, gemma4_text: 31B and 26B-A4B).
+//   Qwen3.8-Flash-Next (qwen4_exp, qwen4_exp_text; qwen4_exp_mtp drafters),
+//   Gemma 4 (gemma4, gemma4_text: 31B and 26B-A4B) and the Qwen3-Omni thinker
+//   (qwen3_omni_moe, converted by tools/clef_convert.py: Clef-Omni).
 //   GGUF general.architecture: qwen35, qwen35moe, gemma4.
 #pragma once
 
@@ -21,7 +22,8 @@
 namespace espetero::family {
 
 inline bool mlx_type_supported(std::string_view t) {
-  return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text";
+  return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text" ||
+         t == "qwen3_omni_moe";
 }
 
 inline bool gguf_arch_supported(std::string_view a) { return a == "qwen35" || a == "qwen35moe" || a == "gemma4"; }

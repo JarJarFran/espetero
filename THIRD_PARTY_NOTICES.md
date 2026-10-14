@@ -18,8 +18,9 @@ uses only Apple's system frameworks.
 | Jinja2 3.1 (lexer, parser, `idtracking`, filters) | `src/tmpl/` (`parser.cpp`, `scope.cpp`, `builtins.cpp`) | BSD-3-Clause |
 | ggml (block dequantization formulas) | `src/model/impl/gguf.h` | MIT |
 | JEVfire (`jevfire/core.py`, `jevfire/models.py`) | `src/engine/decisions.cpp` | MIT |
-| Cloudflare Clef (`joint_schema_model.py`) | `src/engine/clef.h`, `src/engine/clef.cpp` | Apache-2.0 |
+| Cloudflare Clef, Clef-Omni (`joint_schema_model.py`) | `src/engine/clef.h`, `src/engine/clef.cpp`, `src/engine/engine.cpp` (Clef-Omni's media limits), `tests/ref/clef_omni_ref.py` | Apache-2.0 |
 | Hugging Face transformers (Qwen2-VL `smart_resize`) | `src/vision/processor.cpp` | Apache-2.0 |
+| Hugging Face transformers (Qwen3-Omni thinker semantics: `models/qwen3_omni_moe`) | `src/model/impl/qwen3_omni.h`, `src/model/impl/qwen3_omni_load.h`, `kernels/82_qwen3_omni.metal`, the DeepStack mergers in `src/model/impl/vision.h` and `src/model/impl/load.h`, `tools/clef_convert.py`, `tests/ref/clef_omni_ref.py` | Apache-2.0 |
 | Unicode Character Database 15.1 | `src/tok/unicode_data.h`, `src/tmpl/unicode_data.inc` | Unicode-3.0 |
 | mlx-lm 0.32 (Gemma 4 model semantics: `models/gemma4_text.py`, `models/rope_utils.py`) | `src/model/impl/gemma.h`, `src/model/impl/gemma_load.h`, `src/model/impl/config.h` (`config_from_gemma`), `kernels/80_gemma.metal` | MIT |
 | Chat templates of public models (test fixtures) | `tests/ref/tmpl_fixtures/`, `tests/ref/tmpl_ref.py` | Apache-2.0, MIT |
@@ -261,6 +262,15 @@ instead of bf16; the backbone's hidden states come from Espetero's own
 forward pass. These two files are licensed under the Apache License 2.0
 ([third_party/apache-2.0/LICENSE-2.0.txt](third_party/apache-2.0/LICENSE-2.0.txt)).
 
+Clef-Omni (https://huggingface.co/Cloudflare/clef-omni, revision 0db1cd2;
+Apache License 2.0) ships its own `joint_schema_model.py` with the same head:
+the differences Espetero follows are its media block (`"\n"` after each image),
+its image size limits (`IMAGE_SIZE`, 65,536 to 1,048,576 pixels), its default
+`max_length` (64,000) and its image loading without EXIF transposition
+(`src/engine/clef.cpp`, `src/engine/engine.cpp`). `tests/ref/clef_omni_ref.py`
+re-implements its `encode_record` and head in Python and NumPy for the parity
+checks (the release's file is read, never imported).
+
 ## Hugging Face transformers
 
 `smart_resize` in `src/vision/processor.cpp` is a C++ translation of
@@ -270,6 +280,26 @@ License 2.0 ([third_party/apache-2.0/LICENSE-2.0.txt](third_party/apache-2.0/LIC
 
 ```text
 Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+```
+
+The Qwen3-Omni thinker (`src/model/impl/qwen3_omni.h`,
+`src/model/impl/qwen3_omni_load.h`, `kernels/82_qwen3_omni.metal`, the
+DeepStack mergers of the vision tower in `src/model/impl/vision.h` and
+`src/model/impl/load.h`) follows the semantics of transformers 5.17's
+`models/qwen3_omni_moe/modeling_qwen3_omni_moe.py` and
+`configuration_qwen3_omni_moe.py`: the configuration defaults, the per-head
+q / k RMSNorms, the interleaved M-RoPE sections over the whole head, the
+softmax top-k router renormalized over the k picked experts, the DeepStack
+features added to the image rows after the first layers, the post-shuffle
+LayerNorm of the DeepStack mergers and the image M-RoPE positions of
+`get_rope_index`. `tools/clef_convert.py` converts the thinker's tensors to
+the names of mlx-vlm 0.7.1's `qwen3_omni_moe` `sanitize` (MIT), and
+`tests/ref/clef_omni_ref.py` re-implements the thinker in MLX from the same
+transformers semantics. The Metal kernels and the host code are new; no
+transformers or mlx-vlm source is copied.
+
+```text
+Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 ```
 
 ## Unicode Character Database

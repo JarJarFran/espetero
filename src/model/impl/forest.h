@@ -1562,6 +1562,7 @@ inline void xpool_rollback(Model& m) {
 }  // namespace espetero::native
 
 #include "gemma.h"
+#include "qwen3_omni.h"
 
 namespace espetero::native {
 
@@ -1680,6 +1681,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     }
     if (b.commit_chain > 0 && T.NL == 0) fail("commit_chain without leaves");
     if (c.gemma && b.commit_chain > 0) fail("commit_chain: not supported for Gemma 4");
+    if (c.q3moe && b.commit_chain > 0) fail("commit_chain: not supported for qwen3_omni_moe");
     if (c.gemma && b.root_pos) fail("explicit positions: not supported for Gemma 4");
     if (T.P + T.Tr + max_leaf > m.max_ctx) fail("context exceeds max_ctx (" + std::to_string(m.max_ctx) + ")");
     if (b.n_images < 0 || (b.n_images > 0 && !b.images)) fail("invalid images");
@@ -1746,7 +1748,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // Decode-sized passes fuse the RMSNorms into the GEMVs that produce their
   // input: the residual-add GEMV's last threadgroup writes the normalized
   // fp16 rows, so no norm dispatch runs between layers.
-  const bool fuse = !c.q4 && !c.gemma && m.fuse_norm && m.all_quant && gemv_path(m.tune, M) && M <= m.fuse_norm_max_m && n_patch == 0;
+  const bool fuse = !c.q4 && !c.gemma && !c.q3moe && m.fuse_norm && m.all_quant && gemv_path(m.tune, M) && M <= m.fuse_norm_max_m && n_patch == 0;
   if (fuse) {
     // The kernels reset their arrival counters (the last threadgroup stores
     // 0); zeroing them here only re-establishes that after a failed pass. A
@@ -2067,6 +2069,13 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     upload(meta.ring_copies, rc);
     n_ring_saves = rs.size();
     n_ring_copies = rc.size();
+  } else if (c.q3moe) {  // the Qwen3-Omni thinker: Gemma 4's planner without a window (qwen3_omni.h)
+    for (TreePlan& T : trees) g4g.trees.push_back({T.base, T.P, T.read_table, T.M});
+    g4_plan_tiles(g4g, c.Hkv, m.attn_split, 0, pos);
+    upload(meta.a_trees, g4g.trees);
+    upload(meta.a_tiles, g4g.tiles);
+    upload(meta.a_comb, g4g.combine);
+    meta.parts.ensure<float>(m, std::max<size_t>(q3m_parts_floats(c, g4g), 1));
   } else {
     if (qsa_idx) qsa_plan(m, meta.arena, qs, A.trees, desc, true);
     plan_tiles(A, c.Hkv, m.attn_split, qs.n_sparse ? &qs.qt_of : nullptr);
@@ -2075,7 +2084,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     upload(meta.a_comb, A.combine);
   }
   const int G = c.H / c.Hkv;
-  if (!c.gemma) meta.parts.ensure<float>(m, std::max<size_t>(size_t(A.parts) * size_t(c.Hkv) * 8 * size_t(G) * 258, 1));
+  if (!c.gemma && !c.q3moe) meta.parts.ensure<float>(m, std::max<size_t>(size_t(A.parts) * size_t(c.Hkv) * 8 * size_t(G) * 258, 1));
 
   // ---- encode
   const auto t_enc = Clock::now();
@@ -3077,8 +3086,29 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     gp.readout_rows = meta.readout_rows.buf;
     g4_encode_layers(m, E, gp);
   }
-  // (The Qwen3.5-family layers; Gemma 4 ran its own above.)
-  for (int li = 0; !c.gemma && li < c.L; ++li) {
+  if (c.q3moe) {  // the Qwen3-Omni thinker's decoder layers (qwen3_omni.h)
+    Q3PassIn qp;
+    qp.M = M;
+    qp.N = N;
+    qp.prune = prune;
+    qp.chained = chained;
+    qp.plan = &g4g;
+    qp.trees = meta.a_trees.buf;
+    qp.tiles = meta.a_tiles.buf;
+    qp.comb = meta.a_comb.buf;
+    qp.parts = meta.parts.buf;
+    qp.parts_bytes = meta.parts.bytes;
+    qp.saves = meta.kv_saves.buf;
+    qp.n_saves = kv_saves.size();
+    qp.blocks = meta.blocks.buf;
+    qp.desc = meta.desc.buf;
+    qp.pos = meta.pos.buf;
+    qp.readout_rows = meta.readout_rows.buf;
+    qp.vis_rows = n_patch / 4;
+    q3m_encode_layers(m, E, qp);
+  }
+  // (The Qwen3.5-family layers; Gemma 4 and the Qwen3-Omni thinker ran their own above.)
+  for (int li = 0; !c.gemma && !c.q3moe && li < c.L; ++li) {
     const Layer& L = m.layers[size_t(li)];
     const bool last_layer = li == c.L - 1 && prune;
     NormLink l_post, l_next;

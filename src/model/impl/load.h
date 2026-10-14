@@ -335,6 +335,21 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c) {
     commit_wait(cb);
     m.vis.blocks.push_back(B);
   }
+  // DeepStack mergers (Qwen3-Omni): the 2x2 merged rows of blocks c.deepstack[j].
+  for (size_t j = 0; j < c.deepstack.size(); ++j) {
+    Arena dtmp(m.dev);
+    const std::string b = v + "deepstack_merger_list." + std::to_string(j) + ".";
+    VMerger D;
+    D.nw = vec(m, src, b + "norm.weight", size_t(4 * c.D));
+    D.nb = vec(m, src, b + "norm.bias", size_t(4 * c.D));
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    D.fc1 = load_vdense(m, e, dtmp, src, b + "linear_fc1", 4 * c.D, 4 * c.D);
+    D.fc2 = load_vdense(m, e, dtmp, src, b + "linear_fc2", c.out, 4 * c.D);
+    [e endEncoding];
+    commit_wait(cb);
+    m.vis.ds.push_back(D);
+  }
   m.vis.inv_freq = m.arena->alloc(sizeof(float) * (c.hd / 4));
   float* f = (float*)ptr(m.vis.inv_freq);
   const int dim = c.hd / 2;
@@ -564,6 +579,7 @@ inline std::string find_mmproj(const std::string& gguf_path) {
 }  // namespace espetero::native
 
 #include "gemma_load.h"
+#include "qwen3_omni_load.h"
 
 namespace espetero::native {
 
@@ -637,6 +653,13 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       load_gemma(m, src);
       return;
     }
+  }
+  if (is_qwen3_omni_type(src.config().get_string("model_type", ""))) {  // the Qwen3-Omni thinker
+    if (!mtp.empty() && mtp != "none") fail("--mtp: the Qwen3-Omni thinker has no drafting head");
+    m.format = "mlx";
+    m.cfg = config_from_qwen3_omni(src.config());
+    load_qwen3_omni(m, src, want_vision);
+    return;
   }
   if (!src.has("language_model.model.embed_tokens.weight"))
     fail("expected an MLX-converted Qwen3.5 checkpoint (language_model.model.* tensors)");

@@ -581,6 +581,38 @@ photo is ~11,800 tokens). EXIF orientation is applied (as `transformers`'
 `load_image` does). Known difference: integers beyond the int64 range in a JSON
 state are rendered as floats.
 
+**Clef-Omni** (`Cloudflare/clef-omni`) has the Qwen3-Omni-30B-A3B thinker as its
+backbone (the text decoder and the vision tower; the audio encoder, the talker
+and code2wav are not converted). Its bf16 weights do not fit 64 GB, so the
+converter writes an 8-bit decoder (attention and expert matrices, MLX affine
+group 64; the router, norms, embedding, LM head and vision tower stay bf16;
+32 GB):
+
+```
+python tools/clef_convert.py ~/.cache/huggingface/hub/models--Cloudflare--clef-omni/snapshots/<rev> \
+    ~/models/clef/clef-omni-q8            # 8-bit, the only width for this backbone
+espetero serve --model ~/models/clef/clef-omni-q8 --max-ctx 65536
+```
+
+It answers the same `/v1/systemone` and `/v1/decisions` bodies, with the
+release's own record encoding and media rules: `"\n"` after each image block,
+images resized within 65,536 to 1,048,576 pixels by default (`IMAGE_SIZE` of its
+`joint_schema_model.py`; `media_kwargs` may ask up to its processor's
+12,845,056), decoded without EXIF transposition (the release opens them with
+`PIL.Image.open(...).convert("RGB")`; the server applies none while it serves
+this model), and `max_length` 64,000 by default, which needs `--max-ctx 65536`
+(otherwise records are cut at the context window). Requests with `audio` or
+`videos` get a 422. On an M1 Max a record of 1,454 tokens with two images (one of
+1 MP) takes 2.6 s, 0.3 s when its image block is cached; one of 257 text tokens
+0.3 s. Parity against an fp32 MLX reference on the same 8-bit
+weights (`tests/ref/clef_omni_ref.py`, 10 synthetic records, 7 drawn images):
+token ids identical to the release's `encode_record`, patch rows identical,
+merged vision features cosine 0.99991-0.999998 (mean per image), option
+probabilities within 0.0065; the final hidden states agree to cosine 0.976-0.996
+(mean per record), closer than a bf16 run of the same reference (0.959-0.986,
+probabilities within 0.061): 48 layers of top-8 routing amplify rounding (the
+first 16 layers agree to 0.9998).
+
 ### Limits for untrusted clients
 
 This release is meant for one trusted user, but the server refuses what a
