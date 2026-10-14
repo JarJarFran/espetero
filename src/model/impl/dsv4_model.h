@@ -330,6 +330,12 @@ class Dsv4Model final : public NativeModel {
   }
 
   int spec_rounds_ = 0, spec_drafts_ = 0, spec_accepted_ = 0;
+  double spec_draft_ms_ = 0, spec_verify_ms_ = 0;
+  // ESPETERO_DS4_SPEC_MIN: the predicted survival a draft needs to be verified (default below)
+  static double spec_min() {
+    static const double v = std::getenv("ESPETERO_DS4_SPEC_MIN") ? std::atof(std::getenv("ESPETERO_DS4_SPEC_MIN")) : 0.8;
+    return v;
+  }
   static bool spec_on() {
     const char* v = std::getenv("ESPETERO_DS4_SPEC");
     return v && std::atoi(v) != 0;
@@ -357,12 +363,29 @@ class Dsv4Model final : public NativeModel {
         if (nd[t] > 0) dr.push_back(t);
       }
       std::vector<std::array<int32_t, 8>> d(n);
+      std::vector<std::array<float, 8>> cfr(n);
       if (!dr.empty()) {
         std::vector<Seq*> ss;
         std::vector<int32_t> tk;
         for (size_t t : dr) ss.push_back(&seq(first[t].parent)), tk.push_back(cur[t]);
-        const std::vector<std::array<int32_t, 8>> got = draft(ss, tk);
-        for (size_t i = 0; i < dr.size(); ++i) d[dr[i]] = got[i];
+        std::vector<std::array<float, 8>> cf;
+        const auto td = Clock::now();
+        const std::vector<std::array<int32_t, 8>> got = draft(ss, tk, &cf);
+        spec_draft_ms_ += ms_since(td);
+        for (size_t i = 0; i < dr.size(); ++i) {
+          d[dr[i]] = got[i];
+          cfr[dr[i]] = cf[i];
+          // verify a draft only while the chance that it and every draft before it are accepted (the
+          // confidence head's) beats what one more verified row costs, relative to a token
+          double surv = 1.0;
+          int k = 0;
+          while (k < nd[dr[i]]) {
+            surv *= 1.0 / (1.0 + std::exp(-double(cf[i][size_t(k)])));
+            if (surv < spec_min()) break;
+            ++k;
+          }
+          nd[dr[i]] = k;
+        }
       }
       // ---- verification: [cur, drafts...] per tree, logits at every row
       std::vector<Seg> segs;
@@ -380,7 +403,9 @@ class Dsv4Model final : public NativeModel {
         hist0[t] = s.hist;
         segs.push_back(g);
       }
+      const auto tv = Clock::now();
       run_segments(segs);
+      spec_verify_ms_ += ms_since(tv);
       for (size_t t : act) {
         Seq& s = seq(first[t].parent);
         const int R = 1 + nd[t], p0 = s.len - R;
@@ -395,6 +420,12 @@ class Dsv4Model final : public NativeModel {
         }
         spec_drafts_ += nd[t];
         spec_accepted_ += take - 1;
+        static FILE* slog = std::getenv("ESPETERO_DS4_SPEC_LOG") ? std::fopen(std::getenv("ESPETERO_DS4_SPEC_LOG"), "a") : nullptr;
+        if (slog && nd[t] > 0) {  // per round: the confidence logits of the verified drafts, then how many were accepted
+          for (int j = 0; j < nd[t]; ++j) std::fprintf(slog, "%.3f ", cfr[t][size_t(j)]);
+          std::fprintf(slog, "| %d\n", take - 1);
+          std::fflush(slog);
+        }
         if (take < R) rollback(s, p0, R, take, bak[t], hist0[t], rowtok[t]);
         produced[t] += take;
         rows += R;
@@ -447,7 +478,9 @@ class Dsv4Model final : public NativeModel {
   // the target states of the positions not yet in the draft rings enter them,
   // then the draft layers run over [tok, noise ...] and the Markov head picks
   // ds_block drafts. Returns [i][1 .. ds_block].
-  std::vector<std::array<int32_t, 8>> draft(const std::vector<Seq*>& ss, const std::vector<int32_t>& tok) {
+  // conf (optional): per block, each draft's acceptance logit given the ones before (conf[j] for draft j + 1)
+  std::vector<std::array<int32_t, 8>> draft(const std::vector<Seq*>& ss, const std::vector<int32_t>& tok,
+                                            std::vector<std::array<float, 8>>* conf = nullptr) {
     const Cfg& c = c_;
     const int D = c.D, HD = c.HD, nt = int(c.ds_targets.size()), B = c.ds_block;
     // ---- the target states into the rings
@@ -515,6 +548,12 @@ class Dsv4Model final : public NativeModel {
     std::vector<std::array<int32_t, 8>> res(ss.size());
     for (size_t i = 0; i < ss.size(); ++i)
       for (int j = 0; j <= B; ++j) res[i][size_t(j)] = dt[i * 8 + size_t(j)];
+    if (conf) {
+      conf->assign(ss.size(), {});
+      const float* cf = static_cast<const float*>([CONF_ contents]);
+      for (size_t i = 0; i < ss.size(); ++i)
+        for (int j = 0; j < B; ++j) (*conf)[i][size_t(j)] = ds_conf_.b ? cf[i * 8 + size_t(j)] : 30.0f;
+    }
     return res;
   }
 
@@ -580,6 +619,8 @@ class Dsv4Model final : public NativeModel {
     o.set("spec_rounds", spec_rounds_);
     o.set("spec_drafts", spec_drafts_);
     o.set("spec_accepted", spec_accepted_);
+    o.set("spec_draft_ms", spec_draft_ms_);
+    o.set("spec_verify_ms", spec_verify_ms_);
     if (!prof_.empty()) {
       json::Value k = json::Value::object();
       for (const auto& [n, v] : prof_) k.set(n, v.first);
@@ -626,6 +667,7 @@ class Dsv4Model final : public NativeModel {
   Mat8 ds_main_proj_;
   Buf ds_main_norm_, ds_norm_;
   MatB ds_mk_embed_, ds_mk_head_;
+  Buf ds_conf_;  // the confidence head (w over [state, Markov embedding]), or none
   Buf embed_, head_, norm_;
   Buf invf_plain_, invf_yarn_;
   ExpertCache xc_;
@@ -647,7 +689,7 @@ class Dsv4Model final : public NativeModel {
   // scratch (shared)
   id<MTLBuffer> ids_, pos_, gpos_, mix0_, H_, X_, XQ_, Y_, mixA_, mixF_[2], QA_, Q_, KVp_, OA_, CKV_, CSC_, LAT_, IK_, IQ_, IW_,
       ISC_, IDX_, BS_, CAND_, XGRP_, XTILE_, HCP_, RL_, SEL_, RW_, xrow_, yrow_, wsc_, amap_, ident_, ones_, XG_, XU_, XH_, XP_, SG_, SU_, SH_, EE_,
-      ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, DSX_, DSM_, DSQ_, DKV_, DPOS_, PSEL_, PRW_, YT_;
+      ERAW_[2], EKV_, XF_, XN_, LOG_, DTOK_, MKB_, CONF_, DSX_, DSM_, DSQ_, DKV_, DPOS_, PSEL_, PRW_, YT_;
   static constexpr int kPredRows = 16;  // passes up to this many rows predict the next layer's experts
   static constexpr int kMaxSegs = 64;   // segments per pass whose CED rows may split a block
   size_t isc_floats_ = 0;
@@ -835,6 +877,7 @@ class Dsv4Model final : public NativeModel {
       ds_norm_ = vecf(last + "norm.weight", size_t(D));
       ds_mk_embed_ = matb(last + "markov_head.embed.weight", c_.V, c_.ds_markov);
       ds_mk_head_ = matb(last + "markov_head.head.weight", c_.V, c_.ds_markov);
+      if (ck_.has(last + "confidence_head.proj.weight")) ds_conf_ = vecf(last + "confidence_head.proj.weight", size_t(D + c_.ds_markov));
       dspark_ = true;
     }
     if (c_.v_layers > 0 && want_vision_ && !partial_ && ck_.has("vision.patch_embed.proj.weight")) load_vision();
@@ -946,7 +989,7 @@ class Dsv4Model final : public NativeModel {
     EKV_ = F(P * D * 5);
     XN_ = F(D * size_t(max_reads_)), LOG_ = F(size_t(c_.V) * size_t(max_reads_));
     // DSpark: drafts per block, the Markov bias, the target states entering the draft rings
-    DTOK_ = F(size_t(max_reads_) * 8), MKB_ = F(size_t(c_.V));
+    DTOK_ = F(size_t(max_reads_) * 8), MKB_ = F(size_t(c_.V)), CONF_ = F(size_t(max_reads_) * 8);
     const size_t dr = size_t(kDsRows), nt = std::max<size_t>(1, c_.ds_targets.size());
     DSX_ = F(dr * nt * D), DSM_ = F(dr * D), DSQ_ = F(dr * D), DKV_ = F(dr * size_t(c_.HD)), DPOS_ = F(dr);
   }
@@ -2257,6 +2300,18 @@ class Dsv4Model final : public NativeModel {
           E.set(2, DTOK_, i * 8 * 4);
           E.bytes(3, mp);
           E.groups(1, 1, 1, 1024);
+        }
+        if (ds_conf_.b) {  // each draft's acceptance logit (CONF_ rows like DTOK_'s)
+          const int32_t cp[2] = {D, c.ds_markov};
+          E.pipe("ds4_conf");
+          E.set(0, H_, hrow(segs[i].r0 + segs[i].n - segs[i].nlog));
+          E.set(1, prev, size_t(segs[i].r0 + segs[i].n - segs[i].nlog) * 24 * 4);
+          E.set(2, ds_conf_);
+          E.set(3, ds_mk_embed_.w);
+          E.set(4, DTOK_, i * 8 * 4);
+          E.set(5, CONF_, i * 8 * 4);
+          E.bytes(6, cp);
+          E.groups(size_t(segs[i].nlog), 1, 1, 256);
         }
         r += segs[i].nlog;
       }

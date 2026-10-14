@@ -1205,6 +1205,34 @@ kernel void ds4_markov_bias(device const ushort* emb [[buffer(0)]], device const
   for (int k = 0; k < p.R; ++k) s += bf2f(h[k]) * bf2f(e[k]);
   bias[v] = s;
 }
+// DSpark's confidence head: per draft row, the logit of the draft being accepted when the ones before it
+// are, w . [x, markov_embed(previous token)] with x the hc-mixed last-layer state before its norm.
+struct Ds4ConfP {
+  int D, R;
+};
+kernel void ds4_conf(device const float* H [[buffer(0)]], device const float* mix [[buffer(1)]],
+                     device const float* w [[buffer(2)]], device const ushort* emb [[buffer(3)]],
+                     device const int* tok [[buffer(4)]], device float* out [[buffer(5)]], constant Ds4ConfP& p [[buffer(6)]],
+                     uint m [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  device const float* h = H + ulong(m) * ulong(4 * p.D);
+  device const float* pr = mix + ulong(m) * 24;
+  const float p0 = pr[0], p1 = pr[1], p2 = pr[2], p3 = pr[3];
+  float s = 0.0f;
+  for (int d = int(tid); d < p.D; d += 256)
+    s += (p0 * h[d] + p1 * h[p.D + d] + p2 * h[2 * p.D + d] + p3 * h[3 * p.D + d]) * w[d];
+  device const ushort* e = emb + ulong(tok[m]) * ulong(p.R);
+  for (int r = int(tid); r < p.R; r += 256) s += bf2f(e[r]) * w[p.D + r];
+  s = simd_sum(s);
+  if (lane == 0) red[sg] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float t = 0.0f;
+    for (int q = 0; q < 8; ++q) t += red[q];
+    out[m] = t;
+  }
+}
 kernel void ds4_markov_argmax(device const float* L [[buffer(0)]], device const float* bias [[buffer(1)]],
                               device int* tok [[buffer(2)]], constant Ds4MarkovP& p [[buffer(3)]],
                               uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],

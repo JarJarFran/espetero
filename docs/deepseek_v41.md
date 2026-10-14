@@ -205,16 +205,19 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   Belady 9.2, §3 Experts); fewer misses need knowing the next experts earlier
   (trained routing predictors, SpecPrefetch-style, keep the native router and
   so the output). The GPU part is ~2x a bandwidth bound of ~12 GB per token.
-* **DSpark** (`ESPETERO_DS4_SPEC=1`) with the 97 GB cache: lossless (same text),
-  46 % of drafts accepted, 2.6 tokens per round, but 7.1 tok/s against 10.1
-  plain (history text) and 8.4 against 9.4 (code): each verified row costs
-  ~82 ms, almost a token, mostly the experts rejected drafts bring in (misses
-  per token 19 → 29). The checkpoint ships the confidence head
-  (`mtp.N.confidence_head.proj`, sigmoid of the backbone state and the previous
-  draft's Markov embedding, trained to predict each draft's acceptance) that
-  the report uses to choose how many drafts to verify; Espetero does not use it
-  yet. With it, a draft is worth verifying only when its predicted survival
-  exceeds the row's relative cost (~0.8 today).
+* **DSpark** (`ESPETERO_DS4_SPEC=1`) with the 95 GB cache: lossless (same text).
+  Verifying every draft: 46 % accepted, 7.1 tok/s against ~10 plain. The
+  confidence head (`mtp.2.confidence_head.proj`: w · [the last DSpark layer's
+  hc-mixed state, the Markov embedding of the previous token], `ds4_conf`) is
+  well calibrated in Espetero (predicted 0.97 → 98 % accepted, 0.85 → 88 %,
+  0.45 → 47 %), and drafts are verified only while their predicted survival
+  (the product of the sigmoids) stays above `ESPETERO_DS4_SPEC_MIN` (0.8): 94 %
+  of verified drafts are accepted, 1.6–1.9 tokens per round. Still about even
+  with plain decoding (9.7 / 9.5 tok/s against 9.9 / 9.4): a round costs the
+  draft pass (14 ms) and an accepted row saves only the dense part of a token
+  (~30 ms) — its experts' SSD reads move to the verification pass, they are not
+  saved. So it stays off; `ESPETERO_DS4_SPEC_LOG=file` logs each round's
+  confidences and acceptances.
 * **Engram** rows depend only on the tokens: they can be read at the start of a
   pass (the report prefetches them over RDMA); 1.1 ms per token today.
 
