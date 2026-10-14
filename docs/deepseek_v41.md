@@ -170,6 +170,41 @@ with `<｜Assistant｜><think>` (thinking, `reasoning_effort` low…max) or
 `<｜Assistant｜></think>` (`enable_thinking: false`); the engine treats a prompt
 ending in `<think>` as an open reasoning block.
 
+## 5. What the V4.1 report changes for a single Mac, and what is left
+
+The report (arXiv 2609.19969) describes V4.1-Flash as a causal encoder-decoder
+with CSA2 (Full / Reindex / Reuse layers, a hierarchical indexer from layer 20),
+Single-Pass mHC (each block mixes its input with the previous block's
+coefficients, which is what `hc_pre` with the previous layer's `f_pre` does),
+Engram at layers 1 and 14 and DSpark with a confidence head. Measured on the
+M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
+
+* **Prefill** is bound by expert reads: every layer of a long prompt touches all
+  384 experts, ~190 GB per pass beyond the cache. CED (§3) removed half the GPU
+  work; left: (1) passes of 16,384 rows split longer prompts and read every
+  expert again per pass (19.8 K tokens: 377 GB); (2) reads and GPU overlap only
+  in part (19.8 K tokens: reads 64 s, GPU 65 s, prefill 108 s); reading the next
+  layer's experts during the current layer's attention would approach ~70 s.
+  DeepSeek's decoder bounded replay (128 rows per decoder layer, approximate,
+  trained for) would save ~24 K decoder rows more; not adopted.
+* **Decode** (~10 tok/s): GPU ~46 ms per token, expert reads ~53 ms (19 misses
+  of 18.8 MB). Eviction policies cannot do much (LRU 19 misses per token,
+  Belady 9.2, §3 Experts); fewer misses need knowing the next experts earlier
+  (trained routing predictors, SpecPrefetch-style, keep the native router and
+  so the output). The GPU part is ~2x a bandwidth bound of ~12 GB per token.
+* **DSpark** (`ESPETERO_DS4_SPEC=1`) with the 97 GB cache: lossless (same text),
+  46 % of drafts accepted, 2.6 tokens per round, but 7.1 tok/s against 10.1
+  plain (history text) and 8.4 against 9.4 (code): each verified row costs
+  ~82 ms, almost a token, mostly the experts rejected drafts bring in (misses
+  per token 19 → 29). The checkpoint ships the confidence head
+  (`mtp.N.confidence_head.proj`, sigmoid of the backbone state and the previous
+  draft's Markov embedding, trained to predict each draft's acceptance) that
+  the report uses to choose how many drafts to verify; Espetero does not use it
+  yet. With it, a draft is worth verifying only when its predicted survival
+  exceeds the row's relative cost (~0.8 today).
+* **Engram** rows depend only on the tokens: they can be read at the start of a
+  pass (the report prefetches them over RDMA); 1.1 ms per token today.
+
 ## 9. Parity
 
 `tools/dsv4_ref.py MODEL --tokens … --layers N [--no-quant] [--force-routes DIR]`
