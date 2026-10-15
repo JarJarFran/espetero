@@ -370,8 +370,9 @@ inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
   if (L.gate_up.q.fc() != L.experts_gu.fc() || L.down.q.fc() != L.experts_down.fc()) return 0;
   if (L.gate_up.q.bits == L.experts_gu.bits && L.down.q.bits == L.experts_down.bits) return 1;
-  const int b = L.experts_gu.bits;
-  return L.gate_up.q.bits == 8 && L.down.q.bits == 8 && L.experts_down.bits == b && b >= 4 && b <= 6 ? 2 : 0;
+  // Per matrix: GGUF experts mix widths (Q4_K gate/up beside a Q5_1 or Q8_0 down).
+  auto s8_ok = [](const QW& sh, const QW& ex) { return sh.bits == ex.bits || (sh.bits == 8 && ex.bits >= 4 && ex.bits <= 6); };
+  return s8_ok(L.gate_up.q, L.experts_gu) && s8_ok(L.down.q, L.experts_down) ? 2 : 0;
 }
 
 // Kernel of a grouped expert GEMV (epi 2: gate/up with the gated epilogue, 0:
@@ -678,6 +679,9 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const bool route_name = route_in_gemv && epi == 2 && fma_path && rows == 1 && m.moe_direct;
     const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks) +
                              (route_name && route_e512 ? "_e512" : "");  // routes of 257-512 experts (Qwen4-Exp)
+    if (env_on("ESPETERO_MOE_LOG"))
+      std::fprintf(stderr, "moe: layer %d %s (w %d/%d bits fc %x, w2 %d bits, shared_tiles %d)\n", int(&L - m.layers.data()),
+                   name.c_str(), w.bits, w.src_bits, w.fc(), w2 ? w2->bits : -1, shared_tiles ? 1 : 0);
     E.pipe(name, w.fc());
     gemm_tag(E, name, w.out, w.in, rows);
     // Several column blocks per threadgroup only on direct grids (the indirect arguments hold the block count).
@@ -1429,6 +1433,7 @@ inline void ensure_q4_scratch(Model& m, int rows) {
   q.pflog = f(size_t(R) * size_t(c.E));
   q.pfids = f(size_t(R) * 16);
   q.pfw = f(size_t(R) * 16);
+  q.nrows = f(size_t(R) * size_t(2 * std::max(1, c.ngram_heads)));
   q.rows = R;
 }
 
@@ -3191,7 +3196,36 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         }
       }
     }
-    ngram_gather(m.ple.table, heads, nrows, size_t(M), (__fp16*)[q.e16 contents]);
+    NgramTable& NT = m.ple.table;
+    const auto tg = Clock::now();
+    if (NT.mode == 2) {
+      int32_t* nr = (int32_t*)[q.nrows contents];
+      for (size_t i = 0; i < nrows.size(); ++i) nr[i] = int32_t(nrows[i]);
+      E.pipe("q4_ngram_gather");
+      for (int b = 0; b < 8; ++b) E.set(b, NT.gpu[std::min(size_t(b), NT.gpu.size() - 1)]);
+      E.set(8, q.nrows);
+      E.set(9, q.e16);
+      const int32_t gp[4] = {int32_t(NT.gpu_rows_per), NT.width / 32, M * heads, 0};
+      E.bytes(10, gp);
+      E.rd(q.nrows);
+      E.wr(q.e16);
+      E.threads(MTLSizeMake(size_t(NT.width / 32), size_t(M * heads), 1), MTLSizeMake(size_t(NT.width / 32), 32, 1));
+    } else {
+      ngram_gather(NT, heads, nrows, size_t(M), (__fp16*)[q.e16 contents]);
+    }
+    static const bool nlog = env_on("ESPETERO_NGRAM_LOG");
+    if (nlog) {
+      NT.log_ms += ms_since(tg);
+      NT.log_rows += int64_t(nrows.size());
+      if (++NT.log_passes % 64 == 0) {
+        std::fprintf(stderr, "n-gram (%s): %lld passes, %.3f ms host per pass, %.1f us per row\n",
+                     NT.mode == 2 ? "gpu" : NT.mode == 1 ? "disk" : "ram", (long long)NT.log_passes,
+                     NT.log_ms / double(NT.log_passes), 1000.0 * NT.log_ms / double(std::max<int64_t>(1, NT.log_rows)));
+        NT.log_ms = 0;
+        NT.log_rows = 0;
+        NT.log_passes = 0;
+      }
+    }
     // The embedding (and image rows) in every stream.
     E.pipe("q4_embed_streams");
     E.set(0, s.h);

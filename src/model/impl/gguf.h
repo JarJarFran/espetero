@@ -12,6 +12,11 @@
 #pragma once
 
 #include "../../util/model_family.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <atomic>
+
 #include "tensors.h"
 
 namespace espetero::native {
@@ -288,7 +293,58 @@ class GGUFSource : public WeightSource {
       v.nbytes = owned.size() * 4;
       return v;
     }
+    if (ends_with(name, ".self_attn.indexer.index_qk_proj.weight")) {
+      // llama.cpp splits the indexer's projection into q and k rows; rejoined (dense).
+      const std::string kn = g.substr(0, g.size() - std::string("q_proj.weight").size()) + "k_proj.weight";
+      const GGUFFile::Tensor* tk = f_.find(kn);
+      if (!tk) fail("missing GGUF tensor " + kn + " (" + name + ")");
+      TensorView q = gguf_view(f_, *t, name), k = gguf_view(f_, *tk, name);
+      if (q.kind != TensorView::Dense || k.kind != TensorView::Dense || q.cols() != k.cols())
+        fail(g + ": expected dense indexer q and k projections of one width");
+      auto& owned = owned_[name];
+      const size_t nq = size_t(q.numel()), nk = size_t(k.numel());
+      owned.resize(nq + nk);
+      for (size_t i = 0; i < nq; ++i) owned[i] = dense_at(q.data, q.dtype, i);
+      for (size_t i = 0; i < nk; ++i) owned[nq + i] = dense_at(k.data, k.dtype, i);
+      TensorView v = q;
+      v.shape = {q.rows() + k.rows(), q.cols()};
+      v.dtype = "F32";
+      v.data = (const uint8_t*)owned.data();
+      v.nbytes = owned.size() * 4;
+      return v;
+    }
     return gguf_view(f_, *t, name);
+  }
+
+  // The tensor read into `buf` with F_NOCACHE preads instead of through the
+  // mapping: Qwen4-Exp's 80 GB of resident experts would otherwise sit in the
+  // file cache beside their GPU copies and leave macOS evicting under the load.
+  TensorView tensor_uncached(const std::string& name, std::vector<uint8_t>& buf) const {
+    std::string g;
+    if (!map(name, g)) fail("no GGUF name for " + name);
+    const GGUFFile::Tensor* t = f_.find(g);
+    if (!t) fail("missing GGUF tensor " + g + " (" + name + ")");
+    TensorView v = gguf_view(f_, *t, name);
+    buf.resize(t->nbytes);
+    const int fd = ::open(f_.path().c_str(), O_RDONLY);
+    if (fd < 0) fail("cannot open " + f_.path());
+    ::fcntl(fd, F_NOCACHE, 1);
+    const size_t step = size_t(64) << 20;
+    const size_t n = (t->nbytes + step - 1) / step;
+    std::atomic<bool> bad{false};
+    parallel_for(n, [&](size_t i) {
+      size_t off = i * step, left = std::min(step, t->nbytes - off);
+      while (left) {
+        const ssize_t r = ::pread(fd, buf.data() + off, left, off_t(t->offset + off));
+        if (r <= 0) { bad = true; return; }
+        off += size_t(r);
+        left -= size_t(r);
+      }
+    });
+    ::close(fd);
+    if (bad) fail("read failed: " + g);
+    v.data = buf.data();
+    return v;
   }
 
  private:
@@ -349,7 +405,33 @@ class GGUFSource : public WeightSource {
         {".mlp.shared_expert.up_proj.weight", ".ffn_up_shexp.weight"},
         {".mlp.shared_expert.down_proj.weight", ".ffn_down_shexp.weight"},
         {".mlp.shared_expert_gate.weight", ".ffn_gate_inp_shexp.weight"},
+        // qwen4exp: hyper-connections, the QSA indexer and the n-gram mix.
+        {".attn_hyper_connection.hc_norm.weight", ".hc_attn_norm.weight"},
+        {".attn_hyper_connection.input_mix_weight_down.weight", ".hc_attn_down.weight"},
+        {".attn_hyper_connection.input_mix_weight_up.weight", ".hc_attn_up.weight"},
+        {".attn_hyper_connection.block_inject_weight.weight", ".hc_attn_inject.weight"},
+        {".mlp_hyper_connection.hc_norm.weight", ".hc_ffn_norm.weight"},
+        {".mlp_hyper_connection.input_mix_weight_down.weight", ".hc_ffn_down.weight"},
+        {".mlp_hyper_connection.input_mix_weight_up.weight", ".hc_ffn_up.weight"},
+        {".mlp_hyper_connection.block_inject_weight.weight", ".hc_ffn_inject.weight"},
+        {".self_attn.indexer.q_layernorm.weight", ".indexer.q_norm.weight"},
+        {".self_attn.indexer.k_layernorm.weight", ".indexer.k_norm.weight"},
+        {".self_attn.indexer.index_qk_proj.weight", ".indexer.q_proj.weight"},  // + k_proj (tensor())
+        {".ple.key_proj.weight", ".ple_key.weight"},
+        {".ple.value_proj.weight", ".ple_value.weight"},
+        {".ple.norm_key.weight", ".ple_norm_key.weight"},
+        {".ple.norm_query.weight", ".ple_norm_query.weight"},
+        {".ple.norm_conv.weight", ".ple_norm_conv.weight"},
+        {".ple.conv1d.weight", ".ple_conv1d.weight"},
     };
+    static const std::string MIX = "language_model.model.hyper_connection_mixer.";
+    if (name.compare(0, MIX.size(), MIX) == 0) {
+      const std::string rest = name.substr(MIX.size());
+      if (rest == "hc_norm.weight") return out = "output_hc_norm.weight", true;
+      if (rest == "input_mix_weight_down.weight") return out = "output_hc_down.weight", true;
+      if (rest == "input_mix_weight_up.weight") return out = "output_hc_up.weight", true;
+      return false;
+    }
     if (name == "language_model.model.embed_tokens.weight") return out = "token_embd.weight", true;
     if (name == "language_model.lm_head.weight") return out = "output.weight", true;
     if (name == "language_model.model.norm.weight") return out = "output_norm.weight", true;

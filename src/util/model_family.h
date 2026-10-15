@@ -27,7 +27,9 @@ inline bool mlx_type_supported(std::string_view t) {
          t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41";
 }
 
-inline bool gguf_arch_supported(std::string_view a) { return a == "qwen35" || a == "qwen35moe" || a == "gemma4"; }
+inline bool gguf_arch_supported(std::string_view a) {
+  return a == "qwen35" || a == "qwen35moe" || a == "gemma4" || a == "qwen4exp";
+}
 
 inline std::string unsupported_mlx(const std::string& path, const std::string& model_type) {
   return path + ": model_type '" + model_type + "' is not supported by Espetero " + kVersion +
@@ -39,8 +41,8 @@ inline std::string unsupported_mlx(const std::string& path, const std::string& m
 inline std::string unsupported_gguf(const std::string& path, const std::string& arch) {
   return path + ": GGUF architecture '" + arch + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen35, qwen35moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
-         "Ornith 1.5) and Gemma 4 (gemma4: 31B, 26B-A4B, 12B); Qwen3.8-Flash-Next (qwen4_exp) and Cloudflare "
-         "Clef classifiers run from MLX directories";
+         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4exp; MLX: qwen4_exp) and Gemma 4 (gemma4: 31B, 26B-A4B, 12B); "
+         "Cloudflare Clef classifiers run from MLX directories";
 }
 
 // The message for an MLX config.json of another family, "" when supported.
