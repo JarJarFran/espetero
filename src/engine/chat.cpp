@@ -443,9 +443,14 @@ static void score_options(Engine& engine, const json::Value& body, ChatJob& job)
 
 // {"head": {"slots": n}} (or true: every slot): the hidden-state head's
 // logits for the prompt's last token instead of a reply (hidden_head.h).
-static void head_options(Engine& engine, const json::Value& body, ChatJob& job) {
+// A decision-only model (no LM head) runs nothing else.
+static void head_options(Engine& engine, const json::Value& body, ChatJob& job, bool run) {
   const json::Value* h = body.get("head");
-  if (!h || h->is_null() || (h->is_bool() && !h->as_bool())) return;
+  if (!h || h->is_null() || (h->is_bool() && !h->as_bool())) {
+    if (run && !engine.generates())
+      invalid("this is a decision model without an LM head: it answers chat and completions requests with \"head\" only");
+    return;
+  }
   const int S = engine.head_slots();
   if (!S) invalid("head: this model has no hidden-state head (hidden_head.safetensors next to its weights)");
   if (!h->is_bool() && !h->is_object()) invalid("head: true or an object {\"slots\": n}");
@@ -455,7 +460,7 @@ static void head_options(Engine& engine, const json::Value& body, ChatJob& job) 
   if (job.stream) invalid("head: not with stream (the response is one object)");
 }
 
-ChatJob prepare_chat(Engine& engine, const json::Value& body) {
+ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   if (!body.is_object()) invalid("request body must be a JSON object");
   if (!engine.chat_template()) invalid("this model has no chat template");
   ChatJob job;
@@ -463,7 +468,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body) {
   job.created = now_s();
   sampling_options(body, job, 1024, engine.sampling_defaults());
   score_options(engine, body, job);
-  head_options(engine, body, job);
+  head_options(engine, body, job, run);
   parse_response_format(body.get("response_format"));  // its shape, before the prompt is rendered
   // tool_choice: "auto" (the default); "none": the prompt is rendered without
   // the tools, so no call is parsed; allowed_tools: only those are rendered;
@@ -781,7 +786,7 @@ ChatJob prepare_completion(Engine& engine, const json::Value& body) {
   job.created = now_s();
   sampling_options(body, job, 16, engine.sampling_defaults());
   score_options(engine, body, job);
-  head_options(engine, body, job);
+  head_options(engine, body, job, true);
   job.echo = parse_bool(body.get("echo"), false);
   if (job.echo && job.gen.logprobs >= 0) invalid("logprobs: not with echo (the prompt tokens' log-probabilities are not computed)");
   {
@@ -1112,10 +1117,12 @@ json::Value head_response(Engine& engine, const ChatJob& job) {
   const auto t0 = std::chrono::steady_clock::now();
   const Engine::HeadResult r = engine.head(job.gen, job.head_slots);
   const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  // The probabilities at the head's calibration temperature (hidden_head.json; 1 without one), the logits raw.
+  const double temp = engine.head_temperature();
   double mx = -INFINITY, sum = 0;
   for (float x : r.logits) mx = std::max(mx, double(x));
   std::vector<double> p(r.logits.size());
-  for (size_t i = 0; i < p.size(); ++i) sum += (p[i] = std::exp(double(r.logits[i]) - mx));
+  for (size_t i = 0; i < p.size(); ++i) sum += (p[i] = std::exp((double(r.logits[i]) - mx) / temp));
   json::Value logits = json::Value::array(), probs = json::Value::array();
   for (size_t i = 0; i < p.size(); ++i) {
     logits.push_back(double(r.logits[i]));
@@ -1152,6 +1159,7 @@ json::Value head_response(Engine& engine, const ChatJob& job) {
   json::Value head = json::Value::object();
   head.set("slots", job.head_slots);
   head.set("logits", std::move(logits));
+  head.set("temperature", temp);
   head.set("probabilities", std::move(probs));
   out.set("head", std::move(head));
   json::Value t = json::Value::object();

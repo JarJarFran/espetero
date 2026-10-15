@@ -62,7 +62,9 @@ struct ChatEvent {
 };
 
 // Parse an OpenAI chat request (throws RequestError 422 on invalid input).
-ChatJob prepare_chat(Engine& engine, const json::Value& body);
+// run = false: the job is only rendered (token counts), never run, so a
+// decision-only model (Engine::generates() false) renders it without "head".
+ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run = true);
 // Parse an OpenAI completions request.
 ChatJob prepare_completion(Engine& engine, const json::Value& body);
 
@@ -89,9 +91,10 @@ struct ChoiceResult {
 json::Value respond(Engine& engine, const ChatJob& job, const std::function<bool()>& client_gone = nullptr);
 
 // The response to a "head" request: no reply ("content": ""), and "head":
-// {"slots", "logits", "probabilities"} with the hidden-state head's logits
-// of the first `slots` slots (hidden_head.h) for the prompt's last token and
-// their softmax.
+// {"slots", "logits", "temperature", "probabilities"} with the hidden-state
+// head's logits of the first `slots` slots (hidden_head.h) for the prompt's
+// last token and softmax(logits / temperature), the head's calibration
+// temperature (1 when hidden_head.json gives none).
 json::Value head_response(Engine& engine, const ChatJob& job);
 
 // Whole-response bodies.

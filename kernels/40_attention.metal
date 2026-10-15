@@ -84,7 +84,9 @@ kernel void attn_prep(
 // tree with the tree mask: desc[row] = (seg_start, 0, anc_len, 0) relative to
 // the tree's first row; visible batch keys are j < anc_len (the root) and
 // seg_start <= j <= row (its own segment). Output (fp16) = softmax(qK^T/16) V
-// * sigmoid(gate).
+// * sigmoid(gate). A noncausal root (TreeSpec::noncausal) gives its own rows
+// anc_len = its length: each sees the rows after it too, so a tile scans the
+// batch keys up to the last its rows see (beyond its own last row).
 //
 // Threadgroup = one KV head x one tile of 8 consecutive query rows of one
 // tree; 2 simdgroups per query head (each owns 128 of the 256 dims; score
@@ -188,15 +190,19 @@ kernel void flash_attention(
     anc_max = max(anc_max, dr.z);
     seg_min = min(seg_min, dr.x);
   }
+  // The last batch key a row of the tile sees: its last row, or the end of
+  // a noncausal root (a leaf's root ends before the leaf, so leaves and
+  // causal roots keep r_last).
+  const int k_last = max(r_last, anc_max - 1);
 
   const ulong blk_halves = ulong(p.bt) * p.kv_ld;
   device const half* kvl = kv + p.kv_base;
   const int n_slot_blocks = (tile.k1 - tile.k0 + FA_BK - 1) / FA_BK;
-  const int n_batch_blocks = tile.last ? (r_last + 1 + FA_BK - 1) / FA_BK : 0;
+  const int n_batch_blocks = tile.last ? (k_last + 1 + FA_BK - 1) / FA_BK : 0;
   for (int blk = 0; blk < n_slot_blocks + n_batch_blocks; ++blk) {
     const bool in_slot = blk < n_slot_blocks;
     const int j0 = in_slot ? tile.k0 + blk * FA_BK : (blk - n_slot_blocks) * FA_BK;
-    const int j_end = in_slot ? tile.k1 : r_last + 1;
+    const int j_end = in_slot ? tile.k1 : k_last + 1;
     if (!in_slot) {
       const bool anc_vis = j0 < anc_max;
       const bool own_vis = (j0 + FA_BK - 1 >= seg_min) && (j0 <= r_last);

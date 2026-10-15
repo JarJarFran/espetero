@@ -279,8 +279,33 @@ void hidden_head_tests() {
       ok = std::fabs(double(z[size_t(s)]) - ref) < 1e-6;
     }
     check(ok, "head: logits of the first two slots");
+    check(!head->noncausal() && head->temperature() == 1.0 && head->lm_head(), "head: causal, temperature 1, LM head by default");
   } catch (const std::exception& e) {
     check(false, std::string("head: load failed: ") + e.what());
+  }
+  // A decision checkpoint's head (tools/pplx_decider_convert.py): noncausal attention, a calibration
+  // temperature, a placeholder LM head; unknown modes and non-positive temperatures are refused.
+  auto with_json = [&](const std::string& extra) {
+    std::ofstream(std::string(dir) + "/hidden_head.json")
+        << R"({"type": "linear", "input": "final_norm_last_row", "standardize": true, "slots": 3, "hidden_size": 4)" + extra + "}";
+  };
+  with_json(R"(, "attention_mode": "noncausal_full_attention", "temperature": 1.0087417621345625, "lm_head": false)");
+  try {
+    auto head = HiddenHead::load(dir);
+    check(head->noncausal() && head->temperature() == 1.0087417621345625 && !head->lm_head(),
+          "head: noncausal, its temperature, no LM head");
+  } catch (const std::exception& e) {
+    check(false, std::string("head: noncausal load failed: ") + e.what());
+  }
+  for (const char* bad : {R"(, "attention_mode": "bidirectional")", R"(, "temperature": 0)", R"(, "temperature": -1)"}) {
+    with_json(bad);
+    bool refused = false;
+    try {
+      HiddenHead::load(dir);
+    } catch (const std::exception&) {
+      refused = true;
+    }
+    check(refused, std::string("head: refused ") + bad);
   }
   for (const char* f : {"/hidden_head.safetensors", "/hidden_head.json"}) std::remove((std::string(dir) + f).c_str());
   rmdir(dir);

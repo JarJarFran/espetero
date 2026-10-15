@@ -265,7 +265,7 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
     std::vector<int32_t> ids;
     if (body.get("messages")) {
       json::Value b = body;
-      ChatJob job = prepare_chat(engine, b);
+      ChatJob job = prepare_chat(engine, b, false);
       ids = job.gen.prompt;
     } else {
       const std::string text = body.get_string("prompt", body.get_string("text", ""));

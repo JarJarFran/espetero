@@ -277,14 +277,22 @@ class Engine {
   // of the first `slots` slots of the model's head for the final-normed state
   // of the prompt's last token. The prompt (with its images) runs alone in
   // its passes without generating; its image prefix (up to
-  // GenRequest::img_split) is cached as a Clef request's is.
+  // GenRequest::img_split) is cached as a Clef request's is. A noncausal
+  // head (attention_mode noncausal_full_attention) runs the whole prompt in
+  // one pass with bidirectional full attention (TreeSpec::noncausal) and
+  // caches nothing: a prefix computed without the rest of the prompt is not
+  // the one the head reads (422 when the prompt exceeds --max-rows).
   struct HeadResult {
     std::vector<float> logits;
     int cached = 0, passes = 0;
     double gpu_ms = 0, run_ms = 0, queue_ms = 0;
   };
   HeadResult head(const GenRequest& request, int slots);
-  int head_slots() const;  // 0: no head
+  int head_slots() const;           // 0: no head
+  double head_temperature() const;  // the head's calibration temperature (1 without one)
+  // False for a decision-only model (hidden_head.json "lm_head": false: its
+  // LM head is a placeholder): only head requests run (others get a 422).
+  bool generates() const;
 
   // ---- generation (thread-safe): the stream starts filling immediately
   std::shared_ptr<GenStream> generate(GenRequest request);

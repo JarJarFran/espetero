@@ -124,6 +124,13 @@ struct TreeSpec {
   // heads: no fp16 rounding of the LM head's input). Disables last-layer
   // pruning for the pass, as out_hidden does.
   float* out_last_hidden = nullptr;
+  // The full-attention layers attend over the whole root in both directions
+  // (no causal mask between root rows); the linear-attention layers keep
+  // their causal recurrence. Decision models trained without the causal mask
+  // (hidden-state heads with attention_mode noncausal_full_attention). A
+  // root on its own: no parent, leaves, save or work slot (a checkpoint of
+  // these rows would not continue causally). Qwen3.5 family only.
+  bool noncausal = false;
   // > 0: the top-`topk` (<= 32) scaled logits x = logit / temperature of every
   // readout, their ids, the maximum and the full-vocabulary sum of exp(x - max),
   // computed on the GPU (NativeModel::topk).

@@ -179,6 +179,8 @@ struct Engine::ClefJob {
   // final-normed state in fp32 instead.
   bool rows = true;
   std::vector<float> last;
+  // A noncausal head (TreeSpec::noncausal): the whole sequence in one pass, uncached.
+  bool noncausal = false;
   // Pass arrays.
   std::vector<int32_t> root_pos;
   std::vector<ImageRef> irefs;
@@ -396,8 +398,9 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     if (head_->hidden() != I.hidden) throw std::runtime_error("hidden_head: its width differs from the model's hidden size");
   }
 
-  // Decisions: labels, the prompt builder and the shared header checkpoint.
-  if (template_ && I.leaves && !clef_) {
+  // Decisions: labels, the prompt builder and the shared header checkpoint
+  // (not for a decision-only model: they read the LM head).
+  if (template_ && I.leaves && !clef_ && generates()) {
     dp_ = std::make_unique<DecisionPrompts>();
     dp_->labels = make_labels(*tok_);
     // The image's place in the prompt as the template writes it (Gemma 4: the
@@ -1000,6 +1003,8 @@ int Engine::answer_reserve(int remaining) const {
 // ---------------------------------------------------------------- decisions
 json::Value Engine::decide(const json::Value& body) {
   if (clef_) return clef_decide(body);
+  if (!generates())  // decisions read label logits from the LM head
+    throw RequestError(422, "this is a decision model without an LM head: ask /v1/chat/completions with \"head\"");
   const auto started = Clock::now();
   if (!dp_)
     throw RequestError(422, model_->info().leaves ? "this model has no chat template; decisions need one"
@@ -1427,6 +1432,8 @@ bool Engine::clef_evict_prefix(const std::vector<int>& keep) {
 
 // ---------------------------------------------------------------- hidden-state heads
 int Engine::head_slots() const { return head_ ? head_->slots() : 0; }
+double Engine::head_temperature() const { return head_ ? head_->temperature() : 1.0; }
+bool Engine::generates() const { return !head_ || head_->lm_head(); }
 
 Engine::HeadResult Engine::head(const GenRequest& g, int slots) {
   if (!head_) throw RequestError(422, "head: this model has no hidden-state head (hidden_head.safetensors)");
@@ -1434,10 +1441,15 @@ Engine::HeadResult Engine::head(const GenRequest& g, int slots) {
     throw RequestError(422, "head.slots: 1 to " + std::to_string(head_->slots()));
   if (g.prompt.empty()) throw RequestError(422, "empty prompt");
   const ModelInfo& I = model_->info();
+  if (head_->noncausal() && int(g.prompt.size()) > I.max_rows)
+    throw RequestError(422, "the prompt has " + std::to_string(g.prompt.size()) + " tokens: this model's noncausal attention "
+                            "needs it in one pass of at most " + std::to_string(I.max_rows) + " rows (raise --max-rows)");
   auto job = std::make_shared<ClefJob>();
   job->rec.ids = g.prompt;
-  // The image prefix (system prompt, instructions and images) is shared by every question about the same images.
-  job->rec.prefix_tokens = g.img_split > 0 && !g.images.empty() ? g.img_split : 0;
+  job->noncausal = head_->noncausal();
+  // The image prefix (system prompt, instructions and images) is shared by every question about the same images
+  // (not under noncausal attention: its rows see the rest of the prompt).
+  job->rec.prefix_tokens = !job->noncausal && g.img_split > 0 && !g.images.empty() ? g.img_split : 0;
   job->images = g.images;
   job->positions = g.positions;
   for (const PreparedImage& im : g.images) job->digest += im.digest;
@@ -1490,6 +1502,41 @@ void Engine::run_clef(ClefJob& j) {
     }
   }
   if (runs.size() != j.images.size()) throw RequestError(422, "image runs do not match the images");
+  if (j.noncausal) {  // one pass over the whole sequence, bidirectional full attention, no checkpoint
+    if (L > I.max_rows)
+      throw RequestError(422, "the prompt needs one pass of " + std::to_string(L) + " rows (raise --max-rows)");
+    TreeSpec t;
+    t.root = j.rec.ids.data();
+    t.root_len = L;
+    if (!j.positions.empty()) t.root_pos = j.positions.data();
+    j.irefs.clear();
+    for (size_t k = 0; k < runs.size(); ++k) {
+      const PreparedImage& im = j.images[k];
+      ImageRef ref;
+      ref.pixels = im.pixels.data();
+      ref.grid_t = im.grid_t;
+      ref.grid_h = im.grid_h;
+      ref.grid_w = im.grid_w;
+      ref.row = runs[k].first;
+      j.irefs.push_back(ref);
+    }
+    if (!j.irefs.empty()) {
+      t.images = j.irefs.data();
+      t.n_images = int(j.irefs.size());
+    }
+    if (j.rows) t.out_hidden = j.hidden.data();
+    if (!j.last.empty()) t.out_last_hidden = j.last.data();
+    t.noncausal = true;
+    PassStats st;
+    model_->run({t}, &st);
+    j.gpu_ms += st.gpu_ms;
+    ++j.passes;
+    ++passes_;
+    rows_ += uint64_t(st.rows);
+    gpu_ms_ = gpu_ms_ + st.gpu_ms;
+    j.run_ms = ms_since(j.started);
+    return;
+  }
   int done = 0, parent = -1;
   size_t g = 0;
   // Image prefix cache: the system prompt + media block of a request with

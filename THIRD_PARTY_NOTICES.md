@@ -26,6 +26,7 @@ uses only Apple's system frameworks.
 | Hugging Face transformers 5.17 (Gemma 4 unified semantics: `models/gemma4_unified/modeling_gemma4_unified.py`, `image_processing_gemma4_unified.py`, `configuration_gemma4_unified.py`) | `src/model/impl/gemma_vision.h` (unified), `src/model/impl/gemma_load.h` (`load_gemma_unified_vision`), `src/model/impl/config.h` (`vision_from_gemma_unified`, `per_layer_config`), `kernels/85_gemma_vision.metal` (`g4u_embed_norm`), `tools/gemma4_unified_convert.py` | Apache-2.0 |
 | mlx-vlm 0.7.1 (Gemma 4 vision semantics: `models/gemma4/vision.py`, `gemma4.py`, `language.py`) | `src/model/impl/gemma_vision.h`, `src/model/impl/gemma_load.h` (`load_gemma_vision`), `src/model/impl/config.h` (`vision_from_gemma`), `kernels/85_gemma_vision.metal`, `kernels/80_gemma.metal` (the image mask) | MIT |
 | Decision prompts of public models (akhilaaa3/Jev-Omni `jev_omni.py`; EldanRing/winnow-inference `native/protocol.h`, `native/engine.h`) | `tests/ref/gemma4_unified_ref.py` | Apache-2.0, MIT |
+| perplexity-ai/pplx-decider-v1.1-27b (`model.py`: the decision prompt, the read-out, `enable_noncausal_full_attention`) | `tests/ref/pplx_decider_ref.py`, `tools/pplx_decider_convert.py`, `src/engine/hidden_head.h`, `src/engine/hidden_head.cpp`, `src/engine/engine.cpp`, `src/engine/chat.cpp` (the head's temperature), `src/model/api.h`, `src/model/impl/forest.h`, `kernels/40_attention.metal` (`TreeSpec::noncausal`) | Apache-2.0 |
 | Chat templates of public models (test fixtures) | `tests/ref/tmpl_fixtures/`, `tests/ref/tmpl_ref.py` | Apache-2.0, MIT |
 
 ## libjpeg-turbo and the Independent JPEG Group's software
@@ -523,12 +524,33 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## pplx-decider (decision prompt, read-out, noncausal attention)
+
+`tests/ref/pplx_decider_ref.py` reproduces the decision protocol of
+`source/src/autojev/model.py` in perplexity-ai/pplx-decider-v1.1-27b (Apache
+License 2.0, as the release's LICENSE states;
+[third_party/apache-2.0/LICENSE-2.0.txt](third_party/apache-2.0/LICENSE-2.0.txt)):
+the system message and prompt text of `decision_messages`, the option lists
+of `options` and the read-out of `DecisionModel.forward` and `predict` (the
+last token's final-normed state through the readout, the first n slots, the
+calibration temperature). `tools/pplx_decider_convert.py` reads the
+release's `decision_config.json` and `readout.safetensors` into a
+hidden-state head (`src/engine/hidden_head.*`), whose probabilities the
+server divides by that temperature (`src/engine/chat.cpp`), and the
+noncausal attention (`TreeSpec::noncausal` in `src/model/api.h` and
+`src/model/impl/forest.h`, the batch-key range of `flash_attention` in
+`kernels/40_attention.metal`, the one-pass uncached head requests in
+`src/engine/engine.cpp`) follows `enable_noncausal_full_attention`: the
+full-attention layers see every position of the prompt, the linear-attention
+layers keep their recurrence. The release's files are read, never imported;
+the code is new.
+
 ## Acknowledgements (ideas, no code)
 
 These projects informed the design without contributing code:
 
 - TensorFold (https://github.com/ashhart/TensorFold, read at 0.3.x, MIT; Apache-2.0 since 0.6.0): the exact position-keyed sampling scheme (`src/engine/sampling.h`) and the structure of the MoE down projection with the expert combine folded in (`kernels/15_moe.metal`).
 - MLX (https://github.com/ml-explore/mlx, MIT): the chunked gated delta rule formulation (`kernels/30_deltanet.metal`).
-- mlx-vlm (https://github.com/Blaizzy/mlx-vlm, MIT): the reference the vision path and the Qwen3.5 / Qwen3.8-Flash-Next models are checked against; `tools/vision_fidelity.py`, `tests/ref/moe_ref.py` and `tests/ref/gemma4_vision_ref.py` run it as an installed package (the Gemma 4 vision semantics are listed above).
+- mlx-vlm (https://github.com/Blaizzy/mlx-vlm, MIT): the reference the vision path and the Qwen3.5 / Qwen3.8-Flash-Next models are checked against; `tools/vision_fidelity.py`, `tests/ref/moe_ref.py`, `tests/ref/gemma4_vision_ref.py` and `tests/ref/pplx_decider_ref.py` run it as an installed package (the Gemma 4 vision semantics are listed above).
 - llama.cpp (https://github.com/ggml-org/llama.cpp, MIT): the GGUF format and the names of its pre-tokenizers (`src/tok/pretok.cpp`).
 - BLAKE2 (RFC 7693): the image digest (`src/vision/digest.cpp`) implements BLAKE2b from the specification.

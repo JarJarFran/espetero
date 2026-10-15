@@ -5,6 +5,7 @@
 
 #include <sys/stat.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -63,6 +64,14 @@ std::unique_ptr<HiddenHead> HiddenHead::load(const std::string& dir) {
   h->slots_ = int(cfg.get_int("slots", 0));
   h->hidden_ = int(cfg.get_int("hidden_size", 0));
   if (h->slots_ < 1 || h->slots_ > 65536 || h->hidden_ < 1) throw std::runtime_error(dir + "/hidden_head.json: bad sizes");
+  const std::string mode = cfg.get_string("attention_mode", "causal");
+  if (mode != "causal" && mode != "noncausal_full_attention")
+    throw std::runtime_error(dir + "/hidden_head.json: attention_mode is causal or noncausal_full_attention");
+  h->noncausal_ = mode == "noncausal_full_attention";
+  h->temperature_ = cfg.get_double("temperature", 1.0);
+  if (!(h->temperature_ > 0) || !std::isfinite(h->temperature_))
+    throw std::runtime_error(dir + "/hidden_head.json: temperature must be positive and finite");
+  h->lm_head_ = cfg.get_bool("lm_head", true);
   const std::string file = dir + "/hidden_head.safetensors";
   const std::string bytes = slurp(file);
   if (bytes.size() < 8) throw std::runtime_error(file + ": truncated");

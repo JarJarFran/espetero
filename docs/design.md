@@ -52,7 +52,15 @@ last hidden state (`hidden_head.safetensors` beside the weights,
 `src/engine/hidden_head.*`) run a chat request's prompt as a Clef record
 runs (alone in its passes, the image prefix cached) and read the last row's
 final-normed state in fp32 from the residual stream
-(`TreeSpec::out_last_hidden`). The **Qwen3-Omni thinker** (`qwen3_omni_moe`, the
+(`TreeSpec::out_last_hidden`). A head trained without the causal mask
+(`attention_mode` `noncausal_full_attention` in `hidden_head.json`, as
+`perplexity-ai/pplx-decider-v1.1-27b` on Qwen3.8-27B) runs its whole prompt
+as one root of one pass, uncached, with `TreeSpec::noncausal`: each root row's
+visible-ancestor length (`desc.z`, what a leaf has for its root) is the
+root's length, so `flash_attention` lets every row see every other and
+scans the batch keys up to the root's end instead of the tile's last row;
+the DeltaNet layers keep their causal recurrence.
+The **Qwen3-Omni thinker** (`qwen3_omni_moe`, the
 backbone of Cloudflare's Clef-Omni decision model; images and text, no audio)
 runs from an MLX directory written by `tools/clef_convert.py`: 48 layers of
 full attention (GQA 32 / 4, 128-dim heads with q / k RMSNorms and interleaved
@@ -139,7 +147,8 @@ Per layer, one dispatch per kernel for the whole forest:
   MLX's chunked kernel), is kept for long segments behind `ESPETERO_DN_CHUNK`
   (measured 2% faster than the recurrence on prefill, so not the default).
 * `attn_prep` — per-head q/k RMS norm, partial M-RoPE, fp16 Q and batch K/V.
-* `flash_attention_gG` — tree-masked flash attention over the paged cache.
+* `flash_attention_gG` — tree-masked flash attention over the paged cache
+  (a noncausal root: every root row sees the whole root).
   Work is a table of *tiles* (8 query rows of one tree); passes with few
   tiles split the cached context over several tiles (flash decoding: 32- to
   512-key chunks, for ~256 threadgroups) and `attention_combine` merges

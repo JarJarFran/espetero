@@ -1632,6 +1632,11 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     T.N = T.NL + (b.score_root ? 1 : 0);
     if (b.score_root && T.Tr == 0) fail("score_root needs root tokens");
     if ((b.out_hidden || b.out_last_hidden) && T.Tr == 0) fail("out_hidden needs root tokens");
+    if (b.noncausal) {
+      if (c.gemma || c.q3moe || c.q4) fail("noncausal: Qwen3.5-family attention only");
+      if (b.parent >= 0 || b.save >= 0 || b.work >= 0 || b.n_leaves > 0 || b.mtp || T.Tr == 0)
+        fail("noncausal: a root alone (no parent, save or work slot, leaves or MTP)");
+    }
     int leaf_rows = 0, max_leaf = 0;
     if (T.NL > 0) {
       const bool cands = b.cand_offsets != nullptr;
@@ -1830,7 +1835,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       rslot[r] = T.pstate;
       desc[r * 4 + 0] = 0;
       desc[r * 4 + 1] = 0;
-      desc[r * 4 + 2] = 0;
+      // Noncausal: every root row sees the whole root, as a leaf row sees its root.
+      desc[r * 4 + 2] = b.noncausal ? T.Tr : 0;
       desc[r * 4 + 3] = 0;
     }
     // Gemma 4: an image's soft tokens see each other (desc.w = the end of

@@ -1215,7 +1215,7 @@ void install_compat_routes(http::Server& server, Engine& engine) {
       json::Value body = parse_body(req);
       body.set("max_tokens", 1);  // counting only: no output budget against the context
       body.set("stream", false);
-      ChatJob job = prepare_chat(engine, anthropic_to_chat(body));
+      ChatJob job = prepare_chat(engine, anthropic_to_chat(body), false);
       json::Value o = obj();
       o.set("input_tokens", int64_t(job.gen.prompt.size()));
       res.send_json(200, o);
