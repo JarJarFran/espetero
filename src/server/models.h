@@ -45,6 +45,7 @@ struct Geometry {
   // paged pool), n_swa sliding layers (a ring of `window` positions per slot).
   bool gemma = false;
   int HDg = 0, Hkv_g = 0, window = 0, n_swa = 0, ld = 0;
+  bool ds4 = false;                         // deepseek_v41: experts and Engram tables on the SSD
   std::string unsupported;                  // why the engine refuses this geometry ("" = it loads)
 
   int64_t kv_bytes_per_token(bool mtp) const;

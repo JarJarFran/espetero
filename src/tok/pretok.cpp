@@ -17,10 +17,16 @@ constexpr std::string_view kLlama3Regex =
 
 }  // namespace
 
+// DeepSeek-V3's third Split regex (the first two are fixed; see deepseek_split).
+constexpr std::string_view kDeepSeekV3Regex =
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| "
+    "?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+
 std::optional<SplitPattern> split_pattern_from_regex(std::string_view regex) {
   if (regex == kQwen35Regex) return SplitPattern::kQwen35;
   if (regex == kQwen2Regex) return SplitPattern::kQwen2;
   if (regex == kLlama3Regex) return SplitPattern::kLlama3;
+  if (regex == kDeepSeekV3Regex) return SplitPattern::kDeepSeekV3;
   return std::nullopt;
 }
 
@@ -29,6 +35,7 @@ std::optional<SplitPattern> split_pattern_from_gguf_pre(std::string_view pre) {
   if (pre == "qwen35") return SplitPattern::kQwen35;
   if (pre == "qwen2" || pre == "deepseek-r1-qwen") return SplitPattern::kQwen2;
   if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe") return SplitPattern::kLlama3;
+  if (pre == "deepseek-v3") return SplitPattern::kDeepSeekV3;
   return std::nullopt;
 }
 
@@ -37,6 +44,7 @@ std::string_view split_pattern_name(SplitPattern p) {
     case SplitPattern::kQwen2: return "qwen2";
     case SplitPattern::kQwen35: return "qwen35";
     case SplitPattern::kLlama3: return "llama3";
+    case SplitPattern::kDeepSeekV3: return "deepseek-v3";
   }
   return "?";
 }

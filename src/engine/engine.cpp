@@ -324,7 +324,7 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   const ModelInfo& I = model_->info();
   // Models without multi-branch passes (Qwen4-Exp so far): no prompt-lookup
   // drafts (verified as leaves) and no decision trees.
-  if (!I.leaves) opt_.prompt_lookup = false;
+  if (!I.leaves || !I.prompt_lookup) opt_.prompt_lookup = false;
   if (opt_.draft_tokens < 0) opt_.draft_tokens = I.draft_default > 0 ? I.draft_default : 5;
 
   for (const char* t : {"<|im_end|>", "<|endoftext|>", "<|end_of_text|>", "<|eot_id|>"}) {
@@ -335,7 +335,10 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     end_ids.push_back(tok_->eos_id());
   for (const int id : I.end_ids)  // Gemma 4: the config's end-of-turn ids, e.g. <turn|>
     if (id >= 0 && std::find(end_ids.begin(), end_ids.end(), id) == end_ids.end()) end_ids.push_back(id);
-  if (I.vision) {
+  if (I.vision && I.vision_layout == "deepseek") {  // one placeholder per image; no start / end tokens of its own
+    image_token = I.image_token_id;
+    if (image_token < 0) throw std::runtime_error("vision model without an image token id");
+  } else if (I.vision) {
     const bool g4 = I.family == "gemma4";
     image_token = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
     vision_start = tok_->token_id(g4 ? "<|image>" : "<|vision_start|>");
@@ -404,11 +407,12 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     dp_ = std::make_unique<DecisionPrompts>();
     dp_->labels = make_labels(*tok_);
     // The image's place in the prompt as the template writes it (Gemma 4: the
-    // <|image|> placeholder alone; expand_images adds its <|image> / <image|>).
+    // <|image|> placeholder alone, expand_images adds its <|image> / <image|>;
+    // DeepSeek: one placeholder of its own).
     const std::string image_block =
         !I.vision ? ""
-        : gemma_vision() ? tok_->decode(std::vector<int32_t>{image_token})
-                         : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
+        : gemma_vision() || vision_start < 0 ? tok_->decode(std::vector<int32_t>{image_token})
+                                             : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
     if (!header_.empty()) {
@@ -717,6 +721,18 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
   if (w > vision::max_image_pixels() / h)
     throw RequestError(422, "image: " + std::to_string(w) + "x" + std::to_string(h) + " pixels is over the limit of " +
                                 std::to_string(vision::max_image_pixels()) + " pixels per image (--image-max-mp)");
+  const ModelInfo& I = model_->info();
+  if (I.vision_layout == "deepseek") {
+    int n = 0;
+    try {
+      const auto plan = vision::deepseek_plan(int(w), int(h), I.vision_patch, I.vision_merge, I.vision_max_tokens, I.vision_min_pixels);
+      n = vision::deepseek_run(plan[2], plan[3]);
+    } catch (const std::exception& e) {
+      throw RequestError(422, std::string("image: ") + e.what());
+    }
+    check_image_rows(n, I.max_rows);
+    return n;
+  }
   const vision::Spec spec = image_spec(max_pixels, min_pixels);
   int n = 0;
   try {
@@ -749,6 +765,22 @@ PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pix
   DecodeGate gate;
   vision::RGBImage rgb;
   if (!vision::decode_image(bytes, rgb, err)) throw RequestError(422, "image: " + err);
+  const ModelInfo& I = model_->info();
+  if (I.vision_layout == "deepseek") {  // the checkpoint's own planner and padding (detail levels do not apply)
+    vision::Prepared p;
+    try {
+      p = vision::preprocess_deepseek(rgb, I.vision_patch, I.vision_merge, I.vision_max_tokens, I.vision_min_pixels);
+    } catch (const std::exception& e) {
+      throw RequestError(422, std::string("image: ") + e.what());
+    }
+    PreparedImage out;
+    out.pixels = std::move(p.pixels);
+    out.grid_t = 1, out.grid_h = p.grid_h, out.grid_w = p.grid_w;
+    out.ntok = vision::deepseek_run((p.grid_h + I.vision_merge - 1) / I.vision_merge, (p.grid_w + I.vision_merge - 1) / I.vision_merge);
+    out.digest = hex(p.digest.data(), p.digest.size());
+    check_image_rows(out.ntok, I.max_rows);
+    return out;
+  }
   vision::Spec spec = image_spec(max_pixels, min_pixels);
   // Normalization from the processor config when the checkpoint has one
   // (Gemma 4 rescales only).
@@ -1052,7 +1084,7 @@ json::Value Engine::decide(const json::Value& body) {
     plan.image_tokens = int(plan.prefix.size() - before + job->images.size() * size_t(1 - image_wrap()));
     std::vector<int32_t> ps = plan.prefix;
     ps.insert(ps.end(), plan.stem.begin(), plan.stem.end());
-    job->positions = mrope_positions(ps, job->images);
+    if (model_->info().vision_layout != "deepseek") job->positions = mrope_positions(ps, job->images);
     for (const auto& im : job->images) job->digest += im.digest;
   }
   if (plan.max_prompt_tokens() + 1 > size_t(model_->info().max_ctx))
@@ -1244,7 +1276,7 @@ json::Value Engine::systemone(const json::Value& body) {
   job->rec = clef::encode(*tok_, *state, questions ? *questions : json::Value(), itoks, image_token, max_length,
                           has_max_state, max_state, clef_omni_);
   const double encode_ms = ms_since(t_enc);
-  if (!job->images.empty()) job->positions = mrope_positions(job->rec.ids, job->images);
+  if (!job->images.empty() && model_->info().vision_layout != "deepseek") job->positions = mrope_positions(job->rec.ids, job->images);
   for (const PreparedImage& im : job->images) job->digest += im.digest;
   if (const json::Value* salt = body.get("cache_salt"); salt && salt->is_string()) {  // no sharing across salts
     job->digest.push_back('\0');
@@ -2936,6 +2968,11 @@ void Engine::step() {
         return;
       }
       passes_ += uint64_t(K);
+      if (xstream_) {  // expert-cache counters for /v1/stats
+        std::string x = model_->bench_json("xcache");
+        std::lock_guard<std::mutex> lk(xsnap_mu_);
+        xsnap_ = std::move(x);
+      }
       rows_ += uint64_t(st.rows);
       gpu_ms_ = gpu_ms_ + st.gpu_ms;
       if (trace)
@@ -3195,10 +3232,10 @@ void Engine::step() {
     t.cand_ids = j->cand_ids.data();
     t.out_cand_logits = j->cand_logits.data();
     t.out_lse = j->lse.data();
-    if (!j->images.empty()) {
-      // Explicit M-RoPE positions for the root (Qwen3-VL; Gemma 4 has none);
-      // images only when their rows are computed here (a checkpoint hit
-      // already holds them).
+    if (!j->positions.empty() || !j->images.empty()) {
+      // Explicit M-RoPE positions for the root (Qwen3-VL; Gemma 4 and DeepSeek
+      // have none); images only when their rows are computed here (a
+      // checkpoint hit already holds them).
       const size_t start = size_t(j->cached);
       if (!j->positions.empty()) {
         j->root_pos.assign(j->positions.begin() + long(start * 3), j->positions.begin() + long((start + j->root.size()) * 3));
@@ -3347,8 +3384,8 @@ void Engine::step() {
     t.root = s->root.data();
     t.root_len = int(s->root.size());
     t.mtp = s->mtp;
-    if (!s->req.images.empty()) {
-      if (!s->req.positions.empty()) {  // M-RoPE (Qwen3-VL; Gemma 4's images take plain positions)
+    if (!s->req.positions.empty() || !s->req.images.empty()) {
+      if (!s->req.positions.empty()) {  // M-RoPE (Qwen3-VL; Gemma 4's and DeepSeek's images take plain positions)
         s->root_pos.assign(s->req.positions.begin() + long(size_t(s->done) * 3), s->req.positions.begin() + long(size_t(end) * 3));
         t.root_pos = s->root_pos.data();
       }

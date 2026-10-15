@@ -331,8 +331,77 @@ json::Value template_special_tokens(const Tokenizer& tok) {
 }
 
 // ---------------------------------------------------------------- tools
+// DeepSeek-V3.2 / V4 DSML calls:
+//   <｜DSML｜ calls>
+//   <｜DSML｜ invoke name="NAME">
+//   <｜DSML｜ parameter name="P" string="true|false">VALUE</｜DSML｜ parameter>
+//   </｜DSML｜ invoke>
+//   </｜DSML｜ calls>
+// string="true": VALUE as is; otherwise JSON (kept as a string when it does not parse).
+static std::string parse_dsml_calls(const std::string& content, json::Value& calls) {
+  static const std::string kCalls = "<｜DSML｜ calls>";
+  static const std::string kInvoke = "<｜DSML｜ invoke name=\"";
+  static const std::string kInvokeEnd = "</｜DSML｜ invoke>";
+  static const std::string kParam = "<｜DSML｜ parameter name=\"";
+  static const std::string kParamEnd = "</｜DSML｜ parameter>";
+  const size_t at = content.find(kCalls);
+  if (at == std::string::npos) return content;
+  std::string before = content.substr(0, at);
+  while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
+  json::Value out = json::Value::array();
+  size_t p = at + kCalls.size();
+  while (true) {
+    const size_t i0 = content.find(kInvoke, p);
+    if (i0 == std::string::npos) break;
+    const size_t n1 = content.find('"', i0 + kInvoke.size());
+    if (n1 == std::string::npos) break;
+    const std::string name = content.substr(i0 + kInvoke.size(), n1 - i0 - kInvoke.size());
+    size_t iend = content.find(kInvokeEnd, n1);
+    if (iend == std::string::npos) iend = content.size();
+    json::Value args = json::Value::object();
+    size_t q = n1;
+    while (true) {
+      const size_t a0 = content.find(kParam, q);
+      if (a0 == std::string::npos || a0 >= iend) break;
+      const size_t a1 = content.find('"', a0 + kParam.size());
+      if (a1 == std::string::npos) break;
+      const std::string pname = content.substr(a0 + kParam.size(), a1 - a0 - kParam.size());
+      const size_t gt = content.find('>', a1);
+      if (gt == std::string::npos) break;
+      const bool is_string = content.substr(a1, gt - a1).find("string=\"true\"") != std::string::npos;
+      size_t v1 = content.find(kParamEnd, gt + 1);
+      if (v1 == std::string::npos || v1 > iend) v1 = iend;
+      const std::string value = content.substr(gt + 1, v1 - gt - 1);
+      json::Value v(value);
+      if (!is_string) {
+        try {
+          v = json::parse(value);
+        } catch (...) {
+          v = json::Value(value);
+        }
+      }
+      args.set(pname, std::move(v));
+      q = v1 == iend ? iend : v1 + kParamEnd.size();
+    }
+    json::Value fn = json::Value::object();
+    fn.set("name", name);
+    fn.set("arguments", json::dump(args));
+    json::Value call = json::Value::object();
+    call.set("id", random_id("call_"));
+    call.set("type", "function");
+    call.set("function", std::move(fn));
+    out.push_back(std::move(call));
+    if (iend >= content.size()) break;
+    p = iend + kInvokeEnd.size();
+  }
+  if (!out.size()) return content;
+  calls = std::move(out);
+  return before;
+}
+
 std::string parse_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls) {
   calls = json::Value();
+  if (content.find("<｜DSML｜ calls>") != std::string::npos) return parse_dsml_calls(content, calls);
   const std::string open = "<tool_call>", close = "</tool_call>";
   size_t at = content.find(open);
   if (at == std::string::npos) return content;
@@ -480,9 +549,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     // The reply starts with the opening of a call in the template's format,
     // which the parser must understand: Qwen's XML calls (parse_tool_calls).
     const std::string& src = engine.tokenizer().chat_template();
-    if (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos)
-      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...> calls; this model's has "
-              "another format (only \"auto\" and \"none\" here)");
+    const bool dsml = src.find("｜DSML｜") != std::string::npos;
+    if (!dsml && (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos))
+      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...> or DSML calls; this "
+              "model's has another format (only \"auto\" and \"none\" here)");
     if (job.gen.ignore_eos) invalid("tool_choice: a forced call does not take ignore_eos");
   }
   const json::Value* msgs = body.get("messages");
@@ -617,20 +687,28 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   // block first lets the model think: generation stops at </think>, then a
   // second phase continues the same prompt, the reasoning, </think> and
   // "\n\n" + the opening (run_chat_stream).
+  job.tool_open = chat_markers(engine).tool_open;  // Qwen's <tool_call> or Gemma 4's <|tool_call>
+  if (engine.tokenizer().chat_template().find("｜DSML｜") != std::string::npos) job.tool_open = "<｜DSML｜ calls>";
   if (forced) {
-    const std::string open = choice.mode == ToolChoice::Named ? "<tool_call>\n<function=" + choice.name + ">\n"
-                                                              : std::string("<tool_call>\n<function");
-    static const std::string think = "<think>\n";
+    // DSML (DeepSeek): the template writes "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"NAME\">\n" after the content.
+    const std::string dsml_open = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"";
+    const bool dsml = job.tool_open == "<｜DSML｜ calls>";
+    const std::string open = dsml ? (choice.mode == ToolChoice::Named ? dsml_open + choice.name + "\">\n" : dsml_open)
+                             : choice.mode == ToolChoice::Named ? "<tool_call>\n<function=" + choice.name + ">\n"
+                                                                : std::string("<tool_call>\n<function");
+    // Qwen opens the reasoning with "<think>\n", DeepSeek with "<think>".
+    auto ends = [&](const std::string& t) { return text.size() >= t.size() && text.compare(text.size() - t.size(), t.size(), t) == 0; };
+    const bool think_open = ends("<think>\n") || ends("<think>");
     const int32_t think_end = engine.tokenizer().token_id("</think>");
-    if (text.size() >= think.size() && text.compare(text.size() - think.size(), think.size(), think) == 0 && think_end >= 0) {
+    if (think_open && think_end >= 0) {
       job.force_after_think = "\n\n" + open;
       job.think_end = think_end;
       job.gen.stop_ids.push_back(think_end);
     } else {
-      if (text.size() >= think.size() && text.compare(text.size() - think.size(), think.size(), think) == 0)
-        text += "</think>\n\n";  // no single </think> token to stop at: no reasoning
-      text += open;
-      job.prefill = open;
+      if (think_open) text += dsml ? "</think>" : "</think>\n\n";  // no single </think> token to stop at: no reasoning
+      const std::string lead = dsml ? "\n\n" : "";
+      text += lead + open;
+      job.prefill = lead + open;
     }
   }
   // Structured output (response_format json_object / json_schema): a
@@ -681,7 +759,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
       for (size_t j = 0; j < marks.size(); ++j) marks[j] += shift[j];
     }
     ids = engine.expand_images(ids, g.images);
-    g.positions = engine.mrope_positions(ids, g.images);
+    if (engine.info().vision_layout != "deepseek") g.positions = engine.mrope_positions(ids, g.images);  // DeepSeek: plain positions
     const int merge = engine.info().vision_merge;
     size_t k = 0;
     for (size_t i = 0; i < ids.size() && k < g.images.size();) {
@@ -771,8 +849,12 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   if (g.sys_split > 0) g.sys_hash = fnv(g.sys_split);
   if (g.pre_split > 0) g.pre_hash = fnv(g.pre_split);
   // (Gemma 4's <|channel> is a special token: parsed as one, as the prompt was.)
-  const std::vector<int32_t> think = tok.encode(mk.think_prompt, mk.gemma);
-  job.reasoning_open = ids.size() >= think.size() && std::equal(think.begin(), think.end(), ids.end() - long(think.size()));
+  // DeepSeek-V4.1's template opens the block with "<think>", no newline.
+  for (const std::string& open : {mk.think_prompt, std::string("<think>")}) {
+    const std::vector<int32_t> think = tok.encode(open, mk.gemma);
+    job.reasoning_open = job.reasoning_open ||
+                         (!think.empty() && ids.size() >= think.size() && std::equal(think.begin(), think.end(), ids.end() - long(think.size())));
+  }
   g.prompt = std::move(ids);
   return job;
 }
@@ -837,7 +919,7 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
   for (const auto& s : job.stops) hold = std::max(hold, s.size() - 1);
   const bool tools = !job.tools.is_null();
   const ChatMarkers& mk = chat_markers(engine);
-  if (tools) hold = std::max(hold, mk.tool_open.size() - 1);
+  if (tools) hold = std::max(hold, job.tool_open.size() - 1);
   bool stop_hit = false;
   std::string stop_seq;  // the stop string that cut the content (the earliest match)
   std::vector<int32_t> got;
@@ -872,14 +954,18 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
       stop_hit = true;
     }
     if (tools) {
-      const size_t at = content.find(mk.tool_open);
+      const size_t at = content.find(job.tool_open);
       if (at != std::string::npos) {
         safe = std::min(safe, at);  // the rest is parsed at the end
+        while (safe > 0 && (content[safe - 1] == '\n' || content[safe - 1] == ' ')) --safe;  // the gap before the calls
         return;
       }
     }
     if (stop_hit || final_view) safe = content.size();
     else safe = content.size() > hold ? content.size() - hold : 0;
+    // With tools, trailing blank space waits: it may be the gap before a call.
+    if (tools && !final_view)
+      while (safe > 0 && (content[safe - 1] == '\n' || content[safe - 1] == ' ')) --safe;
     // Never split a UTF-8 sequence.
     while (safe > 0 && safe < content.size() && (static_cast<unsigned char>(content[safe]) & 0xC0) == 0x80) --safe;
   };

@@ -36,6 +36,7 @@ struct ChatJob {
   // the prompt opened the reasoning block, so generation stops at </think>
   // (`think_end`) and continues with this text after it.
   std::string prefill;
+  std::string tool_open = "<tool_call>";  // where a reply's calls start: Qwen XML, or DeepSeek's "<｜DSML｜ calls>"
   std::string force_after_think;
   int32_t think_end = -1;
   // Keywords of a non-strict json_schema the reply does not enforce

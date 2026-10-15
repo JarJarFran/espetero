@@ -200,3 +200,7 @@ $(BUILD)/vision_dump: tests/vision_dump.mm $(BUILD)/model.o $(BUILD)/json.o $(VI
 # tests/ref/gemma4_vision_ref.py).
 $(BUILD)/logits_dump: tests/logits_dump.mm $(BUILD)/model.o $(BUILD)/json.o $(VISION_OBJS)
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
+
+# DeepSeek-V4.1 development driver (tests/dsv4_run.mm).
+$(BUILD)/dsv4_run: tests/dsv4_run.mm $(BUILD)/model.o $(BUILD)/json.o $(VISION_OBJS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@

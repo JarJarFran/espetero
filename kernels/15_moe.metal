@@ -806,14 +806,14 @@ kernel void moe_route_fin(
 }
 
 // Softmax + top-k of one row on one simdgroup, from the parallel route's
-// slice partials rp = parts + row * nsl * (E + 1): each lane holds E / 32
-// experts (E <= 256: 8 per lane); k rounds of (largest probability, lowest
-// expert index among equals) on simd reductions only, no barriers. pick_i /
-// pick_v (k <= 16) and sum are uniform across the simdgroup; gate is the
-// shared-expert gate logit (partials at column E).
+// slice partials rp = parts + row * nsl * (E + 1): each lane holds PL experts
+// (E <= 32 * PL: PL 8 up to 256 experts, 16 up to 512); k rounds of (largest
+// probability, lowest expert index among equals) on simd reductions only, no
+// barriers. pick_i / pick_v (k <= 16) and sum are uniform across the
+// simdgroup; gate is the shared-expert gate logit (partials at column E).
+template <int PL = 8>
 static inline void route_topk_simd(device const float* rp, int E, int k, int nsl, uint lane, thread int* pick_i,
                                    thread float* pick_v, thread float& sum, thread float& gate, int noload = 0) {
-  constexpr int PL = 8;
   constexpr int NSL = 8;  // slices at most (route_nsl <= 8)
   const int stride = E + 1;
   // All slice partials of this lane's experts are requested at once (a
@@ -883,6 +883,8 @@ static inline void route_topk_simd(device const float* rp, int E, int k, int nsl
 // Barrier-free finalize of the parallel route: one simdgroup per row
 // (route_topk_simd); lane r < k writes pair r. Replaces moe_route_fin (256
 // threads, 2 barriers per top-k round, one thread writing the outputs).
+// PL: experts per lane (moe_route_fin1: 256 experts; _e512: 512).
+template <int PL>
 kernel void moe_route_fin1(
     device const float* parts [[buffer(0)]],     // [rows][nsl][E + 1]
     device int* ids [[buffer(1)]],
@@ -898,7 +900,7 @@ kernel void moe_route_fin1(
   int pick_i[16];
   float pick_v[16];
   float sum, gate;
-  route_topk_simd(parts + ulong(row) * ulong(p.nsl) * ulong(p.E + 1), p.E, p.k, p.nsl, lane, pick_i, pick_v, sum, gate, p.sync & 32);
+  route_topk_simd<PL>(parts + ulong(row) * ulong(p.nsl) * ulong(p.E + 1), p.E, p.k, p.nsl, lane, pick_i, pick_v, sum, gate, p.sync & 32);
   if (lane == 0) sgate[row] = gate;
   UNROLL for (int r = 0; r < 16; ++r) {
     if (r >= p.k) break;
@@ -928,6 +930,12 @@ kernel void moe_route_fin1(
     }
   }
 }
+#define INSTANTIATE_MOE_ROUTE_FIN1(NAME, PL)                                                   \
+  template [[host_name(NAME)]] kernel void moe_route_fin1<PL>(                                 \
+      device const float*, device int*, device float*, device float*, device int4*,           \
+      device uint*, device int*, device int*, constant MoeRouteParParams&, uint, uint);
+INSTANTIATE_MOE_ROUTE_FIN1("moe_route_fin1", 8)
+INSTANTIATE_MOE_ROUTE_FIN1("moe_route_fin1_e512", 16)
 
 #define INSTANTIATE_MOE_ROUTE_PAR(PRE, BITS) INSTANTIATE_MOE_ROUTE_PAR_R(PRE, BITS, 0) INSTANTIATE_MOE_ROUTE_PAR_R(PRE "h", BITS, 1)
 #define INSTANTIATE_MOE_ROUTE_PAR_R(PRE, BITS, RF16)                                           \
@@ -1229,17 +1237,19 @@ kernel void moe_gemv(
     // threadgroup id, so no tile or rowmap load precedes the weight stream.
     e = int(tix) < 8 ? ((int(tix) * 31 + 5) & 255) : p.shared_e;
     r0 = int(tix), rows = 1;
-  } else if (DIAG == 2) {
+  } else if (DIAG == 2 || DIAG == 3) {
     // The route finalize folded in (single row, direct grid): simdgroup 0
     // recomputes the row's top-k from the partials (identical in every
     // threadgroup), threadgroup (0, 0) writes ids / weights / tiles / rowmap /
-    // slotpos / shared gate for the down GEMV and the combine.
+    // slotpos / shared gate for the down GEMV and the combine. DIAG 3: up to
+    // 512 experts (16 per lane) instead of 256.
     r0 = int(tix), rows = 1;
     if (sgid == 0) {
       int pick_i[16];
       float pick_v[16];
       float sum, gate;
-      route_topk_simd(rparts, p.route_E, p.route_k, p.route_nsl, lane, pick_i, pick_v, sum, gate, p.route_sync & 32);
+      route_topk_simd<DIAG == 3 ? 16 : 8>(rparts, p.route_E, p.route_k, p.route_nsl, lane, pick_i, pick_v, sum, gate,
+                                          p.route_sync & 32);
       int ee = p.route_E;
       UNROLL for (int r = 0; r < 16; ++r) {
         if (r >= p.route_k) break;
@@ -1357,6 +1367,12 @@ kernel void moe_gemv(
 #define INSTANTIATE_MOE_GEMV_ROUTE(PRE, BITS, KS, TAG) INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, BITS, KS, TAG)
 #define INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, BITS2, KS, TAG)                                \
   template [[host_name(PRE "1_swiglu" TAG)]] kernel void moe_gemv<BITS, 1, 2, KS, 2, BITS2>(    \
+      device const half*, device const uint*, device const half4*, device const uint*,        \
+      device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
+      device int*, device const uint*, device const half4*, device const uint*,               \
+      device const float*, device int*, device float*, device float*, device int*,           \
+      uint3, uint, uint);                                                                     \
+  template [[host_name(PRE "1_swiglu" TAG "_e512")]] kernel void moe_gemv<BITS, 1, 2, KS, 3, BITS2>( \
       device const half*, device const uint*, device const half4*, device const uint*,        \
       device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
       device int*, device const uint*, device const half4*, device const uint*,               \

@@ -10,6 +10,7 @@
 #include "impl/forest.h"
 #include "impl/load.h"
 #include "impl/qwen4_load.h"
+#include "impl/dsv4_model.h"
 #include "kernels_src.h"
 
 #include <fcntl.h>
@@ -54,6 +55,18 @@ json::Value ModelInfo::to_json() const {
 namespace {
 
 using namespace native;
+
+// Kernel source: embedded at build time; ESPETERO_KERNELS=<dir> loads the
+// .metal files from a directory instead (kernel development without a rebuild).
+std::string kernel_source_text() {
+  if (const char* dir = std::getenv("ESPETERO_KERNELS")) {
+    std::string out;
+    for (const std::string& f : list_files(dir, "", ".metal")) out += read_file(f) + "\n";
+    if (out.empty()) fail(std::string("no .metal files in ") + dir);
+    return out;
+  }
+  return std::string(espetero_kernels_metal, espetero_kernels_metal_len);
+}
 
 class MetalModel final : public NativeModel {
  public:
@@ -180,11 +193,31 @@ class MetalModel final : public NativeModel {
                      double(m.arena->held()) / 1e9, kv / 1e9, gb);
         if (gb < 3) gb = -1;  // too little memory for a useful cache: whole layers per pass
       }
-      if (gb > 0) {
+      // Every expert fits: load them all once instead of a cache, so passes
+      // route on the GPU without a handshake per layer (ESPETERO_RESIDENT=0
+      // keeps the cache).
+      const bool resident = gb > 0 && gb >= record_store_gb(m) - 1e-6 && !(std::getenv("ESPETERO_RESIDENT") && *std::getenv("ESPETERO_RESIDENT") == '0');
+      if (resident) {
+        ensure_resident_experts(m);
+        xcache_bytes = double([m.dev currentAllocatedSize]) - double(m.weight_bytes);
+        gb = 0;  // no pools: moe_mlp reads the resident whole-layer stacks
+      } else if (gb > 0) {
         ensure_expert_pools(m, gb);
         xcache_bytes = double([m.dev currentAllocatedSize]) - double(m.weight_bytes);
       }
       m.expert_cache_gb = gb;
+      // The n-gram table into the file cache after the experts (no competing
+      // reads), when the Mac keeps 12 GB beside it and the GPU's memory.
+      if (m.ple.present) {
+        const NgramTable& T = m.ple.table;
+        const double table = double(T.rows) * double(T.width / 2 + (T.width / T.group) * 4);
+        uint64_t ram = 0;
+        size_t len = sizeof ram;
+        sysctlbyname("hw.memsize", &ram, &len, nullptr, 0);
+        const double spare = double(ram) - double([m.dev currentAllocatedSize]) - table;
+        if (spare >= 12e9) ensure_ngram_preload(T);
+        else std::fprintf(stderr, "n-gram table: %.1f GB not preloaded (%.1f GB of memory would be left)\n", table / 1e9, spare / 1e9);
+      }
     }
 
     // ---- pools: user slots and KV blocks within the memory budget
@@ -275,6 +308,7 @@ class MetalModel final : public NativeModel {
     // reads [324 x 10240]: 32 us unsplit; decode GPU -9 %). Off elsewhere.
     if (m.cfg.q4) m.tune.gemv_splitk = true;
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITK")) m.tune.gemv_splitk = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_GEMV_SPLITS")) m.tune.max_splits = std::max(2, std::min(64, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_SHARED")) m.fuse_shared = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN")) m.fuse_gdn = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GDN_CONV_FOLD")) m.gdn_conv_fold = *v == '1';
@@ -896,15 +930,7 @@ class MetalModel final : public NativeModel {
 
   // Kernel source: embedded at build time; ESPETERO_KERNELS=<dir> loads the
   // .metal files from a directory instead (kernel development without a rebuild).
-  static std::string kernel_source() {
-    if (const char* dir = std::getenv("ESPETERO_KERNELS")) {
-      std::string out;
-      for (const std::string& f : list_files(dir, "", ".metal")) out += read_file(f) + "\n";
-      if (out.empty()) fail(std::string("no .metal files in ") + dir);
-      return out;
-    }
-    return std::string(espetero_kernels_metal, espetero_kernels_metal_len);
-  }
+  static std::string kernel_source() { return kernel_source_text(); }
 
   // Build every pipeline the model can use, in parallel.
   void prewarm() {
@@ -924,6 +950,7 @@ class MetalModel final : public NativeModel {
         if (L.router.dense && L.shared_gate.dense) list.push_back({"moe_route_parhh", 64});  // F32 router and gate (GGUF), moe_mlp's constants
         list.push_back({"moe_route_fin", 0});
         list.push_back({"moe_route_fin1", 0});
+        if (m.cfg.E > 256) list.push_back({"moe_route_fin1_e512", 0});
       }
     };
     for (const Layer& L : m.layers) add_layer(L);
@@ -994,6 +1021,14 @@ class MetalModel final : public NativeModel {
 
 std::unique_ptr<NativeModel> NativeModel::load(const std::string& path, const LoadOptions& options) {
   @autoreleasepool {
+    // DeepSeek-V4.1: a model of its own (impl/dsv4_model.h).
+    if (is_dir(path) && file_exists(path + "/config.json")) {
+      const json::Value cfg = json::parse(read_file(path + "/config.json"));
+      const json::Value* tc = cfg.get("text_config");
+      const std::string mt = tc && tc->is_object() ? tc->get_string("model_type", cfg.get_string("model_type", ""))
+                                                   : cfg.get_string("model_type", "");
+      if (mt.rfind("deepseek_v41", 0) == 0) return std::make_unique<native::ds4::Dsv4Model>(path, options, kernel_source_text());
+    }
     return std::make_unique<MetalModel>(path, options);
   }
 }

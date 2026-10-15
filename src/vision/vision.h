@@ -189,6 +189,17 @@ Prepared preprocess(const RGBImage& image, const Spec& spec);
 // Exposed for tests; `resized` must be smart_resize'd for spec.
 Prepared patchify(const RGBImage& resized, const Spec& spec);
 
+// ---- DeepSeek-VL2 / DeepSeek-V4.1 images (inference/image_processor.py) --------
+// The pixel size an image of width x height is padded to (multiples of
+// `patch`, at least min_pixels, a run of at most max_tokens) and its token grid
+// after the down x down aligner: {best_h, best_w, n_llm_h, n_llm_w}.
+std::array<int, 4> deepseek_plan(int width, int height, int patch, int down, int max_tokens, int64_t min_pixels);
+// Tokens of the run: n_llm_h * (n_llm_w + 1) + 2 (start, rows with a newline each, end).
+inline int deepseek_run(int n_llm_h, int n_llm_w) { return n_llm_h * (n_llm_w + 1) + 2; }
+// ImageOps.pad to the plan's size (bicubic, grey 127, centred), (x / 255 - 0.5) / 0.5 rounded to
+// bf16, patches [grid_h * grid_w][3][patch][patch] in reading order (grid in patches).
+Prepared preprocess_deepseek(const RGBImage& image, int patch, int down, int max_tokens, int64_t min_pixels);
+
 // Digest of a grid and its pixel rows: BLAKE2b-128 over a header and the
 // BLAKE2b-256 digests of 256 KiB chunks of the little-endian float32 pixels
 // (chunks hashed in parallel):

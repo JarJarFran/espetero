@@ -64,12 +64,19 @@ struct ModelInfo {
   size_t weight_bytes = 0, kv_bytes = 0, state_bytes = 0, slot_state_bytes = 0;
   bool vision = false, mtp = false;
   bool leaves = true;  // multi-branch passes (draft leaves, decision trees)
+  bool prompt_lookup = true;  // the engine may verify prompt-lookup drafts as leaves
   bool commit = false;  // verify-commit: TreeSpec::commit_chain + NativeModel::commit
   bool hidden_states = true;  // TreeSpec::out_hidden readouts (not Qwen4-Exp yet)
   int draft_default = 0;  // MTP drafts per pass when --draft is not given (0: the engine's default, 5)
   std::string family = "qwen3_5";  // "qwen3_5" (also qwen3_5_moe, qwen4_exp) or "gemma4"
   std::vector<int> end_ids;        // end-of-turn ids the checkpoint's config names beside the tokenizer's (Gemma 4)
   int vision_patch = 0, vision_merge = 0, vision_patch_dim = 0, vision_temporal = 0;
+  // "qwen": Qwen-VL patches and runs (<|image_pad|>, merge x merge cells per token);
+  // "deepseek": DeepSeek-VL2 style (ImageRef: grid_h x grid_w patches of 3 x patch x patch,
+  // the run [start] + (row of ceil(w / merge) tokens + newline) x ceil(h / merge) + [end]).
+  std::string vision_layout = "qwen";
+  int image_token_id = -1;  // the placeholder the chat template writes for an image (-1: the layout's default)
+  int vision_max_tokens = 0, vision_min_pixels = 0;  // deepseek: the run's token budget, the pixel floor
   double load_ms = 0, tune_ms = 0;
   json::Value extra;        // format details (matrix widths, source types, ...)
   json::Value to_json() const;

@@ -24,7 +24,7 @@ namespace espetero::family {
 
 inline bool mlx_type_supported(std::string_view t) {
   return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text" ||
-         t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe";
+         t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41";
 }
 
 inline bool gguf_arch_supported(std::string_view a) { return a == "qwen35" || a == "qwen35moe" || a == "gemma4"; }
