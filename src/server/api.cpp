@@ -178,10 +178,11 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   auto decisions = guarded([&engine](const http::Request& req, http::Response& res) {
     try {
       const json::Value body = parse_body(req);
-      // Clef models take both bodies: SystemOne (state, questions) or JEVfire (context, fields).
+      // Clef models take both bodies: SystemOne (state, questions) or JEVfire (context, fields); Kev models the first.
       // pplx-decider checkpoints (head answer codes): SystemOne bodies through pplx.h.
       if (!engine.head_codes().empty() && !body.get("context")) res.send_json(200, pplx::systemone(engine, body));
-      else res.send_json(200, engine.is_clef() && !body.get("context") ? engine.systemone(body) : engine.decide(body));
+      else res.send_json(200, (engine.is_clef() || engine.is_kev()) && !body.get("context") ? engine.systemone(body)
+                                                                                               : engine.decide(body));
     } catch (const RequestError& e) {
       if (e.status == 422) {
         json::Value o = json::Value::object();

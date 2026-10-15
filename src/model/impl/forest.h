@@ -1732,6 +1732,11 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     T.N = T.NL + (b.score_root ? 1 : 0);
     if (b.score_root && T.Tr == 0) fail("score_root needs root tokens");
     if ((b.out_hidden || b.out_last_hidden) && T.Tr == 0) fail("out_hidden needs root tokens");
+    if (b.out_rows_hidden) {
+      if (b.n_out_rows < 1 || !b.out_rows) fail("out_rows: no rows");
+      for (int i = 0; i < b.n_out_rows; ++i)
+        if (b.out_rows[i] < 0 || b.out_rows[i] >= T.Tr) fail("out_rows: a row outside the root");
+    }
     if (b.noncausal) {
       if (c.gemma || c.q3moe || c.q4) fail("noncausal: Qwen3.5-family attention only");
       if (b.parent >= 0 || b.save >= 0 || b.work >= 0 || b.n_leaves > 0 || b.mtp || T.Tr == 0)
@@ -1885,7 +1890,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   }
   // Hidden-state readouts (Clef heads) need every row's final state too.
   bool any_hidden = false;
-  for (const TreeSpec& b : specs) any_hidden = any_hidden || b.out_hidden != nullptr || b.out_last_hidden != nullptr;
+  for (const TreeSpec& b : specs)
+    any_hidden = any_hidden || b.out_hidden != nullptr || b.out_last_hidden != nullptr || b.out_rows_hidden != nullptr;
   if (any_hidden && c.q4) fail("hidden-state readouts are not supported for qwen4_exp");
   // MTP needs every root row's final hidden state: no last-layer pruning.
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
@@ -4159,14 +4165,19 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // ---- outputs
   if (any_hidden)
     for (const TreePlan& T : trees) {
-      if (T.spec->out_last_hidden) {  // rmsnorm(h) * final_norm of the last root row, in double
-        const float* h = static_cast<const float*>([s.h contents]) + size_t(T.base + T.Tr - 1) * size_t(c.D);
+      // rmsnorm(h) * final_norm of a root row from the fp32 residual, in double
+      auto final_normed = [&](int row, float* out) {
+        const float* h = static_cast<const float*>([s.h contents]) + size_t(T.base + row) * size_t(c.D);
         const float* w = static_cast<const float*>(ptr(m.final_norm));
         double ss = 0;
         for (int i = 0; i < c.D; ++i) ss += double(h[i]) * double(h[i]);
         const double inv = 1.0 / std::sqrt(ss / double(c.D) + double(c.eps));
-        for (int i = 0; i < c.D; ++i) T.spec->out_last_hidden[i] = float(double(h[i]) * inv * double(w[i]));
-      }
+        for (int i = 0; i < c.D; ++i) out[i] = float(double(h[i]) * inv * double(w[i]));
+      };
+      if (T.spec->out_last_hidden) final_normed(T.Tr - 1, T.spec->out_last_hidden);
+      if (T.spec->out_rows_hidden)
+        for (int i = 0; i < T.spec->n_out_rows; ++i)
+          final_normed(T.spec->out_rows[i], T.spec->out_rows_hidden + size_t(i) * size_t(c.D));
       if (!T.spec->out_hidden) continue;
       const __fp16* src = static_cast<const __fp16*>([s.hid contents]) + size_t(T.base) * size_t(c.D);
       float* dst = T.spec->out_hidden;

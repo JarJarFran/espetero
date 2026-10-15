@@ -90,6 +90,11 @@ LIB_OBJS := $(filter-out $(BUILD)/obj/server/%,$(OBJS))
 $(BUILD)/decisions_test: tests/decisions_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
+# Kev decision models without a GPU: the release's encoding, answers and head file
+# (on Kev's tokenizer when a snapshot is cached; skipped otherwise).
+$(BUILD)/kev_test: tests/kev_test.cpp $(BUILD)/obj/engine/kev.o $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC)) $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ -framework Accelerate -framework CoreFoundation -o $@
+
 # Gemma 4 without a GPU: config parsing, its tool-call format, hidden-state heads.
 $(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/obj/engine/hidden_head.o $(BUILD)/obj/engine/pplx.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
@@ -150,7 +155,7 @@ $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BU
 
 .PHONY: test
 test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http_test $(BUILD)/vision_limits_test $(BUILD)/hub_test $(BUILD)/model_meta_test $(BUILD)/api_test \
-      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test
+      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/kev_test
 	python3 tests/ref/json_ref.py $(BUILD)/json_cases.json && $(BUILD)/json_test $(BUILD)/json_cases.json
 	$(BUILD)/sampling_test
 	$(BUILD)/tmpl_test tests/ref/tmpl_fixtures
@@ -164,6 +169,7 @@ test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http
 	$(BUILD)/service_test
 	$(BUILD)/grammar_test "" $(BUILD)/grammar_samples.jsonl && python3 tests/ref/grammar_check.py $(BUILD)/grammar_samples.jsonl
 	$(BUILD)/gemma_test
+	$(BUILD)/kev_test tests/ref/kev_fixtures.json
 
 # ---- install / package
 # make install [PREFIX=/usr/local] [DESTDIR=staging]: the espetero binary in

@@ -131,6 +131,14 @@ struct TreeSpec {
   // heads: no fp16 rounding of the LM head's input). Disables last-layer
   // pruning for the pass, as out_hidden does.
   float* out_last_hidden = nullptr;
+  // The final-normed hidden states of the root rows out_rows[0 ..
+  // n_out_rows), float32 [n_out_rows][hidden], computed on the CPU from the
+  // pass's fp32 residual as out_last_hidden is (Kev pointer heads: each
+  // option's closing row and the question's last). Disables last-layer
+  // pruning for the pass, as out_hidden does.
+  const int32_t* out_rows = nullptr;
+  int n_out_rows = 0;
+  float* out_rows_hidden = nullptr;
   // The full-attention layers attend over the whole root in both directions
   // (no causal mask between root rows); the linear-attention layers keep
   // their causal recurrence. Decision models trained without the causal mask

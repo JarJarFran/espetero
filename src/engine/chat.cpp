@@ -516,6 +516,8 @@ static void score_options(Engine& engine, const json::Value& body, ChatJob& job)
 static void head_options(Engine& engine, const json::Value& body, ChatJob& job, bool run) {
   const json::Value* h = body.get("head");
   if (!h || h->is_null() || (h->is_bool() && !h->as_bool())) {
+    if (run && engine.is_kev())
+      invalid("this is a Kev decision model: it answers /v1/systemone (state, questions), not chat");
     if (run && !engine.generates())
       invalid("this is a decision model without an LM head: it answers chat and completions requests with \"head\" only");
     return;

@@ -29,6 +29,7 @@
 #include "decisions.h"
 #include "grammar.h"
 #include "hidden_head.h"
+#include "kev.h"
 
 namespace espetero {
 
@@ -393,9 +394,19 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     if (clef_limit_pixels_ < clef_max_pixels_) clef_limit_pixels_ = clef_max_pixels_;
   }
 
+  // Kev releases: a pointer head next to the backbone answers /v1/systemone
+  // from the final hidden states of each question's rows (kev.h).
+  if (is_dir(path) && !clef_ && kev::is_release(path)) {
+    if (I.format == "gguf" || !I.hidden_states)
+      throw std::runtime_error("Kev pointer heads need an MLX-layout Qwen3.5 backbone (tools/kev_convert.py)");
+    kev_ = kev::PointerHead::load(path);
+    if (kev_->hidden() != I.hidden) throw std::runtime_error("Kev head width differs from the backbone's hidden size");
+    kev_->bind(*tok_);
+  }
+
   // A hidden-state decision head next to the weights (hidden_head.h): chat
   // requests with "head" read it instead of generating.
-  if (is_dir(path) && !clef_ && HiddenHead::present(path)) {
+  if (is_dir(path) && !clef_ && !kev_ && HiddenHead::present(path)) {
     if (!I.hidden_states) throw std::runtime_error("hidden_head: this model's hidden states cannot be read out");
     head_ = HiddenHead::load(path);
     if (head_->hidden() != I.hidden) throw std::runtime_error("hidden_head: its width differs from the model's hidden size");
@@ -454,7 +465,7 @@ void Engine::publish_counters() {
 void Engine::calibrate_drafts() {
   const ModelInfo& I = model_->info();
   if (!I.mtp || !I.leaves || !opt_.adaptive_drafts || opt_.draft_tokens <= 0) return;
-  if (clef_) return;  // Clef models serve no generation
+  if (clef_ || kev_) return;  // Clef and Kev models serve no generation
   if (model_->bench_json("xcache").find("\"slots\": 0,") == std::string::npos) return;
   const auto t0 = Clock::now();
   const int kmax = std::min(7, std::max(opt_.draft_tokens, opt_.draft_auto ? opt_.draft_max : 0));
@@ -1035,6 +1046,8 @@ int Engine::answer_reserve(int remaining) const {
 // ---------------------------------------------------------------- decisions
 json::Value Engine::decide(const json::Value& body) {
   if (clef_) return clef_decide(body);
+  if (kev_)
+    throw RequestError(422, "this is a Kev decision model: it answers the SystemOne body (state, questions) at /v1/systemone");
   if (!generates())  // decisions read label logits from the LM head
     throw RequestError(422, "this is a decision model without an LM head: ask /v1/chat/completions with \"head\"");
   const auto started = Clock::now();
@@ -1196,6 +1209,7 @@ json::Value Engine::decide(const json::Value& body) {
 
 // ---------------------------------------------------------------- Clef
 json::Value Engine::systemone(const json::Value& body) {
+  if (kev_) return kev_systemone(body);
   const auto started = Clock::now();
   if (!clef_)
     throw RequestError(422, "this model has no Clef joint head (joint_head.safetensors); /v1/systemone serves Clef releases");
@@ -1469,7 +1483,7 @@ const std::vector<std::string>& Engine::head_codes() const {
   return head_ ? head_->codes() : none;
 }
 double Engine::head_temperature() const { return head_ ? head_->temperature() : 1.0; }
-bool Engine::generates() const { return !head_ || head_->lm_head(); }
+bool Engine::generates() const { return !kev_ && (!head_ || head_->lm_head()); }
 
 Engine::HeadResult Engine::head(const GenRequest& g, int slots) {
   if (!head_) throw RequestError(422, "head: this model has no hidden-state head (hidden_head.safetensors)");
@@ -2027,8 +2041,8 @@ void Engine::loop() {
     {
       std::unique_lock<std::mutex> lk(mu_);
       cv_.wait(lk, [&] {
-        return stop_ || clear_requested_ || !decisions_.empty() || !clef_jobs_.empty() || !waiting_.empty() ||
-               !active_.empty() || !embed_jobs_.empty();
+        return stop_ || clear_requested_ || !decisions_.empty() || !clef_jobs_.empty() || !kev_jobs_.empty() ||
+               !waiting_.empty() || !active_.empty() || !embed_jobs_.empty();
       });
       if (stop_) break;
     }
@@ -2071,6 +2085,7 @@ void Engine::loop() {
   }
   active_.clear();
   embed_fail_all(msg);
+  kev_fail_all(msg);
 }
 
 // Sampled requests whose distribution the GPU top-k candidates determine.
@@ -2383,6 +2398,7 @@ void Engine::step() {
   if (clear_requested_.exchange(false)) {
     for (ClefPrefix& c : clef_prefixes_) model_->slot_free(c.slot);
     clef_prefixes_.clear();
+    kev_clear();
     for (auto it = cache_.begin(); it != cache_.end();) {
       if (std::find(pinned_.begin(), pinned_.end(), it->second.slot) != pinned_.end()) {
         ++it;
@@ -2426,6 +2442,9 @@ void Engine::step() {
       return;
     }
   }
+  // ---- Kev requests: one at a time, alone in their passes (Kev models
+  // serve nothing else); the head runs on the caller's thread.
+  if (kev_ && kev_step()) return;
   // ---- embeddings: one pass of the oldest job, ahead of the step's own.
   embed_step();
   const int max_rows = I.max_rows, max_readouts = I.max_readouts;

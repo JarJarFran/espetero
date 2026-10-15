@@ -869,6 +869,117 @@ M1 Max a text decision of ~100 tokens takes 0.8 to 1 s, one with an image
 (~330 tokens) 2.5 to 3 s, one with two images 4.3 to 5.3 s (each prompt is
 computed whole: nothing is cached).
 
+### Kev decision models (Qwen3.8-27B, a pointer head)
+
+`jaredpalmer/kev-27b` (Kev 1.0) is a decision model on Qwen3.8-27B with
+every backbone weight fine-tuned. The release is the text backbone
+(transformers' `Qwen3_5TextModel`: no vision tower, LM head or MTP layers)
+and `head.pt`, a pointer head (two 5,120 -> 256 projections q and k) with
+its calibration temperature (T = 1.3195). It converts into an MLX
+directory:
+
+```
+python -I tools/kev_convert.py ~/.cache/huggingface/hub/models--jaredpalmer--kev-27b/snapshots/<rev> \
+    ~/models/jev/kev-27b-mlx-8bit \
+    --vision-from ~/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-8bit/snapshots/<rev>  # optional
+espetero serve --model ~/models/jev/kev-27b-mlx-8bit
+```
+
+The converter (mlx on the CPU, a shard at a time; about 90 s for the 27B,
+28 GB with the grafted tower) writes the 8-bit group-64 decoder, the bf16
+embedding, a placeholder LM head of zeros and the head as
+`pointer_head.safetensors` (fp32, read from `head.pt` without unpickling
+it, as `tools/gemma4_unified_convert.py` reads a head) and
+`pointer_head.json` (the temperature, the five delimiter tokens,
+`"lm_head": false`). A directory with them answers `POST /v1/systemone`
+(and `/v1/decisions` with the same body) only; chat, completions and a
+`/v1/decisions` body with `context` get a 422.
+
+The request is TypeSafe's System One body, as the release's server takes
+it: `state` (text, or JSON rendered as labelled text), `questions` (`noul`,
+`choice` with 1 to 255 named options, `score` with 1 to 255 levels; each
+with `instructions` and `criteria`), `model` (echoed, `kev-latest` by
+default); Espetero adds `images`, `image_detail`, `cache_salt` and
+`return_logits`. The response is the release's: `answers` (noul:
+`"noul"` = P(yes); choice: `choice`, `confidence`, `probabilities` by
+option name; score: `score` (the expected level index), `legend`,
+`probabilities` by level index, `confidence`), `usage` (`input_tokens`:
+the state and every question's row; `output_tokens`: the tokens of the
+serialized answers) and `latency_ms`, plus `logits` (raw, before the
+temperature) when `return_logits` is true and `metal` (timings, passes,
+cached state tokens, the temperature).
+
+The prompt is token for token the release's encoding (`kev/api.py`
+`to_record`, `kev/model.py` `encode`): the state as `<|fim_prefix|>` and
+`render(state)`, then each question as its own row continuing it,
+`<|fim_middle|>` instructions, each option as `<|box_start|>` option
+`<|box_end|>` (noul: `no` and `yes`, with `criteria.false` / `.true` as
+`no: description`; choice: `key` or `key: description`; score: the level's
+text) and `<|fim_suffix|>`. Caller text is tokenized with `<|name|>`
+rewritten to `<¦name¦>`, so it never yields a delimiter. The state runs
+once and is cached (4 states, LRU, keyed by its tokens, images and
+`cache_salt`); the questions' rows run as separate trees on top of it, so
+questions never see each other, several per pass. The head reads the
+final-normed hidden states of each option's `<|box_end|>` and the
+question's `<|fim_suffix|>` in fp32 from the residual stream and scores
+them on the CPU in double: z_k = (W_k h_k + b_k) · (W_q h + b_q) / 16,
+p = softmax(z / T) over the question's options. The release's limits
+apply: a state of up to 65,536 tokens (422 beyond, as its server refuses
+one) and a question row of up to 8,192 tokens more; a row longer than
+`--max-ctx` (32,768 by default) needs a larger one.
+
+**Images (an experiment).** Kev was fine-tuned and evaluated on text only;
+its checkpoint has no vision tower. `--vision-from` grafts the base
+model's tower unchanged (`vision_tower.*` of the base MLX directory, its
+`vision_config`, image token ids and processor configuration;
+`pointer_head.json` records the graft), so requests may carry `images`
+(data URLs, up to 16; `image_detail` `low`, `auto` / `standard` (~1 MP),
+`high`, `max`, Espetero's chat budgets). They open the state the way the
+base model's chat template writes image parts that precede the text:
+`<|fim_prefix|><|vision_start|><|image_pad|>…<|vision_end|>` per image,
+then the state text, with M-RoPE positions (the question rows continue
+after the images). The fine-tuned backbone never saw image tokens, so
+these answers are outside the release's evaluated setup:
+on 24 yes / no questions about 9 drawn images (shapes, colours, positions,
+counts; one request with two images) it answered all 24 correctly, at a
+mean confidence of 0.991 (the lowest 0.966); without the images the same
+questions got 13 of 24 at a mean confidence of 0.59. Without the graft, a
+request with images gets a 422.
+
+One noul decision with one image:
+
+```json
+{"state": "A test picture.",
+ "questions": {"square": {"type": "noul", "instructions": "Is there a square in the picture?"}},
+ "images": ["data:image/png;base64,..."]}
+```
+
+`answers.square.noul` is P(yes) (rounded to 4 decimals as the release
+rounds it; with `"return_logits": true`, `logits.square` holds the raw
+`false` / `true` logits and P(yes) = softmax(logits / `metal.temperature`)[1]).
+
+Parity against an MLX reference of the release's encoding and head
+(`tests/ref/kev_ref.py`: mlx-vlm 0.7.1's Qwen3.5 with fp32 activations, the
+same 8-bit weights, one causal row per question as the release's `forward`
+runs them, the head from `head.pt`) on 20 synthetic requests (11 of text
+with 1 to 4 questions: noul with and without descriptions, choice with 2
+to 5 options, score with 1 to 5 levels, JSON states and instructions,
+delimiter-like text; 9 with drawn images): the same token counts,
+probabilities within 0.0008 (0.0004 on text; logits within 0.029), no
+changed answer, also with `--max-rows 64` and `512` (states, a question
+row and a state with two images computed over several passes). The same
+reference with bf16 activations differs from its fp32 by up to 0.0082.
+The card publishes no example output of Kev-27B (the repository's example
+response is Kev-4B's; its `input_tokens`, 101, is what Espetero counts for
+the same request). On an M1 Max a text decision of ~100 tokens with 4
+questions takes about 0.8 s, one question about a cached state 0.2 s, one
+with an image (256 to 475 image tokens) and 2 to 5 questions 2.4 to 4 s.
+`tests/kev_test.cpp` checks the encoding token for token against the
+reference's (`tests/ref/kev_fixtures.json`: 20 requests, 9 with images)
+and the answers' rounding, confidences and `output_tokens`. Known
+difference: integers beyond the int64 range in a JSON state are rendered
+as floats.
+
 ### Limits for untrusted clients
 
 This release is meant for one trusted user, but the server refuses what a

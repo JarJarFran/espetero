@@ -60,6 +60,16 @@ visible-ancestor length (`desc.z`, what a leaf has for its root) is the
 root's length, so `flash_attention` lets every row see every other and
 scans the batch keys up to the root's end instead of the tile's last row;
 the DeltaNet layers keep their causal recurrence.
+Kev's pointer head (`jaredpalmer/kev-27b` on Qwen3.8-27B: `pointer_head.*`
+beside the weights, `src/engine/kev.*`) answers `/v1/systemone`: a
+request's state (`<|fim_prefix|>`, its images, the rendered state) runs
+once into a checkpoint slot (cached, 4 states, LRU), and every question is
+a tree of its own whose root continues that slot (`TreeSpec::parent`, its
+positions too), several per pass, so questions never see each other. Each
+tree reads out the final-normed states of chosen root rows (its
+`<|fim_suffix|>` and each option's `<|box_end|>`) in fp32 from the residual
+stream (`TreeSpec::out_rows`, as `out_last_hidden` computes the last row's),
+and the head scores the options on the CPU in double.
 The **Qwen3-Omni thinker** (`qwen3_omni_moe`, the
 backbone of Cloudflare's Clef-Omni decision model; images and text, no audio)
 runs from an MLX directory written by `tools/clef_convert.py`: 48 layers of

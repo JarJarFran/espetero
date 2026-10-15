@@ -45,6 +45,9 @@ class Template;
 namespace clef {
 class Head;
 }
+namespace kev {
+class PointerHead;
+}
 namespace vision {
 struct Spec;
 }
@@ -274,6 +277,13 @@ class Engine {
   // Clef head: fields become noul / choice questions; the response keeps decide()'s format.
   json::Value clef_decide(const json::Value& request);
 
+  // ---- Kev pointer-head decisions (blocking, thread-safe; kev.h,
+  // kev_engine.cpp): a /v1/systemone body (state, questions, images) ->
+  // the release's answers. Only for Kev releases (pointer_head.json next to
+  // the backbone); such models serve no chat.
+  json::Value kev_systemone(const json::Value& request);
+  bool is_kev() const { return kev_ != nullptr; }
+
   // ---- hidden-state heads (blocking, thread-safe; hidden_head.h): the logits
   // of the first `slots` slots of the model's head for the final-normed state
   // of the prompt's last token. The prompt (with its images) runs alone in
@@ -359,6 +369,12 @@ class Engine {
   struct DecisionJob;
   struct ClefJob;
   void run_clef(ClefJob& job);
+  struct KevJob;  // kev_engine.cpp
+  std::deque<std::shared_ptr<KevJob>> kev_jobs_;
+  bool kev_step();                                   // scheduler: runs the oldest Kev job (true when there was one)
+  void run_kev(KevJob& job);
+  void kev_fail_all(const std::string& why);         // scheduler: at shutdown
+  void kev_clear();                                  // scheduler: frees the cached states
   struct EmbedJob;  // embed.cpp
   std::deque<std::shared_ptr<EmbedJob>> embed_jobs_;
   std::vector<float> embed_hidden_;  // a pass's hidden rows
@@ -476,6 +492,22 @@ class Engine {
   int64_t clef_limit_pixels_ = 0;
   // Frees the least recently used Clef prefix other than those in `keep`; false when none is left.
   bool clef_evict_prefix(const std::vector<int>& keep);
+  // Kev: the pointer head and the states of recent requests (scheduler
+  // thread), a checkpoint slot each, so a request about the same state (and
+  // images) only computes its questions' rows.
+  std::unique_ptr<kev::PointerHead> kev_;
+  struct KevState {
+    std::vector<int32_t> tokens;
+    std::string digest;
+    int slot = -1;
+    uint64_t used = 0;
+  };
+  std::vector<KevState> kev_states_;
+  size_t kev_state_cap_ = 4;
+  // Frees the least recently used Kev state other than those in `keep`; false when none is left.
+  bool kev_evict_state(const std::vector<int>& keep);
+  // Makes KV room for a pass over `trees` by evicting Kev states (never those in `keep`); 503 when it cannot.
+  void kev_room(const std::vector<TreeSpec>& trees, const std::vector<int>& keep);
   std::deque<std::shared_ptr<Seq>> waiting_;
   std::vector<std::shared_ptr<Seq>> active_;
   std::thread worker_;
