@@ -570,6 +570,34 @@ namespace espetero::native {
 // Qwen4-Exp checkpoints (qwen4_load.h).
 inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision);
 inline void load_q4_mtp(Model& m, const std::string& dir);
+inline void load_q4_gguf(Model& m, const GGUFSource& src);
+
+// A Qwen4-Exp MTP drafter directory (config model_type qwen4_exp_mtp, e.g.
+// Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16) beside the model, or one level up
+// for a .gguf inside its own folder; "" when none.
+inline std::string find_q4_drafter(const std::string& path) {
+  std::string base = path;
+  while (base.size() > 1 && base.back() == '/') base.pop_back();
+  std::vector<std::string> parents = {base.substr(0, base.find_last_of('/'))};
+  if (ends_with(path, ".gguf")) parents.push_back(parents[0].substr(0, parents[0].find_last_of('/')));
+  for (const std::string& parent : parents) {
+    std::vector<std::string> found;
+    if (DIR* d = ::opendir(parent.c_str())) {
+      while (dirent* e = ::readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.find("MTP") == std::string::npos && name.find("mtp") == std::string::npos) continue;
+        std::ifstream cf(parent + "/" + name + "/config.json");
+        std::stringstream cs;
+        cs << cf.rdbuf();
+        if (cs.str().find("\"qwen4_exp_mtp\"") != std::string::npos) found.push_back(parent + "/" + name);
+      }
+      ::closedir(d);
+    }
+    std::sort(found.begin(), found.end());
+    if (!found.empty()) return found[0];
+  }
+  return "";
+}
 
 // `path`: an MLX model directory or a .gguf file. `mmproj`: vision projector
 // for GGUF ("" = look next to the model file, "none" = text only).
@@ -608,6 +636,21 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       return;
     }
     m.cfg = config_from_gguf(text.file());
+    if (m.cfg.q4) {
+      load_q4_gguf(m, text);
+      if (want_vision && mmproj != "none") {
+        if (mmproj.empty()) mmproj = find_mmproj(path);
+        if (!mmproj.empty()) {
+          GGUFVisionSource vsrc(mmproj);
+          const VisionConfig vc = vision_from_gguf(vsrc.file());
+          if (vc.present) load_vision(m, vsrc, vc);
+        }
+      }
+      // llama.cpp's qwen4exp files carry no MTP head here: an MLX drafter (--mtp DIR, or found nearby).
+      const std::string dir = mtp.empty() ? find_q4_drafter(path) : mtp;
+      if (!dir.empty() && dir != "none") load_q4_mtp(m, dir);
+      return;
+    }
     std::string mtp_file;
     const bool own = mtp.empty() && text.has("language_model.mtp.fc.weight");
     if (mtp != "none" && !own) mtp_file = mtp.empty() ? find_mtp(path) : mtp;
@@ -648,26 +691,7 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     // beside the model whose config says qwen4_exp_mtp, e.g.
     // Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16); the file's own mtp.* head
     // (4-bit experts, reported to accept 0-4 % of drafts) is not loaded.
-    std::string dir = mtp;
-    if (dir.empty()) {
-      std::string base = path;
-      while (base.size() > 1 && base.back() == '/') base.pop_back();
-      const std::string parent = base.substr(0, base.find_last_of('/'));
-      if (DIR* d = ::opendir(parent.c_str())) {
-        std::vector<std::string> found;
-        while (dirent* e = ::readdir(d)) {
-          const std::string name = e->d_name;
-          if (name.find("MTP") == std::string::npos && name.find("mtp") == std::string::npos) continue;
-          std::ifstream cf(parent + "/" + name + "/config.json");
-          std::stringstream cs;
-          cs << cf.rdbuf();
-          if (cs.str().find("\"qwen4_exp_mtp\"") != std::string::npos) found.push_back(parent + "/" + name);
-        }
-        ::closedir(d);
-        std::sort(found.begin(), found.end());
-        if (!found.empty()) dir = found[0];
-      }
-    }
+    const std::string dir = mtp.empty() ? find_q4_drafter(path) : mtp;
     if (!dir.empty() && dir != "none") load_q4_mtp(m, dir);
     return;
   }

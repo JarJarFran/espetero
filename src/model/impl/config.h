@@ -347,7 +347,7 @@ inline Config config_from_gguf(const GGUFFile& f) {
   Config c;
   c.D = int(f.get_int(a + "embedding_length", 0));
   c.I = int(f.get_int(a + "feed_forward_length", 0));
-  if (arch == "qwen35moe") {
+  if (arch == "qwen35moe" || arch == "qwen4exp") {
     c.E = int(f.get_int(a + "expert_count", 0));
     c.k = int(f.get_int(a + "expert_used_count", 0));
     c.Ie = int(f.get_int(a + "expert_feed_forward_length", 0));
@@ -377,6 +377,39 @@ inline Config config_from_gguf(const GGUFFile& f) {
   c.set_mrope(f.get_ints(a + "rope.dimension_sections"), true);
   c.set_layers(int(f.get_int(a + "full_attention_interval", 4)), nullptr);
   c.eos_token_id = int(f.get_int("tokenizer.ggml.eos_token_id", -1));
+  if (arch == "qwen4exp") {
+    // llama.cpp's qwen4exp keys (conversion/qwen4exp.py); the output gate is
+    // sigmoid in every Qwen4-Exp checkpoint and the indexer has one key head.
+    c.q4 = true;
+    c.hc = int(f.get_int(a + "hyper_connection.count", 0));
+    c.hc_rank = int(f.get_int(a + "hyper_connection.low_rank", 0));
+    c.idx_heads = int(f.get_int(a + "attention.indexer.head_count", 0));
+    c.idx_hd = int(f.get_int(a + "attention.indexer.key_length", 0));
+    c.idx_budget = int(f.get_int(a + "attention.indexer.top_k", 0));
+    for (int64_t r : f.get_ints(a + "attention.compress_ratios"))
+      if (r > 0) c.idx_ratio = int(r);
+    if (const GGUFFile::Tensor* k = f.find("blk.3.indexer.k_proj.weight"); k && k->dims.size() == 2 && c.idx_hd)
+      c.idx_kv = int(k->dims[1] / c.idx_hd);
+    const std::vector<int64_t> ple = f.get_ints(a + "ple.layers");
+    if (ple.size() == 1) c.ple_layer = int(ple[0]);  // zero-indexed here
+    c.ngram = int(f.get_int(a + "ple.ngram_size", 0));
+    c.ngram_heads = int(f.get_int(a + "ple.heads_per_ngram", 0));
+    c.ple_conv_k = int(f.get_int(a + "ple.conv_kernel", 0));
+    // The n-gram hash restarts on this id (the MLX text config's eos_token_id).
+    c.eos_token_id = int(f.get_int(a + "ple.eos_token_id", c.eos_token_id));
+    c.gate_sigmoid = true;
+    c.qk_eps = 1e-6f / float(c.Dk);
+    const std::vector<int64_t> ratios = f.get_ints(a + "attention.compress_ratios");
+    if (int(ratios.size()) >= c.L) {  // full-attention layers carry the indexer's ratio
+      c.linear.clear();
+      c.n_full = c.n_linear = 0;
+      for (int i = 0; i < c.L; ++i) {
+        const bool l = ratios[size_t(i)] == 0;
+        c.linear.push_back(l);
+        l ? ++c.n_linear : ++c.n_full;
+      }
+    }
+  }
   return c;
 }
 

@@ -452,3 +452,33 @@ kernel void q4_router_gemv(
   acc = simd_sum(acc);
   if (lane == 0) Y[row * ulong(E) + e] = acc;
 }
+
+// Qwen4-Exp n-gram rows gathered from a GPU-resident GGUF IQ4_NL table
+// (ESPETERO_NGRAM_MODE=gpu): rows[i] -> e[i] (width halves), the table split
+// over up to 8 buffers of p.x rows; one thread per 32-value block.
+constant float kQ4NgramIQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+kernel void q4_ngram_gather(
+    device const uchar* t0 [[buffer(0)]], device const uchar* t1 [[buffer(1)]],
+    device const uchar* t2 [[buffer(2)]], device const uchar* t3 [[buffer(3)]],
+    device const uchar* t4 [[buffer(4)]], device const uchar* t5 [[buffer(5)]],
+    device const uchar* t6 [[buffer(6)]], device const uchar* t7 [[buffer(7)]],
+    device const int* rows [[buffer(8)]],
+    device half* e [[buffer(9)]],
+    constant int4& p [[buffer(10)]],  // x rows per buffer, y blocks per row, z rows to gather
+    uint2 gid [[thread_position_in_grid]]) {
+  const int b = gid.x;
+  const int i = gid.y;
+  if (b >= p.y || i >= p.z) return;
+  const int row = rows[i];
+  const int k = row / p.x;
+  const ulong local = ulong(row - k * p.x);
+  device const uchar* t = k == 0 ? t0 : k == 1 ? t1 : k == 2 ? t2 : k == 3 ? t3 : k == 4 ? t4 : k == 5 ? t5 : k == 6 ? t6 : t7;
+  device const uchar* x = t + (local * ulong(p.y) + ulong(b)) * 18;
+  const float d = float(as_type<half>(ushort(ushort(x[0]) | ushort(ushort(x[1]) << 8))));
+  device half* o = e + ulong(i) * ulong(p.y * 32) + ulong(b) * 32;
+  for (int j = 0; j < 16; ++j) {
+    const uchar q = x[2 + j];
+    o[j] = half(d * kQ4NgramIQ4NL[q & 15]);
+    o[j + 16] = half(d * kQ4NgramIQ4NL[q >> 4]);
+  }
+}

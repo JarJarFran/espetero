@@ -95,6 +95,20 @@ struct NgramTable {
   int64_t shard_rows = 0, rows = 0;
   int width = 160, group = 32;
   float scale = 1.0f;
+  // 0: MLX 4-bit affine shards (codes, bf16 scales, bf16 biases); 1: one GGUF
+  // IQ4_NL tensor (rows of width / 32 blocks: fp16 d + 16 bytes of codebook
+  // indices) at shards[0].w, the weight scale already folded in.
+  int fmt = 0;
+  // Where the rows come from (ESPETERO_NGRAM_MODE): 0 ram (the file mapping,
+  // pages in the file cache once read), 1 disk (F_NOCACHE preads, every row
+  // from the SSD), 2 gpu (the whole table in Metal buffers, rows gathered and
+  // dequantized by q4_ngram_gather; GGUF IQ4_NL tables only).
+  int mode = 0;
+  std::vector<id<MTLBuffer>> gpu;
+  int64_t gpu_rows_per = 0;
+  // ESPETERO_NGRAM_LOG=1: host time of the row reads, reported every 64 passes.
+  double log_ms = 0;
+  int64_t log_passes = 0, log_rows = 0;
   int64_t mult[3] = {0, 0, 0};
   std::vector<int64_t> vocab, offs;  // per hash head (2 x heads_per_ngram)
 };
@@ -416,6 +430,7 @@ struct Model : Runtime {
     int rows = 0;
     id<MTLBuffer> H, N16, dn, injr, inj, a16, mm, y, e16, kraw, vp, g, G, Gn, psrc, pslot, Hc;
     id<MTLBuffer> pfx, pflog, pfids, pfw;  // early guess of the next layer's experts
+    id<MTLBuffer> nrows;                   // n-gram table rows of the pass (int32, gpu mode)
   } q4s;
   id<MTLBuffer> ple_hist = nil;
   std::vector<std::array<int32_t, 2>> ple_ctx;

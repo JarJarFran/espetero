@@ -136,7 +136,7 @@ class MetalModel final : public NativeModel {
     // ---- Qwen4-Exp expert cache, sized before the slot/KV pools:
     // explicit (option or ESPETERO_EXPERT_CACHE_GB), or automatic (below).
     double xcache_bytes = 0;
-    if (c.q4) {
+    if (c.q4 && m.xs.present) {  // GGUF files load their experts resident (qwen4_load.h)
       // Expert records: the store in --expert-store (default: the
       // per-model place under ~/Library/Caches, which Time Machine skips),
       // built there when missing only on request (--expert-store-build, or

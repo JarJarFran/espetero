@@ -44,6 +44,26 @@ inline void ngram_rows(const NgramTable& T, int per_ngram, int64_t c0, int64_t c
 // One table row dequantized (4-bit affine, bf16 scales and biases) times the
 // table's weight_scale, as fp16.
 inline void ngram_read_row(const NgramTable& T, int64_t row, __fp16* out) {
+  if (T.fmt == 1) {  // GGUF IQ4_NL: w = d * kIQ4NL[q] (ggml dequantize_row_iq4_nl)
+    const int nb = T.width / 32;
+    const size_t rb = size_t(nb) * 18;
+    uint8_t buf[18 * 16];
+    const NgramTable::Shard& S = T.shards[0];
+    const uint64_t o = S.w + uint64_t(row) * rb;
+    if (const uint8_t* base = T.maps.empty() ? nullptr : T.maps[size_t(S.file)]) std::memcpy(buf, base + o, rb);
+    else pread_all(T.fds[size_t(S.file)], buf, rb, o);
+    for (int b = 0; b < nb; ++b) {
+      const uint8_t* x = buf + b * 18;
+      uint16_t dh;
+      std::memcpy(&dh, x, 2);
+      const float d = f16_to_f32(dh) * T.scale;
+      for (int j = 0; j < 16; ++j) {
+        out[b * 32 + j] = __fp16(d * float(kIQ4NL[x[2 + j] & 0xF]));
+        out[b * 32 + j + 16] = __fp16(d * float(kIQ4NL[x[2 + j] >> 4]));
+      }
+    }
+    return;
+  }
   const int64_t sh = row / T.shard_rows, r = row % T.shard_rows;
   const NgramTable::Shard& S = T.shards[size_t(sh)];
   const int ng = T.width / T.group;
