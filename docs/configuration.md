@@ -836,7 +836,11 @@ P(true); `choice` the best key, `probabilities` per key and `confidence`
 (the best probability above uniform, rescaled to 0-1); `score` the expected
 level, `probabilities`, the `legend` of levels and a `confidence` from the
 spread around the best level. `logits` (with `return_logits`) are already
-divided by the temperature; `metal` gives the passes, GPU and queue times.
+divided by the temperature; `metal` gives the passes, GPU and queue times. Each
+noncausal decision is a pass of its own, so the questions of a request run
+one after another: on an M1 Max three questions about one image (~330 tokens
+each) take 7.6 s, ~2.5 s each; the `noul` answer equals
+`head.probabilities[1]` of the same decision sent as a chat request.
 
 ```json
 {"state": "A photo from the site.",
