@@ -1,8 +1,10 @@
 # Third-party notices
 
 Espetero is licensed under the MIT License (see [LICENSE](LICENSE)), except
-`src/engine/clef.h` and `src/engine/clef.cpp`, which are licensed under the
-Apache License 2.0 because they are derived from Cloudflare's Clef release.
+`src/engine/clef.h`, `src/engine/clef.cpp`, `src/engine/pplx.h`,
+`src/engine/pplx.cpp` and `src/engine/pplx_systemone.cpp`, which are licensed
+under the Apache License 2.0 because they are derived from Cloudflare's Clef
+release and Perplexity's pplx-decider release.
 
 Some files contain code derived from the projects below. Those parts remain
 under their original licenses, reproduced here; each derived file names its
@@ -26,7 +28,7 @@ uses only Apple's system frameworks.
 | Hugging Face transformers 5.17 (Gemma 4 unified semantics: `models/gemma4_unified/modeling_gemma4_unified.py`, `image_processing_gemma4_unified.py`, `configuration_gemma4_unified.py`) | `src/model/impl/gemma_vision.h` (unified), `src/model/impl/gemma_load.h` (`load_gemma_unified_vision`), `src/model/impl/config.h` (`vision_from_gemma_unified`, `per_layer_config`), `kernels/85_gemma_vision.metal` (`g4u_embed_norm`), `tools/gemma4_unified_convert.py` | Apache-2.0 |
 | mlx-vlm 0.7.1 (Gemma 4 vision semantics: `models/gemma4/vision.py`, `gemma4.py`, `language.py`) | `src/model/impl/gemma_vision.h`, `src/model/impl/gemma_load.h` (`load_gemma_vision`), `src/model/impl/config.h` (`vision_from_gemma`), `kernels/85_gemma_vision.metal`, `kernels/80_gemma.metal` (the image mask) | MIT |
 | Decision prompts of public models (akhilaaa3/Jev-Omni `jev_omni.py`; EldanRing/winnow-inference `native/protocol.h`, `native/engine.h`) | `tests/ref/gemma4_unified_ref.py` | Apache-2.0, MIT |
-| perplexity-ai/pplx-decider-v1.1-27b (`model.py`: the decision prompt, the read-out, `enable_noncausal_full_attention`) | `tests/ref/pplx_decider_ref.py`, `tools/pplx_decider_convert.py`, `src/engine/hidden_head.h`, `src/engine/hidden_head.cpp`, `src/engine/engine.cpp`, `src/engine/chat.cpp` (the head's temperature), `src/model/api.h`, `src/model/impl/forest.h`, `kernels/40_attention.metal` (`TreeSpec::noncausal`) | Apache-2.0 |
+| perplexity-ai/pplx-decider-v1.1-27b (`model.py`: the decision prompt, the read-out, `enable_noncausal_full_attention`) | `tests/ref/pplx_decider_ref.py`, `tools/pplx_decider_convert.py`, `src/engine/hidden_head.h`, `src/engine/hidden_head.cpp`, `src/engine/engine.cpp`, `src/engine/chat.cpp` (the head's temperature), `src/engine/pplx.h`, `src/engine/pplx.cpp`, `src/engine/pplx_systemone.cpp` (`/v1/systemone`), `src/model/api.h`, `src/model/impl/forest.h`, `kernels/40_attention.metal` (`TreeSpec::noncausal`) | Apache-2.0 |
 | Chat templates of public models (test fixtures) | `tests/ref/tmpl_fixtures/`, `tests/ref/tmpl_ref.py` | Apache-2.0, MIT |
 
 ## libjpeg-turbo and the Independent JPEG Group's software
@@ -544,6 +546,14 @@ noncausal attention (`TreeSpec::noncausal` in `src/model/api.h` and
 full-attention layers see every position of the prompt, the linear-attention
 layers keep their recurrence. The release's files are read, never imported;
 the code is new.
+
+`src/engine/pplx.h`, `src/engine/pplx.cpp` and `src/engine/pplx_systemone.cpp`
+port the request side of `model.py` to C++: the decision prompt
+(`decision_messages`, `options`, `describe`), the answer codes and `answer`.
+Changes: images as image parts before the text (the release's own message
+layout), each question run as a hidden-state head request. These three files
+are licensed under the Apache License 2.0
+([third_party/apache-2.0/LICENSE-2.0.txt](third_party/apache-2.0/LICENSE-2.0.txt)).
 
 ## Acknowledgements (ideas, no code)
 

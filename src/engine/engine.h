@@ -290,6 +290,9 @@ class Engine {
   HeadResult head(const GenRequest& request, int slots);
   int head_slots() const;           // 0: no head
   double head_temperature() const;  // the head's calibration temperature (1 without one)
+  // The head's answer codes (hidden_head.json "codes"; empty without them): a
+  // pplx-decider checkpoint, whose /v1/systemone questions pplx.h renders.
+  const std::vector<std::string>& head_codes() const;
   // False for a decision-only model (hidden_head.json "lm_head": false: its
   // LM head is a placeholder): only head requests run (others get a 422).
   bool generates() const;

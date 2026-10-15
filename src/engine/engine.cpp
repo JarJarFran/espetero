@@ -1432,6 +1432,10 @@ bool Engine::clef_evict_prefix(const std::vector<int>& keep) {
 
 // ---------------------------------------------------------------- hidden-state heads
 int Engine::head_slots() const { return head_ ? head_->slots() : 0; }
+const std::vector<std::string>& Engine::head_codes() const {
+  static const std::vector<std::string> none;
+  return head_ ? head_->codes() : none;
+}
 double Engine::head_temperature() const { return head_ ? head_->temperature() : 1.0; }
 bool Engine::generates() const { return !head_ || head_->lm_head(); }
 

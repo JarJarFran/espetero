@@ -72,6 +72,14 @@ std::unique_ptr<HiddenHead> HiddenHead::load(const std::string& dir) {
   if (!(h->temperature_ > 0) || !std::isfinite(h->temperature_))
     throw std::runtime_error(dir + "/hidden_head.json: temperature must be positive and finite");
   h->lm_head_ = cfg.get_bool("lm_head", true);
+  if (const json::Value* codes = cfg.get("codes"); codes && !codes->is_null()) {
+    if (!codes->is_array() || codes->size() > size_t(h->slots_))
+      throw std::runtime_error(dir + "/hidden_head.json: codes is a list of at most `slots` strings");
+    for (const json::Value& c : codes->as_array()) {
+      if (!c.is_string() || c.as_string().empty()) throw std::runtime_error(dir + "/hidden_head.json: codes are strings");
+      h->codes_.push_back(c.as_string());
+    }
+  }
   const std::string file = dir + "/hidden_head.safetensors";
   const std::string bytes = slurp(file);
   if (bytes.size() < 8) throw std::runtime_error(file + ": truncated");

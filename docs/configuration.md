@@ -784,7 +784,7 @@ The converter (mlx on the CPU, 12 GB of memory) writes the readout as
 with the release's `attention_mode`, `temperature` and answer codes, and
 `"lm_head": false`: the LM head beside the weights is a placeholder of zeros
 (Espetero's loader wants one), so the server answers chat and completions
-requests with `"head"` only (others, and `/v1/decisions`, get a 422;
+requests with `"head"` only, and `/v1/systemone` (below; others get a 422;
 `/v1/tokenize` still renders a chat body). A head whose `attention_mode` is
 `noncausal_full_attention` runs a request's whole prompt in one pass whose
 full-attention layers attend in both directions, every row to every other
@@ -823,6 +823,31 @@ the release trained and was evaluated at, 512 × 512 = 262,144 pixels: aspect
 ratio kept, sides multiples of 32, at least 65,536 pixels, at most 256 image
 tokens. Larger budgets work too (the release's own cap is 2048 × 2048:
 `--image-pixels 4194304`), outside what it was trained on.
+
+`POST /v1/systemone` (and `/v1/decisions`) renders those decisions for you,
+on any model whose `hidden_head.json` lists the answer `codes`
+(`tools/pplx_decider_convert.py` writes them): Clef's SystemOne body,
+`state`, `questions` (`noul`, `choice` or `score`, with `instructions` and
+`criteria`), `images` (up to 16 URLs, every one in every question),
+`image_detail` (default `low`, the release's budget) and `return_logits`.
+Each question is one head request as above, the questions of a request run
+at once, and the answers have the release's `answer()` types: `noul` is
+P(true); `choice` the best key, `probabilities` per key and `confidence`
+(the best probability above uniform, rescaled to 0-1); `score` the expected
+level, `probabilities`, the `legend` of levels and a `confidence` from the
+spread around the best level. `logits` (with `return_logits`) are already
+divided by the temperature; `metal` gives the passes, GPU and queue times.
+
+```json
+{"state": "A photo from the site.",
+ "images": ["data:image/jpeg;base64,..."],
+ "questions": {
+   "square": {"type": "noul", "instructions": "Is the shape in the picture a square?"},
+   "color":  {"type": "choice", "instructions": "What colour is it?", "criteria": {"red": null, "blue": null}},
+   "size":   {"type": "score", "criteria": ["almost nothing", "about half", "all of it"]}}}
+```
+
+A JEVfire body (`context` and `fields`) still gets a 422 on these models.
 
 Parity against an MLX reference of the release's `model.py`
 (`tests/ref/pplx_decider_ref.py`: mlx-vlm 0.7.1's Qwen3.5 with the

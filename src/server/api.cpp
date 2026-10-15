@@ -9,6 +9,7 @@
 
 #include "../engine/chat.h"
 #include "../engine/embed.h"
+#include "../engine/pplx.h"
 #include "../tok/tokenizer.h"
 #include "ollama.h"
 #include "version.h"
@@ -172,12 +173,15 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   }));
 
   // Decisions: the JEVfire contract, or for Clef releases the Jev /
-  // SystemOne body answered by the joint schema head (also at /v1/systemone).
+  // SystemOne body answered by the joint schema head (also at /v1/systemone);
+  // for pplx-decider checkpoints the SystemOne body as head requests (pplx.h).
   auto decisions = guarded([&engine](const http::Request& req, http::Response& res) {
     try {
       const json::Value body = parse_body(req);
       // Clef models take both bodies: SystemOne (state, questions) or JEVfire (context, fields).
-      res.send_json(200, engine.is_clef() && !body.get("context") ? engine.systemone(body) : engine.decide(body));
+      // pplx-decider checkpoints (head answer codes): SystemOne bodies through pplx.h.
+      if (!engine.head_codes().empty() && !body.get("context")) res.send_json(200, pplx::systemone(engine, body));
+      else res.send_json(200, engine.is_clef() && !body.get("context") ? engine.systemone(body) : engine.decide(body));
     } catch (const RequestError& e) {
       if (e.status == 422) {
         json::Value o = json::Value::object();

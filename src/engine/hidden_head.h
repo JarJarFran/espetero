@@ -39,6 +39,8 @@ class HiddenHead {
   bool noncausal() const { return noncausal_; }
   double temperature() const { return temperature_; }
   bool lm_head() const { return lm_head_; }
+  // The slots' answer codes (hidden_head.json "codes": A, B, ..., AA, ...), empty when it gives none.
+  const std::vector<std::string>& codes() const { return codes_; }
   // The first `n` slots' logits for hidden state h [hidden] (fp32, accumulated in double).
   std::vector<float> logits(const float* h, int n) const;
 
@@ -47,6 +49,7 @@ class HiddenHead {
   bool noncausal_ = false, lm_head_ = true;
   double temperature_ = 1.0;
   std::vector<float> w_, b_, mu_, sd_;
+  std::vector<std::string> codes_;
 };
 
 }  // namespace espetero

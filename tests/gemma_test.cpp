@@ -19,6 +19,7 @@
 
 #include "../src/engine/chat.h"
 #include "../src/engine/hidden_head.h"
+#include "../src/engine/pplx.h"
 #include "../src/model/impl/config.h"
 #include "../src/util/json.h"
 
@@ -289,15 +290,17 @@ void hidden_head_tests() {
     std::ofstream(std::string(dir) + "/hidden_head.json")
         << R"({"type": "linear", "input": "final_norm_last_row", "standardize": true, "slots": 3, "hidden_size": 4)" + extra + "}";
   };
-  with_json(R"(, "attention_mode": "noncausal_full_attention", "temperature": 1.0087417621345625, "lm_head": false)");
+  with_json(R"(, "attention_mode": "noncausal_full_attention", "temperature": 1.0087417621345625, "lm_head": false, "codes": ["A", "B"])");
   try {
     auto head = HiddenHead::load(dir);
     check(head->noncausal() && head->temperature() == 1.0087417621345625 && !head->lm_head(),
           "head: noncausal, its temperature, no LM head");
+    check(head->codes() == std::vector<std::string>{"A", "B"}, "head: its answer codes");
   } catch (const std::exception& e) {
     check(false, std::string("head: noncausal load failed: ") + e.what());
   }
-  for (const char* bad : {R"(, "attention_mode": "bidirectional")", R"(, "temperature": 0)", R"(, "temperature": -1)"}) {
+  for (const char* bad : {R"(, "attention_mode": "bidirectional")", R"(, "temperature": 0)", R"(, "temperature": -1)",
+                          R"(, "codes": ["A", "B", "C", "D"])", R"(, "codes": ["A", 2])"}) {
     with_json(bad);
     bool refused = false;
     try {
@@ -311,9 +314,60 @@ void hidden_head_tests() {
   rmdir(dir);
 }
 
+// pplx-decider: the release's decision prompt (decision_messages, options,
+// describe), its typed answers, and the 422s before any pass.
+void pplx_tests() {
+  const std::vector<std::string> codes = {"A", "B", "C", "D"};
+  const json::Value state = json::parse(R"({"obra": "Calle Mayor 3", "fotos": 2})");
+  const json::Value images = json::parse(R"(["data:image/png;base64,AAAA"])");
+  auto text_of = [](const pplx::Decision& d) {
+    const json::Value& content = *d.chat.get("messages")->as_array()[1].get("content");
+    return content.as_array().back().get_string("text", "");
+  };
+  const pplx::Decision n = pplx::encode(codes, state, "q", json::parse(R"({"type": "noul", "instructions": "Is it done?"})"),
+                                        images, "low");
+  check(text_of(n) == "State:\n{\"obra\": \"Calle Mayor 3\", \"fotos\": 2}\n\nQuestion:\nIs it done?\n\nOptions:\n"
+                      "A: No / false\nB: Yes / true\n\nReturn only the letter code of the best option.",
+        "pplx: noul prompt as decision_messages renders it");
+  const json::Value& msgs = *n.chat.get("messages");
+  check(msgs.as_array()[0].get_string("content", "").rfind("Classify the supplied state", 0) == 0, "pplx: system prompt");
+  const json::Value& parts = *msgs.as_array()[1].get("content");
+  check(parts.size() == 2 && parts.as_array()[0].get_string("type", "") == "image_url" &&
+            parts.as_array()[0].get("image_url")->get_string("detail", "") == "low",
+        "pplx: the image part before the text, at detail low");
+  check(n.chat.get("head")->get_int("slots", 0) == 2 && !n.chat.get("chat_template_kwargs")->get_bool("enable_thinking", true),
+        "pplx: two head slots, thinking off");
+  const pplx::Decision c = pplx::encode(codes, json::Value("plain"), "c",
+                                        json::parse(R"({"type": "choice", "criteria": {"red": "warm", "blue": null}})"),
+                                        json::Value(), "low");
+  check(text_of(c).find("Question:\nChoose the best matching option.\n\nOptions:\nA: red: warm\nB: blue\n\n") != std::string::npos &&
+            c.chat.get("messages")->as_array()[1].get("content")->size() == 1,
+        "pplx: choice options, default instructions, no images");
+  const json::Value ca = pplx::answer(c, {0.2, 0.8});
+  check(ca.get_string("choice", "") == "blue" && std::fabs(ca.get_double("confidence", 0) - 0.6) < 1e-12,
+        "pplx: choice answer and its confidence");
+  const pplx::Decision s = pplx::encode(codes, state, "s", json::parse(R"({"type": "score", "criteria": ["bad", "ok", "good"]})"),
+                                        json::Value(), "low");
+  const json::Value sa = pplx::answer(s, {0.0, 0.5, 0.5});
+  check(std::fabs(sa.get_double("score", 0) - 1.5) < 1e-12 && sa.get("legend")->get_string("2", "") == "good",
+        "pplx: score answer is the expected level, with its legend");
+  check(std::fabs(pplx::answer(n, {0.3, 0.7}).get_double("noul", 0) - 0.7) < 1e-12, "pplx: noul answer is P(true)");
+  for (const char* bad : {R"({"type": "maybe"})", R"({"type": "choice"})", R"({"type": "score", "criteria": ["one"]})",
+                          R"({"type": "choice", "criteria": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}})"}) {
+    bool refused = false;
+    try {
+      pplx::encode(codes, state, "x", json::parse(bad), json::Value(), "low");
+    } catch (const RequestError& e) {
+      refused = e.status == 422;
+    }
+    check(refused, std::string("pplx: 422 for ") + bad);
+  }
+}
+
 int main() {
   config_tests();
   hidden_head_tests();
+  pplx_tests();
   vision_config_tests();
   unified_tests();
   tool_tests();
