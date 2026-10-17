@@ -95,7 +95,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_DN_CHUNK")) m.dn_chunk = std::atoi(v);
     m.tune.gemv = o.gemv;
     m.tune.gemv8 = o.gemv8;
-    m.mtp.head4 = o.mtp_head4;
+    m.mtp.head4 = o.mtp_head4 >= 0 ? o.mtp_head4 != 0 : o.mtp_coarse == 0;  // default: the coarse head replaces it
     if (const char* v = std::getenv("ESPETERO_MTP_HEAD4")) m.mtp.head4 = std::atoi(v) != 0;
     m.mtp.coarse_c = o.mtp_coarse;
     if (const char* v = std::getenv("ESPETERO_MTP_COARSE")) m.mtp.coarse_c = std::atoi(v);
