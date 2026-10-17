@@ -21,15 +21,20 @@ struct MoeRouteParams {
   int E;      // experts
   int k;      // experts per row
   int M;      // rows
+  int ld;     // floats per logits row (E, or E + 1 with the shared gate's column)
+  int sg;     // 1: column E is the shared-expert gate's logit, copied to sgate
 };
 
 // One threadgroup per row, one thread per expert (E <= 1024): softmax over
 // the router logits, the k largest (ties to the lower index), renormalized.
+// With p.sg the router GEMM carried the shared gate as row E (router_sg,
+// passes of more than 8 rows): its logit goes to sgate[row] untouched.
 kernel void moe_topk(
     device const float* logits [[buffer(0)]],
     device int* ids [[buffer(1)]],
     device float* w [[buffer(2)]],
     constant MoeRouteParams& p [[buffer(3)]],
+    device float* sgate [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -40,7 +45,8 @@ kernel void moe_topk(
   threadgroup float picked_p[16];
   threadgroup int picked_i[16];
   const int e = int(tid);
-  float x = e < p.E ? logits[ulong(row) * p.E + e] : -INFINITY;
+  if (p.sg && tid == 0) sgate[row] = logits[ulong(row) * p.ld + p.E];
+  float x = e < p.E ? logits[ulong(row) * p.ld + e] : -INFINITY;
   float m = simd_max(x);
   if (lane == 0) redf[sg] = m;
   threadgroup_barrier(mem_flags::mem_threadgroup);

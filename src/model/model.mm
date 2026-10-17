@@ -277,6 +277,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_FUSE_NORM_MAXM")) m.fuse_norm_max_m = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_FUSE_ROUTE")) m.fuse_route = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ROUTE_PAR")) m.route_par = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_ROUTE_SG")) m.route_sg = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ROUTE_NSL")) m.route_nsl = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_ROUTE_SYNC")) m.route_sync = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_ROUTE_FIN1")) m.route_fin1 = *v == '1';
@@ -334,6 +335,17 @@ class MetalModel final : public NativeModel {
         if (!m.mtp.fc.dense) mats.push_back(&m.mtp.fc.q);
       }
       autotune(m, m.tune, mats, o.tune_max_m);
+      // router_sg runs its router's tiles and splits: the routing logits of a
+      // multi-row pass stay the router GEMM's bit for bit.
+      auto sg_tiles = [&](const Layer& L) {
+        if (L.router_sg.out() == 0) return;
+        const QW& r = L.router.q;
+        const QW& s = L.router_sg.q;
+        const auto it = m.tune.table.find({r.out, r.in, r.bits, r.fc()});
+        if (it != m.tune.table.end()) m.tune.table[{s.out, s.in, s.bits, s.fc()}] = it->second;
+      };
+      for (const Layer& L : m.layers) sg_tiles(L);
+      if (m.mtp.present) sg_tiles(m.mtp.layer);
     }
     mark("GEMM tiles (autotune)");
     prewarm();
@@ -829,6 +841,7 @@ class MetalModel final : public NativeModel {
     else if (name == "fuse_gated") m_.fuse_gated = value != 0;
     else if (name == "fuse_route") m_.fuse_route = value != 0;
     else if (name == "route_par") m_.route_par = value != 0;
+    else if (name == "route_sg") m_.route_sg = value != 0;
     else if (name == "route_fin1") m_.route_fin1 = value != 0;
     else if (name == "attn_vec") m_.attn_vec = value != 0;
     else if (name == "attn_gqa") m_.attn_gqa = value != 0;
