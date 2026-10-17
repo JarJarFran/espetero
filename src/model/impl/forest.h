@@ -2957,8 +2957,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
           }
         }
         if (XP.layer[pb] != li) {  // nothing prefetched for this layer: start empty
-          while (XF.st_pending[pb].load(std::memory_order_acquire) > 0) {
-          }
+          xio_block(XF, XF.st_pending[pb]);
           std::fill(XP.idx[pb].begin(), XP.idx[pb].end(), -1);
           XP.count[pb] = 0;
         }
@@ -3014,8 +3013,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       if (xpipe_on && li + 1 < c.L && float(need.size()) >= xpipe_min * float(c.E)) {
         const int nb = (li + 1) % 2;
         const ExpertPool& Pn = m.xpool[size_t(li + 1)];
-        while (XF.st_pending[nb].load(std::memory_order_acquire) > 0) {
-        }
+        xio_block(XF, XF.st_pending[nb]);
         std::fill(XP.idx[nb].begin(), XP.idx[nb].end(), -1);
         XP.count[nb] = 0;
         std::vector<ExpertPrefetch::Job> js;
@@ -4096,9 +4094,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   if (q4_swept && !m.chain_active) {
     m.xstage = std::make_unique<Arena>(m.dev, size_t(64) << 20);
     if (m.xpipe.buf[0] && m.xpf) {  // the pipe buffers too, once their reads are done
-      for (int k = 0; k < 2; ++k)
-        while (m.xpf->st_pending[k].load(std::memory_order_acquire) > 0) {
-        }
+      for (int k = 0; k < 2; ++k) xio_block(*m.xpf, m.xpf->st_pending[k]);
       m.xpipe = Model::XPipe{};
     }
   }
