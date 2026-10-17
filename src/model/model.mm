@@ -837,6 +837,7 @@ class MetalModel final : public NativeModel {
     else if (name == "route_in_gemv") m_.route_in_gemv = value != 0;
     else if (name == "gemv_max_m") m_.tune.gemv_max_m = std::max(1, std::min(m_.fma34 ? 4 : kGemvInstM, value));
     else if (name == "gemm_fixed") m_.tune.fixed = value != 0;  // embedding passes
+    else if (name == "tune_clamp") m_.tune.tune_clamp = value != 0;
     else if (name == "gemv_ks") m_.tune.gemv_ks = value == 16 ? 16 : 8;
     else if (name == "moe_down_comb") m_.moe_down_comb = value != 0;
     else if (name == "expert_cache_gb") m_.expert_cache_gb = m_.xpool.empty() ? double(value) : m_.expert_cache_gb;
