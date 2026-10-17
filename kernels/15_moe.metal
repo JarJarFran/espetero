@@ -1562,6 +1562,22 @@ kernel void moe_down_comb(
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
   device const half* arow = A + ulong(slot) * ulong(p.Ie);
+  // Simdgroup 0's epilogue operands, requested before the K loop as
+  // independent clamped loads (as route_topk_simd does): every slot's tile
+  // and routing weight, and the shared gate. A loop of p.k iterations whose
+  // part[] index came from a slotpos load paid its device latencies in
+  // series after the barrier.
+  int tpos[16];
+  float wsl[16];
+  float sgl = 0.0f;
+  if (sgid == 0) {
+    UNROLL for (int s = 0; s < 16; ++s) {
+      const int sc = min(s, p.k - 1);
+      tpos[s] = slotpos[sc];
+      wsl[s] = w[sc];
+    }
+    sgl = sgate[0];
+  }
   float acc[8];
   UNROLL for (int c = 0; c < 8; ++c) acc[c] = 0.0f;
   if (sh)
@@ -1586,15 +1602,17 @@ kernel void moe_down_comb(
   if (sgid == 0) {
     const int c = int(lane);
     float routed = 0.0f;
-    for (int s = 0; s < p.k; ++s) {
-      const int t = slotpos[s];  // simdgroups are laid out by tile
-      float y = 0.0f;
-      UNROLL for (int q = 0; q < KSX; ++q) y += part[t * KSX + q][c];
-      routed += w[s] * y;
+    UNROLL for (int s = 0; s < 16; ++s) {  // slot order, as before
+      if (s < p.k) {
+        const int t = tpos[s];  // simdgroups are laid out by tile
+        float y = 0.0f;
+        UNROLL for (int q = 0; q < KSX; ++q) y += part[t * KSX + q][c];
+        routed += wsl[s] * y;
+      }
     }
     float ysh = 0.0f;
     UNROLL for (int q = 0; q < KSX; ++q) ysh += part[p.k * KSX + q][c];
-    const float g = 1.0f / (1.0f + exp(-sgate[0]));
+    const float g = 1.0f / (1.0f + exp(-sgl));
     device float* hp = h + nloc + c;
     const float v = *hp + (routed + g * ysh);
     if (p.norm && ntgs > 1) atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v), memory_order_relaxed);
