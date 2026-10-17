@@ -4087,7 +4087,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
     }
   } else {
-    commit_wait(cb, 20);  // on failure the guard leaves the slots as they were
+    commit_wait(cb);  // on failure the guard leaves the slots as they were
     E.check_submitted();  // split handshakes' resident tiles
   }
 
@@ -4404,7 +4404,7 @@ inline void run_commit(Model& m, PassMeta& meta, const std::vector<CommitRequest
     E.threads(MTLSizeMake(size_t(W / 4), from.size(), 1), MTLSizeMake(64, 1, 1));
   }
   cb = E.finish();
-  commit_wait(cb, 5);
+  commit_wait(cb);
   // Qwen4-Exp: the n-gram mix state (last kPleHist normalized conv
   // inputs, last two token ids) after the committed rows, from the pass's
   // rows (q4s.Gn and the pass tokens still hold them: no pass ran since).
@@ -4856,7 +4856,7 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
   }
   cb = E.finish();
   const double enc_ms = ms_since(t_enc);
-  commit_wait(cb, 5);
+  commit_wait(cb);
   const int32_t* out = static_cast<const int32_t*>(ptr(meta.m_arg.buf));
   const int32_t* out2 = want2 ? static_cast<const int32_t*>(ptr(meta.m_arg2.buf)) : nullptr;
   for (int i = 0; i < nq; ++i)
@@ -5258,7 +5258,7 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
   }
   cb = E.finish();
   const double enc_ms = ms_since(t_enc);
-  commit_wait(cb, 5);
+  commit_wait(cb);
   owned.armed = false;  // the copies ran: the slots keep their own blocks
   const int32_t* out = static_cast<const int32_t*>(ptr(meta.m_arg.buf));
   const int32_t* out2 = want2 ? static_cast<const int32_t*>(ptr(meta.m_arg2.buf)) : nullptr;

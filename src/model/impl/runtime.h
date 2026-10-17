@@ -548,26 +548,15 @@ class Enc {
   std::string cur_name_;
 };
 
-// Commit and wait. Very short passes spin on the status for a lower wake-up
-// latency than waitUntilCompleted's; everything else blocks. A spinning core
-// draws package power that the (power-limited) GPU could use: a 27B decode
-// step is 60-90 ms, and the spin's ~0.1-0.3 ms of wake-up latency is not
-// worth it there.
-inline void commit_wait(id<MTLCommandBuffer> cb, double expect_ms = 0) {
+// Commit and block until the GPU is done. No spinning on the status: a
+// spinning core draws package power that the (power-limited) GPU could use,
+// and removing the spin cut the sustained 27B decode step 8 % and prefill
+// 3 % (kernel-guidelines.md, measured facts); the ~0.1-0.3 ms of wake-up
+// latency it saved is not worth that.
+inline void commit_wait(id<MTLCommandBuffer> cb) {
   Residency::get().commit();
   [cb commit];
-  if (expect_ms > 0 && expect_ms < 3) {
-    const auto t0 = Clock::now();
-    while ([cb status] < MTLCommandBufferStatusCompleted) {
-      if (ms_since(t0) > 4 * expect_ms + 2) {
-        [cb waitUntilCompleted];
-        break;
-      }
-      std::this_thread::yield();
-    }
-  } else {
-    [cb waitUntilCompleted];
-  }
+  [cb waitUntilCompleted];
   cb_log(cb, "pass end");
   if ([cb status] != MTLCommandBufferStatusCompleted) {
     NSError* err = [cb error];
