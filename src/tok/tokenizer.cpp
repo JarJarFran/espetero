@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <climits>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 #include "tok_internal.h"
 #include "unicode.h"
@@ -411,14 +413,26 @@ inline uint32_t last_cp(std::string_view s, size_t& start) {
 // AddedVocabulary::find_matches: leftmost-longest matches, scanning resumes at
 // a match's end even when the match is skipped (special tokens with
 // parse_special=false, failed single_word checks); lstrip/rstrip absorb
-// surrounding whitespace.
+// surrounding whitespace. A match touching a `plain` range (offsets of s[0]
+// at `base`) is no match: scanning resumes right after its first byte, so a
+// token that starts just after the range is still found.
 template <class OnText>
 void Tokenizer::Impl::split_added(const tok::AddedMatcher& m, std::string_view s, bool parse_special,
-                                  std::vector<int32_t>& out, OnText&& on_text) const {
+                                  std::vector<int32_t>& out, OnText&& on_text, const Tokenizer::Ranges* plain,
+                                  size_t base) const {
   size_t start_offset = 0, pos = 0, mb = 0, me = 0;
+  auto in_plain = [&](size_t b, size_t e) {  // [base + b, base + e) overlaps a plain range
+    const auto it = std::upper_bound(plain->begin(), plain->end(), base + b,
+                                     [](size_t x, const std::pair<size_t, size_t>& r) { return x < r.second; });
+    return it != plain->end() && it->first < base + e;
+  };
   while (pos < s.size()) {
     const int k = m.find(s, pos, mb, me);
     if (k < 0) break;
+    if (plain && in_plain(mb, me)) {
+      pos = mb + 1;
+      continue;
+    }
     pos = me;
     const tok::AddedToken& a = added[size_t(k)];
     if (!parse_special && a.special) continue;
@@ -455,23 +469,36 @@ void Tokenizer::Impl::split_added(const tok::AddedMatcher& m, std::string_view s
   if (start_offset < s.size()) on_text(s.substr(start_offset));
 }
 
-void Tokenizer::Impl::encode(std::string_view text, std::vector<int32_t>& out, bool parse_special) const {
+void Tokenizer::Impl::encode(std::string_view text, std::vector<int32_t>& out, bool parse_special,
+                             const Tokenizer::Ranges* plain) const {
   if (text.empty()) return;
+  if (plain && plain->empty()) plain = nullptr;
   // ~3.5 bytes per token on typical text; grow geometrically so that many small
   // encode_append calls on one vector stay amortized O(1).
   const size_t need = out.size() + text.size() / 3 + 8;
   if (out.capacity() < need) out.reserve(std::max(need, out.capacity() * 2));
   if (raw_matcher.empty()) {
-    encode_segment(text, out, parse_special);
+    encode_segment(text, out, parse_special, plain, 0);
     return;
   }
-  split_added(raw_matcher, text, parse_special, out,
-              [&](std::string_view seg) { encode_segment(seg, out, parse_special); });
+  split_added(
+      raw_matcher, text, parse_special, out,
+      [&](std::string_view seg) { encode_segment(seg, out, parse_special, plain, size_t(seg.data() - text.data())); },
+      plain, 0);
 }
 
 // A stretch of text between non-normalized added tokens: normalize it, split
 // out normalized added tokens, pre-tokenize the rest.
-void Tokenizer::Impl::encode_segment(std::string_view seg, std::vector<int32_t>& out, bool parse_special) const {
+void Tokenizer::Impl::encode_segment(std::string_view seg, std::vector<int32_t>& out, bool parse_special,
+                                     const Tokenizer::Ranges* plain, size_t base) const {
+  // Plain ranges inside this stretch: when normalization changes it, their
+  // offsets no longer hold, and no normalized added token is recognized in it.
+  bool touches_plain = false;
+  if (plain) {
+    const auto it = std::upper_bound(plain->begin(), plain->end(), base,
+                                     [](size_t x, const std::pair<size_t, size_t>& r) { return x < r.second; });
+    touches_plain = it != plain->end() && it->first < base + seg.size();
+  }
   std::string normalized;
   if (spm) {  // the Replace normalizer: every space becomes U+2581
     normalized.reserve(seg.size() + seg.size() / 4);
@@ -483,14 +510,17 @@ void Tokenizer::Impl::encode_segment(std::string_view seg, std::vector<int32_t>&
   } else if (nfc && tok::nfc_normalize(seg, normalized)) {
     seg = normalized;
   }
-  if (norm_matcher.empty()) {
+  if (norm_matcher.empty() || (touches_plain && !normalized.empty())) {
     encode_pieces(seg, out);
     return;
   }
-  split_added(norm_matcher, seg, parse_special, out, [&](std::string_view s) { encode_pieces(s, out); });
+  split_added(
+      norm_matcher, seg, parse_special, out, [&](std::string_view s) { encode_pieces(s, out); },
+      touches_plain ? plain : nullptr, base);
 }
 
-void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& out) const {
+template <class OnPiece>
+void Tokenizer::Impl::for_each_piece(std::string_view s, OnPiece&& on_piece) const {
   if (spm) {
     // No pre-tokenizer: the segment is one BPE word, encoded in pieces at the
     // boundaries no token spans (same ids; each piece is short and cached).
@@ -507,23 +537,58 @@ void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& ou
                          (cp == '\n' && prev != '\n' && !in(spm_before_nl, prev)) ||
                          (prev == '\n' && cp != '\n' && !in(spm_after_nl, cp));
         if (cut) {
-          encode_word(s.substr(start, i - start), out);
+          on_piece(start, i);
           start = i;
         }
       }
       prev = cp;
       i += size_t(len);
     }
-    if (start < s.size()) encode_word(s.substr(start), out);
+    if (start < s.size()) on_piece(start, s.size());
     return;
   }
   if (pattern == tok::SplitPattern::kDeepSeekV3) {
-    tok::deepseek_split(s, [&](size_t b, size_t e) { encode_word(s.substr(b, e - b), out); });
+    tok::deepseek_split(s, [&](size_t b, size_t e) { on_piece(b, e); });
     return;
   }
   tok::PieceSplitter sp(pattern, s);
   size_t b, e;
-  while (sp.next(b, e)) encode_word(s.substr(b, e - b), out);
+  while (sp.next(b, e)) on_piece(b, e);
+}
+
+// Stretches from this size on are BPE'd on several threads.
+constexpr size_t kParallelBytes = size_t(1) << 20;
+
+void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& out) const {
+  const unsigned hw = std::thread::hardware_concurrency();
+  const size_t n_threads = std::min<size_t>(hw ? hw : 1, 8);
+  if (s.size() < kParallelBytes || n_threads < 2 || s.size() > UINT32_MAX) {
+    for_each_piece(s, [&](size_t b, size_t e) { encode_word(s.substr(b, e - b), out); });
+    return;
+  }
+  // A long stretch: split into pieces here, then each thread BPEs a run of
+  // them (the word cache is shared and locked) and the runs are joined in
+  // order, so the ids are the serial ones.
+  std::vector<std::pair<uint32_t, uint32_t>> pieces;
+  pieces.reserve(s.size() / 4);
+  for_each_piece(s, [&](size_t b, size_t e) { pieces.emplace_back(uint32_t(b), uint32_t(e)); });
+  std::vector<std::vector<int32_t>> parts(n_threads);
+  auto work = [&](size_t k) {
+    const size_t p0 = pieces.size() * k / n_threads, p1 = pieces.size() * (k + 1) / n_threads;
+    parts[k].reserve((pieces[p1 - 1].second - pieces[p0].first) / 3 + 8);
+    for (size_t p = p0; p < p1; ++p) encode_word(s.substr(pieces[p].first, pieces[p].second - pieces[p].first), parts[k]);
+  };
+  std::vector<std::thread> threads;
+  for (size_t k = 1; k < n_threads; ++k) {
+    try {
+      threads.emplace_back(work, k);
+    } catch (const std::system_error&) {
+      work(k);  // no thread left: this run here
+    }
+  }
+  work(0);
+  for (auto& t : threads) t.join();
+  for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
 }
 
 void Tokenizer::Impl::encode_word(std::string_view word, std::vector<int32_t>& out) const {
@@ -719,6 +784,17 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special
 
 void Tokenizer::encode_append(std::string_view text, std::vector<int32_t>& out, bool parse_special) const {
   impl_->encode(text, out, parse_special);
+}
+
+std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special, const Ranges& plain) const {
+  std::vector<int32_t> out;
+  impl_->encode(text, out, parse_special, &plain);
+  return out;
+}
+
+void Tokenizer::encode_append(std::string_view text, std::vector<int32_t>& out, bool parse_special,
+                              const Ranges& plain) const {
+  impl_->encode(text, out, parse_special, &plain);
 }
 
 std::string Tokenizer::decode(const int32_t* ids, size_t n, bool skip_special) const {

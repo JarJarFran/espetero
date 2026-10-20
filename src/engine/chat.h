@@ -115,12 +115,18 @@ json::Value chat_chunk(const Engine& engine, const ChatJob& job, const json::Val
                        bool with_choices = true, const std::vector<TokenLogprob>* lps = nullptr,
                        int64_t* text_offset = nullptr, int index = 0);
 
-// Tool calls in Qwen3.5/Qwen3-Coder format inside `content`; returns the text
-// before the first call and fills `calls` (OpenAI shape) when any parse.
-std::string parse_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls);
+// Tool calls in Qwen3.5/Qwen3-Coder format inside `content`, or DeepSeek's
+// DSML calls; returns the text before the first call and fills `calls`
+// (OpenAI shape) when any parse. `at` (sorted, optional): the offsets in
+// `content` where the model generated a call's opening token; a call opens
+// only there, so an opening spelled with ordinary tokens is text. Null: at
+// every occurrence of the opening.
+std::string parse_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls,
+                             const std::vector<size_t>* at = nullptr);
 // Tool calls in Gemma 4 format: <|tool_call>call:NAME{key:value,...}<tool_call|>,
 // strings between <|"|> marks, bare keys, numbers, booleans, objects and arrays.
-std::string parse_gemma_tool_calls(const std::string& content, json::Value& calls);
+// `at` as for parse_tool_calls.
+std::string parse_gemma_tool_calls(const std::string& content, json::Value& calls, const std::vector<size_t>* at = nullptr);
 
 // The chat markers of the model's family: the reasoning block of
 // generated text, the tool-call marks, and the turn header prompt checkpoints
@@ -134,6 +140,62 @@ struct ChatMarkers {
   bool gemma = false;
 };
 const ChatMarkers& chat_markers(const Engine& engine);
+
+// `s` with invalid UTF-8 replaced by U+FFFD (the text layer only emits whole characters).
+std::string sanitize_utf8(std::string_view s);
+
+// A chat marker of generated text ("</think>", "<tool_call>", "<｜DSML｜
+// calls>") and the added token in it (`anchor`, at byte `anchor_off` of the
+// marker: DeepSeek's "<｜DSML｜ calls>" is "<", the token "｜DSML｜" and
+// " calls>"). An occurrence counts only where the model generated that token;
+// the same characters spelled with ordinary tokens (a quoted document, an
+// echoed request) are text. No added token in it (anchor -1): every
+// occurrence counts.
+struct MarkerToken {
+  std::string text;
+  int32_t anchor = -1;
+  size_t anchor_off = 0;
+};
+MarkerToken marker_token(const Tokenizer& tok, const std::string& text);
+
+// A reply's text as it is generated, and where the model generated the end of
+// its reasoning (mk.think_close) and the opening of its tool calls
+// (`tool_open`), by their tokens (MarkerToken).
+class ReplyText {
+ public:
+  // `reasoning_open`: the prompt opened the reasoning block; `split`: report
+  // the reasoning apart (chat), else everything is content.
+  ReplyText(const Tokenizer& tok, const ChatMarkers& mk, std::string tool_open, bool reasoning_open, bool split);
+  void add(int32_t id);                 // a generated token
+  void add_text(const std::string& t);  // text the server wrote (a forced call's opening): its markers count
+  const std::string& raw() const { return raw_; }
+
+  struct View {
+    std::string reasoning, content;
+    size_t held = 0;              // bytes at the end of raw() not shown yet (a partial tag or UTF-8 sequence)
+    bool anchored = false;        // the tool-call opening has a token: calls open only at tool_at
+    std::vector<size_t> tool_at;  // offsets in `content` where the model generated the opening
+    const std::vector<size_t>* calls_at() const { return anchored ? &tool_at : nullptr; }
+  };
+  // `final_view`: all of it (else an incomplete UTF-8 tail waits).
+  View view(bool final_view) const;
+  // Where the calls start in `content` (the view's content, maybe cut by a
+  // stop string), npos if nowhere.
+  size_t calls_start(const View& v, const std::string& content) const;
+  // The tool calls in `content` (parse_tool_calls or parse_gemma_tool_calls);
+  // returns the text before them.
+  std::string parse_calls(const View& v, const std::string& content, const json::Value& tools, json::Value& calls) const;
+
+ private:
+  void note(int32_t id, size_t at);
+  const Tokenizer& tok_;
+  const ChatMarkers& mk_;
+  std::string tool_open_;
+  bool reasoning_open_, split_;
+  MarkerToken close_mark_, tool_mark_;
+  std::string raw_;
+  std::vector<size_t> close_raw_, tool_raw_;  // offsets in raw_ where the markers' tokens were generated
+};
 
 // The special tokens a chat template sees, as transformers passes its
 // special_tokens_map (bos_token, eos_token, unk_token, pad_token). Gemma 4's

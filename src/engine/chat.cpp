@@ -41,22 +41,13 @@ int64_t now_s() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// Replace invalid UTF-8 by U+FFFD (the text layer only emits whole characters).
-std::string sanitize(std::string_view s) {
-  if (json::utf8_valid(s)) return std::string(s);
-  std::string out;
-  size_t i = 0;
-  while (i < s.size()) json::utf8_append(out, json::utf8_next(s, i));
-  return out;
-}
-
 // OpenAI chat logprobs content: per token its text (invalid UTF-8
 // replaced), its bytes, log-probability and the top alternatives.
 json::Value logprobs_json(const Tokenizer& tok, const std::vector<TokenLogprob>& lps) {
   auto entry = [&](int32_t id, float lp) {
     const std::string& p = tok.piece(id);
     json::Value e = json::Value::object();
-    e.set("token", sanitize(p));
+    e.set("token", sanitize_utf8(p));
     e.set("id", int64_t(id));  // beside OpenAI's fields: the token id
     e.set("logprob", std::isfinite(lp) ? double(lp) : -9999.0);
     json::Value b = json::Value::array();
@@ -86,12 +77,12 @@ json::Value legacy_logprobs_json(const Tokenizer& tok, const std::vector<TokenLo
   int64_t off = offset ? *offset : 0;
   for (const TokenLogprob& t : lps) {
     const std::string& p = tok.piece(t.token);
-    const std::string text = sanitize(p);
+    const std::string text = sanitize_utf8(p);
     tokens.push_back(text);
     values.push_back(val(t.logprob));
     json::Value top = json::Value::object();
     for (const auto& [id, lp] : t.top) {
-      const std::string k = sanitize(tok.piece(id));
+      const std::string k = sanitize_utf8(tok.piece(id));
       if (!top.get(k)) top.set(k, val(lp));  // pieces that decode alike: the likelier one
     }
     if (!top.get(text)) top.set(text, val(t.logprob));
@@ -256,56 +247,6 @@ void fetch_remote_images(const Engine& engine, std::vector<std::string>& urls) {
   for (size_t k = 0; k < remote.size(); ++k) urls[remote[k]] = std::move(data[k]);
 }
 
-// (reasoning, content, closed) of generated text; `opened`: the prompt
-// already opened the reasoning block.
-struct Split {
-  std::string reasoning, content;
-  bool closed = true;
-  size_t held = 0;  // trailing bytes held back as a partial tag (their tokens' logprobs wait too)
-};
-Split split_reasoning(const std::string& raw, bool opened, const ChatMarkers& mk) {
-  const std::string& open = mk.think_open;
-  const std::string& close = mk.think_close;
-  Split out;
-  std::string text = raw;
-  if (!opened) {
-    if (text.compare(0, open.size(), open) != 0) {
-      // A partial "<think>" at the very start is held back.
-      if (!text.empty() && open.compare(0, text.size(), text) == 0) {
-        out.closed = false;
-        out.held = text.size();
-        return out;
-      }
-      out.content = raw;
-      return out;
-    }
-    text = text.substr(open.size());
-  }
-  const size_t end = text.find(close);
-  auto strip_nl = [](std::string s, bool left, bool right) {
-    if (left)
-      while (!s.empty() && s.front() == '\n') s.erase(s.begin());
-    if (right)
-      while (!s.empty() && s.back() == '\n') s.pop_back();
-    return s;
-  };
-  if (end == std::string::npos) {
-    // Hold back a partial closing tag.
-    for (size_t k = close.size() - 1; k > 0; --k)
-      if (text.size() >= k && text.compare(text.size() - k, k, close, 0, k) == 0) {
-        text.resize(text.size() - k);
-        out.held = k;
-        break;
-      }
-    out.reasoning = strip_nl(text, true, false);
-    out.closed = false;
-    return out;
-  }
-  out.reasoning = strip_nl(text.substr(0, end), true, true);
-  out.content = strip_nl(text.substr(end + close.size()), true, false);
-  return out;
-}
-
 }  // namespace
 
 const ChatMarkers& chat_markers(const Engine& engine) {
@@ -328,149 +269,6 @@ json::Value template_special_tokens(const Tokenizer& tok) {
   put("pad_token", tok.pad_id());
   put("unk_token", tok.token_id("<unk>"));
   return o;
-}
-
-// ---------------------------------------------------------------- tools
-// DeepSeek-V3.2 / V4 DSML calls:
-//   <｜DSML｜ calls>
-//   <｜DSML｜ invoke name="NAME">
-//   <｜DSML｜ parameter name="P" string="true|false">VALUE</｜DSML｜ parameter>
-//   </｜DSML｜ invoke>
-//   </｜DSML｜ calls>
-// string="true": VALUE as is; otherwise JSON (kept as a string when it does not parse).
-static std::string parse_dsml_calls(const std::string& content, json::Value& calls) {
-  static const std::string kCalls = "<｜DSML｜ calls>";
-  static const std::string kInvoke = "<｜DSML｜ invoke name=\"";
-  static const std::string kInvokeEnd = "</｜DSML｜ invoke>";
-  static const std::string kParam = "<｜DSML｜ parameter name=\"";
-  static const std::string kParamEnd = "</｜DSML｜ parameter>";
-  const size_t at = content.find(kCalls);
-  if (at == std::string::npos) return content;
-  std::string before = content.substr(0, at);
-  while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
-  json::Value out = json::Value::array();
-  size_t p = at + kCalls.size();
-  while (true) {
-    const size_t i0 = content.find(kInvoke, p);
-    if (i0 == std::string::npos) break;
-    const size_t n1 = content.find('"', i0 + kInvoke.size());
-    if (n1 == std::string::npos) break;
-    const std::string name = content.substr(i0 + kInvoke.size(), n1 - i0 - kInvoke.size());
-    size_t iend = content.find(kInvokeEnd, n1);
-    if (iend == std::string::npos) iend = content.size();
-    json::Value args = json::Value::object();
-    size_t q = n1;
-    while (true) {
-      const size_t a0 = content.find(kParam, q);
-      if (a0 == std::string::npos || a0 >= iend) break;
-      const size_t a1 = content.find('"', a0 + kParam.size());
-      if (a1 == std::string::npos) break;
-      const std::string pname = content.substr(a0 + kParam.size(), a1 - a0 - kParam.size());
-      const size_t gt = content.find('>', a1);
-      if (gt == std::string::npos) break;
-      const bool is_string = content.substr(a1, gt - a1).find("string=\"true\"") != std::string::npos;
-      size_t v1 = content.find(kParamEnd, gt + 1);
-      if (v1 == std::string::npos || v1 > iend) v1 = iend;
-      const std::string value = content.substr(gt + 1, v1 - gt - 1);
-      json::Value v(value);
-      if (!is_string) {
-        try {
-          v = json::parse(value);
-        } catch (...) {
-          v = json::Value(value);
-        }
-      }
-      args.set(pname, std::move(v));
-      q = v1 == iend ? iend : v1 + kParamEnd.size();
-    }
-    json::Value fn = json::Value::object();
-    fn.set("name", name);
-    fn.set("arguments", json::dump(args));
-    json::Value call = json::Value::object();
-    call.set("id", random_id("call_"));
-    call.set("type", "function");
-    call.set("function", std::move(fn));
-    out.push_back(std::move(call));
-    if (iend >= content.size()) break;
-    p = iend + kInvokeEnd.size();
-  }
-  if (!out.size()) return content;
-  calls = std::move(out);
-  return before;
-}
-
-std::string parse_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls) {
-  calls = json::Value();
-  if (content.find("<｜DSML｜ calls>") != std::string::npos) return parse_dsml_calls(content, calls);
-  const std::string open = "<tool_call>", close = "</tool_call>";
-  size_t at = content.find(open);
-  if (at == std::string::npos) return content;
-  std::string before = content.substr(0, at);
-  while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
-  json::Value out = json::Value::array();
-  // Declared parameter types, to keep string arguments as strings.
-  auto param_type = [&](const std::string& fn, const std::string& p) -> std::string {
-    if (!tools.is_array()) return "";
-    for (const auto& t : tools.as_array()) {
-      const json::Value* f = t.get("function");
-      if (!f || f->get_string("name", "") != fn) continue;
-      const json::Value* params = f->get("parameters");
-      const json::Value* props = params ? params->get("properties") : nullptr;
-      const json::Value* pp = props ? props->get(p) : nullptr;
-      if (pp) return pp->get_string("type", "");
-    }
-    return "";
-  };
-  while (at != std::string::npos) {
-    const size_t body0 = at + open.size();
-    size_t end = content.find(close, body0);
-    const std::string body = content.substr(body0, end == std::string::npos ? std::string::npos : end - body0);
-    const size_t f0 = body.find("<function=");
-    if (f0 != std::string::npos) {
-      const size_t f1 = body.find('>', f0);
-      std::string name = body.substr(f0 + 10, f1 == std::string::npos ? std::string::npos : f1 - f0 - 10);
-      json::Value args = json::Value::object();
-      size_t p = f1 == std::string::npos ? body.size() : f1;
-      while (true) {
-        const size_t p0 = body.find("<parameter=", p);
-        if (p0 == std::string::npos) break;
-        const size_t p1 = body.find('>', p0);
-        if (p1 == std::string::npos) break;
-        const std::string pname = body.substr(p0 + 11, p1 - p0 - 11);
-        size_t v0 = p1 + 1;
-        if (v0 < body.size() && body[v0] == '\n') ++v0;
-        size_t v1 = body.find("</parameter>", v0);
-        if (v1 == std::string::npos) v1 = body.find("<parameter=", v0);
-        if (v1 == std::string::npos) v1 = body.find("</function>", v0);
-        if (v1 == std::string::npos) v1 = body.size();
-        std::string value = body.substr(v0, v1 - v0);
-        if (!value.empty() && value.back() == '\n') value.pop_back();
-        const std::string type = param_type(name, pname);
-        json::Value v(value);
-        if (type != "string") {
-          try {
-            v = json::parse(value);
-          } catch (...) {
-            v = json::Value(value);
-          }
-        }
-        args.set(pname, std::move(v));
-        p = v1;
-      }
-      json::Value fn = json::Value::object();
-      fn.set("name", name);
-      fn.set("arguments", json::dump(args));
-      json::Value call = json::Value::object();
-      call.set("id", random_id("call_"));
-      call.set("type", "function");
-      call.set("function", std::move(fn));
-      out.push_back(std::move(call));
-    }
-    if (end == std::string::npos) break;
-    at = content.find(open, end + close.size());
-  }
-  if (out.size()) calls = std::move(out);
-  return calls.is_null() ? content : before;
 }
 
 // ---------------------------------------------------------------- prepare
@@ -674,10 +472,24 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
       job.tools = std::move(kept);
     }
   }
+  // The request's own text (message contents, tool results, tool calls,
+  // tool definitions, template kwargs) is tokenized as plain text: a special
+  // or added token written there ("<|im_start|>", "</think>", "<tool_call>",
+  // "<｜DSML｜") stays ordinary text instead of becoming the control token.
+  // Only the template's own text and the image placeholders it writes are
+  // split into added tokens. "parse_special": true reads added tokens
+  // everywhere, for clients that write the prompt themselves; it is the
+  // default in a template's raw mode (chat_template_kwargs.raw_prompt, whose
+  // message contents are the prompt).
+  const json::Value* raw_mode = kwargs.get("raw_prompt");
+  const bool parse_special_content =
+      parse_bool(body.get("parse_special"), raw_mode && raw_mode->is_bool() && raw_mode->as_bool());
   std::string text;
+  Tokenizer::Ranges plain;  // byte ranges of `text` from the request
   try {
     text = tmpl::apply_chat_template(*engine.chat_template(), conv, job.tools, true, kwargs,
-                                     template_special_tokens(engine.tokenizer()));
+                                     template_special_tokens(engine.tokenizer()), tmpl::RenderOptions(),
+                                     parse_special_content ? nullptr : &plain);
   } catch (const std::exception& e) {
     invalid(std::string("chat template: ") + e.what());
   }
@@ -716,9 +528,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   // Structured output (response_format json_object / json_schema): a
   // grammar constrains the reply, after the reasoning when the prompt opens it.
   apply_response_format(engine, body, job, text, true);
-  // Rendering is cheap (tens of ms for 32 MB); tokenizing is not (12.8 s and
-  // 1.2 GB for 32 MB). The rendered prompt is what must fit: history the
-  // template drops (earlier turns' reasoning) does not count.
+  // Rendering is cheap (tens of ms for 32 MB); tokenizing is not (seconds and
+  // 1.2 GB for 32 MB, BPE on several threads). The rendered prompt is what
+  // must fit: history the template drops (earlier turns' reasoning) does not
+  // count.
   engine.check_text_size(text.size(), "prompt");
   const Tokenizer& tok = engine.tokenizer();
   std::vector<int32_t> ids;
@@ -726,13 +539,17 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   if (n_marks) {
     for (size_t pos = 0;;) {
       const size_t m = text.find(kMark, pos);
-      tok.encode_append(std::string_view(text).substr(pos, (m == std::string::npos ? text.size() : m) - pos), ids);
+      const size_t end = m == std::string::npos ? text.size() : m;
+      Tokenizer::Ranges seg;  // the plain ranges of text[pos, end), from pos
+      for (const auto& [b, e] : plain)
+        if (b < end && e > pos) seg.emplace_back(std::max(b, pos) - pos, std::min(e, end) - pos);
+      tok.encode_append(std::string_view(text).substr(pos, end - pos), ids, true, seg);
       if (m == std::string::npos) break;
       marks.push_back(int(ids.size()));
       pos = m + kMark.size();
     }
   } else {
-    ids = tok.encode(text);
+    ids = tok.encode(text, true, plain);
   }
   GenRequest& g = job.gen;
   fetch_remote_images(engine, urls);
@@ -915,13 +732,17 @@ void run_chat(Engine& engine, const ChatJob& job, const std::function<bool(const
 void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStream> stream,
                      const std::function<bool(const ChatEvent&)>& on_event, const std::atomic<bool>* stop, int choice) {
   const Tokenizer& tok = engine.tokenizer();
-  std::string raw = job.prefill;  // generated bytes, after a forced call's opening
   size_t emitted_c = 0, emitted_r = 0;
   size_t hold = 0;
   for (const auto& s : job.stops) hold = std::max(hold, s.size() - 1);
   const bool tools = !job.tools.is_null();
   const ChatMarkers& mk = chat_markers(engine);
   if (tools) hold = std::max(hold, job.tool_open.size() - 1);
+  // The generated text, after a forced call's opening (text of ours: its
+  // markers count).
+  ReplyText reply(tok, mk, job.tool_open, job.reasoning_open, job.split_reasoning);
+  reply.add_text(job.prefill);
+  const std::string& raw = reply.raw();
   bool stop_hit = false;
   std::string stop_seq;  // the stop string that cut the content (the earliest match)
   std::vector<int32_t> got;
@@ -934,18 +755,12 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
   std::vector<size_t> tok_end;
   size_t lp_sent = 0;
   // `held`: bytes at the end of `raw` the view does not show yet.
+  ReplyText::View rv;  // the last view (its call openings, for the final parse)
   auto view = [&](bool final_view, std::string& reasoning, std::string& content, size_t& safe, size_t& held) {
-    const size_t whole = json::utf8_complete_prefix(raw);
-    const std::string text = sanitize(std::string_view(raw).substr(0, final_view ? raw.size() : whole));
-    held = raw.size() - (final_view ? raw.size() : whole);
-    if (job.split_reasoning) {
-      Split sp = split_reasoning(text, job.reasoning_open, mk);
-      reasoning = sp.reasoning;
-      content = sp.content;
-      held += sp.held;
-    } else {
-      content = text;
-    }
+    rv = reply.view(final_view);
+    reasoning = rv.reasoning;
+    content = rv.content;
+    held = rv.held;
     size_t cut = std::string::npos;
     for (const auto& s : job.stops) {
       const size_t at = content.find(s);
@@ -956,7 +771,7 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
       stop_hit = true;
     }
     if (tools) {
-      const size_t at = content.find(job.tool_open);
+      const size_t at = reply.calls_start(rv, content);
       if (at != std::string::npos) {
         safe = std::min(safe, at);  // the rest is parsed at the end
         while (safe > 0 && (content[safe - 1] == '\n' || content[safe - 1] == ' ')) --safe;  // the gap before the calls
@@ -1008,7 +823,8 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
     p1_completion = stream->completion_tokens;
     p1_timings = stream->timings;
     forced_n = int(1 + open.size());
-    raw += tok.piece(job.think_end) + job.force_after_think;
+    reply.add(job.think_end);
+    reply.add_text(job.force_after_think);
     stream = std::move(s2);
     phase2 = true;
     return true;
@@ -1023,7 +839,7 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
       stream->cancel();
     }
     for (int32_t t : got) {
-      raw += tok.piece(t);
+      reply.add(t);
       tok_end.push_back(raw.size());
     }
     if (!job.force_after_think.empty() && !phase2) gen1.insert(gen1.end(), got.begin(), got.end());
@@ -1072,7 +888,7 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
   last.final = true;
   if (tools) {
     json::Value calls;
-    const std::string before = mk.gemma ? parse_gemma_tool_calls(content, calls) : parse_tool_calls(content, job.tools, calls);
+    const std::string before = reply.parse_calls(rv, content, job.tools, calls);
     if (!calls.is_null()) {
       content = before;
       last.tool_calls = calls;

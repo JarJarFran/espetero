@@ -138,17 +138,19 @@ void raise_undefined(const Val& u) {
 }
 
 // ---------------------------------------------------------------- conversions
-Val from_json(const json::Value& v) {
+Val from_json(const json::Value& v, bool data) {
+  Val r;
   switch (v.type()) {
     case json::Type::Null: return Val::none();
     case json::Type::Bool: return Val::boolean(v.as_bool());
     case json::Type::Int: return Val::integer(v.as_int());
     case json::Type::Double: return Val::real(v.as_double());
-    case json::Type::String: return Val::str_ref(v.as_string());
-    case json::Type::Array: return Val::json_list(&v);
-    case json::Type::Object: return Val::json_dict(&v);
+    case json::Type::String: r = Val::str_ref(v.as_string()); break;
+    case json::Type::Array: r = Val::json_list(&v); break;
+    case json::Type::Object: r = Val::json_dict(&v); break;
   }
-  return Val::none();
+  if (data) r.set_data();
+  return r;
 }
 
 PyType type_of(const Val& v) {
@@ -194,8 +196,102 @@ PyType type_of(const Val& v) {
 Val substr(const Val& s, size_t pos, size_t n) {
   std::string_view v = s.sv().substr(pos, n);
   if (v.size() == s.sv().size()) return s;  // e.g. strip() removing nothing
-  if (s.borrowed()) return Val::str_ref(v, s.markup());
-  return Val::str(std::string(v), s.markup());
+  if (s.borrowed()) {
+    Val r = Val::str_ref(v, s.markup());
+    if (s.data()) r.set_data();
+    return r;
+  }
+  if (s.data()) return as_data(Val::str(std::string(v), s.markup()));
+  Spans sp;
+  const size_t b = size_t(v.data() - s.sv().data()), e = b + v.size();
+  for (const auto& [x, y] : s.as<StrObj>()->spans)
+    if (x < e && y > b) add_span(sp, std::max<size_t>(x, b) - b, std::min<size_t>(y, e) - b);
+  return str_spans(std::string(v), std::move(sp), s.markup());
+}
+
+// ---------------------------------------------------------------- data spans
+void add_span(Spans& out, size_t b, size_t e) {
+  if (b >= e) return;
+  if (!out.empty() && out.back().second >= b) {
+    out.back().second = std::max(out.back().second, uint32_t(e));
+    return;
+  }
+  out.emplace_back(uint32_t(b), uint32_t(e));
+}
+
+Spans take_spans(Spans& out, size_t from) {
+  Spans r;
+  size_t k = out.size();
+  while (k > 0 && out[k - 1].second > from) --k;
+  for (size_t i = k; i < out.size(); ++i) add_span(r, std::max<size_t>(out[i].first, from) - from, out[i].second - from);
+  if (k < out.size() && out[k].first < from) {
+    out[k].second = uint32_t(from);
+    ++k;
+  }
+  out.resize(k);
+  return r;
+}
+
+Val str_spans(std::string s, Spans spans, bool markup) {
+  const size_t n = s.size();
+  Val v = Val::str(std::move(s), markup);
+  if (spans.empty() || n == 0) return v;
+  if (spans.size() == 1 && spans[0].first == 0 && spans[0].second >= n) {
+    v.set_data();
+    return v;
+  }
+  v.as<StrObj>()->spans = std::move(spans);
+  return v;
+}
+
+Val as_data(Val v) {
+  if (v.is_str() && !v.sv().empty()) v.set_data();
+  return v;
+}
+
+static bool has_data_depth(const Val& v, int depth) {
+  if (v.data()) return true;
+  switch (v.kind()) {
+    case Kind::Str: return !v.borrowed() && !v.as<StrObj>()->spans.empty();
+    case Kind::List:
+    case Kind::Tuple:
+      if (v.is_json() || depth > 8) return false;
+      for (const Val& x : v.as<ListObj>()->v)
+        if (has_data_depth(x, depth + 1)) return true;
+      return false;
+    case Kind::Dict:
+      if (v.is_json() || depth > 8) return false;
+      for (const Val& x : v.as<DictObj>()->m.keys)
+        if (has_data_depth(x, depth + 1)) return true;
+      for (const Val& x : v.as<DictObj>()->m.vals)
+        if (has_data_depth(x, depth + 1)) return true;
+      return false;
+    case Kind::Namespace:
+      if (depth > 8) return false;
+      for (const Val& x : v.as<NsObj>()->m.vals)
+        if (has_data_depth(x, depth + 1)) return true;
+      return false;
+    case Kind::Iter:
+      if (depth > 8) return false;
+      for (const Val& x : v.as<IterObj>()->items)
+        if (has_data_depth(x, depth + 1)) return true;
+      return false;
+    case Kind::View: return has_data_depth(v.as<ViewObj>()->dict, depth + 1);
+    default: return false;
+  }
+}
+
+bool has_data(const Val& v) { return has_data_depth(v, 0); }
+
+void add_spans(Spans& out, const Val& s, size_t base, size_t len) {
+  if (!len) return;
+  if (s.data()) return add_span(out, base, base + len);
+  if (s.is_str()) {
+    if (!s.borrowed())
+      for (const auto& [b, e] : s.as<StrObj>()->spans) add_span(out, base + b, base + e);
+    return;
+  }
+  if (has_data(s)) add_span(out, base, base + len);
 }
 
 // ---------------------------------------------------------------- containers
@@ -210,7 +306,7 @@ size_t seq_size(const Val& v) {
 }
 
 Val seq_at(const Val& v, size_t i) {
-  if (v.is_json()) return from_json((*v.json())[i]);
+  if (v.is_json()) return from_json((*v.json())[i], v.data());
   return v.as<ListObj>()->v[i];
 }
 
@@ -220,12 +316,16 @@ size_t dict_size(const Val& v) {
 }
 
 Val dict_key(const Val& v, size_t i) {
-  if (v.is_json()) return Val::str_ref(v.json()->as_object().keys[i]);
+  if (v.is_json()) {
+    Val k = Val::str_ref(v.json()->as_object().keys[i]);
+    if (v.data()) k.set_data();
+    return k;
+  }
   return v.as<DictObj>()->m.keys[i];
 }
 
 Val dict_value(const Val& v, size_t i) {
-  if (v.is_json()) return from_json(v.json()->as_object().vals[i]);
+  if (v.is_json()) return from_json(v.json()->as_object().vals[i], v.data());
   return v.as<DictObj>()->m.vals[i];
 }
 
@@ -233,7 +333,7 @@ bool dict_get_str(const Val& d, std::string_view key, Val& out) {
   if (d.is_json()) {
     const json::Value* p = d.json()->as_object().find(key);
     if (!p) return false;
-    out = from_json(*p);
+    out = from_json(*p, d.data());
     return true;
   }
   const MapData& m = d.as<DictObj>()->m;

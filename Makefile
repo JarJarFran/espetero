@@ -96,6 +96,16 @@ $(BUILD)/kev_test: tests/kev_test.cpp $(BUILD)/obj/engine/kev.o $(patsubst src/%
 	$(CXX) $(CXXFLAGS) $^ -framework Accelerate -framework CoreFoundation -o $@
 
 # Gemma 4 without a GPU: config parsing, its tool-call format, hidden-state heads.
+# Special tokens in request text and chat markers in replies (no model files).
+$(BUILD)/reply_test: tests/reply_test.cpp $(BUILD)/obj/engine/reply.o $(BUILD)/obj/engine/gemma_tools.o \
+                     $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC)) $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ -framework CoreFoundation -o $@
+
+# Prompt ids with request text read as plain text vs. the old reading, on model directories
+# (not part of `make test`): build/plain_ids_check DIR...
+$(BUILD)/plain_ids_check: tests/plain_ids_check.cpp $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC)) $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ -framework CoreFoundation -o $@
+
 $(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/obj/engine/hidden_head.o $(BUILD)/obj/engine/pplx.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
@@ -155,7 +165,8 @@ $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BU
 
 .PHONY: test
 test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http_test $(BUILD)/vision_limits_test $(BUILD)/hub_test $(BUILD)/model_meta_test $(BUILD)/api_test \
-      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/kev_test
+      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/kev_test \
+      $(BUILD)/reply_test
 	python3 tests/ref/json_ref.py $(BUILD)/json_cases.json && $(BUILD)/json_test $(BUILD)/json_cases.json
 	$(BUILD)/sampling_test
 	$(BUILD)/tmpl_test tests/ref/tmpl_fixtures
@@ -170,6 +181,7 @@ test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http
 	$(BUILD)/grammar_test "" $(BUILD)/grammar_samples.jsonl && python3 tests/ref/grammar_check.py $(BUILD)/grammar_samples.jsonl
 	$(BUILD)/gemma_test
 	$(BUILD)/kev_test tests/ref/kev_fixtures.json
+	$(BUILD)/reply_test
 
 # ---- install / package
 # make install [PREFIX=/usr/local] [DESTDIR=staging]: the espetero binary in

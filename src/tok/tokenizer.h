@@ -34,6 +34,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace espetero {
@@ -68,6 +69,18 @@ class Tokenizer {
   // `encode_special_tokens=True` in `tokenizers`.
   std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const;
   void encode_append(std::string_view text, std::vector<int32_t>& out, bool parse_special = true) const;
+  // `plain`: byte ranges [begin, end) of `text` (sorted, disjoint) that are plain text, such as
+  // the request's own text in a rendered chat prompt: no added token, special or not, is
+  // recognized in them or across their edges, so "<|im_start|>" or "</think>" written there
+  // encode as ordinary tokens. Everything else is split exactly as encode() does, and the
+  // pre-tokenizer and BPE run across the ranges' edges as if there were none: a text with no
+  // added token inside its plain ranges encodes exactly like encode(text, parse_special).
+  // (Added tokens matched after normalization are not recognized anywhere in a stretch that
+  // normalization changed and that touches a plain range; none of the supported vocabularies
+  // has such tokens.)
+  using Ranges = std::vector<std::pair<size_t, size_t>>;
+  std::vector<int32_t> encode(std::string_view text, bool parse_special, const Ranges& plain) const;
+  void encode_append(std::string_view text, std::vector<int32_t>& out, bool parse_special, const Ranges& plain) const;
 
   // Concatenated raw bytes of the tokens (unknown ids contribute nothing).
   std::string decode(const int32_t* ids, size_t n, bool skip_special = false) const;
