@@ -864,9 +864,10 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
       if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight" ||
-          t.name == "vision_embedder.patch_dense.weight" || t.name == "vision_tower.embeddings.patch_embedding.weight" ||
-          t.name == "model.vision_tower.vision_model.embeddings.patch_embedding.weight")
-        vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified, LFM2-VL (MLX and Hugging Face names)
+          t.name == "vision_embedder.patch_dense.weight" ||
+          (f.geo.lfm2 && (t.name == "vision_tower.embeddings.patch_embedding.weight" ||
+                          t.name == "model.vision_tower.vision_model.embeddings.patch_embedding.weight")))
+        vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified; LFM2-VL (MLX and Hugging Face names)
       if (f.geo.ds4) {  // DeepSeek-V4.1: experts and Engram tables stay on the SSD; no draft head or vision yet
         if (contains(t.name, ".ffn.experts.") || contains(t.name, ".engram.embed.")) f.streamed += t.bytes;
         else if (!starts_with(t.name, "mtp.") && !starts_with(t.name, "vision.") && !starts_with(t.name, "aligner."))
@@ -882,8 +883,9 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         continue;
       }
       if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.") ||
-          starts_with(t.name, "vision_embedder.") || starts_with(t.name, "multi_modal_projector.") ||
-          (hf_names && (starts_with(t.name, "model.vision_tower.") || starts_with(t.name, "model.multi_modal_projector."))))
+          starts_with(t.name, "vision_embedder.") ||
+          (f.geo.lfm2 && (starts_with(t.name, "multi_modal_projector.") || starts_with(t.name, "model.vision_tower.") ||
+                          starts_with(t.name, "model.multi_modal_projector."))))
         f.vision += bytes;
       f.weights += bytes;
     }

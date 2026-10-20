@@ -203,7 +203,7 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   auto generation = [&engine](bool chat) {
     return guarded([&engine, chat](const http::Request& req, http::Response& res) {
       if (engine.decision_only())
-        throw RequestError(422, "this is a decision model (Clef or d1): it answers /v1/systemone and /v1/decisions, not chat");
+        throw RequestError(422, engine.chat_refusal());
       const json::Value body = parse_body(req);
       ChatJob job = chat ? prepare_chat(engine, body) : prepare_completion(engine, body);
       if (!job.stream) {

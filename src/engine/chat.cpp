@@ -318,7 +318,8 @@ const ChatMarkers& chat_markers(const Engine& engine) {
 }
 
 json::Value template_special_tokens(const Tokenizer& tok) {
-  if (tok.pre_tokenizer_name() != "spm" && tok.chat_template().find("bos_token") == std::string::npos) return json::Value();
+  // Gemma 4 (spm) and LFM2 only: every other family renders without them, as before.
+  if (tok.pre_tokenizer_name() != "spm" && tok.pre_tokenizer_name() != "lfm2") return json::Value();
   json::Value o = json::Value::object();
   auto put = [&](const char* key, int32_t id) {
     if (id >= 0 && !tok.token_text(id).empty()) o.set(key, std::string(tok.token_text(id)));

@@ -1286,8 +1286,7 @@ json::Value Engine::systemone(const json::Value& body) {
   const auto started = Clock::now();
   if (d1_) return d1_systemone(body);
   if (!clef_)
-    throw RequestError(422, "this model is not a decision model; /v1/systemone serves Clef releases (joint_head.safetensors) "
-                            "and d1 releases");
+    throw RequestError(422, "this model has no Clef joint head (joint_head.safetensors); /v1/systemone serves Clef releases");
   if (!body.is_object()) throw RequestError(422, "request body must be a JSON object");
   const json::Value* model = body.get("model");
   if (model && !model->is_null() && !model->is_string()) throw RequestError(422, "model: a string");

@@ -453,6 +453,8 @@ json::Value Engine::d1_systemone(const json::Value& body) {
   }
   for (size_t i = 0; i < job->root.size(); ++i)
     if (job->root[i] == run_start) {
+      if (job->image_rows.size() >= job->images.size())
+        throw RequestError(422, "image runs do not match the images (the state holds an image run without an image)");
       job->image_rows.push_back(int(i));
       i += size_t(job->images[job->image_rows.size() - 1].tokens(0)) - 1;
     }

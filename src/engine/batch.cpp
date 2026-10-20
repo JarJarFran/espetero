@@ -322,7 +322,7 @@ std::pair<int, json::Value> BatchService::execute(Engine& engine, const std::str
     if (endpoint == "/v1/embeddings") return {200, embeddings_response(engine, body)};
     if (endpoint == "/v1/chat/completions" || endpoint == "/v1/completions") {
       if (engine.decision_only())
-        throw RequestError(422, "this is a decision model (Clef or d1): it answers /v1/systemone and /v1/decisions, not chat");
+        throw RequestError(422, engine.chat_refusal());
       ChatJob job = endpoint == "/v1/chat/completions" ? prepare_chat(engine, body) : prepare_completion(engine, body);
       job.stream = false;
       job.gen.priority = std::max(job.gen.priority, 1);  // below interactive traffic

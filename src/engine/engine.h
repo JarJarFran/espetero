@@ -314,6 +314,11 @@ class Engine {
   bool is_clef() const { return clef_ != nullptr; }
   // A decision model (Clef or d1): /v1/systemone and /v1/decisions only, no chat.
   bool decision_only() const { return clef_ != nullptr || d1_ != nullptr; }
+  // The 422 text for chat on such a model (Clef's as before; d1 names itself).
+  const char* chat_refusal() const {
+    return d1_ ? "this is a d1 decision model: it answers /v1/systemone and /v1/decisions, not chat"
+               : "this is a Clef decision model: it answers /v1/systemone and /v1/decisions, not chat";
+  }
   // The JEVfire decision contract (context + boolean / enum fields) answered by a
   // Clef head: fields become noul / choice questions; the response keeps decide()'s format.
   json::Value clef_decide(const json::Value& request);

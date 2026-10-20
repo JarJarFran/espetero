@@ -466,9 +466,10 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
     in.nfc = parse_normalizer(normalizer);
     if (!have_pre) fail("missing pre_tokenizer");
     in.pattern = parse_pre_tokenizer(pre_tokenizer);
-    // ByteLevel, or a Sequence of that one decoder (LFM2.5-VL-1.6B's tokenizer.json).
+    // ByteLevel, or for LFM2 a Sequence of that one decoder (LFM2.5-VL-1.6B's
+    // tokenizer.json); other families take exactly what they took before.
     const Value* only = &decoder;
-    if (have_decoder && decoder.get_string("type", "") == "Sequence")
+    if (have_decoder && in.pattern == tok::SplitPattern::kLfm2 && decoder.get_string("type", "") == "Sequence")
       if (const Value* ds = decoder.get("decoders"); ds && ds->is_array() && ds->size() == 1) only = &(*ds)[0];
     if (!have_decoder || only->get_string("type", "") != "ByteLevel")
       fail("unsupported decoder (expected ByteLevel): " + describe(decoder));
@@ -501,6 +502,7 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
       for (const auto& [id, i] : order) in.added.push_back(parse_added_token(o.vals[i]));
     }
   }
+  const bool lfm2 = !in.spm && in.pattern == tok::SplitPattern::kLfm2;
   auto impl = tok::build(std::move(in));
 
   // ---- metadata
@@ -515,14 +517,15 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
     impl->eos = id_of("eos_token");
     impl->bos = id_of("bos_token");
     impl->pad = id_of("pad_token");
-    // A post-processor whose single-sequence template starts with the BOS
-    // token (LFM2.5-VL-1.6B) adds it to raw text, as transformers does.
-    const Value* tp = &post_processor;
-    if (post_processor.get_string("type", "") == "Sequence")
+    // LFM2: a post-processor whose single-sequence template starts with the
+    // BOS token (LFM2.5-VL-1.6B) adds it to raw text, as transformers does.
+    // Other byte-level families keep llama.cpp's default (no BOS) as before.
+    const Value* tp = lfm2 ? &post_processor : nullptr;
+    if (lfm2 && post_processor.get_string("type", "") == "Sequence")
       if (const Value* ps = post_processor.get("processors"); ps && ps->is_array())
         for (const Value& x : ps->as_array())
           if (x.get_string("type", "") == "TemplateProcessing") tp = &x;
-    if (tp->is_object() && tp->get_string("type", "") == "TemplateProcessing" && impl->bos >= 0)
+    if (tp && tp->is_object() && tp->get_string("type", "") == "TemplateProcessing" && impl->bos >= 0)
       if (const Value* single = tp->get("single"); single && single->is_array() && single->size() > 0)
         if (const Value* st = (*single)[0].get("SpecialToken"); st && st->is_object() &&
             impl->find(st->get_string("id", "")) == impl->bos)

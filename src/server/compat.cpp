@@ -1175,7 +1175,7 @@ std::string metrics_text(const Engine& engine) {
 // Clef decision models serve no chat, here as on /v1/chat/completions.
 void refuse_clef(const Engine& engine) {
   if (engine.decision_only())
-    throw RequestError(422, "this is a decision model (Clef or d1): it answers /v1/systemone and /v1/decisions, not chat");
+    throw RequestError(422, engine.chat_refusal());
 }
 
 }  // namespace
