@@ -325,8 +325,8 @@ json::Value loaded(const std::string& name, bool chat) {
 }
 
 void check_chat_model(const Engine& engine) {
-  if (engine.is_clef())
-    throw RequestError(422, "this is a Clef decision model: it answers /v1/systemone and /v1/decisions, not chat");
+  if (engine.decision_only())
+    throw RequestError(422, engine.chat_refusal());
 }
 
 }  // namespace
@@ -394,7 +394,7 @@ void install_ollama_routes(http::Server& server, Engine& engine) {
     info.set(c.arch + ".attention.head_count_kv", int64_t(I.kv_heads));
     info.set(c.arch + ".vocab_size", int64_t(I.vocab));
     json::Value caps = arr();
-    if (!engine.is_clef()) {
+    if (!engine.decision_only()) {
       caps.push_back("completion");
       if (c.tools) caps.push_back("tools");
       if (c.traits.thinking) caps.push_back("thinking");

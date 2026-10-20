@@ -7,7 +7,8 @@
 // MIT-CMU License, see THIRD_PARTY_NOTICES.md.
 
 // Pillow-exact bicubic resampling (port of Pillow 12 src/libImaging/Resample.c
-// for 8-bit RGB with Image.BICUBIC and the default box).
+// for 8-bit RGB with Image.BICUBIC and the default box), and Image.BILINEAR
+// (the same passes with Pillow's triangle filter of support 1).
 //
 // What has to match for byte-identical output:
 //   * Coefficients: precompute_coeffs in double precision with Pillow's
@@ -62,6 +63,13 @@ double bicubic_filter(double x) {
   return 0.0;
 }
 
+// Pillow's bilinear_filter.
+double bilinear_filter(double x) {
+  if (x < 0.0) x = -x;
+  if (x < 1.0) return 1.0 - x;
+  return 0.0;
+}
+
 // Fixed-point filter taps for one axis. Output i reads count[i] source
 // samples starting at start[i]; coefficients are padded with zeros to
 // `stride` (a multiple of 4) so NEON loops can run over whole vectors.
@@ -72,8 +80,8 @@ struct Kernel {
 };
 
 // precompute_coeffs + normalize_coeffs_8bpc for box [0, in_size].
-Kernel make_kernel(int in_size, int out_size) {
-  constexpr double kSupport = 2.0;  // bicubic
+Kernel make_kernel(int in_size, int out_size, bool bilinear) {
+  const double kSupport = bilinear ? 1.0 : 2.0;
   const float in0 = 0.0f, in1 = float(in_size);
   const double scale = double(in1 - in0) / out_size;
   const double filterscale = scale < 1.0 ? 1.0 : scale;
@@ -96,7 +104,8 @@ Kernel make_kernel(int in_size, int out_size) {
     xmax -= xmin;
     double ww = 0.0;
     for (int x = 0; x < xmax; x++) {
-      const double v = bicubic_filter((double(x + xmin) - center + 0.5) * ss);
+      const double t = (double(x + xmin) - center + 0.5) * ss;
+      const double v = bilinear ? bilinear_filter(t) : bicubic_filter(t);
       w[x] = v;
       ww += v;
     }
@@ -334,12 +343,12 @@ void vertical_pass(const uint8_t* src, int width, uint8_t* dst, const Kernel& ky
 #endif
 
 // ImagingResample with box = (0, 0, in.width, in.height).
-RGBImage resample(const RGBImage& in, int out_w, int out_h) {
+RGBImage resample(const RGBImage& in, int out_w, int out_h, bool bilinear) {
   const bool need_h = out_w != in.width;
   const bool need_v = out_h != in.height;
   if (!need_h && !need_v) return in;
 
-  const Kernel ky = make_kernel(in.height, out_h);
+  const Kernel ky = make_kernel(in.height, out_h, bilinear);
   // Source rows the vertical pass reads; only those get the horizontal pass.
   const int ybox_first = ky.start[0];
   const int ybox_last = ky.start[out_h - 1] + ky.count[out_h - 1];
@@ -348,7 +357,7 @@ RGBImage resample(const RGBImage& in, int out_w, int out_h) {
   const RGBImage* vsrc = &in;
   int ybase = 0;
   if (need_h) {
-    const Kernel kx = make_kernel(in.width, out_w);
+    const Kernel kx = make_kernel(in.width, out_w, bilinear);
     tmp.width = out_w;
     tmp.height = ybox_last - ybox_first;
     tmp.rgb.resize(size_t(tmp.width) * tmp.height * 3);
@@ -369,9 +378,7 @@ RGBImage resample(const RGBImage& in, int out_w, int out_h) {
   return out;
 }
 
-}  // namespace
-
-RGBImage resize_bicubic(const RGBImage& in, int width, int height) {
+RGBImage resize_with(const RGBImage& in, int width, int height, bool bilinear) {
   if (width < 1 || height < 1) throw std::invalid_argument("resize: height and width must be > 0");
   if (in.width < 1 || in.height < 1 || in.rgb.size() != size_t(in.width) * in.height * 3)
     throw std::invalid_argument("resize: malformed input image");
@@ -380,10 +387,16 @@ RGBImage resize_bicubic(const RGBImage& in, int width, int height) {
   // resized in two calls, vertical first; the second call is a plain copy
   // (crop fast path) when the width does not change.
   if (int64_t(in.height) > int64_t(in.width) * 100 && height < in.height) {
-    RGBImage mid = resample(in, in.width, height);
-    return width == in.width ? mid : resample(mid, width, height);
+    RGBImage mid = resample(in, in.width, height, bilinear);
+    return width == in.width ? mid : resample(mid, width, height, bilinear);
   }
-  return resample(in, width, height);
+  return resample(in, width, height, bilinear);
 }
+
+}  // namespace
+
+RGBImage resize_bicubic(const RGBImage& in, int width, int height) { return resize_with(in, width, height, false); }
+
+RGBImage resize_bilinear(const RGBImage& in, int width, int height) { return resize_with(in, width, height, true); }
 
 }  // namespace espetero::vision

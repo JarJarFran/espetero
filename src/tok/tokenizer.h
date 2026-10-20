@@ -18,8 +18,9 @@
 //    character and encoded as its byte token, so decode() gives it back.
 //  * decode() returns raw bytes; the reference returns a Python str where
 //    invalid UTF-8 became U+FFFD. Apply a lossy conversion when showing text.
-//  * The post-processor is ignored (for these models it adds nothing), so
-//    encode() never inserts BOS/EOS; use bos_id()/eos_id() explicitly.
+//  * The post-processor is ignored, so encode() never inserts BOS/EOS; use
+//    bos_id()/eos_id() explicitly (add_bos() says when a template processor,
+//    or tokenizer_config.json, puts BOS before raw text).
 //  * GGUF files carry token types, not the HF "special" flags: llama.cpp's
 //    converter marks tokens that look special (<|fim_prefix|>, <|repo_name|>,
 //    <|file_sep|>, ...) as control tokens, so for those is_special(), skip_special
@@ -93,7 +94,7 @@ class Tokenizer {
   std::vector<int32_t> with_bos(std::vector<int32_t> ids) const;
   const std::string& chat_template() const;            // "" if none
   std::vector<int32_t> special_ids() const;
-  std::string_view pre_tokenizer_name() const;         // "qwen35", "qwen2" or "llama3"
+  std::string_view pre_tokenizer_name() const;         // "qwen35", "qwen2", "llama3", "lfm2" or "spm"
 
   struct Impl;
 

@@ -137,8 +137,9 @@ const ChatMarkers& chat_markers(const Engine& engine);
 
 // The special tokens a chat template sees, as transformers passes its
 // special_tokens_map (bos_token, eos_token, unk_token, pad_token). Gemma 4's
-// tokenizers only (its template starts with {{ bos_token }}); null for
-// the Qwen3.5 family, whose templates render exactly as before.
+// tokenizers and LFM2's (its templates start with {{ bos_token }}); null for
+// every other family (the Qwen3.5 family, DeepSeek, ...), whose templates
+// render exactly as before.
 json::Value template_special_tokens(const Tokenizer& tok);
 
 }  // namespace espetero

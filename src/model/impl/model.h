@@ -301,6 +301,9 @@ struct Vision {
   // position table fp32 [n_pos][2][D].
   Buf ln1w, ln1b, ln2w, ln2b, ln3w, ln3b;
   std::vector<VMerger> ds;  // one per c.deepstack block
+  // SigLIP2: the position table resized to recent patch grids (gh, gw) ->
+  // fp32 [gh * gw][D], row-major (vision.h).
+  std::map<std::pair<int, int>, std::vector<float>> pos_grids;
 };
 
 struct VScratch {

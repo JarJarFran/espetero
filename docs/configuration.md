@@ -124,13 +124,14 @@ same Hugging Face cache:
 Only models Espetero runs are loaded: an MLX `config.json` whose `model_type`
 (or `text_config.model_type`) is of the Qwen3.5 family (`qwen3_5`,
 `qwen3_5_moe`, `qwen3_5_mtp`, and `_text` variants), Qwen3.8-Flash-Next
-(`qwen4_exp`) or Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`), a GGUF whose
+(`qwen4_exp`), Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`) or LFM2 (`lfm2`, `lfm2_vl`:
+an MLX conversion or the Hugging Face release itself), a GGUF whose
 `general.architecture` is `qwen35`, `qwen35moe` or `gemma4`. Any other model
 stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers
 ```
 
 Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models with their
@@ -979,6 +980,64 @@ reference's (`tests/ref/kev_fixtures.json`: 20 requests, 9 with images)
 and the answers' rounding, confidences and `output_tokens`. Known
 difference: integers beyond the int64 range in a JSON state are rendered
 as floats.
+
+### LFM2-VL and d1 decision models
+
+LiquidAI's LFM2.5-VL (`LiquidAI/LFM2.5-VL-1.6B`, `LiquidAI/LFM2.5-VL-3B`) and the
+LFM2 text models run as chat models with images; the d1 releases built on
+them (`LiquidAI/d1-3B`) are decision models. Espetero reads the Hugging Face
+release directly (bf16, served as fp16) or a conversion:
+
+```
+espetero serve --model LiquidAI/d1-3B --preset classify      # the release (bf16)
+python tools/lfm2_convert.py ~/.cache/huggingface/hub/models--LiquidAI--d1-3B/snapshots/<rev> \
+    ~/models/lfm2/d1-3B-8bit --bits 8   # MLX names, 8-bit (or 4-bit) decoder matrices; no --bits: bf16
+espetero serve --model ~/models/lfm2/d1-3B-8bit --preset classify
+```
+
+The decoder's gated short-convolution layers keep their window of the last
+two rows in the sequence slot (copied on forks, like the Qwen3.5 DeltaNet
+state), its attention layers use the paged KV pool; a slot's state is 0.6 MB
+and a token's K/V 12 KB for the 3B. There is no MTP head: drafts come from
+prompt lookup only. Images go through the release's own processor
+(`processor_config.json`): an image larger than 2 x 256 image tokens is
+resized to a grid of 512 x 512 tiles (2 to 10 of them, the grid closest to its
+aspect ratio) plus a thumbnail, each view becomes 64 to 256 image tokens
+(SigLIP2 patches of 16 pixels, 2 x 2 unshuffled), and the placeholder becomes
+`<|image_start|>`, `<|img_row_R_col_C|>` and each tile's tokens,
+`<|img_thumbnail|>` and its tokens, `<|image_end|>`. A 640 x 480 picture is 236
+tokens, a 1600 x 400 one 4 tiles + thumbnail, 1,287 tokens. The chat image
+budget (the ~1 MP default, `image_detail`) does not apply: the processor's
+layout is the model's. Images are resized with
+Pillow's bicubic or bilinear filter (the release's `resample` 3 or 2, byte for
+byte); transformers' torchvision backend agrees with Pillow on uint8 images to
+one level. Tool
+calls (`<|tool_call_start|>[name(args)]<|tool_call_end|>`) come back as text:
+`tool_choice` `required` or a named function gets a 422.
+
+A directory whose `config.json` names `modeling_d1.D1Model` in its `auto_map`
+is served as a d1 model: `POST /v1/systemone` (and `/v1/decisions`) take the
+release's System One body — `state` (a string, any JSON value, or `null` when
+the images are the whole state), `questions` (`{name: {type, instructions,
+criteria}}`: `noul` with optional `{"true": ..., "false": ...}`, `choice` with
+`{option: description}`, `score` with a list of levels, lowest first), optional
+`images` (up to 16 data URLs), `return_logits` — and return `answers` as the
+release's `system_one()` does (`noul`: P(yes); `choice`: the option, its
+`confidence` and `probabilities`; `score`: the expected level, `confidence`,
+`probabilities` and `legend`) with `usage.input_tokens`; the chat endpoints
+answer 422. The prompt is token-identical to the release's builder (no
+system turn; the images' placeholders at the head of the user turn; the
+state as written, or `json.dumps(state, ensure_ascii=False, indent=2)`, then
+`QUESTION:`; per question its instructions, options with single-token codes and
+the reply instruction, then the assistant header): a request with one question
+is one sequence, one with several shares its state (and images) as the root of
+a tree whose leaves are the questions. Each option scores the best logit of
+its tokens (choice: the code and " code"; noul: yes, Yes, YES against no, No,
+NO; score: the digits) at the answer slot, and the scores are soft-maxed;
+nothing is generated. Pictures are first bounded at 1024 x 1024 pixels
+(Pillow bicubic), as the release does. On an M1 Max the 3B answers a
+one-question text request in ~50 ms and a 640 x 480 picture in ~0.3 s; three
+questions over one state cost little more than one.
 
 ### Limits for untrusted clients
 

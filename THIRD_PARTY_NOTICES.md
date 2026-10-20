@@ -23,6 +23,8 @@ uses only Apple's system frameworks.
 | Cloudflare Clef, Clef-Omni (`joint_schema_model.py`) | `src/engine/clef.h`, `src/engine/clef.cpp`, `src/engine/engine.cpp` (Clef-Omni's media limits), `tests/ref/clef_omni_ref.py` | Apache-2.0 |
 | Hugging Face transformers (Qwen2-VL `smart_resize`, Gemma 4 `get_aspect_ratio_preserving_size`) | `src/vision/processor.cpp` | Apache-2.0 |
 | Hugging Face transformers (Qwen3-Omni thinker semantics: `models/qwen3_omni_moe`) | `src/model/impl/qwen3_omni.h`, `src/model/impl/qwen3_omni_load.h`, `kernels/82_qwen3_omni.metal`, the DeepStack mergers in `src/model/impl/vision.h` and `src/model/impl/load.h`, `tools/clef_convert.py`, `tests/ref/clef_omni_ref.py` | Apache-2.0 |
+| Hugging Face transformers (LFM2, LFM2-VL and SigLIP2 model semantics; the LFM2-VL processor's geometry and token runs) | `src/model/impl/lfm2.h`, `src/model/impl/lfm2_load.h`, `src/model/impl/config.h` (`config_from_lfm2`, `vision_from_lfm2`), `src/model/impl/vision.h` (SigLIP2 position table), `kernels/90_lfm2.metal`, `src/vision/lfm2.cpp`, `tests/ref/lfm2_ref.py` | Apache-2.0 |
+| LiquidAI d1 (`prompt.py`, `api.py`: the System One prompt, option codes, readout and answer format) | `src/engine/d1.h`, `src/engine/d1.cpp`, `tests/ref/lfm2_ref.py` | LFM Open License v1.0 |
 | Unicode Character Database 15.1 | `src/tok/unicode_data.h`, `src/tmpl/unicode_data.inc` | Unicode-3.0 |
 | mlx-lm 0.32 (Gemma 4 model semantics: `models/gemma4_text.py`, `models/rope_utils.py`) | `src/model/impl/gemma.h`, `src/model/impl/gemma_load.h`, `src/model/impl/config.h` (`config_from_gemma`), `kernels/80_gemma.metal` | MIT |
 | Hugging Face transformers 5.17 (Gemma 4 unified semantics: `models/gemma4_unified/modeling_gemma4_unified.py`, `image_processing_gemma4_unified.py`, `configuration_gemma4_unified.py`) | `src/model/impl/gemma_vision.h` (unified), `src/model/impl/gemma_load.h` (`load_gemma_unified_vision`), `src/model/impl/config.h` (`vision_from_gemma_unified`, `per_layer_config`), `kernels/85_gemma_vision.metal` (`g4u_embed_norm`), `tools/gemma4_unified_convert.py` | Apache-2.0 |
@@ -334,6 +336,40 @@ transformers or mlx-vlm source is copied.
 ```text
 Copyright 2025 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 ```
+
+The LFM2 decoder (`src/model/impl/lfm2.h`, `src/model/impl/lfm2_load.h`,
+`kernels/90_lfm2.metal`, `config_from_lfm2` in `src/model/impl/config.h`)
+follows the semantics of transformers' `models/lfm2/modeling_lfm2.py`
+(gated short convolution `C * conv(B * x)`, per-head q/k RMSNorms, RoPE over
+the whole head, the MLP sizing rule), the vision path (`vision_from_lfm2`,
+`load_lfm2_vision`, the SigLIP2 branch of `src/model/impl/vision.h`) that of
+`models/siglip2/modeling_siglip2.py` (the position table resized with
+antialiased bilinear interpolation, `resize_positional_embeddings`) and
+`models/lfm2_vl/modeling_lfm2_vl.py` (pixel unshuffle, projector), and
+`src/vision/lfm2.cpp` translates the geometry of
+`models/lfm2_vl/image_processing_lfm2_vl.py` (`smart_resize`,
+`_is_image_too_large`, `find_closest_aspect_ratio` over `_target_ratios`,
+`crop_image_to_patches`) and the token runs of `processing_lfm2_vl.py`
+(`_build_image_tokens`). The antialiased weights of the position table follow
+Pillow's `precompute_coeffs` as torch evaluates them in float. Licensed under
+the Apache License 2.0 ([third_party/apache-2.0/LICENSE-2.0.txt](third_party/apache-2.0/LICENSE-2.0.txt)):
+
+```text
+Copyright 2025 the HuggingFace Inc. team. All rights reserved.
+```
+
+## LiquidAI d1
+
+`src/engine/d1.h` and `src/engine/d1.cpp` reproduce the System One prompt and
+readout of LiquidAI's d1 releases (https://huggingface.co/LiquidAI/d1-3B,
+revision 051bcc4: `prompt.py` and `api.py`): the user turn with the images'
+placeholders and the state (`json_only` style, no system turn), the question
+blocks and their reply instructions, the option codes and their fallback
+pool, the max-pooled option tokens and the answer objects; `tests/ref/lfm2_ref.py`
+re-implements the same rules in Python as the parity reference. The release
+is licensed under the LFM Open License v1.0 (Liquid AI, Inc.), whose
+commercial-use grant is limited to entities below an annual revenue
+threshold; the model files themselves are not redistributed here.
 
 ## Unicode Character Database
 

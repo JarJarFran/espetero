@@ -26,6 +26,7 @@
 #include "../util/paths.h"
 #include "../vision/vision.h"
 #include "clef.h"
+#include "d1.h"
 #include "decisions.h"
 #include "grammar.h"
 #include "hidden_head.h"
@@ -337,15 +338,41 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
   for (const int id : I.end_ids)  // Gemma 4: the config's end-of-turn ids, e.g. <turn|>
     if (id >= 0 && std::find(end_ids.begin(), end_ids.end(), id) == end_ids.end()) end_ids.push_back(id);
   if (I.vision && I.vision_layout == "deepseek") {  // one placeholder per image; no start / end tokens of its own
-    image_token = I.image_token_id;
+    image_token = run_start = I.image_token_id;
     if (image_token < 0) throw std::runtime_error("vision model without an image token id");
+  } else if (I.vision && I.family == "lfm2") {
+    // LFM2-VL: the template writes <image>; the processor's run is
+    // <|image_start|> (tile markers and image tokens) <|image_end|>.
+    image_token = tok_->token_id("<image>");
+    vision_start = run_start = tok_->token_id("<|image_start|>");
+    vision_end = tok_->token_id("<|image_end|>");
+    if (image_token < 0 || vision_start < 0 || vision_end < 0)
+      throw std::runtime_error("LFM2-VL model without image tokens in its vocabulary");
+    lfm2_spec_ = std::make_unique<vision::Lfm2Spec>(vision::lfm2_spec_from_model_dir(path));
+    vision::Lfm2Spec& ls = *lfm2_spec_;
+    ls.image_id = image_token;
+    ls.start_id = vision_start;
+    ls.end_id = vision_end;
+    ls.thumb_id = tok_->token_id("<|img_thumbnail|>");
+    for (int r = 1; r <= 10; ++r)
+      for (int c = 1; c <= 10; ++c)
+        ls.grid_ids[size_t((r - 1) * 10 + c - 1)] = tok_->token_id("<|img_row_" + std::to_string(r) + "_col_" + std::to_string(c) + "|>");
+    if (ls.thumb_id < 0 || ls.grid_ids[size_t((ls.max_tiles - 1) * 10)] < 0)
+      throw std::runtime_error("LFM2-VL model without its tile tokens in its vocabulary");
   } else if (I.vision) {
     const bool g4 = I.family == "gemma4";
-    image_token = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
+    image_token = run_start = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
     vision_start = tok_->token_id(g4 ? "<|image>" : "<|vision_start|>");
     vision_end = tok_->token_id(g4 ? "<image|>" : "<|vision_end|>");
     if (image_token < 0 || vision_start < 0 || vision_end < 0)
       throw std::runtime_error("vision model without image tokens in its vocabulary");
+  }
+  // d1 releases: System One decisions from the LM head (d1.h).
+  if (is_dir(path) && d1::is_release(path)) {
+    if (I.family != "lfm2") throw std::runtime_error("d1 decision models need an LFM2 backbone");
+    std::string bos;
+    if (tok_->bos_id() >= 0) bos = std::string(tok_->token_text(tok_->bos_id()));
+    d1_ = std::make_unique<d1::Release>(*tok_, bos);
   }
 
   // Clef releases: a joint schema head next to the backbone answers
@@ -414,16 +441,17 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
 
   // Decisions: labels, the prompt builder and the shared header checkpoint
   // (not for a decision-only model: they read the LM head).
-  if (template_ && I.leaves && !clef_ && generates()) {
+  if (template_ && I.leaves && !clef_ && !d1_ && generates()) {
     dp_ = std::make_unique<DecisionPrompts>();
     dp_->labels = make_labels(*tok_);
     // The image's place in the prompt as the template writes it (Gemma 4: the
     // <|image|> placeholder alone, expand_images adds its <|image> / <image|>;
-    // DeepSeek: one placeholder of its own).
+    // DeepSeek: one placeholder of its own; LFM2-VL: the placeholder alone,
+    // its run brings the start and end tokens).
     const std::string image_block =
         !I.vision ? ""
-        : gemma_vision() || vision_start < 0 ? tok_->decode(std::vector<int32_t>{image_token})
-                                             : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
+        : gemma_vision() || vision_start < 0 || lfm2_spec_ ? tok_->decode(std::vector<int32_t>{image_token})
+                                                           : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
     if (!header_.empty()) {
@@ -744,10 +772,14 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
     check_image_rows(n, I.max_rows);
     return n;
   }
-  const vision::Spec spec = image_spec(max_pixels, min_pixels);
   int n = 0;
   try {
-    n = vision::image_tokens(vision::grid_for(int(h), int(w), spec), spec.merge);
+    if (lfm2_spec_) {  // LFM2-VL: its own layout, no pixel budget
+      n = int(vision::lfm2_run(vision::lfm2_layout(int(h), int(w), *lfm2_spec_), *lfm2_spec_).size());
+    } else {
+      const vision::Spec spec = image_spec(max_pixels, min_pixels);
+      n = vision::image_tokens(vision::grid_for(int(h), int(w), spec), spec.merge);
+    }
   } catch (const std::exception& e) {
     throw RequestError(422, std::string("image: ") + e.what());
   }
@@ -770,6 +802,11 @@ size_t Engine::expanded_length(const std::vector<int32_t>& ids, const std::vecto
 }
 
 PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pixels, int64_t min_pixels) const {
+  return prepare_image_capped(data_url, max_pixels, min_pixels, 0);
+}
+
+PreparedImage Engine::prepare_image_capped(const std::string& data_url, int64_t max_pixels, int64_t min_pixels,
+                                           int64_t max_pixels_lfm2) const {
   if (!has_vision()) throw RequestError(422, "This model has no vision tower; images are not supported");
   std::string bytes, err;
   if (!vision::decode_data_url(data_url, bytes, err)) throw RequestError(422, "image: " + err);
@@ -792,6 +829,7 @@ PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pix
     check_image_rows(out.ntok, I.max_rows);
     return out;
   }
+  if (lfm2_spec_) return prepare_lfm2_image(rgb, max_pixels_lfm2);
   vision::Spec spec = image_spec(max_pixels, min_pixels);
   // Normalization from the processor config when the checkpoint has one
   // (Gemma 4 rescales only).
@@ -828,6 +866,31 @@ PreparedImage Engine::prepare_image(const std::string& data_url, int64_t max_pix
   return out;
 }
 
+PreparedImage Engine::prepare_lfm2_image(const vision::RGBImage& rgb, int64_t max_pixels) const {
+  vision::Lfm2Prepared p;
+  try {
+    if (max_pixels > 0 && int64_t(rgb.width) * rgb.height > max_pixels) {
+      // d1's cap_pixels: Pillow bicubic to max(1, int(side * sqrt(max / (w * h)))).
+      const double scale = std::sqrt(double(max_pixels) / (double(rgb.width) * double(rgb.height)));
+      const int w = std::max(1, int(double(rgb.width) * scale)), h = std::max(1, int(double(rgb.height) * scale));
+      p = vision::lfm2_preprocess(vision::resize_bicubic(rgb, w, h), *lfm2_spec_);
+    } else {
+      p = vision::lfm2_preprocess(rgb, *lfm2_spec_);
+    }
+  } catch (const std::exception& e) {
+    throw RequestError(422, std::string("image: ") + e.what());
+  }
+  PreparedImage out;
+  out.pixels = std::move(p.pixels);
+  out.run = std::move(p.run);
+  for (const auto& v : p.views) out.views.push_back({v.gh, v.gw, v.offset, v.token});
+  out.grid_h = out.views.empty() ? 0 : out.views.back().grid_h;
+  out.grid_w = out.views.empty() ? 0 : out.views.back().grid_w;
+  out.digest = hex(p.digest.data(), p.digest.size());
+  check_image_rows(out.tokens(0), model_->info().max_rows);
+  return out;
+}
+
 std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const {
   std::vector<int32_t> out;
   size_t g = 0;
@@ -835,9 +898,13 @@ std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, cons
   for (int32_t t : ids) {
     if (t == image_token && image_token >= 0) {
       if (g >= images.size()) throw RequestError(422, "more image placeholders than images");
-      if (image_wrap()) out.push_back(vision_start);
-      out.insert(out.end(), size_t(images[g].tokens(merge)), t);
-      if (image_wrap()) out.push_back(vision_end);
+      if (!images[g].run.empty()) {  // LFM2-VL: the processor's run, markers included
+        out.insert(out.end(), images[g].run.begin(), images[g].run.end());
+      } else {
+        if (image_wrap()) out.push_back(vision_start);
+        out.insert(out.end(), size_t(images[g].tokens(merge)), t);
+        if (image_wrap()) out.push_back(vision_end);
+      }
       ++g;
     } else {
       out.push_back(t);
@@ -854,6 +921,11 @@ std::vector<int32_t> Engine::mrope_positions(const std::vector<int32_t>& ids, co
     return {};
   }
   std::vector<int32_t> pos(ids.size() * 3);
+  if (lfm2_spec_) {  // LFM2-VL: plain positions, image runs included
+    for (size_t i = 0; i < ids.size(); ++i) pos[3 * i] = pos[3 * i + 1] = pos[3 * i + 2] = int32_t(i);
+    if (next_pos) *next_pos = int(ids.size());
+    return pos;
+  }
   const int merge = model_->info().vision_merge;
   int nxt = 0;
   size_t i = 0, g = 0;
@@ -1046,6 +1118,7 @@ int Engine::answer_reserve(int remaining) const {
 // ---------------------------------------------------------------- decisions
 json::Value Engine::decide(const json::Value& body) {
   if (clef_) return clef_decide(body);
+  if (d1_) return d1_decide(body);
   if (kev_)
     throw RequestError(422, "this is a Kev decision model: it answers the SystemOne body (state, questions) at /v1/systemone");
   if (!generates())  // decisions read label logits from the LM head
@@ -1211,6 +1284,7 @@ json::Value Engine::decide(const json::Value& body) {
 json::Value Engine::systemone(const json::Value& body) {
   if (kev_) return kev_systemone(body);
   const auto started = Clock::now();
+  if (d1_) return d1_systemone(body);
   if (!clef_)
     throw RequestError(422, "this model has no Clef joint head (joint_head.safetensors); /v1/systemone serves Clef releases");
   if (!body.is_object()) throw RequestError(422, "request body must be a JSON object");
@@ -2041,7 +2115,7 @@ void Engine::loop() {
     {
       std::unique_lock<std::mutex> lk(mu_);
       cv_.wait(lk, [&] {
-        return stop_ || clear_requested_ || !decisions_.empty() || !clef_jobs_.empty() || !kev_jobs_.empty() ||
+        return stop_ || clear_requested_ || !decisions_.empty() || !clef_jobs_.empty() || !kev_jobs_.empty() || !d1_jobs_.empty() ||
                !waiting_.empty() || !active_.empty() || !embed_jobs_.empty();
       });
       if (stop_) break;
@@ -2073,6 +2147,7 @@ void Engine::loop() {
     j->cv.notify_all();
   }
   clef_jobs_.clear();
+  d1_fail_all(msg);
   for (auto& s : waiting_) {
     s->out->completion_tokens = s->generated;
     s->out->finish("error", msg);
@@ -2408,6 +2483,9 @@ void Engine::step() {
       it = cache_.erase(it);
     }
   }
+  // ---- d1 requests: one at a time, alone in their passes (d1 models
+  // serve nothing else).
+  if (d1_ && d1_step()) return;
   // ---- Clef requests and hidden-state head requests: one at a time, alone
   // in their passes (Clef models serve nothing else). The head runs on the
   // caller's thread.
@@ -3045,7 +3123,7 @@ void Engine::step() {
     bool use = !j.req.has_salt && !header_.empty() && p.prefix.size() >= header_.size() &&
                std::equal(header_.begin(), header_.end(), p.prefix.begin());
     if (use && !j.images.empty()) {
-      const auto first = std::find(p.prefix.begin(), p.prefix.end(), image_token);
+      const auto first = std::find(p.prefix.begin(), p.prefix.end(), run_start);
       use = size_t(first - p.prefix.begin()) >= header_.size();
     }
     return use;
@@ -3264,15 +3342,9 @@ void Engine::step() {
         int g = 0;
         j->irefs.clear();
         for (size_t i = 0; i < j->root.size();) {
-          if (j->root[i] == image_token) {
+          if (j->root[i] == run_start) {
             const PreparedImage& im = j->images[size_t(g++)];
-            ImageRef ref;
-            ref.pixels = im.pixels.data();
-            ref.grid_t = im.grid_t;
-            ref.grid_h = im.grid_h;
-            ref.grid_w = im.grid_w;
-            ref.row = int(i);
-            j->irefs.push_back(ref);
+            im.refs(int(i), j->irefs);
             i += size_t(im.tokens(I.vision_merge));
           } else {
             ++i;
@@ -3412,14 +3484,7 @@ void Engine::step() {
       for (size_t g = 0; g < s->req.image_rows.size(); ++g) {
         const int r0 = s->req.image_rows[g];
         if (r0 < s->done || r0 >= end) continue;
-        const PreparedImage& im = s->req.images[g];
-        ImageRef ref;
-        ref.pixels = im.pixels.data();
-        ref.grid_t = im.grid_t;
-        ref.grid_h = im.grid_h;
-        ref.grid_w = im.grid_w;
-        ref.row = r0 - s->done;
-        s->irefs.push_back(ref);
+        s->req.images[g].refs(r0 - s->done, s->irefs);
       }
       t.images = s->irefs.data();
       t.n_images = int(s->irefs.size());

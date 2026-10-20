@@ -122,6 +122,8 @@ static void test_family() {
   CHECK(error_of(dir_with("ok_moe_text", "{\"text_config\": {\"model_type\": \"qwen3_5_moe_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_q4_text", "{\"model_type\": \"qwen4_exp\", \"text_config\": {\"model_type\": \"qwen4_exp_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_gemma", "{\"model_type\": \"gemma4\", \"text_config\": {\"model_type\": \"gemma4_text\"}}")).empty());
+  CHECK(error_of(dir_with("ok_lfm2_vl", "{\"model_type\": \"lfm2_vl\", \"text_config\": {\"model_type\": \"lfm2\"}}")).empty());
+  CHECK(error_of(dir_with("ok_lfm2", "{\"model_type\": \"lfm2\"}")).empty());
   // A finetune wrapper whose text model is of the family, and a config without any model_type: left to the loader.
   CHECK(error_of(dir_with("ok_wrapper", "{\"model_type\": \"ornith\", \"text_config\": {\"model_type\": \"qwen3_5_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_untyped", "{\"hidden_size\": 1024}")).empty());
@@ -131,8 +133,8 @@ static void test_family() {
   const std::string e = error_of(llama);
   CHECK(contains(e, llama + ": model_type 'llama4' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family (qwen3_5, "
                             "qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), "
-                            "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B) and Cloudflare Clef "
-                            "classifiers"));
+                            "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL "
+                            "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers"));
   // Other Gemma generations are not Gemma 4.
   CHECK(contains(error_of(dir_with("no_gemma3", "{\"model_type\": \"gemma3\"}")), "model_type 'gemma3' is not supported"));
   for (const char* t : {"qwen3", "qwen3_vl", "qwen3_moe", "llama", "qwen2_5_vl"})

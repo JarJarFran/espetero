@@ -255,9 +255,10 @@ int main(int argc, char** argv) {
     const espetero::Tokenizer& T = *loaded[ti];
     // BOS before raw text as llama.cpp does it: Gemma's GGUF says so
     // (tokenizer.ggml.add_bos_token) and its tokenizer.json is SentencePiece;
-    // Qwen's files never ask for it.
+    // LFM2.5-VL-1.6B's post-processor template starts with it; Qwen's files
+    // never ask for it.
     {
-      const bool want = R.name.find("gemma") != std::string::npos;
+      const bool want = R.name.find("gemma") != std::string::npos || R.name == "lfm2-1.6b";
       const std::vector<int32_t> ids = T.with_bos(T.encode("x"));
       const bool ok = T.add_bos() == want && (ids.front() == T.bos_id()) == want;
       std::printf("%-13s add_bos %s%s\n", name, T.add_bos() ? "yes" : "no", ok ? "" : " (WRONG)");

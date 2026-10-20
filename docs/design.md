@@ -80,7 +80,15 @@ of blocks 8, 16 and 24) to the image rows after the first three layers. Its
 layers reuse Gemma 4's forest attention kernels instantiated for 128-dim heads
 (q pre-scaled by 1/sqrt(128), no window), `g4_route` with unit expert scales
 and the grouped MoE GEMVs (`src/model/impl/qwen3_omni.h`,
-`kernels/82_qwen3_omni.metal`).
+`kernels/82_qwen3_omni.metal`); and **LFM2 / LFM2-VL** (`lfm2`, `lfm2_vl`:
+LiquidAI's LFM2.5-VL and the d1 decision models built on it) from MLX or the
+Hugging Face release itself: gated short-convolution layers whose 3-tap
+window is slot state like the DeltaNet conv windows (the same tap tables and
+state pool, copied on forks), GQA attention layers with 64-dim heads on the
+paged pool (`src/model/impl/lfm2.h`, `kernels/90_lfm2.metal`), and the SigLIP2
+NaFlex tower run by the Qwen-VL tower's code (position table resized per
+patch grid on the host, no rotary, the 2x2 unshuffle and projector as the
+merger), one tower input per tile of the LFM2-VL processor.
 
 ## Layers
 
@@ -88,14 +96,14 @@ and the grouped MoE GEMVs (`src/model/impl/qwen3_omni.h`,
 src/util/json.*        JSON values, parser, Python-exact json.dumps
 src/tok/               byte-level BPE tokenizer (HF tokenizer.json or GGUF vocab), token-identical to HF
 src/tmpl/              Jinja2 interpreter for the model's own chat_template.jinja
-src/vision/            image decode (ImageIO), Pillow-exact bicubic, Qwen-VL and Gemma 4 patches, M-RoPE
+src/vision/            image decode (ImageIO), Pillow-exact bicubic, Qwen-VL and Gemma 4 patches, M-RoPE, LFM2-VL tiles
 src/http/              HTTP/1.1 server with SSE streaming
 src/model/api.h        pure C++ interface of the native model (forests, slots, drafts)
 src/model/model.mm     the only Objective-C++ translation unit: Metal runtime + model
 src/model/impl/        runtime, weight readers (MLX safetensors, GGUF), matrix layouts,
                        GEMM dispatch + autotune, config, loader, vision tower, forest pass
 kernels/*.metal        Metal kernels, embedded at build time, compiled by the driver at load
-src/engine/            scheduler (engine.cpp), sampling, decisions, chat, batch API
+src/engine/            scheduler (engine.cpp), sampling, decisions (JEV, Clef heads, d1), chat, batch API
 src/server/            routes and the `espetero` CLI
 tools/bench_compare.py the README's speed comparison against other servers
 docs/                  this file; configuration.md; kernel-guidelines.md; moe.md;

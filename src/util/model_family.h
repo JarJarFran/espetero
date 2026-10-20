@@ -9,8 +9,9 @@
 //   Qwen3.5, Qwen3.6, Qwen3.8, their finetunes and Clef backbones),
 //   Qwen3.8-Flash-Next (qwen4_exp, qwen4_exp_text; qwen4_exp_mtp drafters),
 //   Gemma 4 (gemma4, gemma4_text: 31B and 26B-A4B; gemma4_unified,
-//   gemma4_unified_text: the 12B with the encoder-free vision embedder) and the
-//   Qwen3-Omni thinker (qwen3_omni_moe, converted by tools/clef_convert.py: Clef-Omni).
+//   gemma4_unified_text: the 12B with the encoder-free vision embedder), the
+//   Qwen3-Omni thinker (qwen3_omni_moe, converted by tools/clef_convert.py: Clef-Omni)
+//   and LFM2 (lfm2, lfm2_vl: LFM2.5-VL and the d1 decision models).
 //   GGUF general.architecture: qwen35, qwen35moe, gemma4.
 #pragma once
 
@@ -24,7 +25,8 @@ namespace espetero::family {
 
 inline bool mlx_type_supported(std::string_view t) {
   return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text" ||
-         t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41";
+         t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41" ||
+         t == "lfm2" || t == "lfm2_vl";
 }
 
 inline bool gguf_arch_supported(std::string_view a) {
@@ -34,15 +36,15 @@ inline bool gguf_arch_supported(std::string_view a) {
 inline std::string unsupported_mlx(const std::string& path, const std::string& model_type) {
   return path + ": model_type '" + model_type + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
-         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B) "
-         "and Cloudflare Clef classifiers";
+         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL "
+         "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers";
 }
 
 inline std::string unsupported_gguf(const std::string& path, const std::string& arch) {
   return path + ": GGUF architecture '" + arch + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen35, qwen35moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
          "Ornith 1.5), Qwen3.8-Flash-Next (qwen4exp; MLX: qwen4_exp) and Gemma 4 (gemma4: 31B, 26B-A4B, 12B); "
-         "Cloudflare Clef classifiers run from MLX directories";
+         "LFM2 / LFM2-VL (lfm2, lfm2_vl) and Cloudflare Clef classifiers run from MLX directories";
 }
 
 // The message for an MLX config.json of another family, "" when supported.

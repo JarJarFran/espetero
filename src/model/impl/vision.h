@@ -3,6 +3,11 @@
 
 // Qwen3-VL vision tower: host-side patch metadata and the GPU encode (patch
 // embedding, interpolated position embedding, 2D-rotary blocks, 2x2 merger).
+// LFM2-VL's SigLIP2 NaFlex tower runs on the same structures: patch rows
+// (py, px, channel) of one temporal patch, the learned position table resized
+// to each image's patch grid on the host (torch's antialiased bilinear
+// interpolation, siglip2's resize_positional_embeddings), no rotary (zero
+// frequencies), and the 2x2 pixel unshuffle + projector as the merger.
 #pragma once
 
 #include "../api.h"
@@ -60,6 +65,90 @@ inline void ensure_vscratch(Model& m, int rows) {
   v.rows = R;
 }
 
+// torch's antialiased separable weights for one axis (bilinear,
+// _compute_indices_min_size_weights_aa of aten's UpSampleKernel.cpp with the
+// same float / double steps): output i reads inputs [x0, x0 + w.size()).
+struct AaTaps {
+  int x0 = 0;
+  std::vector<float> w;
+};
+inline std::vector<AaTaps> aa_bilinear_taps(int n_in, int n_out) {
+  const float scale = float(n_in) / float(n_out);
+  const float support = scale >= 1.0f ? float(1.0 * double(scale)) : 1.0f;
+  const float invscale = scale >= 1.0f ? float(1.0 / double(scale)) : 1.0f;
+  const int max_taps = int(std::ceil(double(support))) * 2 + 1;
+  std::vector<AaTaps> out(static_cast<size_t>(n_out));
+  for (int i = 0; i < n_out; ++i) {
+    const float center = float(double(scale) * (double(i) + 0.5));
+    const int64_t xmin = std::max<int64_t>(int64_t(double(center - support) + 0.5), 0);
+    int64_t xsize = std::min<int64_t>(int64_t(double(center + support) + 0.5), n_in) - xmin;
+    xsize = std::clamp<int64_t>(xsize, 0, max_taps);
+    AaTaps& t = out[size_t(i)];
+    t.x0 = int(xmin);
+    float total = 0.0f;
+    for (int64_t j = 0; j < xsize; ++j) {
+      float x = float((double(float(j + xmin) - center) + 0.5) * double(invscale));
+      x = std::fabs(x);
+      const float w = x < 1.0f ? float(1.0 - double(x)) : 0.0f;
+      t.w.push_back(w);
+      total += w;
+    }
+    if (total != 0.0f)
+      for (float& w : t.w) w /= total;
+  }
+  return out;
+}
+
+// SigLIP2: the position table [side][side][D] resized to (gh, gw) as
+// F.interpolate(..., mode="bilinear", align_corners=False, antialias=True)
+// does it in fp32 (the width first, then the height), row-major [gh * gw][D];
+// kept for the 8 most recent grids.
+inline const std::vector<float>& siglip_pos(Model& m, int gh, int gw) {
+  auto& cache = m.vis.pos_grids;
+  if (auto it = cache.find({gh, gw}); it != cache.end()) return it->second;
+  if (cache.size() >= 8) cache.clear();
+  const int side = m.vis.c.side, D = m.vis.c.D;
+  const float* tab = static_cast<const float*>(ptr(m.vis.pos));
+  std::vector<float> wide;  // [side][gw][D]
+  if (gw != side) {
+    const std::vector<AaTaps> tx = aa_bilinear_taps(side, gw);
+    wide.assign(size_t(side) * size_t(gw) * size_t(D), 0.0f);
+    parallel_for(size_t(side), [&](size_t a) {
+      for (int j = 0; j < gw; ++j) {
+        const AaTaps& t = tx[size_t(j)];
+        float* o = &wide[(a * size_t(gw) + size_t(j)) * size_t(D)];
+        for (int d = 0; d < D; ++d) {
+          float acc = tab[(a * size_t(side) + size_t(t.x0)) * size_t(D) + size_t(d)] * t.w[0];
+          for (size_t k = 1; k < t.w.size(); ++k) acc += tab[(a * size_t(side) + size_t(t.x0) + k) * size_t(D) + size_t(d)] * t.w[k];
+          o[d] = acc;
+        }
+      }
+    });
+  } else {
+    wide.assign(tab, tab + size_t(side) * size_t(side) * size_t(D));
+  }
+  std::vector<float> out;
+  if (gh != side) {
+    const std::vector<AaTaps> ty = aa_bilinear_taps(side, gh);
+    out.assign(size_t(gh) * size_t(gw) * size_t(D), 0.0f);
+    parallel_for(size_t(gh), [&](size_t i) {
+      const AaTaps& t = ty[i];
+      for (int j = 0; j < gw; ++j) {
+        float* o = &out[(i * size_t(gw) + size_t(j)) * size_t(D)];
+        for (int d = 0; d < D; ++d) {
+          float acc = wide[(size_t(t.x0) * size_t(gw) + size_t(j)) * size_t(D) + size_t(d)] * t.w[0];
+          for (size_t k = 1; k < t.w.size(); ++k)
+            acc += wide[((size_t(t.x0) + k) * size_t(gw) + size_t(j)) * size_t(D) + size_t(d)] * t.w[k];
+          o[d] = acc;
+        }
+      }
+    });
+  } else {
+    out = std::move(wide);
+  }
+  return cache.emplace(std::make_pair(gh, gw), std::move(out)).first->second;
+}
+
 // One image of a pass: its patch rows in the vision batch, its merged tokens
 // in the tower's output and the decoder rows they replace.
 struct ImageJob {
@@ -71,6 +160,12 @@ struct ImageJob {
 // Per-patch metadata in the processor's merge-window order: bilinear taps of
 // the learned position table (weights rounded to bf16 like the reference),
 // 2D rotary coordinates and the image segment; pixels -> fp16.
+//
+// SigLIP2 (c.siglip): the processor's patch rows are row-major; they take
+// the merge-window order here (patch (2 bh + mh, 2 bw + mw) at row
+// ((bh * gw / 2 + bw) * 2 + mh) * 2 + mw), so the merged rows are the
+// projector's 2x2 unshuffle; each row's resized position embedding goes into
+// the tower's input rows, which the patch embedding then adds to.
 inline void prepare_images(Model& m, const std::vector<ImageJob>& jobs) {
   const VisionConfig& c = m.vis.c;
   VScratch& v = m.vs;
@@ -81,6 +176,32 @@ inline void prepare_images(Model& m, const std::vector<ImageJob>& jobs) {
   int32_t* seg = static_cast<int32_t*>([v.seg contents]);
   int32_t* dst = static_cast<int32_t*>([v.dst_rows contents]);
   __fp16* pix = static_cast<__fp16*>([v.pix contents]);
+  if (c.siglip) {
+    float* X = static_cast<float*>([v.x contents]);
+    const int D = c.D;
+    for (const ImageJob& J : jobs) {
+      const int gh = J.im->grid_h, gw = J.im->grid_w;
+      const std::vector<float>& pos = siglip_pos(m, gh, gw);
+      const float* src = J.im->pixels;
+      const int p0 = J.patch0;
+      parallel_for(size_t(J.n_patch), [&](size_t q) {
+        const int r = int(q), mw = r % 2, mh = (r / 2) % 2, b = r / 4, bw = b % (gw / 2), bh = b / (gw / 2);
+        const int i = bh * 2 + mh, j = bw * 2 + mw, sq = i * gw + j;
+        const int row = p0 + r;
+        std::memcpy(X + size_t(row) * size_t(D), pos.data() + size_t(sq) * size_t(D), size_t(D) * 4);
+        __fp16* d = pix + size_t(row) * size_t(kp);
+        const float* sp = src + size_t(sq) * size_t(pd);
+        for (int e = 0; e < pd; ++e) d[e] = __fp16(sp[e]);
+        for (int e = pd; e < kp; ++e) d[e] = __fp16(0.0f);
+        hw[row * 2 + 0] = i;
+        hw[row * 2 + 1] = j;
+        seg[row * 2 + 0] = p0;
+        seg[row * 2 + 1] = p0 + J.n_patch;
+      });
+      for (int k = 0; k < J.n_patch / 4; ++k) dst[J.patch0 / 4 + k] = J.dst_row0 + k;
+    }
+    return;
+  }
   const int side = c.side;
   for (const ImageJob& J : jobs) {
     const int gt = J.im->grid_t, gh = J.im->grid_h, gw = J.im->grid_w;
@@ -129,17 +250,21 @@ inline void prepare_images(Model& m, const std::vector<ImageJob>& jobs) {
 inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
   const VisionConfig& c = m.vis.c;
   VScratch& v = m.vs;
-  const int D = c.D, Dm = 4 * c.D;
-  gemm_h(E, m.vis.patch, v.pix, 0, m.vis.patch.kp, v.x, 0, D, P, 0);
-  E.pipe("vit_pos_add");
-  E.set(0, v.x);
-  E.set(1, m.vis.pos);
-  E.set(2, v.pidx);
-  E.set(3, v.pw);
-  E.bytes(4, D);
-  E.rd(v.x);
-  E.wr(v.x);
-  E.threads(MTLSizeMake(size_t(D / 4), size_t(P), 1), MTLSizeMake(64, 1, 1));
+  const int D = c.D, Dm = 4 * c.D, Dh = c.merger_hidden();
+  if (c.siglip) {  // the rows hold their position embeddings (prepare_images): add the patch embedding
+    gemm_h(E, m.vis.patch, v.pix, 0, m.vis.patch.kp, v.x, 0, D, P, 1);
+  } else {
+    gemm_h(E, m.vis.patch, v.pix, 0, m.vis.patch.kp, v.x, 0, D, P, 0);
+    E.pipe("vit_pos_add");
+    E.set(0, v.x);
+    E.set(1, m.vis.pos);
+    E.set(2, v.pidx);
+    E.set(3, v.pw);
+    E.bytes(4, D);
+    E.rd(v.x);
+    E.wr(v.x);
+    E.threads(MTLSizeMake(size_t(D / 4), size_t(P), 1), MTLSizeMake(64, 1, 1));
+  }
   struct {
     int N, H, HD;
     float scale;
@@ -220,8 +345,8 @@ inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
     }
   }
   layernorm(E, v.x, m.vis.mnw, m.vis.mnb, v.xn, P, D, c.eps);
-  gemm_h(E, m.vis.m1, v.xn, 0, Dm, v.mact, 0, Dm, P / 4, 3);
-  gemm_h(E, m.vis.m2, v.mact, 0, Dm, v.out, 0, c.out, P / 4, 0);
+  gemm_h(E, m.vis.m1, v.xn, 0, Dm, v.mact, 0, Dh, P / 4, 3);
+  gemm_h(E, m.vis.m2, v.mact, 0, Dh, v.out, 0, c.out, P / 4, 0);
   E.pipe("scatter_rows_f32");
   E.set(0, v.out);
   E.set(1, h);

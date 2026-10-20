@@ -50,6 +50,11 @@ class PointerHead;
 }
 namespace vision {
 struct Spec;
+struct Lfm2Spec;
+struct RGBImage;
+}
+namespace d1 {
+class Release;
 }
 namespace grammar {
 struct Constraint;
@@ -125,12 +130,43 @@ struct EngineOptions {
 class GenStream;
 
 // Images prepared for the model (preprocessed pixels and their placement).
+// LFM2-VL: the image is several views (tiles and a thumbnail), each its own
+// vision tower input, and its placeholder becomes `run` (the views' image
+// tokens between their marker tokens).
 struct PreparedImage {
   std::vector<float> pixels;
   int grid_t = 1, grid_h = 0, grid_w = 0;
   std::string digest;  // content hash (hex)
   int ntok = 0;  // the run's tokens when the layout sets them (DeepSeek: start, rows + newlines, end)
-  int tokens(int merge) const { return ntok > 0 ? ntok : grid_t * grid_h * grid_w / (merge * merge); }
+  struct View {
+    int grid_h = 0, grid_w = 0;  // patches
+    size_t offset = 0;           // first float of its patch rows in `pixels`
+    int token = 0;               // its first image token in `run`
+  };
+  std::vector<View> views;
+  std::vector<int32_t> run;
+  int tokens(int merge) const { return ntok > 0 ? ntok : !run.empty() ? int(run.size()) : grid_t * grid_h * grid_w / (merge * merge); }
+  // The vision tower inputs of this image when its run starts at root row `row`.
+  void refs(int row, std::vector<ImageRef>& out) const {
+    if (views.empty()) {
+      ImageRef r;
+      r.pixels = pixels.data();
+      r.grid_t = grid_t;
+      r.grid_h = grid_h;
+      r.grid_w = grid_w;
+      r.row = row;
+      out.push_back(r);
+      return;
+    }
+    for (const View& v : views) {
+      ImageRef r;
+      r.pixels = pixels.data() + v.offset;
+      r.grid_h = v.grid_h;
+      r.grid_w = v.grid_w;
+      r.row = row + v.token;
+      out.push_back(r);
+    }
+  }
 };
 
 // A generation request in tokens.
@@ -258,8 +294,11 @@ class Engine {
   // Image token ids (vision models). Qwen3-VL: <|image_pad|> runs inside the
   // template's <|vision_start|> ... <|vision_end|>; Gemma 4: <|image|> runs
   // that the expansion wraps in <|image> ... <image|> (vision_start / end),
-  // as its processor does, with plain positions (no M-RoPE).
-  int32_t image_token = -1, vision_start = -1, vision_end = -1;
+  // as its processor does, with plain positions (no M-RoPE). An expanded
+  // image's run starts with run_start (Qwen-VL: its image tokens, after
+  // <|vision_start|>; LFM2-VL: <|image_start|>; Gemma 4 and DeepSeek: the
+  // placeholder itself).
+  int32_t image_token = -1, vision_start = -1, vision_end = -1, run_start = -1;
   bool gemma_vision() const { return model_->info().vision && model_->info().family == "gemma4"; }
   // Tokens an image's run takes beside its soft tokens (Gemma 4: the <|image> / <image|> pair).
   int image_wrap() const { return gemma_vision() ? 2 : 0; }
@@ -273,6 +312,13 @@ class Engine {
   // (joint_head.safetensors next to the backbone); such models serve no chat.
   json::Value systemone(const json::Value& request);
   bool is_clef() const { return clef_ != nullptr; }
+  // A decision model (Clef or d1): /v1/systemone and /v1/decisions only, no chat.
+  bool decision_only() const { return clef_ != nullptr || d1_ != nullptr; }
+  // The 422 text for chat on such a model (Clef's as before; d1 names itself).
+  const char* chat_refusal() const {
+    return d1_ ? "this is a d1 decision model: it answers /v1/systemone and /v1/decisions, not chat"
+               : "this is a Clef decision model: it answers /v1/systemone and /v1/decisions, not chat";
+  }
   // The JEVfire decision contract (context + boolean / enum fields) answered by a
   // Clef head: fields become noul / choice questions; the response keeps decide()'s format.
   json::Value clef_decide(const json::Value& request);
@@ -307,6 +353,12 @@ class Engine {
   // False for a decision-only model (hidden_head.json "lm_head": false: its
   // LM head is a placeholder): only head requests run (others get a 422).
   bool generates() const;
+  // ---- System One decision models (LFM2-VL d1 releases; d1.h): the same
+  // /v1/systemone body, answered from the option tokens' logits at each
+  // question's answer slot; /v1/decisions fields become questions.
+  bool is_d1() const { return d1_ != nullptr; }
+  json::Value d1_systemone(const json::Value& request);
+  json::Value d1_decide(const json::Value& request);
 
   // ---- generation (thread-safe): the stream starts filling immediately
   std::shared_ptr<GenStream> generate(GenRequest request);
@@ -352,6 +404,11 @@ class Engine {
   // Replace each image placeholder token by the image's token run (Gemma 4:
   // <|image> + the soft tokens + <image|>).
   std::vector<int32_t> expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const;
+  // LFM2-VL: a decoded image through the processor (bounded at max_pixels first when > 0, as d1 does).
+  PreparedImage prepare_lfm2_image(const vision::RGBImage& rgb, int64_t max_pixels) const;
+  // prepare_image, an LFM2-VL image first bounded at max_pixels_lfm2 pixels when > 0.
+  PreparedImage prepare_image_capped(const std::string& data_url, int64_t max_pixels, int64_t min_pixels,
+                                     int64_t max_pixels_lfm2) const;
 
   json::Value stats() const;
   void clear_cache();
@@ -375,6 +432,13 @@ class Engine {
   void run_kev(KevJob& job);
   void kev_fail_all(const std::string& why);         // scheduler: at shutdown
   void kev_clear();                                  // scheduler: frees the cached states
+  struct D1Job;
+  void run_d1(D1Job& job);
+  bool d1_step();                              // scheduler: the oldest d1 request (d1.cpp); false when none waits
+  void d1_fail_all(const std::string& why);    // scheduler: at shutdown
+  std::deque<std::shared_ptr<D1Job>> d1_jobs_;
+  std::unique_ptr<d1::Release> d1_;
+  std::unique_ptr<vision::Lfm2Spec> lfm2_spec_;  // LFM2-VL image processor
   struct EmbedJob;  // embed.cpp
   std::deque<std::shared_ptr<EmbedJob>> embed_jobs_;
   std::vector<float> embed_hidden_;  // a pass's hidden rows

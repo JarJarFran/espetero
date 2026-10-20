@@ -63,13 +63,19 @@ struct Config {
   // RMSNorms), E experts of width Ie, k per token, no shared expert;
   // DeepStack features of the vision tower added after the first layers.
   bool q3moe = false;
+  // LFM2 (`lfm2`, the text_config of `lfm2_vl`; lfm2.h): gated short
+  // convolutions (linear[i]: in_proj rows [B | C | x] of D each, a causal
+  // depthwise conv of conv_k taps over B * x, times C, out_proj) interleaved
+  // with GQA attention (head dim HD, RoPE theta over every dim, per-head q/k
+  // RMSNorms, no output gate), SwiGLU MLPs, no delta-rule heads (Hk = Hv = 0).
+  bool lfm2 = false;
 
   int W() const { return hc * D; }  // residual width per token
-  int C() const { return 2 * Hk * Dk + Hv * Dv; }
+  int C() const { return lfm2 ? D : 2 * Hk * Dk + Hv * Dv; }  // conv channels
   int Vd() const { return Hv * Dv; }
   int kv_dim() const { return Hkv * HD; }
-  int lin_ld() const { return C() + Vd() + 2 * Hv; }
-  int full_ld() const { return H * HD * 2 + 2 * kv_dim(); }
+  int lin_ld() const { return lfm2 ? 3 * D : C() + Vd() + 2 * Hv; }
+  int full_ld() const { return lfm2 ? H * HD + 2 * kv_dim() : H * HD * 2 + 2 * kv_dim(); }
   // Gemma 4: the KV width of the global layers (the paged pool) and the
   // projection rows of a sliding / global layer ([q; k; v], no v when k_eq_v).
   int kv_dim_g() const { return Hkv_g * HDg; }
@@ -78,6 +84,7 @@ struct Config {
   }
   int proj_ld() const {
     if (gemma) return std::max({g4_ld(true), g4_ld(false), D});
+    if (lfm2) return std::max(lin_ld(), full_ld());
     return std::max(lin_ld(), full_ld());
   }
 
@@ -103,6 +110,16 @@ struct Config {
   }
 
   void validate() const {
+    if (lfm2) {
+      // The attention kernels exist for 64-dim heads and groups of 1-8 (lfm2.h).
+      if (!D || !I || !L || !H || !Hkv || !V) fail("incomplete LFM2 configuration");
+      if (H % Hkv || HD != 64 || rot != HD) fail("unsupported LFM2 attention geometry (head dim 64)");
+      const int G = H / Hkv;
+      if (G != 1 && G != 2 && G != 4 && G != 8) fail("unsupported LFM2 GQA group " + std::to_string(G));
+      if (conv_k != 3 || D % 64 || I % 64) fail("unsupported LFM2 geometry (conv of 3 taps, widths multiples of 64)");
+      if (E) fail("LFM2 mixture-of-experts models are not supported");
+      return;
+    }
     if (gemma) {
       // The attention kernels exist for these head sizes and groups (gemma.h).
       if (!D || !I || !L || !H || !Hkv || !Hkv_g || !V || !window) fail("incomplete Gemma 4 configuration");
@@ -159,9 +176,16 @@ struct VisionConfig {
   bool chw = false;  // unified: a token's pixels by (channel, y, x), as llama.cpp's gemma4uv weights take them
 
   std::vector<int> deepstack;  // blocks whose output feeds a DeepStack merger (Qwen3-Omni), in order
+  // SigLIP2 NaFlex (LFM2-VL; vision.h): one temporal patch, patch rows
+  // (py, px, channel), no rotary; the position table is resized to each
+  // image's patch grid, and the projector after the 2x2 unshuffle is
+  // linear(4 D -> proj) -> GELU -> linear(proj -> out).
+  bool siglip = false;
+  int proj = 0;
   int patch_dim() const { return in_ch * tps * patch * patch; }
   int unified_dim() const { return in_ch * patch * patch * merge * merge; }
   int Ip() const { return (I + 63) / 64 * 64; }
+  int merger_hidden() const { return siglip ? proj : 4 * D; }
 
   void validate(int text_hidden) {
     if (unified) {
@@ -178,7 +202,8 @@ struct VisionConfig {
       return;
     }
     side = int(std::lround(std::sqrt(double(n_pos))));
-    if (merge != 2 || side * side != n_pos || D % 64 || out != text_hidden || tps != 2)
+    if (merge != 2 || side * side != n_pos || D % 64 || out != text_hidden || tps != (siglip ? 1 : 2) ||
+        (siglip && (proj % 64 || patch_dim() % 64)))
       fail("unsupported vision geometry");
     for (size_t j = 0; j < deepstack.size(); ++j)
       if (deepstack[j] < 0 || deepstack[j] >= depth || (j > 0 && deepstack[j] <= deepstack[j - 1]))
@@ -387,6 +412,107 @@ inline Config config_from_gemma(const json::Value& root) {
   c.eos_ids.erase(std::unique(c.eos_ids.begin(), c.eos_ids.end()), c.eos_ids.end());
   c.eos_token_id = int(tc.get_int("eos_token_id", 1));
   return c;
+}
+
+// LFM2 / LFM2-VL: config.json of an lfm2 checkpoint or the text_config of
+// an lfm2_vl one, read as transformers' Lfm2Config reads it.
+inline bool is_lfm2_type(const std::string& t) { return t == "lfm2" || t == "lfm2_vl"; }
+
+inline Config config_from_lfm2(const json::Value& root) {
+  const json::Value* tcp = root.get("text_config");
+  const json::Value& tc = tcp && tcp->is_object() ? *tcp : root;
+  Config c;
+  c.lfm2 = true;
+  c.D = int(tc.get_int("hidden_size", 0));
+  c.L = int(tc.get_int("num_hidden_layers", 0));
+  c.H = int(tc.get_int("num_attention_heads", 0));
+  c.Hkv = int(tc.get_int("num_key_value_heads", 0));
+  c.HD = c.H ? int(tc.get_int("head_dim", c.D / c.H)) : 0;
+  c.rot = c.HD;
+  c.Hk = c.Hv = 0;
+  // The MLP width as Lfm2MLP sizes it (block_auto_adjust_ff_dim: 2/3, times the
+  // multiplier, up to a multiple of block_multiple_of); the loader checks it
+  // against the tensors.
+  int I = int(tc.get_int("intermediate_size", tc.get_int("block_ff_dim", 0)));
+  if (tc.get_bool("block_auto_adjust_ff_dim", false)) {
+    I = int(2 * I / 3);
+    if (const json::Value* mlt = tc.get("block_ffn_dim_multiplier"); mlt && mlt->is_number())
+      I = int(mlt->as_double() * I);
+    const int mo = int(tc.get_int("block_multiple_of", 256));
+    I = mo * ((I + mo - 1) / mo);
+  }
+  c.I = I;
+  c.V = int(tc.get_int("vocab_size", 0));
+  c.eps = float(tc.get_double("norm_eps", 1e-5));
+  const json::Value* rp = tc.get("rope_parameters");
+  c.theta = rp && rp->is_object() ? rp->get_double("rope_theta", 1e6) : tc.get_double("rope_theta", 1e6);
+  if (rp && rp->is_object() && rp->get_string("rope_type", "default") != "default")
+    fail("unsupported LFM2 RoPE type " + rp->get_string("rope_type", ""));
+  c.conv_k = int(tc.get_int("conv_L_cache", 3));
+  if (tc.get_bool("conv_bias", false)) fail("LFM2 convolutions with a bias are not supported");
+  const json::Value* tie = tc.get("tie_word_embeddings");
+  if (!tie || !tie->is_bool()) tie = root.get("tie_word_embeddings");
+  c.tie = !tie || !tie->is_bool() || tie->as_bool();
+  // Layer types: the config's list, else full_attn_idxs.
+  c.linear.assign(size_t(c.L), true);
+  if (const json::Value* types = tc.get("layer_types"); types && types->is_array() && types->size() == size_t(c.L)) {
+    for (int i = 0; i < c.L; ++i) {
+      const std::string t = (*types)[size_t(i)].as_string();
+      if (t != "conv" && t != "full_attention") fail("unsupported LFM2 layer type " + t);
+      c.linear[size_t(i)] = t == "conv";
+    }
+  } else if (const json::Value* fa = tc.get("full_attn_idxs"); fa && fa->is_array()) {
+    for (const json::Value& x : fa->as_array())
+      if (x.is_int() && x.as_int() >= 0 && x.as_int() < c.L) c.linear[size_t(x.as_int())] = false;
+  } else {
+    fail("LFM2 config without layer_types");
+  }
+  c.n_full = c.n_linear = 0;
+  for (bool lin : c.linear) lin ? ++c.n_linear : ++c.n_full;
+  auto add_eos = [&](const json::Value* e) {
+    if (!e) return;
+    if (e->is_int()) c.eos_ids.push_back(int(e->as_int()));
+    else if (e->is_array())
+      for (const auto& x : e->as_array())
+        if (x.is_int()) c.eos_ids.push_back(int(x.as_int()));
+  };
+  add_eos(root.get("eos_token_id"));
+  add_eos(tc.get("eos_token_id"));
+  std::sort(c.eos_ids.begin(), c.eos_ids.end());
+  c.eos_ids.erase(std::unique(c.eos_ids.begin(), c.eos_ids.end()), c.eos_ids.end());
+  c.eos_token_id = c.eos_ids.empty() ? -1 : c.eos_ids[0];
+  return c;
+}
+
+// LFM2-VL's SigLIP2 NaFlex tower and projector (no layer norm before it).
+inline VisionConfig vision_from_lfm2(const json::Value& root) {
+  VisionConfig v;
+  const json::Value* vcp = root.get("vision_config");
+  if (!vcp || !vcp->is_object()) return v;
+  const json::Value& vc = *vcp;
+  if (vc.get_string("hidden_act", "gelu_pytorch_tanh") != "gelu_pytorch_tanh")
+    fail("unsupported vision activation " + vc.get_string("hidden_act", ""));
+  if (root.get_string("projector_hidden_act", "gelu") != "gelu")
+    fail("unsupported projector activation " + root.get_string("projector_hidden_act", ""));
+  if (root.get_bool("projector_use_layernorm", false)) fail("LFM2-VL projectors with a layer norm are not supported yet");
+  if (!root.get_bool("projector_bias", true)) fail("LFM2-VL projectors without biases are not supported");
+  if (root.get_int("vision_feature_layer", -1) != -1) fail("LFM2-VL: only the last vision layer's features are supported");
+  const json::Value* tcp = root.get("text_config");
+  v.siglip = true;
+  v.depth = int(vc.get_int("num_hidden_layers", 0));
+  v.D = int(vc.get_int("hidden_size", 0));
+  v.I = int(vc.get_int("intermediate_size", 0));
+  v.heads = int(vc.get_int("num_attention_heads", 0));
+  v.patch = int(vc.get_int("patch_size", 16));
+  v.in_ch = int(vc.get_int("num_channels", 3));
+  v.n_pos = int(vc.get_int("num_patches", 256));
+  v.eps = float(vc.get_double("layer_norm_eps", 1e-6));
+  v.tps = 1;
+  v.merge = int(root.get_int("downsample_factor", 2));
+  v.proj = int(root.get_int("projector_hidden_size", 0));
+  v.out = tcp && tcp->is_object() ? int(tcp->get_int("hidden_size", 0)) : 0;
+  v.present = v.depth > 0;
+  return v;
 }
 
 // deepstack: the decoder adds DeepStack features (qwen3_omni.h); other

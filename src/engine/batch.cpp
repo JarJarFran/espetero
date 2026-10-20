@@ -318,11 +318,11 @@ json::Value BatchService::delete_file(const std::string& id) {
 std::pair<int, json::Value> BatchService::execute(Engine& engine, const std::string& endpoint, const json::Value& body) {
   try {
     if (endpoint == "/v1/decisions" || endpoint == "/v1/systemone")
-      return {200, engine.is_clef() && !body.get("context") ? engine.systemone(body) : engine.decide(body)};
+      return {200, engine.decision_only() && !body.get("context") ? engine.systemone(body) : engine.decide(body)};
     if (endpoint == "/v1/embeddings") return {200, embeddings_response(engine, body)};
     if (endpoint == "/v1/chat/completions" || endpoint == "/v1/completions") {
-      if (engine.is_clef())
-        throw RequestError(422, "this is a Clef decision model: it answers /v1/systemone and /v1/decisions, not chat");
+      if (engine.decision_only())
+        throw RequestError(422, engine.chat_refusal());
       ChatJob job = endpoint == "/v1/chat/completions" ? prepare_chat(engine, body) : prepare_completion(engine, body);
       job.stream = false;
       job.gen.priority = std::max(job.gen.priority, 1);  // below interactive traffic

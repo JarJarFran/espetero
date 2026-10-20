@@ -373,7 +373,7 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
   in.arena.reserve(text.size() / 5);
   in.merge_arena.reserve(text.size() / 4);
   Value normalizer, pre_tokenizer, decoder, added_tokens, model_type, dropout, byte_fallback, prefix, suffix,
-      ignore_merges, unk_token, fuse_unk;
+      ignore_merges, unk_token, fuse_unk, post_processor;
   bool have_pre = false, have_decoder = false;
 
   Scanner sc(text, path);
@@ -438,8 +438,10 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
       have_decoder = true;
     } else if (key == "added_tokens") {
       added_tokens = sc.value();
+    } else if (key == "post_processor") {
+      post_processor = sc.value();
     } else {
-      sc.raw_value();  // version, truncation, padding, post_processor
+      sc.raw_value();  // version, truncation, padding
     }
   });
   if (!sc.at_end()) sc.error("trailing characters");
@@ -464,7 +466,12 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
     in.nfc = parse_normalizer(normalizer);
     if (!have_pre) fail("missing pre_tokenizer");
     in.pattern = parse_pre_tokenizer(pre_tokenizer);
-    if (!have_decoder || decoder.get_string("type", "") != "ByteLevel")
+    // ByteLevel, or for LFM2 a Sequence of that one decoder (LFM2.5-VL-1.6B's
+    // tokenizer.json); other families take exactly what they took before.
+    const Value* only = &decoder;
+    if (have_decoder && in.pattern == tok::SplitPattern::kLfm2 && decoder.get_string("type", "") == "Sequence")
+      if (const Value* ds = decoder.get("decoders"); ds && ds->is_array() && ds->size() == 1) only = &(*ds)[0];
+    if (!have_decoder || only->get_string("type", "") != "ByteLevel")
       fail("unsupported decoder (expected ByteLevel): " + describe(decoder));
   }
   in.ignore_merges = ignore_merges.is_bool() && ignore_merges.as_bool();
@@ -495,6 +502,7 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
       for (const auto& [id, i] : order) in.added.push_back(parse_added_token(o.vals[i]));
     }
   }
+  const bool lfm2 = !in.spm && in.pattern == tok::SplitPattern::kLfm2;
   auto impl = tok::build(std::move(in));
 
   // ---- metadata
@@ -502,7 +510,6 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
   // default (SentencePiece vocabularies such as Gemma's: yes; byte-level BPE: no).
   impl->add_bos = impl->spm;
   if (cfg.is_object()) {
-    if (const Value* ab = cfg.get("add_bos_token"); ab && ab->is_bool()) impl->add_bos = ab->as_bool();
     auto id_of = [&](const char* key) {
       const std::string name = token_name(cfg.get(key));
       return name.empty() ? -1 : impl->find(name);
@@ -510,6 +517,20 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir_in) {
     impl->eos = id_of("eos_token");
     impl->bos = id_of("bos_token");
     impl->pad = id_of("pad_token");
+    // LFM2: a post-processor whose single-sequence template starts with the
+    // BOS token (LFM2.5-VL-1.6B) adds it to raw text, as transformers does.
+    // Other byte-level families keep llama.cpp's default (no BOS) as before.
+    const Value* tp = lfm2 ? &post_processor : nullptr;
+    if (lfm2 && post_processor.get_string("type", "") == "Sequence")
+      if (const Value* ps = post_processor.get("processors"); ps && ps->is_array())
+        for (const Value& x : ps->as_array())
+          if (x.get_string("type", "") == "TemplateProcessing") tp = &x;
+    if (tp && tp->is_object() && tp->get_string("type", "") == "TemplateProcessing" && impl->bos >= 0)
+      if (const Value* single = tp->get("single"); single && single->is_array() && single->size() > 0)
+        if (const Value* st = (*single)[0].get("SpecialToken"); st && st->is_object() &&
+            impl->find(st->get_string("id", "")) == impl->bos)
+          impl->add_bos = true;
+    if (const Value* ab = cfg.get("add_bos_token"); ab && ab->is_bool()) impl->add_bos = ab->as_bool();
 
     if (const Value* ct = cfg.get("chat_template")) {
       if (ct->is_string()) {

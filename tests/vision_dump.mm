@@ -12,7 +12,10 @@
 // from the loaded model: Gemma 4 only.)
 //
 // Writes <out>/<i>.pixels.f32 ([rows, 3*temporal*patch*patch]),
-// <out>/<i>.emb.f32 ([tokens, hidden]) and <out>/index.json.
+// <out>/<i>.emb.f32 ([tokens, hidden]) and <out>/index.json. An LFM2-VL
+// directory goes through its own processor (max_pixels unused): every view
+// (tiles, then the thumbnail) back to back, as tests/ref/lfm2_ref.py vision
+// writes them.
 #include <sys/stat.h>
 
 #include <cmath>
@@ -45,9 +48,28 @@ int main(int argc, char** argv) {
   const long long max_pixels = std::atoll(argv[3]);
   ::mkdir(out.c_str(), 0755);
   const bool gguf = model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0;
+  bool lfm2 = false;
+  {
+    std::FILE* cf = std::fopen((model + "/config.json").c_str(), "rb");
+    std::string txt;
+    if (cf) {
+      char buf[4096];
+      size_t n;
+      while ((n = std::fread(buf, 1, sizeof(buf), cf)) > 0) txt.append(buf, n);
+      std::fclose(cf);
+    }
+    lfm2 = !txt.empty() && json::parse(txt).get_string("model_type", "") == "lfm2_vl";
+  }
   vision::Spec spec;
+  vision::Lfm2Spec lspec;
   try {
-    if (!gguf) spec = vision::spec_from_model_dir(model, max_pixels);
+    if (lfm2) {
+      lspec = vision::lfm2_spec_from_model_dir(model);
+      lspec.image_id = 1, lspec.start_id = 2, lspec.end_id = 3, lspec.thumb_id = 4;  // the run's ids are not dumped
+      for (size_t k = 0; k < lspec.grid_ids.size(); ++k) lspec.grid_ids[k] = int32_t(100 + k);
+    } else if (!gguf) {
+      spec = vision::spec_from_model_dir(model, max_pixels);
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "spec: %s\n", e.what());
     return 1;
@@ -79,6 +101,34 @@ int main(int argc, char** argv) {
     if (!vision::load_rgb_file(path, img, err)) {
       std::fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
       return 1;
+    }
+    if (lfm2) {
+      const vision::Lfm2Prepared p = vision::lfm2_preprocess(img, lspec);
+      std::vector<ImageRef> refs;
+      int tokens = 0;
+      for (const auto& v : p.views) {
+        ImageRef r;
+        r.pixels = p.pixels.data() + v.offset;
+        r.grid_h = v.gh;
+        r.grid_w = v.gw;
+        refs.push_back(r);
+        tokens += v.gh * v.gw / 4;
+      }
+      std::vector<float> emb(size_t(tokens) * size_t(I.hidden));
+      PassStats st;
+      m->encode_images(refs, emb.data(), &st);
+      const std::string stem = out + "/" + std::to_string(i - 4);
+      if (!write_f32(stem + ".pixels.f32", p.pixels) || !write_f32(stem + ".emb.f32", emb)) return 1;
+      json::Value e = json::Value::object();
+      e.set("file", path);
+      e.set("views", int64_t(p.views.size()));
+      e.set("tokens", int64_t(tokens));
+      e.set("run", int64_t(p.run.size()));
+      e.set("gpu_ms", st.gpu_ms);
+      index.push_back(e);
+      std::printf("%s: %zu views, %d tokens (run %zu), tower %.1f ms\n", path.c_str(), p.views.size(), tokens, p.run.size(),
+                  st.gpu_ms);
+      continue;
     }
     const vision::Prepared p = vision::preprocess(img, spec);
     const int tokens = p.tokens(spec.merge);

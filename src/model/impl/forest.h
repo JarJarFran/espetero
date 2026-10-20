@@ -1673,6 +1673,7 @@ inline void xpool_rollback(Model& m) {
 #include "gemma.h"
 #include "gemma_vision.h"
 #include "qwen3_omni.h"
+#include "lfm2.h"
 
 namespace espetero::native {
 
@@ -1802,6 +1803,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     if (b.commit_chain > 0 && T.NL == 0) fail("commit_chain without leaves");
     if (c.gemma && b.commit_chain > 0) fail("commit_chain: not supported for Gemma 4");
     if (c.q3moe && b.commit_chain > 0) fail("commit_chain: not supported for qwen3_omni_moe");
+    if (c.lfm2 && b.commit_chain > 0) fail("commit_chain: not supported for LFM2");
     if (c.gemma && b.root_pos) fail("explicit positions: not supported for Gemma 4");
     if (T.P + T.Tr + max_leaf > m.max_ctx) fail("context exceeds max_ctx (" + std::to_string(m.max_ctx) + ")");
     if (b.n_images < 0 || (b.n_images > 0 && !b.images)) fail("invalid images");
@@ -1883,7 +1885,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // Decode-sized passes fuse the RMSNorms into the GEMVs that produce their
   // input: the residual-add GEMV's last threadgroup writes the normalized
   // fp16 rows, so no norm dispatch runs between layers.
-  const bool fuse = !c.q4 && !c.gemma && !c.q3moe && m.fuse_norm && m.all_quant && gemv_path(m.tune, M) && M <= m.fuse_norm_max_m && n_patch == 0;
+  const bool fuse = !c.q4 && !c.gemma && !c.q3moe && !c.lfm2 && m.fuse_norm && m.all_quant && gemv_path(m.tune, M) && M <= m.fuse_norm_max_m && n_patch == 0;
   if (fuse) {
     // The kernels reset their arrival counters (the last threadgroup stores
     // 0); zeroing them here only re-establishes that after a failed pass. A
@@ -1906,7 +1908,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
   // The DeltaNet kernels of this pass (the rule of every linear layer below);
   // the verify-commit replays a commit chain with the same ones.
-  const bool gdn_fused_pass = !c.q4 && m.fuse_gdn && gemv_path(m.tune, M) && n_patch == 0 && c.Dk == 128 && c.Dv == 128;
+  const bool gdn_fused_pass = !c.q4 && !c.lfm2 && m.fuse_gdn && gemv_path(m.tune, M) && n_patch == 0 && c.Dk == 128 && c.Dv == 128;
   if (c.q4) {
     // The Qwen4-Exp path: roots, draft leaves and MTP rows; no decode chains.
     if (chained || m.chain_active) fail("qwen4_exp: decode chains are not supported yet");
@@ -3297,8 +3299,32 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     qp.vis_rows = n_patch / 4;
     q3m_encode_layers(m, E, qp);
   }
-  // (The Qwen3.5-family layers; Gemma 4 and the Qwen3-Omni thinker ran their own above.)
-  for (int li = 0; !c.gemma && !c.q3moe && li < c.L; ++li) {
+  if (c.lfm2) {  // LFM2 decoder layers (lfm2.h)
+    Lfm2PassIn lp;
+    lp.M = M;
+    lp.N = N;
+    lp.prune = prune;
+    lp.chained = chained;
+    lp.plan = &A;
+    lp.trees = meta.a_trees.buf;
+    lp.tiles = meta.a_tiles.buf;
+    lp.comb = meta.a_comb.buf;
+    lp.parts = meta.parts.buf;
+    lp.parts_bytes = meta.parts.bytes;
+    lp.saves = meta.kv_saves.buf;
+    lp.n_saves = kv_saves.size();
+    lp.conv_src = meta.conv_src.buf;
+    lp.row_slot = meta.row_slot.buf;
+    lp.conv_jobs = meta.conv_jobs.buf;
+    lp.n_conv_jobs = conv_jobs.size();
+    lp.blocks = meta.blocks.buf;
+    lp.desc = meta.desc.buf;
+    lp.pos = meta.pos.buf;
+    lp.readout_rows = meta.readout_rows.buf;
+    lfm2_encode_layers(m, E, lp);
+  }
+  // (The Qwen3.5-family layers; Gemma 4, the Qwen3-Omni thinker and LFM2 ran their own above.)
+  for (int li = 0; !c.gemma && !c.q3moe && !c.lfm2 && li < c.L; ++li) {
     const Layer& L = m.layers[size_t(li)];
     const bool last_layer = li == c.L - 1 && prune;
     NormLink l_post, l_next;
