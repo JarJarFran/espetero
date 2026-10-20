@@ -16,7 +16,8 @@
 //   5  \s*[\r\n]+                               whitespace ending at the last CR/LF of the run
 //   6  \s+(?!\S)                                whitespace run minus its last char (unless at end)
 //   7  \s+                                      whitespace run
-// Qwen2 / Llama-3 use \p{L}+ in 2 and [^\s\p{L}\p{N}] in 4 (marks are symbols).
+// Qwen2 / Llama-3 use \p{L}+ in 2 and [^\s\p{L}\p{N}] in 4 (marks are symbols);
+// LFM2's pattern is Llama-3's (pretok.cpp).
 // Every code point can start one of 2, 3, 4 or 7, so the pieces tile the input.
 #pragma once
 
@@ -30,7 +31,7 @@
 
 namespace espetero::tok {
 
-enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3, kDeepSeekV3 };
+enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3, kDeepSeekV3, kLfm2 };  // kLfm2 splits as kLlama3
 
 // Exact pattern strings as they appear in tokenizer.json.
 std::optional<SplitPattern> split_pattern_from_regex(std::string_view regex);
@@ -45,7 +46,7 @@ class PieceSplitter {
         b_(p_),
         e_(p_ + s.size()),
         marks_are_letters_(pat == SplitPattern::kQwen35),
-        max_digits_(pat == SplitPattern::kLlama3 ? 3 : 1) {}
+        max_digits_(pat == SplitPattern::kLlama3 || pat == SplitPattern::kLfm2 ? 3 : 1) {}
 
   // Yields the next piece as byte offsets [begin, end) into s; false at the end.
   bool next(size_t& begin, size_t& end) {

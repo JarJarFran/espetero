@@ -590,6 +590,7 @@ inline std::string find_mmproj(const std::string& gguf_path) {
 
 #include "gemma_load.h"
 #include "qwen3_omni_load.h"
+#include "lfm2_load.h"
 
 namespace espetero::native {
 
@@ -729,6 +730,18 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     m.cfg = config_from_qwen3_omni(src.config());
     load_qwen3_omni(m, src, want_vision);
     return;
+  }
+  {  // LFM2 / LFM2-VL (lfm2_load.h): no drafting head
+    const json::Value& cfg = src.config();
+    const json::Value* tc = cfg.get("text_config");
+    if (is_lfm2_type(cfg.get_string("model_type", "")) ||
+        (tc && tc->is_object() && is_lfm2_type(tc->get_string("model_type", "")))) {
+      if (!mtp.empty() && mtp != "none") fail("--mtp: LFM2 has no drafting head (prompt lookup drafts only)");
+      m.format = "mlx";
+      m.cfg = config_from_lfm2(cfg);
+      load_lfm2(m, src, cfg, want_vision);
+      return;
+    }
   }
   if (!src.has("language_model.model.embed_tokens.weight"))
     fail("expected an MLX-converted Qwen3.5 checkpoint (language_model.model.* tensors)");

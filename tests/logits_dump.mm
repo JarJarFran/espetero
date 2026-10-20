@@ -12,6 +12,10 @@
 // first soft-token row of the expanded ids), preprocessed at the standard
 // budget (--image-pixels) and passed with every pass over the prompt (the
 // split point moves to an image's start when the middle falls inside it).
+// A model with plain positions (LFM2-VL) takes its images as dumped patch rows:
+// {"images": {"pixels": file of float32 patch rows, "tiles": [{"row": first
+// image token, "offset": first float, "gh": patch rows, "gw": patch columns},
+// ...]}}, one ImageRef per tile (the split case cuts after the last tile).
 // Per case, every readout row is reported as its argmax, log-sum-exp and the
 // top `--top` (id, logit) pairs:
 //   prefill: one pass over ids[:P], the root's last row;
@@ -99,6 +103,7 @@ int main(int argc, char** argv) {
   json::Value outc = json::Value::array();
   std::vector<std::vector<int32_t>> prompts;
   std::vector<std::vector<vision::Prepared>> all_prepared;
+  std::vector<std::vector<float>> pixels;  // per case: LFM2-VL's dumped patch rows
   std::vector<std::vector<ImageRef>> image_refs;
   std::deque<std::vector<ImageRef>> shifted;  // per-pass copies (rows relative to their roots)
   for (const json::Value& cs : cases.get("cases")->as_array()) {
@@ -111,6 +116,8 @@ int main(int argc, char** argv) {
     // Images: prepared pixels, and the refs of a root that starts at row `from`.
     std::vector<vision::Prepared> prepared;
     std::vector<int> rows;
+    pixels.emplace_back();
+    image_refs.push_back({});
     if (const json::Value* ims = cs.get("images"); ims && ims->is_array() && ims->size()) {
       if (I.family != "gemma4" || !I.vision) {
         std::fprintf(stderr, "images: Gemma 4 vision models only (others need M-RoPE positions)\n");
@@ -129,7 +136,25 @@ int main(int argc, char** argv) {
         rows.push_back(int(im.get_int("row", 0)));
       }
     }
-    image_refs.push_back({});
+    int img_end = 0;  // first row after the last image token
+    if (const json::Value* im = cs.get("images"); im && im->is_object()) {  // LFM2-VL tiles
+      std::ifstream pf(im->get_string("pixels", ""), std::ios::binary);
+      std::stringstream ps;
+      ps << pf.rdbuf();
+      const std::string raw = ps.str();
+      pixels.back().resize(raw.size() / 4);
+      std::memcpy(pixels.back().data(), raw.data(), raw.size() / 4 * 4);
+      for (const json::Value& t : im->get("tiles")->as_array()) {
+        ImageRef r;
+        r.pixels = pixels.back().data() + t.get_int("offset", 0);
+        r.grid_t = 1;
+        r.grid_h = int(t.get_int("gh", 0));
+        r.grid_w = int(t.get_int("gw", 0));
+        r.row = int(t.get_int("row", 0));
+        image_refs.back().push_back(r);
+        img_end = std::max(img_end, r.row + r.grid_h * r.grid_w / 4);
+      }
+    }
     for (size_t k = 0; k < prepared.size(); ++k) {
       ImageRef r;
       r.pixels = prepared[k].pixels.data();
@@ -241,10 +266,10 @@ int main(int argc, char** argv) {
     // the second half then continues the middle checkpoint into a third slot
     // (prefix checkpoints, rings copied between slots), and the whole one
     // decodes the next token.
-    if (P >= 4 && L > 0) {
+    if (P >= 4 && L > 0 && std::max(P / 2, img_end) < P) {
       const int a = model->slot_alloc(), b = model->slot_alloc(), c = model->slot_alloc();
-      int h = P / 2;
-      for (size_t k = 0; k < refs.size(); ++k)  // not inside an image
+      int h = std::max(P / 2, img_end);  // LFM2-VL: after the last tile
+      for (size_t k = 0; k < refs.size() && k < all_prepared.back().size(); ++k)  // not inside an image
         if (h > refs[k].row && h < refs[k].row + all_prepared.back()[k].tokens(I.vision_merge)) h = refs[k].row;
       TreeSpec t;
       t.root = ids.data();

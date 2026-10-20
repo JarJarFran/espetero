@@ -14,6 +14,12 @@ constexpr std::string_view kQwen2Regex =
     R"re((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
 constexpr std::string_view kLlama3Regex =
     R"re((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)re";
+// LFM2 (LiquidAI): Llama-3's pieces written differently. '(?i:[sdmt]|ll|ve|re)
+// is the same contraction set; \s*[\r\n] and \s*[\r\n]+ both end at the run's
+// last CR/LF; the final \s is reached only by a single whitespace before a
+// non-space, where \s+ takes one character too.
+constexpr std::string_view kLfm2Regex =
+    R"re('(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s)re";
 
 }  // namespace
 
@@ -27,6 +33,7 @@ std::optional<SplitPattern> split_pattern_from_regex(std::string_view regex) {
   if (regex == kQwen2Regex) return SplitPattern::kQwen2;
   if (regex == kLlama3Regex) return SplitPattern::kLlama3;
   if (regex == kDeepSeekV3Regex) return SplitPattern::kDeepSeekV3;
+  if (regex == kLfm2Regex) return SplitPattern::kLfm2;
   return std::nullopt;
 }
 
@@ -36,6 +43,7 @@ std::optional<SplitPattern> split_pattern_from_gguf_pre(std::string_view pre) {
   if (pre == "qwen2" || pre == "deepseek-r1-qwen") return SplitPattern::kQwen2;
   if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe") return SplitPattern::kLlama3;
   if (pre == "deepseek-v3") return SplitPattern::kDeepSeekV3;
+  if (pre == "lfm2") return SplitPattern::kLfm2;
   return std::nullopt;
 }
 
@@ -45,6 +53,7 @@ std::string_view split_pattern_name(SplitPattern p) {
     case SplitPattern::kQwen35: return "qwen35";
     case SplitPattern::kLlama3: return "llama3";
     case SplitPattern::kDeepSeekV3: return "deepseek-v3";
+    case SplitPattern::kLfm2: return "lfm2";
   }
   return "?";
 }

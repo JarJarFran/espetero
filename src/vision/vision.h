@@ -178,6 +178,8 @@ std::pair<int, int> smart_resize(int height, int width, int factor, int64_t min_
 // PIL's Image.resize((w, h), Image.BICUBIC) on an RGB image, byte for byte
 // (Pillow 12: fixed-point two-pass resampling, tall images vertical first).
 RGBImage resize_bicubic(const RGBImage& in, int width, int height);
+// Image.resize((w, h), Image.BILINEAR), byte for byte (LFM2-VL processors of resample 2).
+RGBImage resize_bilinear(const RGBImage& in, int width, int height);
 
 // ---- processor --------------------------------------------------------------
 
@@ -238,5 +240,64 @@ std::vector<std::array<int32_t, 3>> mrope_positions(const std::vector<int32_t>& 
 // native_images). Throws when runs and grids differ in number.
 std::vector<int> image_rows(const std::vector<int32_t>& ids,
                             const std::vector<std::array<int, 3>>& grids, const Spec& spec);
+
+// ---- LFM2-VL (SigLIP2 NaFlex tiles; lfm2.cpp) ---------------------------------
+//
+// transformers' Lfm2VlImageProcessor and Lfm2VlProcessor: an image is resized
+// (smart_resize: sides multiples of patch * factor, between min_tokens and
+// max_tokens image tokens) and, when it is too large for one view (more than
+// tolerance x max_tokens tokens), resized to a grid of tile x tile tiles
+// (min_tiles..max_tiles of them, the grid closest to its aspect ratio) plus
+// the smart-resized view as a thumbnail, last. Each view becomes patch rows
+// (row-major patches, (py, px, channel) inside a patch, (x / 255 - mean) / std)
+// and (h / patch / factor) x (w / patch / factor) image tokens; the placeholder
+// becomes <|image_start|>, per tile <|img_row_R_col_C|> and its tokens, then
+// <|img_thumbnail|> and the thumbnail's, and <|image_end|>. Images are resized
+// with Pillow's bicubic or bilinear filter (the release's resample 3 or 2;
+// transformers' torchvision backend agrees with Pillow on uint8 images to one
+// level).
+struct Lfm2Spec {
+  int patch = 16, factor = 2;          // encoder_patch_size, downsample_factor
+  int min_tokens = 64, max_tokens = 256;
+  int min_tiles = 2, max_tiles = 10, tile = 512;
+  double tolerance = 2.0;              // max_pixels_tolerance
+  bool splitting = true, thumbnail = true;
+  bool bilinear = false;               // resample 2 (LFM2.5-VL-1.6B), else 3 (bicubic)
+  float mean[3] = {0.5f, 0.5f, 0.5f}, std[3] = {0.5f, 0.5f, 0.5f};
+  // Token ids: <image>, <|image_start|>, <|image_end|>, <|img_thumbnail|>, and
+  // <|img_row_R_col_C|> at grid_tokens[(R - 1) * 10 + C - 1] (R, C <= 10).
+  int32_t image_id = -1, start_id = -1, end_id = -1, thumb_id = -1;
+  std::array<int32_t, 100> grid_ids{};
+  int row_dim() const { return 3 * patch * patch; }
+};
+
+// config.json and processor_config.json of an LFM2-VL directory over the
+// defaults (the token ids are the caller's: the tokenizer's lookup).
+Lfm2Spec lfm2_spec_from_model_dir(const std::string& dir);
+
+// The views of an image of this size: rows x cols tiles (1 x 1: a single
+// smart-resized view, no thumbnail) and the smart-resized (height, width).
+struct Lfm2Layout {
+  int rows = 1, cols = 1;
+  bool tiled = false, thumbnail = false;
+  int view_h = 0, view_w = 0;  // the single view or the thumbnail
+  int views() const { return (tiled ? rows * cols : 1) + (thumbnail ? 1 : 0); }
+};
+Lfm2Layout lfm2_layout(int height, int width, const Lfm2Spec& spec);
+// The token run of that layout (what the placeholder becomes).
+std::vector<int32_t> lfm2_run(const Lfm2Layout& layout, const Lfm2Spec& spec);
+
+struct Lfm2Prepared {
+  struct View {
+    int gh = 0, gw = 0;      // patch rows and columns
+    size_t offset = 0;       // first float in `pixels`
+    int token = 0;           // its first image token in `run`
+  };
+  std::vector<float> pixels;  // every view's patch rows, back to back
+  std::vector<View> views;
+  std::vector<int32_t> run;
+  std::array<uint8_t, 16> digest{};
+};
+Lfm2Prepared lfm2_preprocess(const RGBImage& image, const Lfm2Spec& spec);
 
 }  // namespace espetero::vision

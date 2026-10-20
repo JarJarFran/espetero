@@ -178,10 +178,10 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   auto decisions = guarded([&engine](const http::Request& req, http::Response& res) {
     try {
       const json::Value body = parse_body(req);
-      // Clef models take both bodies: SystemOne (state, questions) or JEVfire (context, fields); Kev models the first.
+      // Clef and d1 models take both bodies: SystemOne (state, questions) or JEVfire (context, fields); Kev models the first.
       // pplx-decider checkpoints (head answer codes): SystemOne bodies through pplx.h.
       if (!engine.head_codes().empty() && !body.get("context")) res.send_json(200, pplx::systemone(engine, body));
-      else res.send_json(200, (engine.is_clef() || engine.is_kev()) && !body.get("context") ? engine.systemone(body)
+      else res.send_json(200, (engine.is_clef() || engine.is_kev() || engine.is_d1()) && !body.get("context") ? engine.systemone(body)
                                                                                                : engine.decide(body));
     } catch (const RequestError& e) {
       if (e.status == 422) {
@@ -202,8 +202,8 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
 
   auto generation = [&engine](bool chat) {
     return guarded([&engine, chat](const http::Request& req, http::Response& res) {
-      if (engine.is_clef())
-        throw RequestError(422, "this is a Clef decision model: it answers /v1/systemone and /v1/decisions, not chat");
+      if (engine.decision_only())
+        throw RequestError(422, "this is a decision model (Clef or d1): it answers /v1/systemone and /v1/decisions, not chat");
       const json::Value body = parse_body(req);
       ChatJob job = chat ? prepare_chat(engine, body) : prepare_completion(engine, body);
       if (!job.stream) {

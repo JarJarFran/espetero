@@ -110,15 +110,16 @@ std::unique_ptr<Tokenizer> Tokenizer::from_vocab(std::vector<std::string> tokens
                                                  const std::vector<std::string>& merges, const std::string& pre) {
   const auto pattern = tok::split_pattern_from_gguf_pre(pre);
   if (!pattern)
-    fail("unsupported tokenizer.ggml.pre '" + pre + "' (supported: qwen35, qwen2, deepseek-r1-qwen, llama3, llama-bpe)");
+    fail("unsupported tokenizer.ggml.pre '" + pre + "' (supported: qwen35, qwen2, deepseek-r1-qwen, llama3, llama-bpe, lfm2)");
   if (!types.empty() && types.size() != tokens.size()) fail("token_type count does not match the token count");
 
   tok::BuildInput in;
   in.pattern = *pattern;
   // Match the reference tokenizer.json of these families: Qwen normalizes to NFC
   // and merges strictly; Llama-3 has no normalizer and uses ignore_merges.
-  in.nfc = *pattern != tok::SplitPattern::kLlama3;
-  in.ignore_merges = *pattern == tok::SplitPattern::kLlama3;
+  const bool llama = *pattern == tok::SplitPattern::kLlama3 || *pattern == tok::SplitPattern::kLfm2;  // LFM2: as Llama-3
+  in.nfc = !llama;
+  in.ignore_merges = llama;
   size_t total = 0;
   for (const auto& t : tokens) total += t.size();
   in.arena.reserve(total);

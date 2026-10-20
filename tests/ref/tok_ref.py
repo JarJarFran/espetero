@@ -70,6 +70,9 @@ GGUF_QWEN35 = os.environ.get("TOK_REF_GGUF") or _hub("unsloth/Qwen3.5-0.8B-GGUF"
 # Gemma 4: SentencePiece-style BPE with byte fallback; compared when cached.
 HF_GEMMA4 = os.environ.get("TOK_REF_GEMMA4") or _hub("mlx-community/gemma-4-31b-it-4bit")
 GGUF_GEMMA4 = os.environ.get("TOK_REF_GGUF_GEMMA4") or _hub("unsloth/gemma-4-26B-A4B-it-GGUF", "*Q4_K_M.gguf")
+# LFM2 (Llama-3 pieces under another regex, no normalizer, ignore_merges); compared when cached.
+HF_LFM2 = os.environ.get("TOK_REF_LFM2") or _hub("LiquidAI/LFM2.5-VL-3B")
+HF_LFM2_16 = os.environ.get("TOK_REF_LFM2_16") or _hub("LiquidAI/LFM2.5-VL-1.6B")  # Llama-3's regex, a BOS template
 LLAMA3_RE = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|"
              r"\s*[\r\n]+|\s+(?!\S)|\s+")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -537,6 +540,9 @@ def hf_ref(name, d, config=True):
     tj = os.path.join(d, "tokenizer.json")
     tok = Tokenizer.from_file(tj)
     tok_ns = Tokenizer.from_file(tj)
+    for t in (tok, tok_ns):  # LFM2's tokenizer.json pads batches (BatchLongest); transformers turns that off too
+        t.no_padding()
+        t.no_truncation()
     tok_ns.encode_special_tokens = True
     added = [(t.content, i) for i, t in sorted(tok.get_added_tokens_decoder().items())]
     # Special = skipped by decode(skip_special_tokens=True): the reference's special set,
@@ -628,6 +634,10 @@ def main():
               ("llama3-regex", lambda: hf_ref("llama3-regex", llama_dir)), ("flags", lambda: hf_ref("flags", flags_dir))]
     if HF_GEMMA4:
         makers.append(("gemma4", lambda: hf_ref("gemma4", HF_GEMMA4)))
+    if HF_LFM2:
+        makers.append(("lfm2", lambda: hf_ref("lfm2", HF_LFM2)))
+    if HF_LFM2_16:
+        makers.append(("lfm2-1.6b", lambda: hf_ref("lfm2-1.6b", HF_LFM2_16)))
     if HF_GEMMA4 and GGUF_GEMMA4:  # <eos> is a normal token in the GGUF; the engine keeps it special, as tokenizer.json does
         makers.append(("gemma4-gguf", lambda: gguf_ref("gemma4-gguf", GGUF_GEMMA4, HF_GEMMA4, special_extra=("<eos>",))))
     keep = os.environ.get("TOK_REF_ONLY", "").split(",") if os.environ.get("TOK_REF_ONLY") else None  # e.g. gemma4,qwen35
@@ -657,8 +667,9 @@ def main():
         per_tok = []
         for r in refs:
             dec = getattr(r, "tok_decode", r.tok)
-            ids = [e.ids for e in r.tok.encode_batch(corpus)]
-            ids_ns = [e.ids for e in r.tok_ns.encode_batch(corpus)]
+            # Without the post-processor (the engine's encode(); add_bos() covers a template's BOS).
+            ids = [e.ids for e in r.tok.encode_batch(corpus, add_special_tokens=False)]
+            ids_ns = [e.ids for e in r.tok_ns.encode_batch(corpus, add_special_tokens=False)]
             d0 = dec.decode_batch(ids, skip_special_tokens=False)
             d1 = dec.decode_batch(ids, skip_special_tokens=True)
             per_tok.append((ids, ids_ns, d0, d1))
@@ -696,7 +707,7 @@ def main():
             w.str(o)
         w.str(bench)
         for r in refs:
-            w.ids(r.tok.encode(bench).ids)
+            w.ids(r.tok.encode(bench, add_special_tokens=False).ids)
     print(f"wrote {os.path.join(args.out_dir, 'tok_ref.bin')}: {len(corpus)} cases, {len(cases)} decode cases",
           file=sys.stderr)
 

@@ -381,7 +381,7 @@ class MetalModel final : public NativeModel {
     I.hidden_states = !m.cfg.q4;  // run_forest refuses out_hidden for qwen4_exp
     {  // Verify-commit (ESPETERO_COMMIT=0: accepted drafts re-run as roots, as before)
       const char* v = std::getenv("ESPETERO_COMMIT");
-      I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma && !m.cfg.q3moe;  // Qwen4-Exp too; not Gemma 4, Qwen3-Omni
+      I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma && !m.cfg.q3moe && !m.cfg.lfm2;  // Qwen4-Exp too; not Gemma 4, Qwen3-Omni, LFM2
     }
     I.end_ids = m.cfg.eos_ids;  // Gemma 4: <eos>, <turn|>, <|tool_response>
     if (m.cfg.q3moe) I.family = "qwen3_omni_moe";
@@ -389,6 +389,7 @@ class MetalModel final : public NativeModel {
       I.family = "gemma4";
       I.kv_heads = c.Hkv_g;  // the paged pool's (global layers'); the sliding layers' rings are slot state
     }
+    if (m.cfg.lfm2) I.family = "lfm2";
     // Qwen4-Exp: 3 drafts per pass (measured faster than 5 drafts or
     // --draft-auto when serving: every verify row brings its own experts
     // through the cache).
@@ -400,6 +401,10 @@ class MetalModel final : public NativeModel {
       I.vision_temporal = m.vis.c.tps;
     }
     json::Value d = json::Value::object();
+    if (c.lfm2) {
+      d.set("conv_layers", c.n_linear);
+      d.set("attention_layers", c.n_full);
+    }
     if (c.gemma) {
       d.set("sliding_layers", c.n_swa);
       d.set("global_layers", c.n_full);
@@ -985,6 +990,7 @@ class MetalModel final : public NativeModel {
     gemm_pipelines(m.lm_head, list, m.fma34);
     if (m.cfg.gemma) g4_pipelines(m, list);
     if (m.cfg.q3moe) q3m_pipelines(m, list);
+    if (m.cfg.lfm2) lfm2_pipelines(m, list);
     for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "conv_prep", "conv_state_save",
                           "gated_rmsnorm", "attn_prep", "attention_combine", "kv_save", "kv_copy_blocks",
                           "gather_rows_f32", "gather_rows_f16", "scatter_rows_f32", "lse_rows", "argmax_rows",

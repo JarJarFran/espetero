@@ -313,6 +313,7 @@ int64_t Geometry::kv_bytes_per_token(bool mtp) const {
 
 int64_t Geometry::slot_bytes(bool mtp) const {
   if (gemma) return int64_t(n_swa) * ((window + 63) / 64 * 64) * 2 * int64_t(Hkv) * HD * 2;  // the slot's ring
+  if (lfm2) return 3 * int64_t(D) * n_linear * 4;  // the conv windows
   const int64_t C = 2 * int64_t(Hk) * Dk + int64_t(Hv) * Dv;
   return (3 * C + int64_t(Hv) * Dv * Dk) * n_linear * 4 + (mtp ? int64_t(17) * (q4 ? int64_t(hc) * D : D) * 4 : 0);
 }
@@ -323,6 +324,11 @@ int64_t Geometry::row_bytes() const {
     int64_t r = 4 + 6 * int64_t(D) + 4 * int64_t(ld) + 4 * int64_t(H) * hd + 4 * kv + 2 * std::max<int64_t>(I, 2 * int64_t(D));
     if (E) r += 4 * int64_t(D) + int64_t(k) * (2 * int64_t(Ie) + 4 * int64_t(D)) + 8 * int64_t(E) + 4 * int64_t(D) + 16 * int64_t(k);
     return r;
+  }
+  if (lfm2) {  // ensure_scratch for LFM2: tokens, h, xn, proj (3 D), qo (D), Q, Kb, Vb, O, act
+    const int64_t kv = int64_t(Hkv) * HD;
+    return 4 + 6 * int64_t(D) + 4 * std::max(3 * int64_t(D), int64_t(H) * HD + 2 * kv) + 2 * int64_t(D) +
+           4 * int64_t(H) * HD + 4 * kv + 2 * std::max<int64_t>(I, 2 * int64_t(D));
   }
   // ensure_scratch (forest.h): tokens, h, xn, proj, qo, gb, y, yn, Q, Kb, Vb, O, act
   const int64_t C = 2 * int64_t(Hk) * Dk + int64_t(Hv) * Dv, Vd = int64_t(Hv) * Dv, kv = int64_t(Hkv) * HD;
@@ -411,6 +417,41 @@ void gemma_validate(Geometry& g) {
     g.unsupported = "unsupported mixture-of-experts geometry";
 }
 
+// LFM2 / LFM2-VL: config_from_lfm2's reading (src/model/impl/config.h) and
+// the checks of its Config::validate() branch.
+Geometry lfm2_geometry(const json::Value& tc) {
+  Geometry g;
+  g.lfm2 = true;
+  g.D = int(tc.get_int("hidden_size", 0));
+  g.L = int(tc.get_int("num_hidden_layers", 0));
+  g.H = int(tc.get_int("num_attention_heads", 0));
+  g.Hkv = int(tc.get_int("num_key_value_heads", 0));
+  g.HD = g.H ? int(tc.get_int("head_dim", g.D / g.H)) : 0;
+  g.Hk = g.Hv = 0;
+  g.conv_k = int(tc.get_int("conv_L_cache", 3));
+  int I = int(tc.get_int("intermediate_size", tc.get_int("block_ff_dim", 0)));
+  if (tc.get_bool("block_auto_adjust_ff_dim", false)) {
+    I = int(2 * I / 3);
+    if (const json::Value* m = tc.get("block_ffn_dim_multiplier"); m && m->is_number()) I = int(m->as_double() * I);
+    const int mo = int(tc.get_int("block_multiple_of", 256));
+    I = mo * ((I + mo - 1) / mo);
+  }
+  g.I = I;
+  g.V = int(tc.get_int("vocab_size", 0));
+  if (const json::Value* types = tc.get("layer_types"); types && types->is_array())
+    for (const json::Value& t : types->as_array()) (t.is_string() && t.as_string() == "conv") ? ++g.n_linear : ++g.n_full;
+  g.known = g.D > 0 && g.L > 0 && g.V > 0;
+  if (!g.D || !g.I || !g.L || !g.H || !g.Hkv || !g.V || g.n_full + g.n_linear != g.L)
+    g.unsupported = "incomplete LFM2 configuration";
+  else if (g.H % g.Hkv || g.HD != 64 || g.conv_k != 3 || g.D % 64 || g.I % 64)
+    g.unsupported = "unsupported LFM2 geometry (head dim 64, conv of 3 taps)";
+  else if (const int G = g.H / g.Hkv; G != 1 && G != 2 && G != 4 && G != 8)
+    g.unsupported = "unsupported LFM2 GQA group " + std::to_string(G);
+  else if (tc.get_int("num_experts", 0) > 0)
+    g.unsupported = "LFM2 mixture-of-experts models";
+  return g;
+}
+
 Geometry geometry_from_config(const json::Value& root) {
   Geometry g;
   if (!root.is_object()) return g;
@@ -420,6 +461,7 @@ Geometry geometry_from_config(const json::Value& root) {
     const std::string top = root.get_string("model_type", ""), text = tc.get_string("model_type", "");
     for (const char* t : {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"})
       if (top == t || text == t) return gemma_geometry(root, tc);
+    if (top == "lfm2" || top == "lfm2_vl" || text == "lfm2") return lfm2_geometry(tc);
   }
   g.D = int(tc.get_int("hidden_size", 0));
   g.I = int(tc.get_int("intermediate_size", 0));
@@ -796,6 +838,8 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
   const bool tied = tie && tie->is_bool() && tie->as_bool();
   bool lm_head = false, own_mtp = false, vision_tower = false;
   int64_t embed_bytes = 0;
+  // LFM2: the loader reads the Hugging Face names too (lfm2_load.h).
+  const bool hf_names = f.geo.lfm2;
   bool embed_quantized = false;
   for (const std::string& s : shards) {
     const FileRef* r = size_of(s);
@@ -809,18 +853,20 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
       if (code && gpu_bits(mq.bits) != mq.bits) bytes = bytes * gpu_bits(mq.bits) / mq.bits;  // 2- and 3-bit codes widen to bytes
       if (mq.bits && mq.group == 128 && (ends_with(t.name, ".scales") || ends_with(t.name, ".biases")))
         bytes *= 2;  // group 128 is split in two groups of 64 (exact)
-      if (starts_with(t.name, "language_model.model.embed_tokens.")) {
+      if (starts_with(t.name, "language_model.model.embed_tokens.") || (hf_names && starts_with(t.name, "model.language_model.embed_tokens."))) {
         // Rows are gathered from nibbles or bytes (load_embedding: 5- and 6-bit codes widen).
         if (code && mq.bits != 4 && mq.bits != 8) bytes = t.bytes * 8 / mq.bits;
         embed_bytes += bytes;
         embed_quantized = embed_quantized || code;
       }
       if (starts_with(t.name, "language_model.lm_head.")) lm_head = true;
-      if (t.name == "language_model.model.embed_tokens.weight") f.mlx_layout = true;
+      if (t.name == "language_model.model.embed_tokens.weight" || (hf_names && t.name == "model.language_model.embed_tokens.weight"))
+        f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
       if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight" ||
-          t.name == "vision_embedder.patch_dense.weight")
-        vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified
+          t.name == "vision_embedder.patch_dense.weight" || t.name == "vision_tower.embeddings.patch_embedding.weight" ||
+          t.name == "model.vision_tower.vision_model.embeddings.patch_embedding.weight")
+        vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified, LFM2-VL (MLX and Hugging Face names)
       if (f.geo.ds4) {  // DeepSeek-V4.1: experts and Engram tables stay on the SSD; no draft head or vision yet
         if (contains(t.name, ".ffn.experts.") || contains(t.name, ".engram.embed.")) f.streamed += t.bytes;
         else if (!starts_with(t.name, "mtp.") && !starts_with(t.name, "vision.") && !starts_with(t.name, "aligner."))
@@ -836,7 +882,8 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         continue;
       }
       if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.") ||
-          starts_with(t.name, "vision_embedder."))
+          starts_with(t.name, "vision_embedder.") || starts_with(t.name, "multi_modal_projector.") ||
+          (hf_names && (starts_with(t.name, "model.vision_tower.") || starts_with(t.name, "model.multi_modal_projector."))))
         f.vision += bytes;
       f.weights += bytes;
     }

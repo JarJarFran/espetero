@@ -318,7 +318,7 @@ const ChatMarkers& chat_markers(const Engine& engine) {
 }
 
 json::Value template_special_tokens(const Tokenizer& tok) {
-  if (tok.pre_tokenizer_name() != "spm") return json::Value();
+  if (tok.pre_tokenizer_name() != "spm" && tok.chat_template().find("bos_token") == std::string::npos) return json::Value();
   json::Value o = json::Value::object();
   auto put = [&](const char* key, int32_t id) {
     if (id >= 0 && !tok.token_text(id).empty()) o.set(key, std::string(tok.token_text(id)));
@@ -765,7 +765,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     const int merge = engine.info().vision_merge;
     size_t k = 0;
     for (size_t i = 0; i < ids.size() && k < g.images.size();) {
-      if (ids[i] == engine.image_token) {
+      if (ids[i] == engine.run_start) {
         g.image_rows.push_back(int(i));
         i += size_t(g.images[k++].tokens(merge));
       } else {
