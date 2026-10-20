@@ -538,7 +538,7 @@ EngineOptions engine_options(const Args& a) {
   // decoding on MoE and dense models); models without
   // an MTP head are unaffected. --mtp-coarse 0 restores the 4-bit head.
   o.load.mtp_coarse = a.i("mtp-coarse", 256);
-  if (o.load.mtp_coarse > 0 && !a.has("mtp-head4")) o.load.mtp_head4 = false;  // the coarse head replaces it
+  if (a.has("mtp-head4")) o.load.mtp_head4 = 1;  // beside the coarse head (LoadOptions: the coarse head replaces it)
   o.load.mtp_q8 = !a.has("no-mtp-q8");
   o.load.tune_max_m = a.i("tune-max-m", 1024);
   o.load.vision = !a.has("no-vision");

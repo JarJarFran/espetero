@@ -43,7 +43,7 @@ struct LoadOptions {
   bool vision = true;
   std::string mmproj;       // GGUF: "" = look next to the model, "none" = text only
   std::string mtp;          // "" = the model's own head, a path, or "none"
-  bool mtp_head4 = true;    // 4-bit copy of the LM head for drafts
+  int mtp_head4 = -1;       // 4-bit copy of the LM head for drafts: 1 on, 0 off, -1 on only when mtp_coarse is 0
   bool mtp_q8 = true;       // dense (bf16) MTP-layer matrices as 8-bit affine copies (on by default; drafts are verified, output unchanged)
   std::string dense;        // decoder matrices served as fp16: gate_up,down,in_proj,out|all
   int tune_max_m = 1024;    // GEMM autotune up to this many rows (0: off)
@@ -51,8 +51,9 @@ struct LoadOptions {
   bool prune_last = true;
   int attn_split = 512;     // max cached keys per split-K attention tile (0: off); few-tile passes split down to 64
   int mtp_vocab = 0;        // MTP drafts score LM head rows [0, mtp_vocab) only (0: the whole vocabulary, opt-in)
-  int mtp_coarse = 0;       // MTP drafts from a 2-bit copy of the LM head: this many 32-id column blocks per draft rescored
-                            // with the LM head (0: off; drafts are verified, output unchanged)
+  int mtp_coarse = 256;     // MTP drafts from a 2-bit copy of the LM head: this many 32-id column blocks per draft rescored
+                            // with the LM head (0: off; drafts are verified, output unchanged). These two defaults
+                            // are the server's, so bench_native, parity_test and calibration measure the served drafts.
   bool verbose = false;
 };
 

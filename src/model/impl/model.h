@@ -56,6 +56,10 @@ struct Layer {
   // E * 2 * Ie rows; all experts' down rows one of E * D rows.
   bool moe = false;
   Mat router, shared_gate;  // [E, D], [1, D]
+  // Passes of more than 8 rows: a copy of the router with the shared-expert
+  // gate as row E ([E + 1, D]), so one GEMM gives both (quantized routers and
+  // gates of one layout only; empty otherwise).
+  Mat router_sg;
   QW experts_gu, experts_down;
   // Gated DeltaNet: in_proj = [qkv; z; a; b]; full attention: [q|gate; k; v].
   std::vector<Mat> in_proj;
@@ -547,6 +551,16 @@ struct Model : Runtime {
   bool fuse_gated = false;   // decode passes: gated per-head norm fused into the out projection (reads fp32 y and z: off)
   bool fuse_route = true;    // MoE: router + shared gate + top-k (+ single-row tile table) in one dispatch
   bool route_par = true;     // MoE: the fused route as partial-GEMV threadgroups + a finalize dispatch
+  // MoE, more than 8 rows: router and shared gate as one GEMM (router_sg,
+  // -1 dispatch per MoE layer; ESPETERO_ROUTE_SG=1, "route_sg"). 35B-A3B
+  // 4-bit, M1 Max, 16-row step: 806 -> 766 dispatches, 44.12 -> 41.09 ms GPU
+  // (-6.9 %, 3 alternating pairs, median). Off: the
+  // gate's logit then sums K in the router's split order (the M1 Max tuning
+  // splits the 256 x 2048 router up to 896 rows), and the drift reaches
+  // near-tied top-k choices of later layers: greedy replies on the 35B-A3B
+  // 4-bit diverged on 2 of 16 prompts after ~45 tokens. The routing logits
+  // of a layer are equal bit for bit.
+  bool route_sg = false;
   int route_nsl = 0;         // parallel route: K slices per column block (0: (K/64 + 7) / 8, at most 8)
   bool attn_vec = false;     // with attn_gqa off: decode attention of single-row trees on the GEMV-style kernel (measured neutral, off)
   bool attn_gqa = true;      // decode attention of single-row trees with the GQA group as the MMA rows (attn_decode_gqa, g4_attention_dec)

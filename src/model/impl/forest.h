@@ -213,7 +213,7 @@ inline void ensure_moe_scratch(Model& m, int rows) {
   const int R = std::max(rows, std::max(64, z.rows * 3 / 2));
   const size_t pairs = size_t(R) * size_t(c.k);
   auto b = [&](size_t n) { return m.buffer(std::max<size_t>(n, 16)); };
-  z.logits = b(sizeof(float) * size_t(R) * size_t(c.E));
+  z.logits = b(sizeof(float) * size_t(R) * size_t(c.E + 1));  // + the shared gate's column (router_sg)
   z.ids = b(sizeof(int32_t) * pairs);
   z.w = b(sizeof(float) * pairs);
   z.counts = b(sizeof(int32_t) * size_t(c.E));
@@ -245,6 +245,8 @@ inline void ensure_moe_scratch(Model& m, int rows) {
 
 struct MoeRouteParams {
   int32_t E, k, M;
+  int32_t ld;  // floats per logits row (E, or E + 1 with the shared gate's column)
+  int32_t sg;  // 1: column E is the shared gate's logit, copied to sgate
 };
 struct MoeSortParams {
   int32_t E, k, M, gu_blocks, down_blocks, shared, remap;
@@ -596,7 +598,12 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     }
     E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(size_t(threads), 1, 1));
   } else if (m.moe_stages & 1) {
-    gemm(E, m.tune, L.shared_gate, X, 0, c.D, z.sgate, 0, 1, rows, 0);
+    // route_sg (opt-in, see model.h), more than 8 rows: the shared gate is row
+    // E of router_sg, one GEMM for both instead of its own 1 x D GEMM (one
+    // threadgroup; 0.23 ms per layer isolated at 16 rows); moe_topk moves
+    // column E to z.sgate.
+    const int sg = m.route_sg && rows > 8 && L.router_sg.out() == c.E + 1 ? 1 : 0;
+    if (!sg) gemm(E, m.tune, L.shared_gate, X, 0, c.D, z.sgate, 0, 1, rows, 0);
     static const bool router_gemv = !env_on("ESPETERO_Q4_NO_ROUTER_GEMV");
     if (router_gemv && L.router_f16 && rows <= 8) {  // dense router, few rows (Qwen4-Exp): the plain GEMV
       E.pipe("q4_router_gemv");
@@ -609,17 +616,19 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
       E.wr(z.logits);
       E.groups(MTLSizeMake(size_t((c.E + 7) / 8), size_t(rows), 1), MTLSizeMake(256, 1, 1));
     } else {
-      gemm(E, m.tune, L.router, X, 0, c.D, z.logits, 0, c.E, rows, 0);
+      gemm(E, m.tune, sg ? L.router_sg : L.router, X, 0, c.D, z.logits, 0, c.E + sg, rows, 0);
     }
-    const MoeRouteParams rp{c.E, c.k, rows};
+    const MoeRouteParams rp{c.E, c.k, rows, c.E + sg, sg};
     E.pipe("moe_topk");
     E.set(0, z.logits);
     E.set(1, z.ids);
     E.set(2, z.w);
     E.bytes(3, rp);
+    E.set(4, z.sgate);
     E.rd(z.logits);
     E.wr(z.ids);
     E.wr(z.w);
+    if (sg) E.wr(z.sgate);
     E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(size_t((c.E + 31) / 32 * 32), 1, 1));
   }
   // Expert cache: the hook brings the routed experts into the layer's
@@ -2822,12 +2831,13 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       } else {
         gemm(E, m.tune, Ln.router, X, 0, c.D, q.pflog, 0, c.E, rows, 0);  // the router once for all rows
       }
-      const MoeRouteParams rp{c.E, 16, rows};
+      const MoeRouteParams rp{c.E, 16, rows, c.E, 0};
       E.pipe("moe_topk");
       E.set(0, q.pflog);
       E.set(1, q.pfids);
       E.set(2, q.pfw);
       E.bytes(3, rp);
+      E.set(4, q.pfw);  // unread (sg = 0)
       E.rd(q.pflog);
       E.wr(q.pfids);
       E.wr(q.pfw);
@@ -2947,8 +2957,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
           }
         }
         if (XP.layer[pb] != li) {  // nothing prefetched for this layer: start empty
-          while (XF.st_pending[pb].load(std::memory_order_acquire) > 0) {
-          }
+          xio_block(XF, XF.st_pending[pb]);
           std::fill(XP.idx[pb].begin(), XP.idx[pb].end(), -1);
           XP.count[pb] = 0;
         }
@@ -3004,8 +3013,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       if (xpipe_on && li + 1 < c.L && float(need.size()) >= xpipe_min * float(c.E)) {
         const int nb = (li + 1) % 2;
         const ExpertPool& Pn = m.xpool[size_t(li + 1)];
-        while (XF.st_pending[nb].load(std::memory_order_acquire) > 0) {
-        }
+        xio_block(XF, XF.st_pending[nb]);
         std::fill(XP.idx[nb].begin(), XP.idx[nb].end(), -1);
         XP.count[nb] = 0;
         std::vector<ExpertPrefetch::Job> js;
@@ -4077,7 +4085,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
     }
   } else {
-    commit_wait(cb, 20);  // on failure the guard leaves the slots as they were
+    commit_wait(cb);  // on failure the guard leaves the slots as they were
     E.check_submitted();  // split handshakes' resident tiles
   }
 
@@ -4086,9 +4094,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   if (q4_swept && !m.chain_active) {
     m.xstage = std::make_unique<Arena>(m.dev, size_t(64) << 20);
     if (m.xpipe.buf[0] && m.xpf) {  // the pipe buffers too, once their reads are done
-      for (int k = 0; k < 2; ++k)
-        while (m.xpf->st_pending[k].load(std::memory_order_acquire) > 0) {
-        }
+      for (int k = 0; k < 2; ++k) xio_block(*m.xpf, m.xpf->st_pending[k]);
       m.xpipe = Model::XPipe{};
     }
   }
@@ -4394,7 +4400,7 @@ inline void run_commit(Model& m, PassMeta& meta, const std::vector<CommitRequest
     E.threads(MTLSizeMake(size_t(W / 4), from.size(), 1), MTLSizeMake(64, 1, 1));
   }
   cb = E.finish();
-  commit_wait(cb, 5);
+  commit_wait(cb);
   // Qwen4-Exp: the n-gram mix state (last kPleHist normalized conv
   // inputs, last two token ids) after the committed rows, from the pass's
   // rows (q4s.Gn and the pass tokens still hold them: no pass ran since).
@@ -4846,7 +4852,7 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
   }
   cb = E.finish();
   const double enc_ms = ms_since(t_enc);
-  commit_wait(cb, 5);
+  commit_wait(cb);
   const int32_t* out = static_cast<const int32_t*>(ptr(meta.m_arg.buf));
   const int32_t* out2 = want2 ? static_cast<const int32_t*>(ptr(meta.m_arg2.buf)) : nullptr;
   for (int i = 0; i < nq; ++i)
@@ -5248,7 +5254,7 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
   }
   cb = E.finish();
   const double enc_ms = ms_since(t_enc);
-  commit_wait(cb, 5);
+  commit_wait(cb);
   owned.armed = false;  // the copies ran: the slots keep their own blocks
   const int32_t* out = static_cast<const int32_t*>(ptr(meta.m_arg.buf));
   const int32_t* out2 = want2 ? static_cast<const int32_t*>(ptr(meta.m_arg2.buf)) : nullptr;

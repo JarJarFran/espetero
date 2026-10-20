@@ -385,6 +385,16 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
   L.router = finish(m, e, tmp, router);
   L.shared_gate = finish(m, e, tmp, sgate);
+  // The multi-row route's single GEMM: the router's rows, then the shared
+  // gate's (same codes and scales, so every output is the separate GEMMs').
+  const QW& rq = router.q;
+  const QW& gq = sgate.q;
+  if (!router.dense && !sgate.dense && rq.bits == gq.bits && rq.src_bits == gq.src_bits && rq.group == gq.group &&
+      rq.half_scales == gq.half_scales && rq.scale_mode == gq.scale_mode) {
+    L.router_sg.q = concat_rows(tmp, {rq, gq});
+    repack(m, e, L.router_sg.q, tmp);
+    L.router_sg.q.w = L.router_sg.q.s = L.router_sg.q.z = Buf{};
+  }
   // Routers and shared gates read the normalized rows through the route
   // kernels (or plain GEMMs without norm links): a dense one does not block
   // the fused RMSNorm of the decoder GEMVs.

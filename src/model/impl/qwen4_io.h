@@ -303,15 +303,24 @@ inline void xio_submit(ExpertPrefetch& X, std::vector<ExpertPrefetch::Job>& js, 
   X.cv_job.notify_all();
 }
 
+// Block until a batch counter of the long-pass pipeline (st_pending) is
+// zero; the readers notify cv_ready when a batch completes. Those batches
+// are whole layers of expert records (milliseconds to seconds of reads), so
+// spinning on them saved nothing but kept a core drawing package power.
+inline void xio_block(ExpertPrefetch& X, std::atomic<int>& cnt) {
+  if (cnt.load(std::memory_order_acquire) <= 0) return;
+  std::unique_lock<std::mutex> lk(X.mu);
+  X.cv_ready.wait(lk, [&] { return cnt.load(std::memory_order_acquire) <= 0; });
+}
+
 // Spin (never sleep: the GPU is idle here and a sleeping host lets the
 // performance controller lower its clock) until every read the encoded work
-// depends on has completed.
+// depends on has completed; a long pass's staging buffer blocks instead.
 inline void xio_wait(ExpertPrefetch& X) {
   while (X.outstanding.load(std::memory_order_acquire) > 0) {
   }
   if (X.st_need >= 0) {  // the staging buffer the committed MoE reads
-    while (X.st_pending[X.st_need].load(std::memory_order_acquire) > 0) {
-    }
+    xio_block(X, X.st_pending[X.st_need]);
     X.st_need = -1;
   }
   for (int idx : X.await)
@@ -497,7 +506,10 @@ inline void xpf_worker(ExpertPrefetch* X) {
     }
     if (j.entry < 0) {  // batch read
       if (!ok) X->io_failed.store(true);
-      j.cnt->fetch_sub(1, std::memory_order_release);
+      if (j.cnt->fetch_sub(1, std::memory_order_release) == 1) {  // the batch is done: wake xio_block
+        std::lock_guard<std::mutex> lk(X->mu);
+        X->cv_ready.notify_all();
+      }
       continue;
     }
     ExpertPrefetch::Entry& e = *X->entries[size_t(j.entry)];

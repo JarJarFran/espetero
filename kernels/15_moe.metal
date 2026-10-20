@@ -21,15 +21,20 @@ struct MoeRouteParams {
   int E;      // experts
   int k;      // experts per row
   int M;      // rows
+  int ld;     // floats per logits row (E, or E + 1 with the shared gate's column)
+  int sg;     // 1: column E is the shared-expert gate's logit, copied to sgate
 };
 
 // One threadgroup per row, one thread per expert (E <= 1024): softmax over
 // the router logits, the k largest (ties to the lower index), renormalized.
+// With p.sg the router GEMM carried the shared gate as row E (router_sg,
+// passes of more than 8 rows): its logit goes to sgate[row] untouched.
 kernel void moe_topk(
     device const float* logits [[buffer(0)]],
     device int* ids [[buffer(1)]],
     device float* w [[buffer(2)]],
     constant MoeRouteParams& p [[buffer(3)]],
+    device float* sgate [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -40,7 +45,8 @@ kernel void moe_topk(
   threadgroup float picked_p[16];
   threadgroup int picked_i[16];
   const int e = int(tid);
-  float x = e < p.E ? logits[ulong(row) * p.E + e] : -INFINITY;
+  if (p.sg && tid == 0) sgate[row] = logits[ulong(row) * p.ld + p.E];
+  float x = e < p.E ? logits[ulong(row) * p.ld + e] : -INFINITY;
   float m = simd_max(x);
   if (lane == 0) redf[sg] = m;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1556,6 +1562,22 @@ kernel void moe_down_comb(
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
   device const half* arow = A + ulong(slot) * ulong(p.Ie);
+  // Simdgroup 0's epilogue operands, requested before the K loop as
+  // independent clamped loads (as route_topk_simd does): every slot's tile
+  // and routing weight, and the shared gate. A loop of p.k iterations whose
+  // part[] index came from a slotpos load paid its device latencies in
+  // series after the barrier.
+  int tpos[16];
+  float wsl[16];
+  float sgl = 0.0f;
+  if (sgid == 0) {
+    UNROLL for (int s = 0; s < 16; ++s) {
+      const int sc = min(s, p.k - 1);
+      tpos[s] = slotpos[sc];
+      wsl[s] = w[sc];
+    }
+    sgl = sgate[0];
+  }
   float acc[8];
   UNROLL for (int c = 0; c < 8; ++c) acc[c] = 0.0f;
   if (sh)
@@ -1580,15 +1602,17 @@ kernel void moe_down_comb(
   if (sgid == 0) {
     const int c = int(lane);
     float routed = 0.0f;
-    for (int s = 0; s < p.k; ++s) {
-      const int t = slotpos[s];  // simdgroups are laid out by tile
-      float y = 0.0f;
-      UNROLL for (int q = 0; q < KSX; ++q) y += part[t * KSX + q][c];
-      routed += w[s] * y;
+    UNROLL for (int s = 0; s < 16; ++s) {  // slot order, as before
+      if (s < p.k) {
+        const int t = tpos[s];  // simdgroups are laid out by tile
+        float y = 0.0f;
+        UNROLL for (int q = 0; q < KSX; ++q) y += part[t * KSX + q][c];
+        routed += wsl[s] * y;
+      }
     }
     float ysh = 0.0f;
     UNROLL for (int q = 0; q < KSX; ++q) ysh += part[p.k * KSX + q][c];
-    const float g = 1.0f / (1.0f + exp(-sgate[0]));
+    const float g = 1.0f / (1.0f + exp(-sgl));
     device float* hp = h + nloc + c;
     const float v = *hp + (routed + g * ysh);
     if (p.norm && ntgs > 1) atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v), memory_order_relaxed);

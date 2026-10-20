@@ -218,6 +218,15 @@ Rules that keep the tiers honest:
   saves.** Normalizing on load (a load and two multiplies per activation)
   was 12% slower per step on the 2B than a separate `rmsnorm`; the
   producer-side finalizer is 1% faster with 20% fewer dispatches.
+- **Tuned GEMM tiles apply above the tuned range** (`tune_clamp`, on).
+  Prefill chunks are 2048 rows against `tune_max_m` 1024; taking the top
+  bucket's tile without its K split keeps config 2's summation order (logits
+  bit-identical) and cut a 27B 4-bit 2048-row prefill 5.9–6.3% (paired A/B,
+  ratio 0.941 / 0.937; 165 tok/s against 158 on an idle M1 Max).
+- **Two multi-row switches measured slower, off by default:**
+  `ESPETERO_FUSE_NORM_MAXM=8` (fused norms up to 8 rows) +2.4% per step at
+  4 rows, +4.7% at 8; `ESPETERO_FMA34=1 ESPETERO_GEMV_MAXM=4` (FMA GEMV up
+  to 4 rows) +22% at 4 sequences (27B 4-bit, M1 Max, 2026-10-17).
 
 ### Measured facts: the MoE path (Qwen3.6-35B-A3B unless noted)
 
@@ -258,6 +267,22 @@ Rules that keep the tiers honest:
   does not move (power-throttled regime). It runs one threadgroup per value
   head (Hv = 32 threadgroups on the 27B, 16 on the 2B): splitting a head
   over 2–4 threadgroups needs a cross-threadgroup gated norm.
+- **Folding the shared-expert gate into the router GEMM (`route_sg`,
+  `ESPETERO_ROUTE_SG=1`) is faster but not output-preserving; off by
+  default.** With the gate as row 257 of the router, passes of more than 8
+  rows save one dispatch per MoE layer: 806 → 766 dispatches and 44.12 →
+  41.09 ms per 16-row step (−6.9%, 3 alternating pairs, idle M1 Max). The
+  router columns stay bit-identical, but the gate's logit is then summed in
+  the router's split-K order, and the drift flips near-tied top-k choices in
+  later layers: greedy replies diverged on 2 of 16 prompts after ~45 tokens
+  (argmax of every logits readout unchanged). Kept off for reproducible
+  output; worth it only for many concurrent users without that need.
+- **Preloading `moe_down_comb`'s epilogue operands** (every slot's tile
+  position and weight and the shared gate, requested before `moe_kloop` as
+  independent loads instead of a dependent loop after the barrier) is
+  bit-identical and **made no measurable difference**: 9.37 → 9.45 ms per
+  1-row step, inside the runs' 9.28–9.50 ms spread. Those serial latencies
+  were not on the critical path.
 - **Session-to-session numbers drift ±3–5% with the thermal state**; A/B
   inside one session, alternating, and confirm on whole-model runs.
 

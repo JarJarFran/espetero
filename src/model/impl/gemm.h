@@ -47,6 +47,13 @@ struct Tuner {
   bool gemv = true;        // decode-sized rows use rgemv ("gemv": 0 disables)
   bool gemv8 = true;       // 3..8 rows use the MMA GEMV ("gemv8": 0 disables)
   int gemv_max_m = 2;      // rows served by the FMA GEMV (1..kGemvInstM; ESPETERO_GEMV_MAXM)
+  // GEMMs above the tuned range (prefill chunks of 2048-4096 rows against
+  // tune_max_m = 1024) take the top bucket's tile without its K split, so the
+  // summation order stays config 2's ("tune_clamp": 0 = config 2 as before).
+  // Qwen3.8-27B 4-bit, 2048-row prefill, M1 Max, alternating A/B: 15.62 s
+  // with 32x4 everywhere, 14.70 s with the top bucket's tiles (32x8 for the large
+  // matrices; -5.9 %), logits equal, same dispatches.
+  bool tune_clamp = true;
   // GEMMs of more than 8 rows take the untuned tile (config 2, no split
   // K) whatever their row count, so a row's result does not depend on the
   // rows beside it (embedding passes, "gemm_fixed").
@@ -262,8 +269,12 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
   int choice = M <= 8 ? 0 : 2;
   auto it = T.table.find({w.out, w.in, w.bits, w.fc()});
   const int bucket = (M + 31) / 32 - 1;
-  if (M > 8 && !T.fixed && it != T.table.end() && bucket < int(it->second.size())) choice = it->second[size_t(bucket)];
+  const int nb = it != T.table.end() ? int(it->second.size()) : 0;
+  if (M > 8 && !T.fixed && bucket < nb) choice = it->second[size_t(bucket)];
   else if (M > 8 && M <= 64 && !T.fixed) choice = 1;
+  // Past the last tuned bucket: its tile, never its split (every tile sums K
+  // in the same order, so the output is config 2's bit for bit).
+  else if (M > 8 && !T.fixed && nb > 0 && T.tune_clamp) choice = it->second[size_t(nb - 1)] & 15;
   if (M <= 8) {
     // Decode-sized: one 8-row block per 128 columns; split K until ~256
     // threadgroups keep every core busy (memory-bound, one pass per weight).
