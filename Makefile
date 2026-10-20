@@ -90,6 +90,11 @@ LIB_OBJS := $(filter-out $(BUILD)/obj/server/%,$(OBJS))
 $(BUILD)/decisions_test: tests/decisions_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
+# Engine-level refusals and the d1 image-run guard on real checkpoints (GPU):
+#   build/engine_test --chat <Qwen3.5 dir> --d1 <d1 dir> --clef <Clef dir>
+$(BUILD)/engine_test: tests/engine_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
+
 # Kev decision models without a GPU: the release's encoding, answers and head file
 # (on Kev's tokenizer when a snapshot is cached; skipped otherwise).
 $(BUILD)/kev_test: tests/kev_test.cpp $(BUILD)/obj/engine/kev.o $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC)) $(BUILD)/json.o
