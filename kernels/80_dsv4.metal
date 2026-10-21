@@ -534,6 +534,134 @@ kernel void ds4_hc_post(device float* H [[buffer(0)]], device const float* Y [[b
 }
 
 // ---------------------------------------------------------------------------
+// The hyper-connection kernels between two sub-layers in one dispatch, one
+// threadgroup of 256 per row (D = 5120: W = 20480 = 20 slices of 1024):
+//   post: H[m][k] = post[k] Y[m] + sum_j comb[j][k] H[m][j]   (ds4_hc_post, with pmix)
+//   mix:  the next block's coefficients from the new H     (ds4_hc_part + ds4_hc_fin -> mout)
+//   pre:  X[m] = norm_w(sum_j pre_j H[m][j])                (ds4_hc_pre, with prem)
+// Bit-identical to the three kernels: in round r a thread owns channels
+// 1024 r + 4 tid .. + 3 of every stream (the post reads the old streams and
+// writes the new ones itself), which for stream k is the float4 that lane of
+// that simdgroup held in ds4_hc_part's slice 5 k + r, so each slice's 8
+// simdgroup partials and the 20 slices add in the same order; the pre is
+// ds4_hc_pre's loop. Each flag may be off.
+struct Ds4HcFP {
+  int D, iters;
+  float eps, hc_eps;
+  int post, mix, pre;
+};
+kernel void ds4_hc_fused(device float* H [[buffer(0)]], device const float* Y [[buffer(1)]],
+                         device const float* pmix [[buffer(2)]], device const float* fn [[buffer(3)]],
+                         device const float* scale [[buffer(4)]], device const float* base [[buffer(5)]],
+                         device float* mout [[buffer(6)]], device const float* prem [[buffer(7)]],
+                         device const float* w [[buffer(8)]], device float* X [[buffer(9)]],
+                         constant Ds4HcFP& p [[buffer(10)]], uint m [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int NM = 24, NS = 20, NR = 5;
+  threadgroup float red[8][4][NM + 1];  // simdgroup, stream: one round's slice partials
+  threadgroup float part[NS][NM + 1];
+  threadgroup float red8[8];
+  const int D = p.D, W = 4 * D;
+  device float* h = H + ulong(m) * ulong(W);
+  device const float* c = pmix + ulong(m) * 24;
+  device const float* y = Y + ulong(m) * ulong(D);
+  for (int r = 0; r < NR; ++r) {
+    const int c0 = r * 1024 + 4 * int(tid);
+    float4 x[4];
+    for (int k = 0; k < 4; ++k) x[k] = *(device const float4*)(h + k * D + c0);
+    if (p.post) {
+      const float4 yv = *(device const float4*)(y + c0);
+      const float4 r0 = x[0], r1 = x[1], r2 = x[2], r3 = x[3];
+      for (int k = 0; k < 4; ++k) {
+        x[k] = c[4 + k] * yv + c[8 + k] * r0 + c[12 + k] * r1 + c[16 + k] * r2 + c[20 + k] * r3;
+        *(device float4*)(h + k * D + c0) = x[k];
+      }
+    }
+    if (!p.mix) continue;
+    for (int k = 0; k < 4; ++k) {
+      const int k4 = (k * D + c0) / 4;
+      float acc[NM];
+      for (int j = 0; j < NM; ++j) acc[j] = dot(x[k], ((device const float4*)(fn + ulong(j) * ulong(W)))[k4]);
+      float ss = dot(x[k], x[k]);
+      for (int j = 0; j < NM; ++j) acc[j] = simd_sum(acc[j]);
+      ss = simd_sum(ss);
+      if (lane == 0) {
+        for (int j = 0; j < NM; ++j) red[sg][k][j] = acc[j];
+        red[sg][k][NM] = ss;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (int(tid) < 4 * (NM + 1)) {  // slice (stream k, round r): the 8 simdgroups in order
+      const int k = int(tid) / (NM + 1), j = int(tid) % (NM + 1);
+      float t = 0.0f;
+      for (int s = 0; s < 8; ++s) t += red[s][k][j];
+      part[k * NR + r][j] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (p.mix && tid == 0) {  // ds4_hc_fin
+    float mix[NM + 1];
+    for (int j = 0; j <= NM; ++j) mix[j] = 0.0f;
+    for (int s = 0; s < NS; ++s)
+      for (int j = 0; j <= NM; ++j) mix[j] += part[s][j];
+    const float rr = rsqrt(mix[NM] / float(W) + p.eps);
+    for (int j = 0; j < NM; ++j) mix[j] *= rr;
+    device float* o = mout + ulong(m) * NM;
+    for (int j = 0; j < 4; ++j) o[j] = 1.0f / (1.0f + exp(-(mix[j] * scale[0] + base[j]))) + p.hc_eps;
+    for (int j = 0; j < 4; ++j) o[4 + j] = 2.0f / (1.0f + exp(-(mix[4 + j] * scale[1] + base[4 + j])));
+    float cm[4][4];
+    for (int j = 0; j < 4; ++j) {
+      float mx = -INFINITY;
+      for (int k = 0; k < 4; ++k) {
+        cm[j][k] = mix[8 + 4 * j + k] * scale[2] + base[8 + 4 * j + k];
+        mx = max(mx, cm[j][k]);
+      }
+      float sm = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        cm[j][k] = exp(cm[j][k] - mx);
+        sm += cm[j][k];
+      }
+      for (int k = 0; k < 4; ++k) cm[j][k] = cm[j][k] / sm + p.hc_eps;
+    }
+    for (int k = 0; k < 4; ++k) {
+      const float cs = cm[0][k] + cm[1][k] + cm[2][k] + cm[3][k] + p.hc_eps;
+      for (int j = 0; j < 4; ++j) cm[j][k] /= cs;
+    }
+    for (int it = 1; it < p.iters; ++it) {
+      for (int j = 0; j < 4; ++j) {
+        const float rs = cm[j][0] + cm[j][1] + cm[j][2] + cm[j][3] + p.hc_eps;
+        for (int k = 0; k < 4; ++k) cm[j][k] /= rs;
+      }
+      for (int k = 0; k < 4; ++k) {
+        const float cs = cm[0][k] + cm[1][k] + cm[2][k] + cm[3][k] + p.hc_eps;
+        for (int j = 0; j < 4; ++j) cm[j][k] /= cs;
+      }
+    }
+    for (int j = 0; j < 4; ++j)
+      for (int k = 0; k < 4; ++k) o[8 + 4 * j + k] = cm[j][k];
+  }
+  if (!p.pre) return;
+  threadgroup_barrier(mem_flags::mem_device);  // every thread's new H
+  device const float* pr = prem + ulong(m) * 24;
+  const float p0 = pr[0], p1 = pr[1], p2 = pr[2], p3 = pr[3];
+  device float* xo = X + ulong(m) * ulong(D);
+  float ss = 0.0f;
+  for (int d = int(tid); d < D; d += 256) {
+    const float v = p0 * h[d] + p1 * h[D + d] + p2 * h[2 * D + d] + p3 * h[3 * D + d];
+    xo[d] = v;
+    ss += v * v;
+  }
+  ss = simd_sum(ss);
+  if (lane == 0) red8[sg] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float t = 0.0f;
+  for (int s = 0; s < 8; ++s) t += red8[s];
+  const float rr = rsqrt(t / float(D) + p.eps);
+  for (int d = int(tid); d < D; d += 256) xo[d] = xo[d] * rr * w[d];
+}
+
+// ---------------------------------------------------------------------------
 // Row RMSNorm in place over `n` floats per row: x = x * rsqrt(mean(x^2) + eps) * w,
 // for `heads` vectors of n per row (stride n). One simdgroup per vector.
 struct Ds4NormP {
