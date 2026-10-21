@@ -1414,19 +1414,23 @@ class Dsv4Model final : public NativeModel {
   }
 
   // The end of layer l for rows [r0, r0 + M): hc_post with `fmix` (the FFN's post / comb), and with the fused
-  // kernel also the next layer's input mix (its hca block -> mixA_) and attention input (X_), unless an Engram
-  // changes H first or this is the last layer. pre_done tells the next layer what was done.
+  // kernel also the next layer's input mix (its hca block -> mixA_, indexed by pass row) and, when the next
+  // layer runs over the same rows (same_rows: X_ is indexed from each block's first row), its attention input
+  // X_; not past an Engram layer (it changes H first) or the last layer. mix_done / pre_done tell the next
+  // layer what was done.
   void hc_end(Enc2& E, int l, int r0, int M, id<MTLBuffer> Ys, size_t yso, id<MTLBuffer> fmix, const std::vector<LayerW>& LW,
-              bool& pre_done) {
+              bool same_rows, bool& mix_done, bool& pre_done) {
     if (!hc_fuse()) {
       hc_post(E, fmix, r0, M, Ys, yso);
       return;
     }
     const bool next = l + 1 < int(LW.size()) && LW[size_t(l + 1)].eg < 0;
     const LayerW* n = next ? &LW[size_t(l + 1)] : nullptr;
+    const bool pre = next && same_rows;
     hc_fused(E, r0, M, Ys, yso, fmix, n ? &n->hca_fn : nullptr, n ? &n->hca_base : nullptr, n ? &n->hca_scale : nullptr, mixA_,
-             fmix, n ? &n->attn_norm : nullptr, X_, 0);
-    pre_done = next;
+             fmix, pre ? &n->attn_norm : nullptr, X_, 0);
+    mix_done = next;
+    pre_done = pre;
   }
 
   // ---- GPU-driven decode: the GPU signals route_ev_ after each router and waits for exp_ev_ before each
@@ -2223,7 +2227,7 @@ class Dsv4Model final : public NativeModel {
     }
     id<MTLBuffer> prev = mix0_;
     int cur = 0;
-    bool pre_done = false;  // the fused kernel of the previous layer's end wrote this layer's mixA_ and X_
+    bool mix_done = false, pre_done = false;  // the fused kernel of the previous layer's end wrote this layer's mixA_ / X_
     // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
     // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
     static const bool pred_on = std::getenv("ESPETERO_DS4_PREDICT") && std::atoi(std::getenv("ESPETERO_DS4_PREDICT")) != 0;
@@ -2264,6 +2268,7 @@ class Dsv4Model final : public NativeModel {
       }
       std::vector<Blk>& fb = dec0 >= 0 && l >= dec0 ? fsub : blks;
       const int Tf = full_rows(l);
+      const bool same_rows = l + 1 < int(LW.size()) && full_rows(l + 1) == Tf;  // the next layer's blocks are these
       const bool more = pf_on_ && !draft && l + 1 < int(LW.size()) && !dense[size_t(std::min(l + 1, int(LW.size()) - 1))];
       const bool predict = more && pred_on && T <= kPredRows;
       // the draft head's view of this layer's input: the mean of the hc copies
@@ -2316,8 +2321,10 @@ class Dsv4Model final : public NativeModel {
         if (!hc_fuse()) {
           hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, mixA_, r0, M);
           hc_pre(E, prev, w.attn_norm, X_, 0, r0, M);
-        } else if (!pre_done || w.eg >= 0) {
+        } else if (!mix_done || w.eg >= 0) {
           hc_fused(E, r0, M, nil, 0, nil, &w.hca_fn, &w.hca_base, &w.hca_scale, mixA_, prev, &w.attn_norm, X_, 0);
+        } else if (!pre_done) {  // the rows changed (a decoder layer): the input norm again, from the same mix
+          hc_fused(E, r0, M, nil, 0, nil, nullptr, nullptr, nullptr, nil, prev, &w.attn_norm, X_, 0);
         }
         attention_block(E, w, l, bk, segs, draft);
         if (!dump_dir_.empty()) dump_rows(E, "a" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
@@ -2339,7 +2346,7 @@ class Dsv4Model final : public NativeModel {
         for (size_t ci = 0; ci < fb.size(); ++ci) {
           const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts_encode(E, w, int(ci), r0, M, M * K, M * K, true, nil, 0, 0);
-          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, pre_done);
+          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
         }
         drives.push_back(std::move(d));
         prev = mixF_[cur];
@@ -2404,7 +2411,7 @@ class Dsv4Model final : public NativeModel {
           const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts(E, w, int(ci), r0, M, slot_of);
           if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
-          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, pre_done);
+          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
         }
       } else {
         // ---- phase 3, pipelined (long passes): the GPU computes the experts in
@@ -2444,7 +2451,8 @@ class Dsv4Model final : public NativeModel {
             moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, false, YT_, size_t(fb[ci].r0) * yrow, par);
           used[par] = E.submit_chained();
         }
-        for (size_t ci = 0; ci < fb.size(); ++ci) hc_end(E, l, fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow, mixF_[cur], LW, pre_done);
+        for (size_t ci = 0; ci < fb.size(); ++ci)
+          hc_end(E, l, fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow, mixF_[cur], LW, same_rows, mix_done, pre_done);
       }
       prev = mixF_[cur];
       cur ^= 1;
