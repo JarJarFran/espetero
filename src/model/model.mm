@@ -11,6 +11,7 @@
 #include "impl/load.h"
 #include "impl/qwen4_load.h"
 #include "impl/dsv4_model.h"
+#include "impl/glm5.h"
 #include "kernels_src.h"
 
 #include <fcntl.h>
@@ -1076,6 +1077,14 @@ std::unique_ptr<NativeModel> NativeModel::load(const std::string& path, const Lo
       const std::string mt = tc && tc->is_object() ? tc->get_string("model_type", cfg.get_string("model_type", ""))
                                                    : cfg.get_string("model_type", "");
       if (mt.rfind("deepseek_v41", 0) == 0) return std::make_unique<native::ds4::Dsv4Model>(path, options, kernel_source_text());
+      // GLM-5.3-Flash (glm5_next): the loader's index and checks exist (impl/glm5.h), the engine does not yet
+      // (docs/glm5.md). Recognize the checkpoint and say so instead of failing inside the Qwen loader.
+      if (mt.rfind("glm5_next", 0) == 0) {
+        native::glm5::Index idx;
+        idx.open(path, native::env_on("ESPETERO_GLM5_PARTIAL"));
+        throw std::runtime_error("GLM-5.3-Flash is not served yet (docs/glm5.md); the checkpoint is complete and recognized: " +
+                                 idx.summary());
+      }
     }
     return std::make_unique<MetalModel>(path, options);
   }

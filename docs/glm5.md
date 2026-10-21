@@ -506,7 +506,12 @@ Dispatches per decoded token: ≈ 24 per KDA layer, ≈ 30 per DSA layer, ≈ 1,
 per token (DSv4: 1,285); one host round trip per MoE layer for the routing, as
 DSv4.
 
-Loader (`glm5.h`): HF names `model.language_model.layers.L.*`, `lm_head.weight`,
+Loader (`glm5.h`, written: the config with its validation, every layer's
+tensor names, dtypes and shapes, the routed experts' byte locations in
+cache-slot order; `tests/ref/glm5_ref.py fake-ckpt` writes a checkpoint
+directory of sparse shards holding the real headers and `build/glm5_load_test`
+checks the index on it, so the loader is exercised before any download): HF
+names `model.language_model.layers.L.*`, `lm_head.weight`,
 `model.language_model.{embed_tokens,norm}.weight`; concatenations at load:
 q/k/v projections, the three conv weights (tap order kept), `f_a|g_a|b` rows;
 `kv_b_proj` kept as stored (per-head slices by offset); `hc_*_fn` bf16 → fp32;

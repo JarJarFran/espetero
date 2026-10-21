@@ -115,6 +115,11 @@ $(BUILD)/glm_test: tests/glm_test.cpp $(BUILD)/obj/engine/glm_tools.o $(BUILD)/j
 $(BUILD)/topk_test: tests/topk_test.mm $(BUILD)/model.o $(BUILD)/json.o $(BUILD)/obj/engine/sampling.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
+# GLM-5.3-Flash loader skeleton without a GPU: config and checkpoint index on a (fake) checkpoint directory
+# (python3 -I tests/ref/glm5_ref.py fake-ckpt DIR; build/glm5_load_test DIR).
+$(BUILD)/glm5_load_test: tests/glm5_load_test.mm $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 $(BUILD)/sampling_test: tests/sampling_test.cpp $(BUILD)/obj/engine/sampling.o
 	$(CXX) $(CXXFLAGS) $^ -framework Accelerate -o $@
 
