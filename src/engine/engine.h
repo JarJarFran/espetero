@@ -81,6 +81,10 @@ struct EngineOptions {
   bool single_flight = true;       // a prompt waits for a shared prefix another request is computing
   bool keep_live = true;           // checkpoints running sequences continue or saved are evicted last, made recent when they end
   bool prompt_checkpoint = true;   // chats: a checkpoint at the prompt end for later turns (requests override with cache_prompt)
+  bool reply_checkpoint = true;    // chats that keep their prompt checkpoint: the finished reply's state becomes a
+                                   // checkpoint of prompt + reply (an agent's next turn continues it instead of reading the reply again)
+  int reply_snapshot = 256;        // ... a fork of the reply's state every this many tokens (0: none), the latest
+  int reply_snapshots = 2;         // ... this many kept: the fallback when the next turn renders the reply's tail differently
   bool decode_first = true;        // prompts wait (bounded) for decoding sequences; big prompts one per pass
   int prefill_wait_ms = 2500;      // ... longest wait of a prompt chunk while sequences decode
   int prefill_batch_rows = 512;    // ... prompt rows per pass beyond which no further prompt joins
@@ -475,6 +479,14 @@ class Engine {
   double mtp_expect(const Seq& s, int k) const;      // expected tokens of a pass with k MTP drafts
   // Slots: a free model slot, evicting unpinned cache entries (LRU) if needed.
   int acquire_slot(const std::vector<int>& avoid);
+  // Reply checkpoints (EngineOptions::reply_checkpoint): a fork of a decoding
+  // sequence's work slot (periodic, or `chain`: before a decode chain); at the
+  // end of the reply, its longest exact state and the snapshots under it
+  // become chat checkpoints (true: the work slot is one of them).
+  void reply_snapshot(Seq& s, bool chain);
+  bool save_reply(Seq& s);
+  void drop_snapshots(Seq& s);
+  int steal_snapshot();  // a running reply's snapshot slot (reset), -1 when none
   // `live_ok`: also checkpoints running sequences continue or saved (last);
   // false stops before them (admission and decode chains).
   int evict_lru(const std::vector<int>& avoid, bool live_ok = true);
@@ -599,6 +611,9 @@ class Engine {
   // Optional checkpoints (prompt boundaries, decision prefixes) a pass
   // short of KV skipped so that its work could run.
   std::atomic<uint64_t> kv_skipped_{0};
+  // Reply checkpoints saved (an end-of-reply state, a snapshot under it) and
+  // snapshots forked while replies decode.
+  std::atomic<uint64_t> reply_saved_{0}, reply_forks_{0};
   // Model counters published by the scheduler after every step:
   // stats() runs on HTTP threads and never calls the model, which is not
   // thread-safe.

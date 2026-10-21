@@ -224,6 +224,10 @@ void usage_all() {
                "  --no-keep-live        plain LRU for checkpoints (default: those running requests continue are evicted last)\n"
                "  --no-prompt-checkpoint no chat checkpoint at the prompt end (later turns re-read the prompt; requests can\n"
                "                        ask for it with \"cache_prompt\": true)\n"
+               "  --no-reply-checkpoint no chat checkpoint at the end of a reply (default: the next turn of an agent or\n"
+               "                        tool loop continues the reply's state instead of reading the reply again)\n"
+               "  --reply-snapshot N    ... and a fork of the reply's state every N tokens, the latest 2 kept, for a turn\n"
+               "                        that renders the end of the reply differently (default 256; 0 = none)\n"
                "  --no-decode-first     prompt chunks run beside decoding sequences at once (default: they wait up to\n"
                "                        --prefill-wait-ms, 2500 (200 in --preset general), and prompts beyond\n"
                "                        --prefill-batch-rows, 512, wait a pass)\n"
@@ -478,6 +482,8 @@ json::Value effective_json(const EngineOptions& o, const std::string& repo = "")
   e.set("single-flight", o.single_flight);
   e.set("keep-live", o.keep_live);
   e.set("prompt-checkpoint", o.prompt_checkpoint);
+  e.set("reply-checkpoint", o.reply_checkpoint);
+  e.set("reply-snapshot", int64_t(o.reply_snapshot));
   e.set("exif-rotate", vision::exif_orientation_enabled());
   e.set("chain", int64_t(o.chain_steps));
   e.set("prefill-chunk", int64_t(o.prefill_chunk));
@@ -568,6 +574,8 @@ EngineOptions engine_options(const Args& a) {
   o.single_flight = !a.has("no-single-flight");
   o.keep_live = !a.has("no-keep-live");
   o.prompt_checkpoint = !a.has("no-prompt-checkpoint");
+  o.reply_checkpoint = !a.has("no-reply-checkpoint");
+  o.reply_snapshot = std::max(0, a.i("reply-snapshot", 256));
   o.prefill_wait_ms = a.i("prefill-wait-ms", 2500);
   o.prefill_batch_rows = a.i("prefill-batch-rows", 512);
   o.image_max_pixels = a.i("image-pixels", 131072);
