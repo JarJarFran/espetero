@@ -1703,11 +1703,17 @@ inline void reset_arrival_counters(Model& m) {
 // repacked into resident GPU buffers in the whole-layer format moe_mlp reads
 // (slot = expert id), so a pass routes on the GPU without handshakes. Chosen
 // at load when they all fit (model.mm); replaces the expert cache.
+// The buffers are GPU-private and join the residency set as they are filled
+// (ESPETERO_XRES_SHARED=1: shared buffers, committed at the first pass, as
+// before): with shared buffers the first pass after loading took 4 s more
+// than the expert cache's on the M4 Max (128 GB), 77 GB brought back into
+// the GPU's working set before its command buffer could start.
 inline void ensure_resident_experts(Model& m) {
   const Config& c = m.cfg;
   if (!m.xres_l.empty() || !m.xs.present) return;
   const auto t0 = Clock::now();
-  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true);
+  static const bool shared = env_on("ESPETERO_XRES_SHARED");
+  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true, !shared);
   Arena tmp(m.dev, size_t(1) << 30);
   m.xres_l.resize(size_t(c.L));
   for (int li = 0; li < c.L; ++li) {
@@ -1719,6 +1725,7 @@ inline void ensure_resident_experts(Model& m) {
     repack(m, e, gu, tmp, m.xres.get());
     repack(m, e, dn, tmp, m.xres.get());
     [e endEncoding];
+    if (!shared) Residency::get().commit();  // this layer's new chunks resident now, not at the first pass
     [cb commit];
     [cb waitUntilCompleted];
     if (cb.status != MTLCommandBufferStatusCompleted) fail("resident experts: repack of layer " + std::to_string(li) + " failed");

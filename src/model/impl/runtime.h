@@ -114,9 +114,11 @@ struct Residency {
 class Arena {
  public:
   // resident: the model's weights join the residency set; scratch and
-  // staging arenas do not.
-  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false)
-      : dev_(dev), chunk_(chunk), resident_(resident) {}
+  // staging arenas do not. priv: GPU-private buffers, written and read by
+  // kernels only (no host access: macOS compresses idle shared buffers, and a
+  // pass then pays to bring them back; the resident experts, 77 GB).
+  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false, bool priv = false)
+      : dev_(dev), chunk_(chunk), resident_(resident), priv_(priv) {}
   ~Arena() {
     if (resident_)
       for (id<MTLBuffer> b : buffers_) Residency::get().remove(b);
@@ -141,10 +143,11 @@ class Arena {
       }
     }
     const size_t cap = std::max(nbytes, chunk_);
-    id<MTLBuffer> b = [dev_ newBufferWithLength:cap options:kShared];
+    id<MTLBuffer> b = [dev_ newBufferWithLength:cap
+                                        options:priv_ ? (MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked) : kShared];
     if (!b) fail("Metal allocation of " + std::to_string(cap >> 20) + " MB failed");
     if (resident_) Residency::get().add(b);
-    alloc_log(dev_, resident_ ? "arena (resident)" : "arena", cap, __builtin_return_address(0));
+    alloc_log(dev_, priv_ ? "arena (private)" : resident_ ? "arena (resident)" : "arena", cap, __builtin_return_address(0));
     buffers_.push_back(b);
     len_.push_back(cap);
     fill_.push_back(nbytes);
@@ -154,6 +157,7 @@ class Arena {
   }
 
   Buf copy(const void* src, size_t n) {
+    if (priv_) fail("Arena::copy into GPU-private memory");
     Buf b = alloc(n);
     parallel_copy(ptr(b), src, n);
     return b;
@@ -169,7 +173,7 @@ class Arena {
   id<MTLDevice> dev_;
   size_t chunk_;
   size_t total_ = 0, held_ = 0;
-  bool resident_ = false;
+  bool resident_ = false, priv_ = false;
   std::vector<id<MTLBuffer>> buffers_;
   std::vector<size_t> len_, fill_;
 };
