@@ -2,8 +2,9 @@
 
 The model's math as the references define it, the checkpoint's facts, and how
 Espetero will run it on a 128 GB Mac (text only first). Written before the
-kernels; the loader and kernels cite the sections below. Status: **design
-note, nothing implemented yet** (branch `arch/glm5`).
+kernels; the loader and kernels cite the sections below. Status: design note
+under review; step 2 (tokenizer check, template fixtures, GLM tool calls,
+loader skeleton) in progress on branch `arch/glm5`.
 
 GLM-5.3-Flash (zai-org, 2026-09) is a 320B-A18B hybrid: 34 KDA linear-attention
 layers (Kimi Delta Attention) and 11 DeepSeek-sparse-attention layers (nope-only
@@ -372,16 +373,33 @@ expert cache and streams the rest, and a 2-bit model is a quality question
 Fran decides. Two ways to get there: (a) `tools/glm5_quant.py`, numpy, FP8 →
 Espetero 4-bit g64 affine experts in safetensors with the same two-read
 layout (the trunk stays FP8/bf16), one more decode format in the expert
-GEMV; (b) unsloth's GGUF: the tensor names map one-to-one ([LC]: `blk.N.
-hc_attn_fn`, `ssm_conv1d_q/k/v`, `ssm_f_a/f_b/g_a/g_b/beta/a/dt`,
-`attn_k_b`/`attn_v_b` (= `kv_b_proj` split and transposed per head),
-`indexer_compressor_gate/ape`, `ffn_*_exps` as one 3-D tensor per matrix,
-`nextn.*`), but the i-quant types of the ≤ 120 GB files (IQ1_S/M, IQ2_XXS,
-IQ3_XXS) have no Espetero dequantizer, and the K-quant ones (UD-Q2_K_XL 109
-GB, UD-Q3_K_XL 148 GB, UD-Q4_K_XL 200 GB) need K-quant expert GEMVs in this
-model path (the forest has them, the DSv4-derived code does not). (a) is the
-smaller step and keeps the FP8 reference as the parity anchor; (b) is listed
-in the hand-over as remaining work.
+GEMV; (b) unsloth's GGUF files (`unsloth/GLM-5.3-Flash-GGUF`, 2026-10-05;
+headers read, nothing downloaded):
+
+| File | Size (experts) | Routed experts: gate/up, down | Dense matrices | Espetero's GGUF converter |
+|:--|--:|:--|:--|:--|
+| UD-Q4_K_XL | 199.7 GB (189.9) | Q4_K (one layer Q5_K), Q5_K (3 layers Q6_K) | Q8_0 everywhere (KDA q/k/v/o, DSA, `attn_k_b`/`attn_v_b`, indexer, hc `fn`, head, embeddings); routers, norms, convs F32 | **every type supported** (Q4_K, Q5_K, Q6_K, Q8_0, F32) |
+| UD-Q3_K_XL | 147.5 GB (137.8) | IQ3_XXS, IQ4_XS | Q8_0; head Q6_K | IQ3_XXS missing |
+| UD-IQ3_XXS | 120.4 GB (112.5) | IQ2_S, IQ3_S | Q6_K; `k_b`/`v_b`, indexer Q8_0 | IQ2_S, IQ3_S missing |
+| UD-Q2_K_XL | 108.7 GB (101.7) | IQ2_XS, IQ3_XXS | Q5_K / Q6_K; head Q4_K | IQ2_XS, IQ3_XXS missing |
+
+The tensor names map one-to-one onto the HF ones ([LC]: `blk.N.hc_attn_fn`,
+`ssm_conv1d_q/k/v` [4, 1, 8192], `ssm_f_a/f_b/g_a/g_b/beta/a/dt`,
+`attn_q/k/v` for the KDA projections, `attn_k_b`/`attn_v_b` = `kv_b_proj`
+split and transposed per head (the absorbed layout), `indexer.attn_q_b`,
+`indexer.attn_k`, `indexer.proj`, `indexer.k_norm.{weight,bias}`,
+`indexer_compressor_gate/ape`, `ffn_{gate,up,down}_exps` as one 3-D tensor per
+matrix (a per-expert slice is contiguous: three reads per expert for the SSD
+cache), `exp_probs_b.bias`, `ffn_*_shexp`, `nextn.*`; 1412 tensors, 46
+blocks). The metadata carries the config (`glm5-next.*`: `kda.head_dim`,
+`kda.gate_lower_bound`, `attention.indexer.{head_count,key_length,top_k,
+kpool,index_share_mtp}`, `hyper_connection.*`, `expert_weights_scale` 2.5,
+`expert_gating_func` 2, `swiglu_clamp_{exp,shexp}` per layer,
+`nextn_predict_layers` 1), the tokenizer (`gpt2` model, pre `glm4` =
+Llama-3's regex) and the chat template. Only UD-Q4_K_XL is loadable with the
+types Espetero has; the ≤ 150 GB files need the IQ2/IQ3 codebook
+dequantizers first. (a) is the smaller step and keeps the FP8 reference as the
+parity anchor; (b) is §12's route B.
 
 ## 9. Per-token traffic, state, expected speed (FP8 route, M4 Max)
 
@@ -552,20 +570,32 @@ run with `ESPETERO_*_PREFETCH=0 ESPETERO_*_PIPE=0`.
 | `hc_mult ≠ 4` | general | asserts 4 | assert 4 |
 | head | `norm(mean(H))` | same | same |
 
-Open questions for Fran before the kernels:
+### The two routes to a first serving model (Fran picks)
 
-1. **Disk:** ~330 GB must be freed on the Studio for the FP8 checkpoint
-   (61 GB free today; the FP8 files are also the input of any conversion and
-   of the reference). Which models go, and may the download start?
-2. **Route:** FP8 + SSD experts first (exact parity, DSv4's machinery, ~3–6
-   tok/s expected), then 4-bit experts for speed — or straight to a 4-bit
-   conversion with parity against the FP8 reference at a looser bound?
-3. **Load-time 8-bit copies** of the KDA matrices and the head (−5.3 GB per
-   token, ~25 % faster GPU side; results change at the 1e-3 level): default
-   on after parity, or opt-in?
-4. **Code sharing:** copy DSv4's expert-cache host code into the GLM model
-   first (no risk to DSv4), factor into a shared header afterwards — agreed?
-5. Context default 32 K (0.78 GB per slot) and 6 slots, as DSv4?
+| | **A. FP8 checkpoint, experts from the SSD** | **B. GGUF first: unsloth UD-Q4_K_XL** |
+|:--|:--|:--|
+| Disk on the Studio (61 GB free today) | 328 GB (`zai-org/GLM-5.3-Flash`, 62 shards) | 200 GB (6 shards); the 120 GB UD-IQ3_XXS only after IQ2_S / IQ3_S dequantizers exist |
+| Memory | 15.6 GB resident; expert cache ≈ 95 GB = 30 % of the experts | ≈ 10 GB resident (Q8_0 dense); 190 GB of experts, ≈ 50 % cached |
+| Bytes per decoded token | 22.5 GB (bf16 KDA 9.4, fp8 experts 8.5) → ≈ 47 ms GPU | ≈ 14 GB (Q8_0 KDA 4.9, Q4_K/Q5_K experts 15.2 MB × 336 = 5.1) → ≈ 29 ms GPU |
+| SSD per token (DSv4's locality, 8 %) | 28 misses × 25.2 MB ≈ 105 ms | ≈ 5–15 misses × 15.2 MB ≈ 11–34 ms |
+| Expected decode | **3–6 tok/s** (SSD-bound; 1 tok/s without locality) | **12–20 tok/s** (3–5 without locality) |
+| Prefill of a long prompt | 304 GB streamed per pass, ≈ 45 s + GPU | 190 GB, ≈ 28 s + GPU |
+| Parity story | exact: `tools/glm5_ref.py` (fp32 numpy of [T] on the same weights), per-layer dumps, logits to half-precision noise; kernels proven against the model itself | against llama.cpp on the very same file (teacher-forced logits, `llama-cli`/`llama-perplexity` with mmap on the Studio: slow but complete) — the kernels are then checked against another engine's quantized arithmetic, not the model; the FP8 transcription stays the oracle for anything that disagrees, so route B still wants the FP8 files (or a smaller FP8 slice: the first layers) at some point |
+| Engine work | §10 as written | §10 plus: the GGUF tensor map and metadata for this model (`gguf.h` has the `qwen35`/`gemma4` ones), per-head `k_b`/`v_b` slices, expert slices from 3-D tensors (3 reads), Q4_K/Q5_K/Q6_K experts in the DSv4-derived path (repack each expert into the forest's affine layout when it enters the cache, with the existing conversion kernels, or K-quant-native GEMVs), Q8_0 dense GEMVs (one more `ds4_gemv` format) |
+| What it serves | the model as released, lossless; any later quantization is Espetero's own (EQ) | what M4 Max users download; unsloth's choices (Q8_0 dense, Q4_K/Q5_K experts) |
+| Order | A first when the disk is freed; (a) of §8.2 (4-bit experts) for speed after parity | B first only if the 328 GB cannot be freed; A's kernels are the same (the cache is format-agnostic), the GGUF map and K-quant formats are additions |
+
+Decisions taken with the parent session's advice (pending Fran's review):
+
+1. Load-time 8-bit copies of the bf16 KDA matrices and the head are
+   **opt-in** (`--dense-8bit`, measured both ways); bf16 by default (lossless
+   by default; EQ covers the dense matrices properly later).
+2. DeepSeek-V4.1's expert-cache host code is **copied** into the GLM model
+   first and factored once both run (no premature abstraction).
+3. Context default 32 K (0.78 GB per slot) and 6 slots, as DSv4, until
+   measured.
+
+Open for Fran: the disk (which models go; the download), and A or B.
 
 ## Appendix A. Tensor inventory ([C]; logical shapes `[out, in]`)
 
