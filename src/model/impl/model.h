@@ -587,6 +587,11 @@ struct Model : Runtime {
   int moe_ks_dn = 4;         // as moe_ks / moe_nbpt, for the down projection (4 slices x 2 column blocks)
   int moe_nbpt_dn = 2;
   bool moe_swap = false;     // FMA expert GEMV: block-major grid (consecutive threadgroups stream one expert)
+  // MMA expert kernel on passes of more than 8 rows (prefill): rows per
+  // expert tile, 8 (the 8-row kernel, as before), 16 or 32 (moe_gemm16 /
+  // moe_gemm32: each expert's weights read and dequantized once per tile
+  // instead of once per 8 rows; every row's sums are the same). ESPETERO_MOE_BM, "moe_bm".
+  int moe_bm = 8;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set

@@ -250,6 +250,7 @@ struct MoeRouteParams {
 };
 struct MoeSortParams {
   int32_t E, k, M, gu_blocks, down_blocks, shared, remap;
+  int32_t bm = 0;  // rows per tile (0: 8); 16 / 32 for the moe_gemm16 / moe_gemm32 kernels
 };
 struct MoeRouteFusedParams {
   int32_t E, k, K, lda, gu_blocks, down_blocks, build_tiles, shared;
@@ -287,7 +288,7 @@ struct MoeDownCombParams {
 // GEMVs of the first pass with staged experts, so it is inspected without
 // running them.
 inline void moe_check_tiles(Model& m, Enc& E, const MoeScratch& z, const ExpertPool* PV, int li, int Eeff, int rows,
-                            int shared, int mode) {
+                            int shared, int mode, int bm = 8) {
   const Config& c = m.cfg;
   E.flush();
   const int n = rows * c.k;
@@ -308,17 +309,17 @@ inline void moe_check_tiles(Model& m, Enc& E, const MoeScratch& z, const ExpertP
   }
   int want = 0, used = 0;
   for (int e = 0; e < Eeff; ++e) {
-    want += (cnt[size_t(e)] + 7) / 8;
+    want += (cnt[size_t(e)] + bm - 1) / bm;
     used += cnt[size_t(e)] > 0 ? 1 : 0;
   }
-  if (shared) want += (rows + 7) / 8;
+  if (shared) want += (rows + bm - 1) / bm;
   const size_t cap = size_t([z.tiles length]) / 16;
   const int got = int(ind[0]);
   int bad_tiles = 0, first_bad = -1;
   std::vector<int> seen(size_t(Eeff) + 1, 0);
   for (int t = 0; t < std::min(got, int(cap)); ++t) {
     const int e = tl[4 * t], r0 = tl[4 * t + 1], nr = tl[4 * t + 2];
-    const bool ok = e >= 0 && e <= Eeff && nr >= 1 && nr <= 8 && r0 >= 0 && r0 + nr <= n + rows;
+    const bool ok = e >= 0 && e <= Eeff && nr >= 1 && nr <= bm && r0 >= 0 && r0 + nr <= n + rows;
     if (ok) seen[size_t(e)] += nr;
     if (!ok && bad_tiles++ == 0) first_bad = t;
   }
@@ -380,10 +381,10 @@ inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
 // Kernel of a grouped expert GEMV (epi 2: gate/up with the gated epilogue, 0:
 // down): the 1-2-row FMA kernel (ks K slices, the route folded into the
 // gate/up prologue, w2: the shared expert as tile k, _s8 when its width
-// differs) or the 8-row MMA kernel.
-inline std::string moe_gemv_name(const QW& w, const QW* w2, bool fma_path, int rows, int epi, bool route, int ks) {
+// differs) or the MMA kernel with bm (8, 16 or 32) rows per tile.
+inline std::string moe_gemv_name(const QW& w, const QW* w2, bool fma_path, int rows, int epi, bool route, int ks, int bm = 8) {
   const std::string tail = epi == 2 ? "_swiglu" : "_store";
-  if (!fma_path) return "moe_gemv8r" + std::to_string(w.bits) + tail;
+  if (!fma_path) return (bm > 8 ? "moe_gemm" + std::to_string(bm) + "r" : "moe_gemv8r") + std::to_string(w.bits) + tail;
   return "moe_gemv" + std::to_string(w.bits) + "_" + std::to_string(rows) + tail + (route ? "_route" : "") +
          (ks == 8 ? "" : "_k" + std::to_string(ks)) + (w2 && w2->bits != w.bits ? "_s" + std::to_string(w2->bits) : "");
 }
@@ -408,6 +409,10 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
   const QW* sdn = tiles ? &L.down.q : nullptr;
   out.push_back({moe_gemv_name(gu, sgu, false, 8, 2, false, 8), gu.fc()});
   out.push_back({moe_gemv_name(dn, sdn, false, 8, 0, false, 8), dn.fc()});
+  if (m.moe_bm > 8) {  // the wide tiles of passes of more than 8 rows
+    out.push_back({moe_gemv_name(gu, nullptr, false, 8, 2, false, 8, m.moe_bm), gu.fc()});
+    out.push_back({moe_gemv_name(dn, nullptr, false, 8, 0, false, 8, m.moe_bm), dn.fc()});
+  }
   for (int rows : {1, 2})
     for (int ks : {8, 4, 2}) {
       out.push_back({moe_gemv_name(gu, sgu, true, rows, 2, false, ks), gu.fc()});
@@ -650,7 +655,12 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // Expert cache: the sort maps the routed expert ids to pool slots itself (m.xmap).
   const int remap = pooled ? 1 : 0;
   if (Eeff > moe_sort_cap(c)) fail("moe_sort: " + std::to_string(Eeff) + " expert indices exceed its tables");
-  const MoeSortParams sp{Eeff, c.k, rows, gu_blocks, down_blocks, shared_flag, remap};
+  // Rows per expert tile of the MMA kernel: 8 on decode-sized passes (and
+  // on the expert cache's pooled passes, whose staged records the 8-row
+  // kernel reads), moe_bm (16 / 32) on larger ones: at 2048 rows an expert
+  // holds ~64 rows, read and dequantized once per tile.
+  const int bm = (rows > 8 && !pooled && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
+  const MoeSortParams sp{Eeff, c.k, rows, gu_blocks, down_blocks, shared_flag, remap, bm};
   if ((m.moe_stages & 1) && !(fused_route && rows == 1)) {
   E.pipe("moe_sort");
   E.set(7, remap ? m.xmap : z.ids);
@@ -676,7 +686,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     return v && *v ? std::atoi(v) : 0;
   }();
   if (moe_check && pooled && rows > 8 && (m.moe_stages & 1))
-    moe_check_tiles(m, E, z, PV, int(&L - m.layers.data()), Eeff, rows, shared_flag, moe_check);
+    moe_check_tiles(m, E, z, PV, int(&L - m.layers.data()), Eeff, rows, shared_flag, moe_check, bm);
   auto grouped = [&](const QW& w, const QW* w2, id<MTLBuffer> A, int lda, int gather, id<MTLBuffer> Y, int ldy, int Ne,
                      int epi, int part, int split = 0) {  // part: 0 gate/up, 1 down (the staged records' halves); split: the split pass
     // 1-2 rows: the FMA kernel (no MMA padding); 3-8 rows: the MMA kernel.
@@ -686,7 +696,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const int ks_opt = epi == 2 ? m.moe_ks : m.moe_ks_dn;
     const int ks = fma_path ? (ks_opt == 4 || (ks_opt == 2 && rows <= 2) ? ks_opt : 8) : 8;  // no k2 variants above 2 rows
     const bool route_name = route_in_gemv && epi == 2 && fma_path && rows == 1 && m.moe_direct;
-    const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks) +
+    const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks, bm) +
                              (route_name && route_e512 ? "_e512" : "");  // routes of 257-512 experts (Qwen4-Exp)
     if (env_on("ESPETERO_MOE_LOG"))
       std::fprintf(stderr, "moe: layer %d %s (w %d/%d bits fc %x, w2 %d bits, shared_tiles %d)\n", int(&L - m.layers.data()),

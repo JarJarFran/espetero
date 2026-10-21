@@ -304,6 +304,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_KS_DN")) m.moe_ks_dn = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_NBPT_DN")) m.moe_nbpt_dn = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_SWAP")) m.moe_swap = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_BM")) m.moe_bm = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) m.expert_cache_gb = std::atof(v);
     // Qwen4-Exp: split K for the few-column decode GEMVs (the hyper-connection
     // reads [324 x 10240]: 32 us unsplit; decode GPU -9 %). Off elsewhere.
@@ -877,6 +878,7 @@ class MetalModel final : public NativeModel {
     else if (name == "gemv_splitk") m_.tune.gemv_splitk = value != 0;
     else if (name == "fuse_gdn") m_.fuse_gdn = value != 0;
     else if (name == "fuse_kvsave") m_.fuse_kvsave = value != 0;
+    else if (name == "moe_bm") m_.moe_bm = value == 16 || value == 32 ? value : 8;
     else if (name == "gdn_conv_fold") m_.gdn_conv_fold = value != 0;
     else if (name == "widen6_m") m_.tune.widen6_m = std::max(0, value);
     else if (name == "attn_split") m_.attn_split = value;
