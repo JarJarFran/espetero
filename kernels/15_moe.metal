@@ -1062,8 +1062,141 @@ struct MoeGemmParams {
 // and each dequantized B fragment feeds BM / 8 MMAs. Every row's result is
 // the same whatever BM: each simdgroup accumulates its own K slice over the
 // same k steps, and the slices are summed in the same order.
-template <int BITS, int EPI, int BM = 8>
+template <int BITS, int EPI>
 kernel void moe_gemv8(
+    device const half* A [[buffer(0)]],
+    device const uint* Wr [[buffer(1)]],
+    device const half4* SB [[buffer(2)]],
+    device const uint* Wh [[buffer(3)]],
+    device void* Yv [[buffer(4)]],
+    constant MoeGemmParams& p [[buffer(5)]],
+    device const int4* tiles [[buffer(6)]],
+    device const uint* ntiles [[buffer(7)]],  // indirect arguments: [0] is the tile count
+    device const int* rowmap [[buffer(8)]],
+    device const uint* Wr2 [[buffer(9)]],     // the shared expert's matrix (same layout, bits and group)
+    device const half4* SB2 [[buffer(10)]],
+    device const uint* Wh2 [[buffer(11)]],
+    device const uint* Wr3 [[buffer(12)]],    // staged experts: one single-expert record each (p.st_*)
+    device const half4* SB3 [[buffer(13)]],
+    device const uint* Wh3 [[buffer(14)]],
+    device const uchar* loading [[buffer(15)]],  // per expert index: being read (p.split)
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int KS = 8;
+  if (!p.direct && tgid.x >= ntiles[0]) return;
+  const int4 ti = tiles[tgid.x];
+  const int e = ti.x, r0 = ti.y, rows = ti.z;
+  if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  const int nloc = int(tgid.y) * 32;
+  if (nloc >= p.Ne) return;
+  const bool sh = e == p.shared_e;  // uniform per threadgroup
+  const bool st = !sh && p.st_count > 0 && e >= p.st_first && e < p.st_first + p.st_count;
+  if (sh) {
+    Wr = Wr2;
+    SB = SB2;
+    Wh = Wh2;
+  } else if (st) {
+    const ulong s = ulong(e - p.st_first);
+    Wr = Wr3 + s * ulong(p.st_words);
+    SB = SB3 + s * ulong(p.st_half4);
+    Wh = Wh3 + s * ulong(p.st_words);
+  }
+  const int n0 = (sh || st) ? nloc : e * p.Ne + nloc;
+  const int nb = n0 / 32;
+  const int KGall = p.K / 64;
+  const int per = (KGall + KS - 1) / KS;
+  const int g_begin = int(sgid) * per;
+  const int g_end = min(KGall, g_begin + per);
+  const int Np2 = ((sh ? p.N2 : (st ? p.Ne : p.N)) + 31) / 32 * 16;
+  constexpr int MAXG = 4;
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+  constexpr int WPL = BITS == 8 ? 4 : 2;
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
+  device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  const bool row_ok = fm < rows;
+  const int arow_i = row_ok ? (p.gather ? rowmap[r0 + fm] : r0 + fm) : 0;
+  device const half* arow = A + ulong(arow_i) * p.lda;
+  simdgroup_matrix<float, 8, 8> acc[4];
+  UNROLL for (int j = 0; j < 4; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  uint words[4 * WPL], hw[4] = {0u, 0u, 0u, 0u};
+  if (ESPETERO_PF && g_begin < g_end) load_kstep<BITS, WPL>(wp, hp, g_begin, words, hw);
+  for (int g = g_begin; g < g_end; ++g) {
+    // Software pipeline: the next K step's weight words are requested before
+    // this step's dequantization and FMAs, so two steps' loads are in flight
+    // per simdgroup (the loop was latency-bound: ~2.7 us per 64-wide step).
+    uint wnext[4 * WPL], hnext[4] = {0u, 0u, 0u, 0u};
+    if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
+    if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
+    half2 s2[MAXG * 4], b2[MAXG * 4];
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    half2 av[8];
+    UNROLL for (int jj = 0; jj < 8; ++jj)
+      av[jj] = row_ok ? *((device const half2*)(arow + g * 64 + jj * 8 + fn)) : half2(0.0h);
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      simdgroup_matrix<half, 8, 8> a;
+      a.thread_elements()[0] = av[jj].x;
+      a.thread_elements()[1] = av[jj].y;
+      UNROLL for (int j = 0; j < 4; ++j) {
+        half2 q;
+        if (BITS == 4) {
+          const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
+          q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
+        } else if (BITS == 6 || BITS == 5) {
+          const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
+          const uint h = BITS == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
+                                   : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+          q = as_type<half2>(x | (h << 4) | 0x64006400u);
+        } else {
+          const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
+          q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
+        }
+        const int gi = (jj * 8) / kGroup;
+        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        simdgroup_matrix<half, 8, 8> b;
+        b.thread_elements()[0] = wv.x;
+        b.thread_elements()[1] = wv.y;
+        simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+      }
+    }
+    if (ESPETERO_PF) {
+      UNROLL for (int i = 0; i < 4 * WPL; ++i) words[i] = wnext[i];
+      UNROLL for (int i = 0; i < 4; ++i) hw[i] = hnext[i];
+    }
+  }
+  threadgroup float part[KS][8][32];
+  UNROLL for (int j = 0; j < 4; ++j) {
+    part[sgid][fm][j * 8 + fn] = acc[j].thread_elements()[0];
+    part[sgid][fm][j * 8 + fn + 1] = acc[j].thread_elements()[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int row = int(sgid);
+  const int c = int(lane);
+  if (row >= rows) return;
+  float v = 0.0f;
+  UNROLL for (int k = 0; k < KS; ++k) v += part[k][row][c];
+  const ulong orow = ulong(r0 + row) * p.ldy;
+  if (EPI == EPI_SWIGLU) {
+    if ((c / 8) % 2 == 0 && nloc + c < p.Ne) {
+      float u = 0.0f;
+      UNROLL for (int k = 0; k < KS; ++k) u += part[k][row][c + 8];
+      const int out = ((nloc + (c / 8) * 8) / 16) * 8 + (c % 8);
+      ((device half*)Yv)[orow + out] = half(glu_gate(v) * u);
+    }
+  } else if (nloc + c < p.Ne) {
+    device float* y = (device float*)Yv + orow + nloc + c;
+    *y = (EPI == EPI_ADD) ? *y + v : v;
+  }
+}
+
+// moe_gemm_bm: the same tile with BM = 16 or 32 rows (moe_gemm16* / moe_gemm32*, option moe_bm) for
+// passes of more than 8 rows. Kept separate from moe_gemv8 so the default kernel stays main's code
+// (templating moe_gemv8 on BM changed the generated code of the 8-row tile: 2048-row prefill +2 %).
+template <int BITS, int EPI, int BM>
+kernel void moe_gemm_bm(
     device const half* A [[buffer(0)]],
     device const uint* Wr [[buffer(1)]],
     device const half4* SB [[buffer(2)]],
@@ -1142,12 +1275,15 @@ kernel void moe_gemv8(
     if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
     kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    half2 av[FM][8];
+    UNROLL for (int i = 0; i < FM; ++i)
+      UNROLL for (int jj = 0; jj < 8; ++jj)
+        av[i][jj] = row_ok[i] ? *((device const half2*)(arow[i] + g * 64 + jj * 8 + fn)) : half2(0.0h);
     UNROLL for (int jj = 0; jj < 8; ++jj) {
       simdgroup_matrix<half, 8, 8> a[FM];
       UNROLL for (int i = 0; i < FM; ++i) {
-        const half2 av = row_ok[i] ? *((device const half2*)(arow[i] + g * 64 + jj * 8 + fn)) : half2(0.0h);
-        a[i].thread_elements()[0] = av.x;
-        a[i].thread_elements()[1] = av.y;
+        a[i].thread_elements()[0] = av[i][jj].x;
+        a[i].thread_elements()[1] = av[i][jj].y;
       }
       UNROLL for (int j = 0; j < 4; ++j) {
         half2 q;
@@ -1210,20 +1346,32 @@ kernel void moe_gemv8(
   }
 }
 
-#define INSTANTIATE_MOE_BM(PRE, BITS, BM)                                                 \
-  template [[host_name(PRE "_store")]] kernel void moe_gemv8<BITS, 0, BM>(                \
+#define INSTANTIATE_MOE(PRE, BITS)                                                        \
+  template [[host_name(PRE "_store")]] kernel void moe_gemv8<BITS, 0>(                    \
       device const half*, device const uint*, device const half4*, device const uint*,   \
       device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
       device const int*, device const uint*, device const half4*, device const uint*,    \
       device const uint*, device const half4*, device const uint*, device const uchar*,  \
       uint3, uint, uint);                                                                 \
-  template [[host_name(PRE "_swiglu")]] kernel void moe_gemv8<BITS, 2, BM>(               \
+  template [[host_name(PRE "_swiglu")]] kernel void moe_gemv8<BITS, 2>(                   \
       device const half*, device const uint*, device const half4*, device const uint*,   \
       device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
       device const int*, device const uint*, device const half4*, device const uint*,    \
       device const uint*, device const half4*, device const uint*, device const uchar*,  \
       uint3, uint, uint);
-#define INSTANTIATE_MOE(PRE, BITS) INSTANTIATE_MOE_BM(PRE, BITS, 8)
+#define INSTANTIATE_MOE_BM(PRE, BITS, BM)                                                 \
+  template [[host_name(PRE "_store")]] kernel void moe_gemm_bm<BITS, 0, BM>(                \
+      device const half*, device const uint*, device const half4*, device const uint*,   \
+      device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
+      device const int*, device const uint*, device const half4*, device const uint*,    \
+      device const uint*, device const half4*, device const uint*, device const uchar*,  \
+      uint3, uint, uint);                                                                 \
+  template [[host_name(PRE "_swiglu")]] kernel void moe_gemm_bm<BITS, 2, BM>(               \
+      device const half*, device const uint*, device const half4*, device const uint*,   \
+      device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
+      device const int*, device const uint*, device const half4*, device const uint*,    \
+      device const uint*, device const half4*, device const uint*, device const uchar*,  \
+      uint3, uint, uint);
 INSTANTIATE_MOE("moe_gemv8r4", 4)
 INSTANTIATE_MOE("moe_gemv8r5", 5)
 INSTANTIATE_MOE("moe_gemv8r6", 6)

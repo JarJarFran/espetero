@@ -453,14 +453,171 @@ kernel void repack_q6k_scales(
   }
 }
 
+template <int BM, int WN, int EPI, int BITS>
+kernel void rgemm(
+    device const half* A [[buffer(0)]],
+    device const uint* Wr [[buffer(1)]],
+    device const half4* SB [[buffer(2)]],
+    device const uint* Wh [[buffer(3)]],
+    device void* Yv [[buffer(4)]],
+    constant GemmParams& p [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int BK = 64;
+  constexpr int BN = WN * 32;
+  constexpr int NT = WN * 32;
+  constexpr int FM = BM / 8;
+  constexpr int LDA = BK + 8;
+  constexpr int AC = (BM * 8 + NT - 1) / NT;
+  threadgroup half As[BM * LDA];
+
+  // Row blocks vary fastest in the grid, so the threadgroups that share one
+  // column block (its weights) run back to back and read them from cache.
+  const int m0 = tgid.x * BM;
+  const int n0 = tgid.y * BN + sgid * 32;
+  const int KGall = p.K / 64;
+  const int g_begin = p.g_split ? int(tgid.z) * p.g_split : 0;
+  const int g_end = p.g_split ? min(KGall, g_begin + p.g_split) : KGall;
+  const int Np2 = (p.N + 31) / 32 * 16;  // SB row length in pairs
+  constexpr int MAXG = 4;                // groups per 64-wide K step (kGroup = 16)
+  const int NG = 64 / kGroup;
+  const bool n_ok = n0 < p.N;
+
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+
+  simdgroup_matrix<float, 8, 8> acc[FM][4];
+  UNROLL for (int i = 0; i < FM; ++i)
+    UNROLL for (int j = 0; j < 4; ++j)
+      acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  int a_row[AC], a_col[AC];
+  bool a_ok[AC], a_live[AC];
+  UNROLL for (int c = 0; c < AC; ++c) {
+    const int idx = tid + c * NT;
+    a_live[c] = idx < BM * 8;
+    a_row[c] = min(idx / 8, BM - 1);
+    a_col[c] = (idx % 8) * 8;
+    a_ok[c] = a_live[c] && (m0 + a_row[c]) < p.M;
+  }
+  uint4 ar[AC];
+  UNROLL for (int c = 0; c < AC; ++c)
+    ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + g_begin * 64 + a_col[c])) : uint4(0);
+
+  // uint4 words per lane and K group: 2 for the nibble plane (4-, 5- and
+  // 6-bit), 4 for 8-bit codes; 5/6-bit add a high-bit plane (2 or 4 words).
+  constexpr int WPL = BITS == 8 ? 4 : 2;
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  device const uint4* wp = (device const uint4*)(Wr) + ulong(n_ok ? n0 / 32 : 0) * KGall * (32 * WPL) + lane * WPL;
+  device const uint* hp = Wh + (ulong(n_ok ? n0 / 32 : 0) * KGall * 32 + lane) * (HPL ? HPL : 1);
+
+  for (int g = g_begin; g < g_end; ++g) {
+    UNROLL for (int c = 0; c < AC; ++c)
+      if (a_live[c]) *((threadgroup uint4*)(As + a_row[c] * LDA + a_col[c])) = ar[c];
+    uint words[4 * WPL];
+    UNROLL for (int i = 0; i < WPL; ++i) {
+      const uint4 w = wp[ulong(g) * (32 * WPL) + i];
+      words[4 * i] = w.x;
+      words[4 * i + 1] = w.y;
+      words[4 * i + 2] = w.z;
+      words[4 * i + 3] = w.w;
+    }
+    uint hw[4] = {0u, 0u, 0u, 0u};
+    if (BITS == 6) {
+      const uint4 h = *((device const uint4*)(hp + ulong(g) * 32 * 4));
+      hw[0] = h.x, hw[1] = h.y, hw[2] = h.z, hw[3] = h.w;
+    } else if (BITS == 5) {
+      const uint2 h = *((device const uint2*)(hp + ulong(g) * 32 * 2));
+      hw[0] = h.x, hw[1] = h.y;
+    }
+    half2 s2[MAXG * 4], b2[MAXG * 4];
+    kstep_scales(SB, ulong(g), KGall, Np2, n_ok ? (n0 + fn) / 2 : 0, s2, b2);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (g + 1 < g_end) {
+      UNROLL for (int c = 0; c < AC; ++c)
+        ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+    }
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      simdgroup_matrix<half, 8, 8> a[FM];
+      simdgroup_matrix<half, 8, 8> b[4];
+      UNROLL for (int i = 0; i < FM; ++i) {
+        const half2 v = *((const threadgroup half2*)(As + (i * 8 + fm) * LDA + jj * 8 + fn));
+        a[i].thread_elements()[0] = v.x;
+        a[i].thread_elements()[1] = v.y;
+      }
+      UNROLL for (int j = 0; j < 4; ++j) {
+        half2 q;
+        if (BITS == 2) {
+          const uint x = words[j] >> (2 * jj);
+          q = as_type<half2>((x & 0x00030003u) | 0x64006400u);
+        } else if (BITS == 4) {
+          const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
+          q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
+        } else if (BITS == 6 || BITS == 5) {
+          const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
+          const uint h = BITS == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
+                                   : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+          q = as_type<half2>(x | (h << 4) | 0x64006400u);
+        } else {
+          const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
+          q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
+        }
+        const int gi = (jj * 8) / kGroup;
+        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        b[j].thread_elements()[0] = wv.x;
+        b[j].thread_elements()[1] = wv.y;
+      }
+      UNROLL for (int i = 0; i < FM; ++i)
+        UNROLL for (int j = 0; j < 4; ++j)
+          simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  UNROLL for (int i = 0; i < FM; ++i) {
+    const int row = m0 + i * 8 + fm;
+    if (row >= p.M) continue;
+    if (EPI == EPI_SWIGLU) {
+      // fragment columns (0,1) and (2,3) are gate/up blocks of 8 outputs
+      device half* y = (device half*)Yv + ulong(row) * p.ldy;
+      UNROLL for (int j = 0; j < 4; j += 2) {
+        const int col = n0 + j * 8;
+        if (col >= p.N) continue;
+        const int out = (col / 16) * 8 + fn;
+        const float g0 = acc[i][j].thread_elements()[0];
+        const float g1 = acc[i][j].thread_elements()[1];
+        const float u0 = acc[i][j + 1].thread_elements()[0];
+        const float u1 = acc[i][j + 1].thread_elements()[1];
+        *((device half2*)(y + out)) = half2(half(glu_gate(g0) * u0), half(glu_gate(g1) * u1));
+      }
+    } else {
+      device float* y = (device float*)Yv + ulong(tgid.z) * p.z_stride + ulong(row) * p.ldy;
+      UNROLL for (int j = 0; j < 4; ++j) {
+        const int col = n0 + j * 8 + fn;
+        float2 v = float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+        if (col + 1 < p.N) {
+          if (EPI == EPI_ADD) v += *((device float2*)(y + col));
+          *((device float2*)(y + col)) = v;
+        } else if (col < p.N) {
+          y[col] = (EPI == EPI_ADD) ? y[col] + v.x : v.x;
+        }
+      }
+    }
+  }
+}
+
+// Experimental variants of rgemm (gemm_var, compiled with ESPETERO_GEMM_VAR; measured slower or neutral):
 // KPB: 64-wide K steps per threadgroup barrier pair (1, or 2: the A tile
 // holds 128 columns and the weights of both steps are requested before the
 // barrier, so a loop iteration costs two barriers per 128 instead of per 64;
 // the MMAs run in the same K order, so the sums are the same bit for bit).
 // SGL: A fragments through simdgroup_load from the staged tile instead of
 // two half2 element loads (the same fragment).
-template <int BM, int WN, int EPI, int BITS, int KPB = 1, int SGL = 0>
-kernel void rgemm(
+template <int BM, int WN, int EPI, int BITS, int KPB, int SGL>
+kernel void rgemm_v(
     device const half* A [[buffer(0)]],
     device const uint* Wr [[buffer(1)]],
     device const half4* SB [[buffer(2)]],
@@ -1573,13 +1730,13 @@ INSTANTIATE_RGEMM("64x4", 64, 4)
 #endif
 #if ESPETERO_GEMM_VAR
 #define INSTANTIATE_RGEMM_VB(PRE, TAG, BM, WN, BITS, KPB, SGL)                                 \
-  template [[host_name(PRE TAG "_store")]] kernel void rgemm<BM, WN, 0, BITS, KPB, SGL>(      \
+  template [[host_name(PRE TAG "_store")]] kernel void rgemm_v<BM, WN, 0, BITS, KPB, SGL>(    \
       device const half*, device const uint*, device const half4*,                           \
       device const uint*, device void*, constant GemmParams&, uint3, uint, uint, uint);       \
-  template [[host_name(PRE TAG "_add")]] kernel void rgemm<BM, WN, 1, BITS, KPB, SGL>(        \
+  template [[host_name(PRE TAG "_add")]] kernel void rgemm_v<BM, WN, 1, BITS, KPB, SGL>(      \
       device const half*, device const uint*, device const half4*,                           \
       device const uint*, device void*, constant GemmParams&, uint3, uint, uint, uint);       \
-  template [[host_name(PRE TAG "_swiglu")]] kernel void rgemm<BM, WN, 2, BITS, KPB, SGL>(     \
+  template [[host_name(PRE TAG "_swiglu")]] kernel void rgemm_v<BM, WN, 2, BITS, KPB, SGL>(   \
       device const half*, device const uint*, device const half4*,                           \
       device const uint*, device void*, constant GemmParams&, uint3, uint, uint, uint);
 #define INSTANTIATE_RGEMM_V(TAG, BM, WN, KPB, SGL)              \
