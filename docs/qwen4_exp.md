@@ -479,8 +479,13 @@ next draft step: (argmax/sampled token, H^m pre-mixer) → same computation  ([M
   2026-10-22): the 4-bit head accepts 44 / 67 / 56 % of its drafts against the
   bf16 drafter's 44 / 69 / 52 % and decodes at 66 / 89 / 77 tokens/s against
   65 / 90 / 73 (plain decoding 58–59); the two heads' replies were identical on
-  the three prompts. (An earlier note in the loader said the file's head
-  accepted 0–4 % of drafts; it does not.)
+  the three prompts. Drafts are verified, but greedy replies still depend on
+  the decoding mode: a verify pass of 2–4 rows takes other expert kernels
+  than the 1-row step (another summation order, like `route_par`'s), so plain
+  decoding and the two heads diverge at near-ties on some prompts (one of
+  three here, with `ESPETERO_ROUTE_PAR=0`: plain, drafter and own gave three
+  texts). (An earlier note in the loader said the file's head accepted 0–4 %
+  of drafts; it does not.)
 * `mtp.hybrid: true` is read by neither reference.
 
 ## 8. Vision tower and M-RoPE positions
