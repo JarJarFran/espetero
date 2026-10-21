@@ -420,7 +420,16 @@ Rules that keep the tiers honest:
   the 24.98 ms step) and the shared gate_up `rgemm_8x4_swiglu` 1024×2048
   (16 unsplit threadgroups) 41 µs (1.66 ms, 59 GB/s). `route_sg` (the gate as
   row 257 of the router GEMM, not output-preserving) measures 24.87 / 25.03 /
-  24.92 → 21.65 / 22.23 / 22.12 ms (−11 %, 630 → 707–725 tok/s) on the M4 Max.
+  24.92 → 21.65 / 22.23 / 22.12 ms (−11 %, 630 → 707–725 tok/s) on the M4 Max;
+  its drift on the logits_dump cases: 16,234 of 22,250 values differ, max
+  |Δlogit| 1.17, 5 argmax flips. The shared expert as two 8-row tiles of the
+  grouped MMA kernel at 9–16 rows (`fuse_shared_rows` 16: its own gate_up
+  and down GEMMs and their reduces gone, −120 dispatches): 24.76 / 24.63 /
+  24.94 → 23.22 / 23.23 / 23.25 ms (−6.2 %, 679 tok/s); 3,742 values differ,
+  max |Δ| 0.12, no argmax flip. Both together: 20.45 / 20.09 / 20.42 ms
+  (−18 %, 770–782 tok/s). Both are the arithmetic other shapes already use
+  (the router's split-K order; the grouped kernel's tile order) and wait for
+  a decision; off by default.
 
 ## 6. Numerics and determinism
 
