@@ -235,8 +235,11 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   GPU-driven decode (the pass is one command buffer committed before any route
   is known, the GPU signals a shared event after each router and waits for the
   host's before each layer's experts, the host resolves the route, reads the
-  misses and fills the expert kernels' tables while it waits;
-  `ESPETERO_DS4_DRIVE=0` restores the 41 command buffers), and one
+  misses and fills the expert kernels' tables while it waits; opt-in
+  `ESPETERO_DS4_DRIVE=1`: it **lost** too, wall time minus reads +15 / +23 /
+  +26 ms per token in 3 pairs against main's binary, so the 40 waits on a
+  host-signalled event cost far more than the 41 command-buffer launches they
+  replace, 5.6 ms), and one
   hyper-connection dispatch between sub-layers instead of four
   (`ds4_hc_fused`, opt-in `ESPETERO_DS4_HCFUSE=1`: it **lost**, GPU time
   40.1 → 44.2 ms per token in 3 of 3 pairs against main; one threadgroup per
