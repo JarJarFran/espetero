@@ -2,6 +2,8 @@
 
 Espetero against the other engines for Apple silicon on one Mac: a MacBook Pro
 with an M1 Max (64 GB), macOS 26.5, measured on 2026-10-10 and 2026-10-11.
+The same protocol on a Mac Studio M4 Max (128 GB), with Qwen3.8-Flash-Next
+and DeepSeek-V4.1-Flash: [m4-max.md](m4-max.md).
 
 Engines: Espetero 0.1.0, llama.cpp b11429, mlx-lm 0.32.0 (MLX) with
 mlx-vlm 0.7.6 for the images, oMLX 0.7.0, vLLM-metal 0.30.0, TensorFold 1.0.4.

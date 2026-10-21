@@ -36,6 +36,30 @@ Greedy decoding with thinking off. *Decode*: 8 short prompts, 512 new tokens eac
 ² TensorFold's native engine has no backend for the Qwen3.6 mixture-of-experts or Gemma 4 checkpoints yet, and it serves images only with `--vision`, which these runs did not pass.
 ³ Not measured: these runs used Espetero 0.1.0, which ran Gemma 4 text only.
 
+## Speed on a Mac Studio M4 Max (128 GB)
+
+The same client and protocol on a Mac Studio with an M4 Max (128 GB, macOS 27.0.1), measured on 2026-10-20 and 21 with Espetero main 70f3bb4 (0.1.2 in preparation), medians:
+
+| Model · file | Engine | Decode, tok/s | First token, s | Prompt of 8K tokens, tok/s | Decode at 32K context, tok/s | 8 users at once, tok/s | Photo, s |
+|:--|:--|--:|--:|--:|--:|--:|--:|
+| **Qwen3.8-27B** · MLX 4-bit | Espetero 0.1.2 (main 70f3bb4) | 29.9 · **59.2** with MTP¹ | 0.20 | 293 | 26.2 | 157.6 | 7.3 |
+|  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 27.9 | 0.40 | 256 | 23.1 | 77.9 | 7.8 |
+| **Qwen3.6-35B-A3B** · MLX 4-bit | Espetero 0.1.2 (main 70f3bb4) | 130.0 | 0.05 | 2122 | 109.3 | 423.5 | 1.7 |
+|  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 110.8 | 0.10 | 1848 | 80.9 | 318.3 | 1.8 |
+| **Qwen3.8-Flash-Next** (125B-A6B) · MLX oQ4e, experts resident | Espetero 0.1.2 (main 70f3bb4) | 58.7 · **72.9** with MTP | 0.16 | 758 | 54.0 | 127.4 | 3.5 |
+|  | MLX (mlx-lm 0.32)² | – | – | – | – | – | – |
+| **DeepSeek-V4.1-Flash** (552B-A16B) · FP8/FP4, experts on the SSD | Espetero 0.1.2 (main 70f3bb4)³ | 9.7 | 5.39 | 253 | 10.2 | 6.1 | 43.6 |
+| **Qwen3.8-27B** · GGUF UD-Q6_K | Espetero 0.1.2 (main 70f3bb4) | 20.2 · **46.9** with MTP | 0.22 | 279 | 18.3 | 123.9 | 9.6 |
+|  | llama.cpp b11429 | 19.3 · **33.6** with MTP | 0.39 | 231 | 17.0 | 73.9 | 10.4 |
+| **Qwen3.6-35B-A3B** · GGUF UD-Q6_K | Espetero 0.1.2 (main 70f3bb4) | 90.5 | 0.05 | 1873 | 79.8 | 307.1 | 2.2 |
+|  | llama.cpp b11429 | 88.8 | 0.11 | 1509 | 73.8 | 213.6 | 2.4 |
+
+Same protocol as above (greedy, thinking off, 16 parallel slots, 40K context, no drafts except *with MTP*). Files: [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit), [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), [Jundot/Qwen3.8-Flash-Next-oQ4e-mtp](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ4e-mtp) (every expert resident in memory), [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (the routed experts and Engram tables read from the SSD). Every measure, the flags and every request: [docs/benchmarks/m4-max.md](docs/benchmarks/m4-max.md).
+
+¹ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF. Flash-Next: the bf16 drafter directory `Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16` (`--mtp DIR`); the oQ4e file's own 4-bit MTP tensors are not used.
+² mlx-lm 0.32 loads the Flash-Next file but its generation thread dies on the first request (HTTP 404).
+³ DeepSeek-V4.1 runs with 6 sequence slots (its state is a slot of its own), so *8 users* queue: 6 at a time. Its first token includes the experts a new prompt reads from the SSD.
+
 ## Quick start
 
 ```bash
