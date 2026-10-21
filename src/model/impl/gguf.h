@@ -17,6 +17,7 @@
 
 #include <atomic>
 
+#include "gguf_iq_grids.h"
 #include "tensors.h"
 
 namespace espetero::native {
@@ -24,7 +25,7 @@ namespace espetero::native {
 enum GGMLType : int {
   GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
   GGML_Q8_0 = 8, GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14,
-  GGML_IQ4_NL = 20, GGML_IQ4_XS = 23, GGML_BF16 = 30,
+  GGML_IQ4_NL = 20, GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_BF16 = 30,
 };
 
 struct GGMLTypeInfo {
@@ -45,6 +46,9 @@ const GGMLTypeInfo* ggml_type_info(int t) {
       {GGML_Q4_K, {"Q4_K", 256, 144, 4, 32}}, {GGML_Q5_K, {"Q5_K", 256, 176, 5, 32}},
       {GGML_Q6_K, {"Q6_K", 256, 210, 6, 16}}, {GGML_IQ4_NL, {"IQ4_NL", 32, 18, 8, 32}},
       {GGML_IQ4_XS, {"IQ4_XS", 256, 136, 8, 32}},
+      // codebook types (gguf_iq_grids.h): IQ3_S magnitudes are odd 1..15, so +-v is 2c - 15 with a 4-bit
+      // c (scale 2 db, bias -15 db); IQ2_S magnitudes are 8 / 25 / 43, so +-v takes an 8-bit code v + 43.
+      {GGML_IQ3_S, {"IQ3_S", 256, 110, 4, 32}},  {GGML_IQ2_S, {"IQ2_S", 256, 82, 8, 16}},
   };
   auto it = table.find(t);
   return it == table.end() ? nullptr : &it->second;
@@ -766,6 +770,58 @@ void convert_row(int type, const uint8_t* src, int64_t cols, RowSink& out) {
         }
       }
       break;
+    case GGML_IQ3_S:
+      // ggml dequantize_row_iq3_s: w = d (1 + 2 s) grid[k] (sign bit ? -1 : 1), s a nibble per 32
+      for (int64_t b = 0; b < cols / 256; ++b) {
+        const uint8_t* x = src + b * 110;
+        const float d = h2f(x);
+        const uint8_t* qs = x + 2;
+        const uint8_t* qh = x + 66;
+        const uint8_t* signs = x + 74;
+        const uint8_t* sc = x + 106;
+        for (int ib = 0; ib < 8; ++ib) {
+          const float db = d * float(1 + 2 * ((sc[ib / 2] >> (4 * (ib % 2))) & 0xF));
+          out.group(b * 8 + ib, 2.0f * db, -15.0f * db);
+          const uint8_t* q = qs + 8 * ib;
+          const uint8_t* sg = signs + 4 * ib;
+          const int h = qh[ib];
+          for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = kIQ3SGrid[q[2 * l] | ((h << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = kIQ3SGrid[q[2 * l + 1] | ((h << (7 - 2 * l)) & 256)];
+            for (int j = 0; j < 8; ++j) {
+              const int v = int(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF);
+              const int sv = (sg[l] >> j) & 1 ? -v : v;
+              out.code(b * 256 + ib * 32 + l * 8 + j, uint32_t((sv + 15) / 2));
+            }
+          }
+        }
+      }
+      break;
+    case GGML_IQ2_S:
+      // ggml dequantize_row_iq2_s: w = d (0.5 + s) / 4 grid[k] (sign bit ? -1 : 1), s a nibble per 16
+      for (int64_t b = 0; b < cols / 256; ++b) {
+        const uint8_t* x = src + b * 82;
+        const float d = h2f(x);
+        const uint8_t* qs = x + 2;
+        const uint8_t* signs = x + 34;
+        const uint8_t* qh = x + 66;
+        const uint8_t* sc = x + 74;
+        for (int ib = 0; ib < 8; ++ib) {
+          for (int half = 0; half < 2; ++half) {
+            const float db = d * (0.5f + float((sc[ib] >> (4 * half)) & 0xF)) * 0.25f;
+            out.group(b * 16 + ib * 2 + half, db, -43.0f * db);
+          }
+          for (int l = 0; l < 4; ++l) {
+            const uint64_t g = kIQ2SGrid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+            const uint8_t sg = signs[4 * ib + l];
+            for (int j = 0; j < 8; ++j) {
+              const int v = int((g >> (8 * j)) & 0xFF);
+              out.code(b * 256 + ib * 32 + l * 8 + j, uint32_t(((sg >> j) & 1 ? -v : v) + 43));
+            }
+          }
+        }
+      }
+      break;
     case GGML_Q2_K:
       for (int64_t b = 0; b < cols / 256; ++b) {
         const uint8_t* x = src + b * 84;
@@ -895,6 +951,46 @@ void convert_row(int type, const uint8_t* src, int64_t cols, RowSink& out) {
       break;
     default:
       fail(std::string("unsupported GGUF block type ") + std::to_string(type));
+  }
+}
+
+// Exact dequantization of codebook rows into floats, ggml's dequantize_row_iq2_s / _iq3_s
+// operation for operation (fp32): the reference a native decoder (the GLM experts kept as
+// stored blocks in the expert cache, docs/glm5.md 8) must reproduce bit for bit. convert_row's
+// affine form rounds each group's scale and bias to fp16 instead (~1e-3 relative).
+inline void dequant_iq_row(int type, const uint8_t* src, int64_t cols, float* y) {
+  if (type == GGML_IQ2_S) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+      const uint8_t* x = src + b * 82;
+      const float d = h2f(x);
+      const uint8_t *qs = x + 2, *signs = x + 34, *qh = x + 66, *sc = x + 74;
+      for (int ib = 0; ib < 8; ++ib) {
+        const float db[2] = {d * (0.5f + float(sc[ib] & 0xF)) * 0.25f, d * (0.5f + float(sc[ib] >> 4)) * 0.25f};
+        for (int l = 0; l < 4; ++l) {
+          const float dl = db[l / 2];
+          const uint64_t g = kIQ2SGrid[qs[4 * ib + l] | ((qh[ib] << (8 - 2 * l)) & 0x300)];
+          for (int j = 0; j < 8; ++j)
+            *y++ = dl * float((g >> (8 * j)) & 0xFF) * ((signs[4 * ib + l] >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+  } else if (type == GGML_IQ3_S) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+      const uint8_t* x = src + b * 110;
+      const float d = h2f(x);
+      const uint8_t *qs = x + 2, *qh = x + 66, *signs = x + 74, *sc = x + 106;
+      for (int ib = 0; ib < 8; ++ib) {
+        const float db = d * float(1 + 2 * ((sc[ib / 2] >> (4 * (ib % 2))) & 0xF));
+        for (int l = 0; l < 4; ++l) {
+          const uint32_t g1 = kIQ3SGrid[qs[8 * ib + 2 * l] | ((qh[ib] << (8 - 2 * l)) & 256)];
+          const uint32_t g2 = kIQ3SGrid[qs[8 * ib + 2 * l + 1] | ((qh[ib] << (7 - 2 * l)) & 256)];
+          for (int j = 0; j < 8; ++j)
+            *y++ = db * float(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF) * ((signs[4 * ib + l] >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+  } else {
+    fail("dequant_iq_row: not a codebook type " + std::to_string(type));
   }
 }
 
