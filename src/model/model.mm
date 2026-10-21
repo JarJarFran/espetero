@@ -318,6 +318,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GDN_CONV_FOLD")) m.gdn_conv_fold = *v == '1';
     if (const char* v = std::getenv("ESPETERO_WIDEN6_M")) m.tune.widen6_m = std::atoi(v);
+    if (const char* v = std::getenv("ESPETERO_GEMM_VAR")) m.tune.gemm_var = std::max(0, std::min(3, std::atoi(v)));
     // The fused RMSNorm needs quantized decoder matrices (GEMV epilogues); the
     // MTP layer's passes use explicit norms and routers / shared gates never
     // take norm links, so their dense matrices do not count (the 27B
@@ -860,6 +861,7 @@ class MetalModel final : public NativeModel {
     else if (name == "gemv_max_m") m_.tune.gemv_max_m = std::max(1, std::min(m_.fma34 ? 4 : kGemvInstM, value));
     else if (name == "gemm_fixed") m_.tune.fixed = value != 0;  // embedding passes
     else if (name == "tune_clamp") m_.tune.tune_clamp = value != 0;
+    else if (name == "gemm_var") m_.tune.gemm_var = std::max(0, std::min(3, value));
     else if (name == "gemv_ks") m_.tune.gemv_ks = value == 16 ? 16 : 8;
     else if (name == "moe_down_comb") m_.moe_down_comb = value != 0;
     else if (name == "expert_cache_gb") m_.expert_cache_gb = m_.xpool.empty() ? double(value) : m_.expert_cache_gb;
@@ -964,9 +966,9 @@ class MetalModel final : public NativeModel {
     Model& m = m_;
     std::vector<std::pair<std::string, int>> list;
     auto add_layer = [&](const Layer& L) {
-      for (const Mat& r : L.in_proj) gemm_pipelines(r, list, m.fma34);
+      for (const Mat& r : L.in_proj) gemm_pipelines(r, list, m.fma34, m.tune.gemm_var);
       for (const Mat* x : {&L.gate_up, &L.gate, &L.up, &L.down, &L.out, &L.router, &L.shared_gate, &L.index_qk})
-        gemm_pipelines(*x, list, m.fma34);
+        gemm_pipelines(*x, list, m.fma34, m.tune.gemm_var);
       if (L.moe && !m.cfg.gemma && !m.cfg.q3moe) {
         moe_pipelines(m, L, list);  // the passes' own choice per layer (formats may differ by layer)
         for (const char* k : {"moe_topk", "moe_sort", "moe_combine"}) list.push_back({k, 0});
@@ -983,8 +985,8 @@ class MetalModel final : public NativeModel {
     for (const Layer& L : m.layers) add_layer(L);
     if (m.mtp.present) {
       add_layer(m.mtp.layer);
-      gemm_pipelines(m.mtp.fc, list, m.fma34);
-      gemm_pipelines(m.mtp.head, list, m.fma34);
+      gemm_pipelines(m.mtp.fc, list, m.fma34, m.tune.gemm_var);
+      gemm_pipelines(m.mtp.head, list, m.fma34, m.tune.gemm_var);
       if (m.mtp.coarse.out() > 0 && !m.mtp.coarse.dense) {
         for (const char* n : {"rgemv2_1_store", "rgemv2_2_store", "rgemv8r2_store"}) list.push_back({n, m.mtp.coarse.q.fc()});
         if (!m.lm_head.dense) {
@@ -995,7 +997,7 @@ class MetalModel final : public NativeModel {
         for (const char* k : {"block_max_rows", "topc_blocks", "argmax2_list"}) list.push_back({k, 0});
       }
     }
-    gemm_pipelines(m.lm_head, list, m.fma34);
+    gemm_pipelines(m.lm_head, list, m.fma34, m.tune.gemm_var);
     if (m.cfg.gemma) g4_pipelines(m, list);
     if (m.cfg.q3moe) q3m_pipelines(m, list);
     if (m.cfg.lfm2) lfm2_pipelines(m, list);

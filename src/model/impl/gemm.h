@@ -20,20 +20,36 @@ struct GemmShape {
 };
 
 // rgemm configs: 8x4, 16x4, 32x4, 16x8, 32x8, 8x8, 64x4 (rows x simdgroups of 32 cols),
-// then the shared-dequantization tiles 32x4s and 64x4s (2 simdgroups per column block)
-constexpr int kGemmConfigs = 9;
+// then the shared-dequantization tiles 32x4s and 64x4s (2 simdgroups per column block),
+// then the variants of the three prefill tiles (gemm_var, never tuned: chosen
+// at dispatch in place of 32x4 / 32x8 / 16x4): k2 (2 K steps per barrier pair),
+// sg (simdgroup_load A fragments), k2sg (both).
+constexpr int kGemmConfigs = 18;
+constexpr int kGemmBaseConfigs = 9;  // the tuner's candidates at most
 // Largest M for which every matrix also tries split-K tiles.
 constexpr int kSplitMaxM = 64;
 
 inline GemmShape gemm_shape(int cfg) {
   static const GemmShape shapes[kGemmConfigs] = {
       {8, 128, 128}, {16, 128, 128}, {32, 128, 128}, {16, 256, 256}, {32, 256, 256}, {8, 256, 256}, {64, 128, 128},
-      {32, 128, 256}, {64, 128, 256}};
+      {32, 128, 256}, {64, 128, 256},
+      {32, 128, 128}, {32, 256, 256}, {16, 128, 128},   // 32x4k2, 32x8k2, 16x4k2
+      {32, 128, 128}, {32, 256, 256}, {16, 128, 128},   // 32x4sg, 32x8sg, 16x4sg
+      {32, 128, 128}, {32, 256, 256}, {16, 128, 128}};  // 32x4k2sg, 32x8k2sg, 16x4k2sg
   return shapes[cfg];
 }
 
+// The variant of a tuned tile for gemm_var (0: itself; 1 k2, 2 sg, 3 k2sg); other tiles stay.
+inline int gemm_variant_cfg(int cfg, int var) {
+  if (var <= 0 || var > 3) return cfg;
+  const int base = cfg == 2 ? 0 : cfg == 4 ? 1 : cfg == 1 ? 2 : -1;
+  return base < 0 ? cfg : 9 + 3 * (var - 1) + base;
+}
+
 inline std::string rgemm_name(int bits, int cfg, int epi) {
-  static const char* tiles[kGemmConfigs] = {"8x4", "16x4", "32x4", "16x8", "32x8", "8x8", "64x4", "32x4s", "64x4s"};
+  static const char* tiles[kGemmConfigs] = {"8x4", "16x4", "32x4", "16x8", "32x8", "8x8", "64x4", "32x4s", "64x4s",
+                                            "32x4k2", "32x8k2", "16x4k2", "32x4sg", "32x8sg", "16x4sg",
+                                            "32x4k2sg", "32x8k2sg", "16x4k2sg"};
   static const char* epis[3] = {"store", "add", "swiglu"};
   const std::string pre = bits == 4 ? "rgemm_" : "rgemm" + std::to_string(bits) + "_";
   return pre + tiles[cfg] + "_" + epis[epi];
@@ -54,6 +70,9 @@ struct Tuner {
   // with 32x4 everywhere, 14.70 s with the top bucket's tiles (32x8 for the large
   // matrices; -5.9 %), logits equal, same dispatches.
   bool tune_clamp = true;
+  // Experiment (prefill GEMMs): the tuned 32x4 / 32x8 / 16x4 tiles run as their
+  // k2 / sg / k2sg variants (1 / 2 / 3; see gemm_variant_cfg). Same sums.
+  int gemm_var = 0;
   // GEMMs of more than 8 rows take the untuned tile (config 2, no split
   // K) whatever their row count, so a row's result does not depend on the
   // rows beside it (embedding passes, "gemm_fixed").
@@ -282,7 +301,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     const int sp = std::min(8, std::max(1, 256 / col_blocks));
     choice = 0 | (sp << 4);
   }
-  int cfg = choice & 15, splits = choice >> 4;
+  int cfg = gemm_variant_cfg(choice & 15, T.gemm_var), splits = choice >> 4;
   if (splits < 1 || epi == 2) splits = 1;
   const GemmShape g = gemm_shape(cfg);
   // Prefill-sized GEMMs on 6-bit codes: at this many rows the GEMM is
@@ -448,7 +467,7 @@ inline void gemm_runs(Enc& E, Tuner& T, const std::vector<Mat>& runs, id<MTLBuff
 }
 
 // Kernels a matrix may use (for building pipelines at load).
-inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>>& out, bool fma34 = false) {
+inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>>& out, bool fma34 = false, int gemm_var = 0) {
   if (m.out() <= 0) return;
   if (m.dense) {
     for (const char* t : {"8x8", "16x4", "32x4"})
@@ -457,10 +476,13 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
   }
   const QW& w = m.q;
   for (int e = 0; e < 3; ++e)
-    for (int cfg = 0; cfg < kGemmConfigs; ++cfg) {
+    for (int cfg = 0; cfg < kGemmBaseConfigs; ++cfg) {
       out.push_back({rgemm_name(w.bits, cfg, e), w.fc()});
       if (w.bits == 6) out.push_back({rgemm_name(8, cfg, e), w.fc()});  // widened prefill GEMMs
     }
+  if (gemm_var > 0)  // the variants the dispatch maps the tuned tiles to
+    for (int e = 0; e < 3; ++e)
+      for (int cfg : {1, 2, 4}) out.push_back({rgemm_name(w.bits, gemm_variant_cfg(cfg, gemm_var), e), w.fc()});
   if (w.bits == 6) out.push_back({"widen6_8", 0});
   for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g"}) {
     for (int mm = 1; mm <= kGemvInstM; ++mm)
