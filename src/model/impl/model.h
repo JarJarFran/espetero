@@ -415,6 +415,7 @@ struct MoeScratch {
   id<MTLBuffer> act, ys, shared, sgate;
   id<MTLBuffer> cparts, cctr;  // combine: per-row partial sums of squares and arrival counters
   id<MTLBuffer> rparts, rctr;  // parallel route: per-row slice partial logits and arrival counters
+  id<MTLBuffer> sctr;          // fuse_sort: moe_topk's arrival counter (one int, self-resetting)
 };
 
 struct Scratch {
@@ -592,6 +593,9 @@ struct Model : Runtime {
   // moe_gemm32: each expert's weights read and dequantized once per tile
   // instead of once per 8 rows; every row's sums are the same). ESPETERO_MOE_BM, "moe_bm".
   int moe_bm = 8;
+  // MoE passes of more than 8 rows: moe_topk's last-arriving row threadgroup
+  // runs the sort (no moe_sort dispatch; same tables). ESPETERO_FUSE_SORT=1, "fuse_sort".
+  bool fuse_sort = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set

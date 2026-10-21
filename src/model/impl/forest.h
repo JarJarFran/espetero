@@ -240,6 +240,10 @@ inline void ensure_moe_scratch(Model& m, int rows) {
   z.rparts = b(sizeof(float) * size_t(R) * 8 * size_t(c.E + 1));
   z.rctr = b(sizeof(int32_t) * size_t(R));
   std::memset([z.rctr contents], 0, sizeof(int32_t) * size_t(R));
+  if (!z.sctr) {
+    z.sctr = b(16);  // fuse_sort: moe_topk's arrival counter (self-resetting)
+    std::memset([z.sctr contents], 0, 16);
+  }
   z.rows = R;
 }
 
@@ -247,6 +251,7 @@ struct MoeRouteParams {
   int32_t E, k, M;
   int32_t ld;  // floats per logits row (E, or E + 1 with the shared gate's column)
   int32_t sg;  // 1: column E is the shared gate's logit, copied to sgate
+  int32_t fold = 0;  // 1: moe_topk's last-arriving row threadgroup runs the sort (no moe_sort dispatch)
 };
 struct MoeSortParams {
   int32_t E, k, M, gu_blocks, down_blocks, shared, remap;
@@ -471,6 +476,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
                                            L.router.q.fc() == L.shared_gate.q.fc()));
   const bool par_route = fused_route && (m.route_par || router_f16) && c.D % 64 == 0;
   bool route_in_gemv = false;
+  bool sort_folded = false;  // fuse_sort: the >8-row route's moe_topk also wrote the tile table
+  // Rows per expert tile of the MMA kernel on a pass without the expert cache
+  // (the pooled passes' staged records need the 8-row kernel; see `bm` below).
+  const int bm_nopool = (rows > 8 && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
   MoeRouteParParams route_p{};
   if ((m.moe_stages & 1) && par_route) {
     // Router GEMV over nblocks x nsl threadgroups (one k-step per simdgroup),
@@ -623,7 +632,11 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     } else {
       gemm(E, m.tune, sg ? L.router_sg : L.router, X, 0, c.D, z.logits, 0, c.E + sg, rows, 0);
     }
-    const MoeRouteParams rp{c.E, c.k, rows, c.E + sg, sg};
+    // fuse_sort: the row threadgroup that finishes last also sorts the pairs
+    // and writes the tile table (moe_sort's work, one dispatch fewer per MoE
+    // layer); not with the expert cache, whose host remaps the ids first.
+    sort_folded = m.fuse_sort && !m.moe_after_route && c.E <= 1024;
+    const MoeRouteParams rp{c.E, c.k, rows, c.E + sg, sg, sort_folded ? 1 : 0};
     E.pipe("moe_topk");
     E.set(0, z.logits);
     E.set(1, z.ids);
@@ -634,6 +647,28 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     E.wr(z.ids);
     E.wr(z.w);
     if (sg) E.wr(z.sgate);
+    if (sort_folded) {
+      const MoeSortParams fsp{c.E, c.k, rows, gu_blocks, down_blocks, shared_flag, 0, bm_nopool};
+      E.set(5, z.offsets);
+      E.set(6, z.tiles);
+      E.set(7, z.ntiles);
+      E.set(8, z.rowmap);
+      E.set(9, z.slotpos);
+      E.bytes(10, fsp);
+      E.set(11, z.ids);  // unread (no remap)
+      E.set(12, z.sctr);
+      E.wr(z.offsets);
+      E.wr(z.tiles);
+      E.wr(z.ntiles);
+      E.wr(z.rowmap);
+      E.wr(z.slotpos);
+      E.rd(z.sctr);
+      E.wr(z.sctr);
+    } else {
+      for (int i = 5; i <= 12; ++i) E.set(i, z.ids);  // unread (fold = 0)
+      const MoeSortParams fsp{};
+      E.bytes(10, fsp);
+    }
     E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(size_t((c.E + 31) / 32 * 32), 1, 1));
   }
   // Expert cache: the hook brings the routed experts into the layer's
@@ -659,9 +694,9 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // on the expert cache's pooled passes, whose staged records the 8-row
   // kernel reads), moe_bm (16 / 32) on larger ones: at 2048 rows an expert
   // holds ~64 rows, read and dequantized once per tile.
-  const int bm = (rows > 8 && !pooled && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
+  const int bm = pooled ? 8 : bm_nopool;
   const MoeSortParams sp{Eeff, c.k, rows, gu_blocks, down_blocks, shared_flag, remap, bm};
-  if ((m.moe_stages & 1) && !(fused_route && rows == 1)) {
+  if ((m.moe_stages & 1) && !(fused_route && rows == 1) && !sort_folded) {
   E.pipe("moe_sort");
   E.set(7, remap ? m.xmap : z.ids);
   if (remap) E.rd(m.xmap);
@@ -1646,7 +1681,7 @@ inline void q4_mtp_streams(Model& m, Enc& E, const Buf& emb, const Buf& hin, con
 // zeroes them all before it encodes. Never inside a decode chain: its earlier
 // passes are still counting on the GPU.
 inline void reset_arrival_counters(Model& m) {
-  for (id<MTLBuffer> b : {m.tune.kctr, m.norm_ctr, m.gdn_ctr, m.mz.cctr, m.mz.rctr})
+  for (id<MTLBuffer> b : {m.tune.kctr, m.norm_ctr, m.gdn_ctr, m.mz.cctr, m.mz.rctr, m.mz.sctr})
     if (b) std::memset([b contents], 0, [b length]);
   m.ctr_dirty = false;
 }
