@@ -1703,17 +1703,25 @@ inline void reset_arrival_counters(Model& m) {
 // repacked into resident GPU buffers in the whole-layer format moe_mlp reads
 // (slot = expert id), so a pass routes on the GPU without handshakes. Chosen
 // at load when they all fit (model.mm); replaces the expert cache.
-// The buffers are GPU-private and join the residency set as they are filled
-// (ESPETERO_XRES_SHARED=1: shared buffers, committed at the first pass, as
-// before): with shared buffers the first pass after loading took 4 s more
-// than the expert cache's on the M4 Max (128 GB), 77 GB brought back into
-// the GPU's working set before its command buffer could start.
+// The buffers are host memory locked with mlock (ESPETERO_XRES_MEM=private |
+// shared: GPU-private buffers, or the shared buffers of 0.1.2) and join the
+// residency set as they are filled. Measured on the M4 Max (128 GB, bench
+// right after the load): the first 128-token prefill took 10.1 s of wall
+// time for 0.2 s of GPU time with shared buffers, 8.7 s after a 90 s idle;
+// 0.4 s with private buffers but 10.9 s after the idle: once free memory is
+// gone macOS compresses the idle GPU's memory, private or shared (vm_stat:
+// 55 GB in the compressor), and the next pass pays to bring it back. Locked
+// pages are left alone (the DeepSeek-V4.1 expert pool, 97 GB, does the same).
 inline void ensure_resident_experts(Model& m) {
   const Config& c = m.cfg;
   if (!m.xres_l.empty() || !m.xs.present) return;
   const auto t0 = Clock::now();
-  static const bool shared = env_on("ESPETERO_XRES_SHARED");
-  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true, !shared);
+  static const Arena::Mem mem = [] {
+    const char* v = std::getenv("ESPETERO_XRES_MEM");
+    return v && !std::strcmp(v, "shared") ? Arena::Mem::Shared : v && !std::strcmp(v, "private") ? Arena::Mem::Private : Arena::Mem::Locked;
+  }();
+  const bool shared = mem == Arena::Mem::Shared;
+  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true, mem);
   Arena tmp(m.dev, size_t(1) << 30);
   m.xres_l.resize(size_t(c.L));
   for (int li = 0; li < c.L; ++li) {

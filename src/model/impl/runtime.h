@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <sys/mman.h>
 #include <thread>
 
 #include "common.h"
@@ -114,11 +115,15 @@ struct Residency {
 class Arena {
  public:
   // resident: the model's weights join the residency set; scratch and
-  // staging arenas do not. priv: GPU-private buffers, written and read by
-  // kernels only (no host access: macOS compresses idle shared buffers, and a
-  // pass then pays to bring them back; the resident experts, 77 GB).
-  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false, bool priv = false)
-      : dev_(dev), chunk_(chunk), resident_(resident), priv_(priv) {}
+  // staging arenas do not. mem: Shared (the default; host-readable),
+  // Private (GPU-only buffers) or Locked (shared buffers over mmap'd pages
+  // locked with mlock: macOS compresses the idle GPU's memory, private or
+  // shared, once free memory runs out, and the next pass pays to bring it
+  // back; locked pages it leaves alone). Private and Locked arenas are
+  // written by kernels only (no copy()).
+  enum class Mem { Shared, Private, Locked };
+  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false, Mem mem = Mem::Shared)
+      : dev_(dev), chunk_(chunk), resident_(resident), mem_(mem) {}
   ~Arena() {
     if (resident_)
       for (id<MTLBuffer> b : buffers_) Residency::get().remove(b);
@@ -143,11 +148,42 @@ class Arena {
       }
     }
     const size_t cap = std::max(nbytes, chunk_);
-    id<MTLBuffer> b = [dev_ newBufferWithLength:cap
-                                        options:priv_ ? (MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked) : kShared];
-    if (!b) fail("Metal allocation of " + std::to_string(cap >> 20) + " MB failed");
+    id<MTLBuffer> b = nil;
+    if (mem_ == Mem::Locked) {
+      const size_t pg = size_t(::getpagesize()), len = (cap + pg - 1) / pg * pg;
+      void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (p == MAP_FAILED) fail("cannot map " + std::to_string(cap >> 20) + " MB for a locked arena");
+      const size_t piece = size_t(256) << 20;  // lock in pieces on every core (faulting tens of GB in on one thread is slow)
+      std::atomic<bool> ok{true};
+      parallel_for((len + piece - 1) / piece, [&](size_t i) {
+        if (::mlock(static_cast<uint8_t*>(p) + i * piece, std::min(piece, len - i * piece)) != 0) ok = false;
+      });
+      if (!ok) {
+        ::munlock(p, len);
+        static bool warned = false;
+        if (!warned) std::fprintf(stderr, "[espetero] could not lock %zu MB in memory (vm.user_wire_limit?): macOS may compress it while the GPU is idle\n", cap >> 20);
+        warned = true;
+      }
+      b = [dev_ newBufferWithBytesNoCopy:p
+                                  length:len
+                                 options:kShared
+                             deallocator:^(void* q, NSUInteger n) {
+                               ::munlock(q, n);
+                               ::munmap(q, n);
+                             }];
+      if (!b) {
+        ::munlock(p, len);
+        ::munmap(p, len);
+        fail("cannot wrap " + std::to_string(cap >> 20) + " MB of locked memory for the GPU");
+      }
+    } else {
+      b = [dev_ newBufferWithLength:cap
+                            options:mem_ == Mem::Private ? (MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked) : kShared];
+      if (!b) fail("Metal allocation of " + std::to_string(cap >> 20) + " MB failed");
+    }
     if (resident_) Residency::get().add(b);
-    alloc_log(dev_, priv_ ? "arena (private)" : resident_ ? "arena (resident)" : "arena", cap, __builtin_return_address(0));
+    alloc_log(dev_, mem_ == Mem::Locked ? "arena (locked)" : mem_ == Mem::Private ? "arena (private)" : resident_ ? "arena (resident)" : "arena", cap,
+              __builtin_return_address(0));
     buffers_.push_back(b);
     len_.push_back(cap);
     fill_.push_back(nbytes);
@@ -157,7 +193,7 @@ class Arena {
   }
 
   Buf copy(const void* src, size_t n) {
-    if (priv_) fail("Arena::copy into GPU-private memory");
+    if (mem_ != Mem::Shared) fail("Arena::copy into a GPU-only arena");
     Buf b = alloc(n);
     parallel_copy(ptr(b), src, n);
     return b;
@@ -173,7 +209,8 @@ class Arena {
   id<MTLDevice> dev_;
   size_t chunk_;
   size_t total_ = 0, held_ = 0;
-  bool resident_ = false, priv_ = false;
+  bool resident_ = false;
+  Mem mem_ = Mem::Shared;
   std::vector<id<MTLBuffer>> buffers_;
   std::vector<size_t> len_, fill_;
 };
