@@ -293,6 +293,9 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_FMA")) m.moe_fma = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_COMB_KS")) m.moe_comb_ks = std::atoi(v);
+    if (const char* v = std::getenv("ESPETERO_MOE_FIN")) m.moe_fin = std::max(0, std::min(2, std::atoi(v)));
+    if (const char* v = std::getenv("ESPETERO_MOE_PF")) m.moe_pf = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_GEMV_FIN")) m.tune.gemv_fin = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_ROWS")) m.moe_fma_rows = std::max(1, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_GEMV_MAXM")) m.tune.gemv_max_m = std::max(1, std::min(m.fma34 ? 4 : kGemvInstM, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_GEMV_KS")) m.tune.gemv_ks = std::atoi(v) == 16 ? 16 : 8;
@@ -878,6 +881,9 @@ class MetalModel final : public NativeModel {
     else if (name == "mtp_coarse") m_.mtp.coarse_c = m_.mtp.coarse.out() > 0 ? std::max(0, std::min(256, value)) : 0;
     else if (name == "mtp_head4") m_.mtp.use_head4 = value != 0;
     else if (name == "moe_comb_ks") m_.moe_comb_ks = value;
+    else if (name == "moe_fin") m_.moe_fin = std::max(0, std::min(2, value));
+    else if (name == "moe_pf") m_.moe_pf = value != 0;
+    else if (name == "gemv_fin") m_.tune.gemv_fin = std::max(0, std::min(2, value));
     else if (name == "moe_fma_rows") m_.moe_fma_rows = std::max(1, std::min(2, value));
     else if (name == "moe_gemv_cfg") {  // A/B composites (ab_native): 0 (8 slices, 1 block), 1 (gate/up 4; down 4 x 2), 2 gate/up 4 only, 3 down 4 x 2 only
       m_.moe_ks = (value == 1 || value == 2) ? 4 : 8;
@@ -990,6 +996,7 @@ class MetalModel final : public NativeModel {
       if (L.moe && !m.cfg.gemma && !m.cfg.q3moe) {
         moe_pipelines(m, L, list);  // the passes' own choice per layer (formats may differ by layer)
         for (const char* k : {"moe_topk", "moe_sort", "moe_combine"}) list.push_back({k, 0});
+        list.push_back({"norm_fin", 0});
         if (!L.router.dense) list.push_back({"moe_route" + std::to_string(L.router.q.bits), L.router.q.fc()});
         if (!L.router.dense) list.push_back({"moe_route_par" + std::to_string(L.router.q.bits), L.router.q.fc()});
         if (L.router.dense && !L.shared_gate.dense)

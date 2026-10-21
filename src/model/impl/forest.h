@@ -429,6 +429,17 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
     for (int ks : {8, 4, 2}) out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks) + "_e512", gu.fc()});
   if (sdn)
     for (int kk : {1, 2}) out.push_back({moe_down_comb_name(dn, *sdn, kk), dn.fc()});
+  // Fase 3 variants in use (moe_pf, moe_fin): the single-row kernels' `_pf` and the finalizer modes.
+  if (m.moe_pf) {
+    for (int ks : {8, 4, 2}) {
+      out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, false, ks) + "_pf", gu.fc()});
+      out.push_back({moe_gemv_name(dn, sdn, true, 1, 0, false, ks) + "_pf", dn.fc()});
+      out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks) + (m.cfg.E > 256 ? "_e512" : "") + "_pf", gu.fc()});
+    }
+  }
+  if (sdn && (m.moe_pf || m.moe_fin))
+    for (int kk : {1, 2})
+      out.push_back({moe_down_comb_name(dn, *sdn, kk) + (m.moe_pf ? "_pf" : "") + (m.moe_fin ? "_f" + std::to_string(m.moe_fin) : ""), dn.fc()});
 }
 
 // The MoE MLP of `rows` rows: X (half, post-norm) in, H (fp32 residual)
@@ -742,7 +753,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const int ks = fma_path ? (ks_opt == 4 || (ks_opt == 2 && rows <= 2) ? ks_opt : 8) : 8;  // no k2 variants above 2 rows
     const bool route_name = route_in_gemv && epi == 2 && fma_path && rows == 1 && m.moe_direct;
     const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks, bm) +
-                             (route_name && route_e512 ? "_e512" : "");  // routes of 257-512 experts (Qwen4-Exp)
+                             (route_name && route_e512 ? "_e512" : "") +  // routes of 257-512 experts (Qwen4-Exp)
+                             (fma_path && rows == 1 && m.moe_pf ? "_pf" : "");  // Fase 3: two K steps in flight
     if (env_on("ESPETERO_MOE_LOG"))
       std::fprintf(stderr, "moe: layer %d %s (w %d/%d bits fc %x, w2 %d bits, shared_tiles %d)\n", int(&L - m.layers.data()),
                    name.c_str(), w.bits, w.src_bits, w.fc(), w2 ? w2->bits : -1, shared_tiles ? 1 : 0);
@@ -852,7 +864,9 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   if (down_comb) {
     const QW& w = *xdn;
     const QW& w2 = L.down.q;
-    const std::string name = moe_down_comb_name(w, w2, comb_ks);
+    // Fase 3 variants: `_pf` (two K steps in flight), `_f1` / `_f2` (the finalizer staged / as a norm_fin dispatch).
+    const int fin = nout ? m.moe_fin : 0;
+    const std::string name = moe_down_comb_name(w, w2, comb_ks) + (m.moe_pf ? "_pf" : "") + (fin ? "_f" + std::to_string(fin) : "");
     E.pipe(name, w.fc());
     gemm_tag(E, name, c.D, c.Ie, rows);
     const MoeDownCombParams dp{c.D, w.out, w2.out, c.Ie, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f};
@@ -883,8 +897,15 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     E.wr(z.cparts);
     E.rd(z.cctr);
     E.wr(z.cctr);
-    if (nout) E.wr(nout->xn.b, nout->xn.off, nout->xn.off + size_t(c.D) * 2);
+    if (nout && fin != 2) E.wr(nout->xn.b, nout->xn.off, nout->xn.off + size_t(c.D) * 2);
     E.groups(MTLSizeMake(size_t(c.D / 32), 1, 1), MTLSizeMake(size_t((c.k + 1) * comb_ks * 32), 1, 1));
+    if (fin == 2) {  // the finalizer as its own dispatch: the block partials (z.cparts) summed in block order
+      NormLink nl = *nout;
+      nl.parts = Buf(z.cparts, 0);
+      nl.ld = 64;
+      nl.P = c.D / 32;
+      norm_fin_encode(E, nl, H, h_off, 1, 0);
+    }
     return;
   }
   if (m.moe_stages & 4) grouped(*xdn, shared_tiles ? &L.down.q : nullptr, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, 1, split ? 2 : 0);

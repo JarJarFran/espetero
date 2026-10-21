@@ -63,6 +63,10 @@ struct Tuner {
   bool gemv = true;        // decode-sized rows use rgemv ("gemv": 0 disables)
   bool gemv8 = true;       // 3..8 rows use the MMA GEMV ("gemv8": 0 disables)
   int gemv_max_m = 2;      // rows served by the FMA GEMV (1..kGemvInstM; ESPETERO_GEMV_MAXM)
+  // Fase 3: the fused norm's finalizer of the 1-2-row residual GEMVs (EPI_ADDP) 0 in the
+  // dispatch (last arriver) as before, 2 as a norm_fin dispatch after an EPI_ADDS GEMV (the
+  // same sums in the same order). ESPETERO_GEMV_FIN, "gemv_fin".
+  int gemv_fin = 0;
   // GEMMs above the tuned range (prefill chunks of 2048-4096 rows against
   // tune_max_m = 1024) take the top bucket's tile without its K split, so the
   // summation order stays config 2's ("tune_clamp": 0 = config 2 as before).
@@ -187,6 +191,30 @@ struct SplitOut {
 // True when a GEMM of M rows runs as a GEMV kernel (fusion is possible).
 inline bool gemv_path(const Tuner& T, int M) { return (M <= T.gemv_max_m && T.gemv) || (M <= 8 && T.gemv && T.gemv8); }
 
+struct NormFinParamsHost {
+  int32_t P, part_ld, D;
+  float eps;
+  int32_t mode;
+};
+
+// Fase 3: the fused RMSNorm's finalizer as its own dispatch (one threadgroup
+// per row): sums the producer's P block partials in its order (mode 0: serial,
+// moe_down_comb's; 1: lane-strided + simd_sum, rgemv EPI_ADDP's) and writes the
+// normalized fp16 rows. h: the residual rows (stride D floats), M rows.
+inline void norm_fin_encode(Enc& E, const NormLink& nl, id<MTLBuffer> h, size_t hoff, int M, int mode) {
+  const NormFinParamsHost np{nl.P, nl.ld, nl.D, nl.eps, mode};
+  E.pipe("norm_fin");
+  E.set(0, h, hoff);
+  E.set(1, nl.parts);
+  E.set(2, nl.w);
+  E.set(3, nl.xn);
+  E.bytes(4, np);
+  E.rd(h, hoff, hoff + size_t(M) * size_t(nl.D) * 4);
+  E.rd(nl.parts.b, nl.parts.off, nl.parts.off + size_t(M) * size_t(nl.ld) * 4);
+  E.wr(nl.xn.b, nl.xn.off, nl.xn.off + size_t(M) * size_t(nl.D) * 2);
+  E.groups(MTLSizeMake(size_t(M), 1, 1), MTLSizeMake(256, 1, 1));
+}
+
 // epi: 0 store fp32, 1 accumulate fp32, 2 SwiGLU -> fp16. n_cols > 0 (GEMV
 // only): compute just the first ~n_cols outputs (a vocabulary prefix).
 // nin: gated per-head norm applied on load; nout: residual add + norm partials
@@ -230,8 +258,10 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
       E.wr(nout->ctr.b, nout->ctr.off, nout->ctr.off + 4);
     }
   };
-  static const char* epis4[4] = {"_store", "_add", "_swiglu", "_addp"};
-  const int e = nout ? 3 : epi;
+  static const char* epis4[6] = {"_store", "_add", "_swiglu", "_addp", "", "_adds"};
+  // EPI_ADDS (5): the residual GEMV without the in-dispatch finalizer; norm_fin follows (gemv_fin 2, rgemv only).
+  const bool fin_split = nout && T.gemv_fin == 2 && M <= T.gemv_max_m && T.gemv;
+  const int e = nout ? (fin_split ? 5 : 3) : epi;
   if ((nin || nout) && !gemv_path(T, M)) fail("fused norm needs a GEMV-sized pass");
   // An RMSNorm'd input is the residual stream itself: never also the output.
   if (nin && nin->kind == 1 && (e == 1 || e == 3)) fail("fused norm input with a residual epilogue");
@@ -286,6 +316,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.rd(A, aoff, aoff + a_bytes);
     E.wr(Y, yoff, yoff + y_bytes);
     E.groups(MTLSizeMake(size_t(nblocks), size_t(splits), 1), MTLSizeMake(k16 ? 512 : 256, 1, 1));
+    if (fin_split) norm_fin_encode(E, *nout, Y, yoff, M, 1);
     return;
   }
   // 3..8 rows (draft verification): the GEMV-shaped MMA kernel.
@@ -506,9 +537,10 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
     for (int e = 0; e < 3; ++e)
       for (int cfg : {1, 2, 4}) out.push_back({rgemm_name(w.bits, gemm_variant_cfg(cfg, gemm_var), e), w.fc()});
   if (w.bits == 6) out.push_back({"widen6_8", 0});
-  for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g"}) {
+  for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g", "_adds", "_adds_g"}) {
     for (int mm = 1; mm <= kGemvInstM; ++mm)
       out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + v, w.fc()});
+    if (v[1] == 'a' && v[2] == 'd' && v[3] == 'd' && v[4] == 's') continue;  // _adds: rgemv only
     if (fma34)
       for (int mm = 3; mm <= 4; ++mm) out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + "j" + v, w.fc()});
     out.push_back({"rgemv8r" + std::to_string(w.bits) + v, w.fc()});

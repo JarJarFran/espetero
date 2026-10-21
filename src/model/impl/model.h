@@ -582,6 +582,13 @@ struct Model : Runtime {
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
+  // Fase 3 (bit-identical variants of the single-row MoE kernels, off by default until measured):
+  // moe_fin: moe_down_comb's fused-norm finalizer 0 as before (last arriver, serial partial
+  // loads), 1 last arriver with the partials staged at once, 2 a norm_fin dispatch after it.
+  // moe_pf: the single-row FMA expert kernels with two K steps' loads in flight (`_pf`).
+  // ESPETERO_MOE_FIN / ESPETERO_MOE_PF, "moe_fin" / "moe_pf".
+  int moe_fin = 0;
+  int moe_pf = 0;
   int moe_ks = 4;            // FMA expert GEMV: simdgroups per threadgroup (K slices): 2, 4 or 8 (4 for gate/up)
   bool moe_direct = true;    // single-row passes: direct grids for the expert GEMVs (no indirect arguments)
   int moe_nbpt = 1;          // FMA expert GEMV: 32-column blocks per threadgroup (direct grids only)

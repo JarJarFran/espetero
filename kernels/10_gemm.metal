@@ -1002,6 +1002,10 @@ struct NormParams {
 };
 
 constant constexpr int EPI_ADDP = 3;
+// Fase 3 (option gemv_fin 2): EPI_ADDP's residual add and block partials
+// with plain stores and no in-dispatch finalizer; a `norm_fin` dispatch
+// (mode 1) sums the partials in EPI_ADDP's order and writes xn.
+constant constexpr int EPI_ADDS = 5;
 // Qwen4-Exp hyper-connection mix (q4_hc_mix folded in): the up matrix's rows
 // are ordered so a 32-column block holds 32 / S channels x S streams (column
 // j * S + s = stream s of channel nb * 32 / S + j); Yv gets the fp16 block
@@ -1267,18 +1271,23 @@ kernel void rgemv(
           acc += float(y16[ulong(m) * np.part_ld + ulong(s) * np.out_ld + d]) / (1.0f + exp(-red[m][c * S + s]));
         ((device half*)Yv)[ulong(m) * p.ldy + d] = half(acc / float(S));
       }
-    } else if (EPI == EPI_ADDP) {
+    } else if (EPI == EPI_ADDP || EPI == EPI_ADDS) {
       // Values another threadgroup (the finalizer) reads inside this dispatch
       // are stored atomically: plain stores are not visible across
       // threadgroups before the dispatch ends on Apple GPUs, fences or not.
+      // (EPI_ADDS: read by the norm_fin dispatch, plain stores.)
       float y = 0.0f;
       if (n0 + c < p.N) {
         device float* yp = (device float*)Yv + ulong(m) * p.ldy + n0 + c;
         y = *yp + v;
-        atomic_store_explicit((device atomic_uint*)yp, as_type<uint>(y), memory_order_relaxed);
+        if (EPI == EPI_ADDP) atomic_store_explicit((device atomic_uint*)yp, as_type<uint>(y), memory_order_relaxed);
+        else *yp = y;
       }
       const float sq = simd_sum(y * y);
-      if (lane == 0) atomic_store_explicit((device atomic_uint*)(pout + m * np.out_ld + nb), as_type<uint>(sq), memory_order_relaxed);
+      if (lane == 0) {
+        if (EPI == EPI_ADDP) atomic_store_explicit((device atomic_uint*)(pout + m * np.out_ld + nb), as_type<uint>(sq), memory_order_relaxed);
+        else pout[m * np.out_ld + nb] = sq;
+      }
     } else if (n0 + c < p.N) {
       device float* y = (device float*)Yv + ulong(m) * p.ldy + n0 + c;
       *y = (EPI == EPI_ADD) ? *y + v : v;
@@ -1334,7 +1343,9 @@ kernel void rgemv(
   template [[host_name(PRE #MM "_store_n")]] kernel void rgemv<BITS, MM, 0, 8, 1>(RGEMV_ARGS);     \
   template [[host_name(PRE #MM "_swiglu_n")]] kernel void rgemv<BITS, MM, 2, 8, 1>(RGEMV_ARGS);     \
   template [[host_name(PRE #MM "_add_g")]] kernel void rgemv<BITS, MM, 1, 8, 2>(RGEMV_ARGS);        \
-  template [[host_name(PRE #MM "_addp_g")]] kernel void rgemv<BITS, MM, 3, 8, 2>(RGEMV_ARGS);
+  template [[host_name(PRE #MM "_addp_g")]] kernel void rgemv<BITS, MM, 3, 8, 2>(RGEMV_ARGS);       \
+  template [[host_name(PRE #MM "_adds")]] kernel void rgemv<BITS, MM, 5, 8, 0>(RGEMV_ARGS);         \
+  template [[host_name(PRE #MM "_adds_g")]] kernel void rgemv<BITS, MM, 5, 8, 2>(RGEMV_ARGS);
 #define INSTANTIATE_RGEMV(PRE, BITS) \
   INSTANTIATE_RGEMV_E(PRE, BITS, 1)  \
   INSTANTIATE_RGEMV_E(PRE, BITS, 2)
