@@ -207,10 +207,50 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   it 8 threadgroups (one simdgroup walking a head's ~640 keys):
   `ds4_attn_split` (≤ 4 rows) gives each head a threadgroup whose simdgroups
   split the keys, 1.2 ms (GPU 46 → 42 ms per token). One-row fp8 GEMVs compute
-  4 output rows per simdgroup (`ESPETERO_DS4_GEMV1=1`: one), ~0.5 ms. Merging
-  the mHC kernels (DeepSeek's Mega-mHC) would save ~240 dispatches per token,
-  a few ms at most. Overlapping a layer's miss reads with its cached experts'
+  4 output rows per simdgroup (`ESPETERO_DS4_GEMV1=1`: one), ~0.5 ms.
+  Overlapping a layer's miss reads with its cached experts'
   GPU work (the pipelined MoE for one row) changed nothing measurable.
+* **Anatomy of a decoded token** (2026-10-22, `dsv4_run`, a 512-token prompt
+  of source text then 128 greedy tokens, medians of the last 64, main dde1aa1):
+  82 ms = GPU 40.0 + command-buffer launch and wake-up 5.6 (41 command buffers)
+  + expert reads 34.0 (12 misses × 2.8 ms) + Engram rows 1.0 + host work 0.9.
+  The 40 ms of GPU, every dispatch timed alone (1332 dispatches): dense fp8
+  GEMVs 16.1 ms (~6.8 GB, ~420 GB/s), routed experts 12.0 (4.5 GB, ~375 GB/s),
+  bf16 head and routers 3.5, the norm / RoPE epilogues 2.1 (120 dispatches),
+  attention 1.6, the four hyper-connection kernels 3.0 over 321 dispatches, the
+  rest ~900 tiny dispatches ≈ 5 ms. The misses depend on the history: the first
+  32 tokens after the prompt missed 58 experts each (225 ms per token).
+* **Reading a token's experts earlier is not possible without prediction.**
+  Layer L's routing is the output of layer L's attention, which needs layer
+  L − 1's complete output, experts included: once layer L's misses are known
+  the only GPU work left that does not need them is layer L's shared expert
+  and its cached experts (~0.3 ms), which is what the pipelined MoE overlapped
+  with nothing to show. What a token decides for itself is read as soon as it
+  is decided; everything earlier is prediction (above). What the host adds
+  around the reads is what can go: three changes, each bit-identical to main
+  (per-layer residual dumps of a 48-token prefill plus 4 decode steps, 800
+  files; logits hashes of 16 greedy steps):
+  the Engram rows gathered in a thread while the GPU runs layer 0
+  (`ESPETERO_DS4_ENGRAM_BG=0`; 1.1 → 0.15 ms per token when it hides), the
+  GPU-driven decode (the pass is one command buffer committed before any route
+  is known, the GPU signals a shared event after each router and waits for the
+  host's before each layer's experts, the host resolves the route, reads the
+  misses and fills the expert kernels' tables while it waits;
+  `ESPETERO_DS4_DRIVE=0` restores the 41 command buffers), and one
+  hyper-connection dispatch between sub-layers instead of four
+  (`ds4_hc_fused`, opt-in `ESPETERO_DS4_HCFUSE=1`: it **lost**, GPU time
+  40.1 → 44.2 ms per token in 3 of 3 pairs against main; one threadgroup per
+  row serializes the 24 × 20480 mix that `ds4_hc_part` spreads over 20, and at
+  1 row the 240 dispatches it saves cost nothing on the M4 Max).
+* **The expert cache's size** (the access trace of the run above replayed with
+  `tools/dsv4_xsim.py`, which starts cold, so the counts are relative):
+  LRU misses per decoded token 28.7 at 4745 slots (89 GB), 26.5 at 5168
+  (97 GB, the default), 24.4 at 5600, 22.1 at 6000, 19.4 at 6500, 16.7 at
+  7000 (132 GB): each 1000 slots (18.8 GB) cut the misses ~15 %, ARC 2–3 %
+  more than LRU. The default cache already takes what the Mac leaves (~14 GB);
+  the Engram tables are read from the SSD (not resident) and the KV of 6 slots
+  is ~1 GB, so neither frees a slot's worth: the misses move only with memory
+  the machine does not have, or with a smaller expert (lossy).
 * **Predicting the next layer's experts** (to read them while the GPU works) does
   not pay here: `ESPETERO_DS4_DUMPX=dir` dumps each layer's MoE input and routes,
   `tools/dsv4_route_predict.py` measures predictors and `tools/dsv4_prefetch_sim.py`
@@ -257,7 +297,8 @@ Development switches: `ESPETERO_DS4_LAYERS=n` (first n layers, no head),
 `ESPETERO_DS4_SUB`, `ESPETERO_DS4_ROWS`, `ESPETERO_DS4_PREFETCH=0`,
 `ESPETERO_DS4_WARM=0`, `ESPETERO_DS4_TRACE=file`, `ESPETERO_DS4_CED=0`, `ESPETERO_DS4_STREAM=0`,
 `ESPETERO_DS4_PIPE=0`, `ESPETERO_DS4_ATTN1=1`, `ESPETERO_DS4_GEMV1=1`, `ESPETERO_DS4_DUMPX=dir`,
-`ESPETERO_EXPERT_CACHE_GB`.
+`ESPETERO_DS4_HCFUSE=0`, `ESPETERO_DS4_ENGRAM_BG=0`, `ESPETERO_DS4_DRIVE=0`, `ESPETERO_EXPERT_CACHE_GB`;
+`build/dsv4_run` with `DS4_RUN_HASH=1` prints a hash of every logit after the prefill and each step.
 
 Determinism: a pass is bit-reproducible except that the pipelined MoE of long
 passes adds a row's expert outputs in an order that depends on which experts

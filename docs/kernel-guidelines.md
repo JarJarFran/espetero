@@ -223,6 +223,28 @@ Rules that keep the tiers honest:
   bucket's tile without its K split keeps config 2's summation order (logits
   bit-identical) and cut a 27B 4-bit 2048-row prefill 5.9–6.3% (paired A/B,
   ratio 0.941 / 0.937; 165 tok/s against 158 on an idle M1 Max).
+- **A fused kernel that serializes what the separate ones spread over the
+  GPU loses, even where a dispatch boundary costs nothing** (`ds4_hc_fused`,
+  DeepSeek-V4.1, 2026-10-22, M4 Max, 3 alternating pairs against main's
+  binary): hc_post + hc_part + hc_fin + hc_pre as one 256-thread threadgroup
+  per row (bit-identical, −240 dispatches per decoded token) made the GPU
+  time per token 40.1 → 44.2 ms in every pair. The 24 × 20480 mix is 2 MB of
+  reads per row that `ds4_hc_part` gives 20 threadgroups; one threadgroup
+  does them, and its ~500 simd reductions, in series. At 1 row the boundary
+  it saves is free on this GPU (Fase 2), so there was nothing to win back.
+  Opt-in (`ESPETERO_DS4_HCFUSE=1`) for machines where a boundary costs 5–23 µs.
+- **Idle GPU memory is compressed, whatever its storage mode; lock what a
+  pass must find in place** (2026-10-22, Studio M4 Max 128 GB,
+  Flash-Next's 77 GB of resident experts): with free memory exhausted by the
+  load, macOS unwires the idle GPU's memory (`iogpu.wired_lwm_mb` 0) and
+  compresses it, shared or GPU-private alike (`vm_stat`: 51–55 GB in the
+  compressor), and the first pass pays the decompression before its command
+  buffer starts (10.1 s of wall time for 0.2 s of GPU time; private buffers
+  0.4 s right after the load but 10.9 s after 90 s of idle). The residency
+  set does not prevent it. Pages locked with `mlock` and wrapped with
+  `newBufferWithBytesNoCopy` (the DeepSeek-V4.1 expert pool, now the
+  resident experts) are never compressed: 0.38 s, and 2.1 s after the idle
+  (the weights and pools, not locked, still are).
 - **Two multi-row switches measured slower, off by default:**
   `ESPETERO_FUSE_NORM_MAXM=8` (fused norms up to 8 rows) +2.4% per step at
   4 rows, +4.7% at 8; `ESPETERO_FMA34=1 ESPETERO_GEMV_MAXM=4` (FMA GEMV up

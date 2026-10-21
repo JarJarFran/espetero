@@ -470,6 +470,17 @@ next draft step: (argmax/sampled token, H^m pre-mixer) → same computation  ([M
   pre-mixer state at its position ([MB]:148-185).
 * Weights (oQ4e): attention 5–6-bit, HC 5-bit, shared expert 8-bit g128,
   router bf16 (the splitter never quantizes `layers.0.mlp.gate`), fc 4-bit g64.
+* Espetero drafts with the file's own `mtp.*` head when no drafter directory
+  (a sibling whose config says `qwen4_exp_mtp`, e.g.
+  `Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16`) is beside the model, loading it as
+  stored (~1.5 GB resident; `--mtp own` forces it, `--mtp DIR` a drafter, whose
+  bf16 matrices become 8-bit copies, ~2.7 GB). Measured on the M4 Max (128 GB,
+  resident experts, three greedy 256-token replies through the server,
+  2026-10-22): the 4-bit head accepts 44 / 67 / 56 % of its drafts against the
+  bf16 drafter's 44 / 69 / 52 % and decodes at 66 / 89 / 77 tokens/s against
+  65 / 90 / 73 (plain decoding 58–59); the two heads' replies were identical on
+  the three prompts. (An earlier note in the loader said the file's head
+  accepted 0–4 % of drafts; it does not.)
 * `mtp.hybrid: true` is read by neither reference.
 
 ## 8. Vision tower and M-RoPE positions
@@ -518,6 +529,23 @@ small vectors in fp32:
 | Embedding row (8-bit) | 0.003 | – | 0.003 | – |
 | n-gram rows (16 × 100 B, from SSD) | 0.002 | – | 0.002 | – |
 | **Total** | **4,617** | | **4,660** | 6,670 |
+
+**Resident experts (128 GB Macs).** When the whole expert store fits, the
+loader repacks every layer's experts once into resident GPU buffers and the
+passes route on the GPU (CHANGELOG 0.1.2). Those 77 GB live in host memory
+locked with `mlock` and wrapped for the GPU without a copy, as DeepSeek-V4.1's
+expert pool does. Measured on the M4 Max (2026-10-22, `bench_native --q4`,
+first 128-token prefill, wall time for 0.2 s of GPU time): the shared buffers
+of 0.1.2 10.1 s right after the load and 8.8 s after 90 s of idle; GPU-private
+buffers 0.4 s right after the load but 10.9 s after the idle; locked pages
+0.38 s and 2.1 s. `vm_stat` shows why: once free memory runs out (the load
+fills it) and the GPU goes idle, macOS unwires its memory (`iogpu.wired_lwm_mb`
+0) and compresses it, private or shared (51–55 GB in the compressor), and the
+next pass decompresses it before its command buffer can start; locked pages are
+left alone, and the 2.1 s that remain after an idle are the rest of the model's
+memory (weights, pools) going the same way. `ESPETERO_XRES_MEM=private|shared`
+selects the other kinds; `ESPETERO_BENCH_SLEEP=S` idles `bench_native --q4`
+between the load and its first pass to reproduce the effect.
 
 Around the weights, per step: GDN recurrent state read + write 2 × 113.2 MB;
 KV and indexer reads per §4.4 (50 MB at 2 k context); GDN conv, PLE conv
