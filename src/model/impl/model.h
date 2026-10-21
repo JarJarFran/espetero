@@ -582,12 +582,16 @@ struct Model : Runtime {
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
-  // Fase 3 (bit-identical variants of the single-row MoE kernels, off by default until measured):
-  // moe_fin: moe_down_comb's fused-norm finalizer 0 as before (last arriver, serial partial
-  // loads), 1 last arriver with the partials staged at once, 2 a norm_fin dispatch after it.
-  // moe_pf: the single-row FMA expert kernels with two K steps' loads in flight (`_pf`).
+  // Fase 3 (bit-identical variants of the single-row MoE kernels):
+  // moe_fin: moe_down_comb's fused-norm finalizer 0 the last arriver reading the 64 block
+  // partials serially in every thread (main dde1aa1: 64 dependent atomic loads, ~37 us of a
+  // 52 us kernel on the M4 Max), 1 the last arriver with the partials staged at once and xn
+  // written four columns per thread (M4 Max, 35B-A3B 4-bit, 1-row step 7.60-7.66 -> 6.31-6.33 ms
+  // GPU, 127 -> 152 tok/s, 3 alternating pairs against main's binary; logits bit-identical),
+  // 2 a norm_fin dispatch after the kernel (6.31-6.38 ms). moe_pf: the single-row FMA expert
+  // kernels with two K steps' loads in flight (`_pf`; measured neutral: 7.67 vs 7.65 ms).
   // ESPETERO_MOE_FIN / ESPETERO_MOE_PF, "moe_fin" / "moe_pf".
-  int moe_fin = 0;
+  int moe_fin = 1;
   int moe_pf = 0;
   // moe_fma_mix (Fase 3, not output-preserving: a decision candidate): on MoE passes of
   // moe_fma_rows + 1 .. moe_fma_mix_rows rows, tiles of at most 2 rows run on the 2-row FMA
