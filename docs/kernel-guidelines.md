@@ -395,6 +395,17 @@ Rules that keep the tiers honest:
   verify pass +7.8 % (35B-A3B) / +12.8 % (27B); fused norms on 3–8-row passes
   (`fuse_norm_max_m` 8) −0.2 % / +4.3 %; `attn_split` 256 / 512 / 1024 at
   1K and 8K contexts within 0.1 % on both models with identical logits.
+- **FMA tiles for the 1–2-row tiles of 9–16-row passes lose** (`moe_fma_mix`:
+  the 2-row FMA kernel over the tile table for tiles of ≤ 2 rows, the MMA
+  kernel skipping them; nearly every routed expert of a 16-row step holds one
+  row): 16-row step 24.82 / 25.00 / 24.98 → 26.60 / 26.55 / 26.68 ms (+7 %,
+  +80 dispatches); with `route_sg` 21.65–22.23 → 23.31–23.95. The FMA
+  kernel's 14–30 % per-call advantage at one row does not survive an
+  indirect grid of ~110 × 32 threadgroups beside the MMA dispatch. Off, not
+  output-preserving either (Fase 2's candidate 10, closed).
+- **The device profile measures 2.12 µs per dependent tiny dispatch on the
+  M4 Max** (`gather_rows_f32` over 2048 floats, 64-deep chain, serial
+  encoder; family 2 = Apple9), cached in device-profile-r1-Apple_M4_Max.json.
 - **The 9–16-row shared expert and its gate are the step's largest small
   items**: at 16 rows the 1×2048 shared-gate GEMM (one threadgroup, one live
   simdgroup streaming 32 K steps) takes 57 µs per layer (2.28 ms, 10.5 % of

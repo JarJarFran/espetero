@@ -593,9 +593,10 @@ struct Model : Runtime {
   // ESPETERO_MOE_FIN / ESPETERO_MOE_PF, "moe_fin" / "moe_pf".
   int moe_fin = 1;
   int moe_pf = 0;
-  // moe_fma_mix (Fase 3, not output-preserving: a decision candidate): on MoE passes of
-  // moe_fma_rows + 1 .. moe_fma_mix_rows rows, tiles of at most 2 rows run on the 2-row FMA
-  // expert kernel and the MMA kernel skips them. ESPETERO_MOE_FMA_MIX, "moe_fma_mix".
+  // moe_fma_mix (Fase 3, measured slower: M4 Max 16-row step 24.8-25.0 -> 26.6-26.7 ms, +7 %, and
+  // not output-preserving): on MoE passes of moe_fma_rows + 1 .. moe_fma_mix_rows rows, tiles of
+  // at most 2 rows run on the 2-row FMA expert kernel and the MMA kernel skips them.
+  // ESPETERO_MOE_FMA_MIX, "moe_fma_mix". Kept as a diagnostic.
   bool moe_fma_mix = false;
   int moe_fma_mix_rows = 16;
   int moe_ks = 4;            // FMA expert GEMV: simdgroups per threadgroup (K slices): 2, 4 or 8 (4 for gate/up)
