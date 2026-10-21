@@ -1384,9 +1384,12 @@ class Dsv4Model final : public NativeModel {
   }
   // The three in one dispatch (ds4_hc_fused, bit-identical): hc_post with `pmix` (post), then from the new H the
   // next block's coefficients `fn / base / scale` into `mout` (mix) and the next sub-layer's input `X` with
-  // `prem` and norm `w` (pre). ESPETERO_DS4_HCFUSE=0 keeps the separate kernels (and D != 5120 does).
+  // `prem` and norm `w` (pre). Opt-in (ESPETERO_DS4_HCFUSE=1; needs D = 5120): measured +4.1 ms of GPU per
+  // decoded token on the M4 Max (3 pairs against main, 40.1 -> 44.2 ms), where a dispatch boundary costs
+  // nothing at 1 row and one threadgroup per row serializes the 480 float4 dots and ~500 simd reductions that
+  // ds4_hc_part spreads over 20 threadgroups.
   bool hc_fuse() const {
-    static const bool on = !(std::getenv("ESPETERO_DS4_HCFUSE") && std::atoi(std::getenv("ESPETERO_DS4_HCFUSE")) == 0);
+    static const bool on = std::getenv("ESPETERO_DS4_HCFUSE") && std::atoi(std::getenv("ESPETERO_DS4_HCFUSE")) == 1;
     return on && c_.D == 5120;
   }
   void hc_fused(Enc2& E, int r0, int M, id<MTLBuffer> Ys, size_t yso, id<MTLBuffer> pmix, const Buf* fn, const Buf* base,
