@@ -154,7 +154,12 @@ Per MoE layer at one row, three dispatches:
    TensorFold's `expert_down`).
 
 Knobs: `ESPETERO_ROUTE_IN_GEMV` (default on), `ESPETERO_ROUTE_FIN1` (a
-separate barrier-free finalize when the fold is off).
+separate barrier-free finalize when the fold is off), `ESPETERO_MOE_FIN`
+(the next norm's finalizer in `moe_down_comb`: 1, the default since Fase 3,
+requests the block partials at once and stages them; 0 the serial loads of
+dependent atomic loads that cost 37 of the kernel's 52 µs on the M4 Max; 2 a
+`norm_fin` dispatch instead), `ESPETERO_MOE_PF` (two K steps' loads in
+flight in the single-row FMA kernels; measured neutral).
 
 Multi-row passes keep the separate steps: `moe_route` (one threadgroup per
 row, sized at dispatch time from `maxTotalThreadsPerThreadgroup`: threadgroup
