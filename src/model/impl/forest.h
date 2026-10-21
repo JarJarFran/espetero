@@ -1936,7 +1936,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
   // The DeltaNet kernels of this pass (the rule of every linear layer below);
   // the verify-commit replays a commit chain with the same ones.
-  const bool gdn_fused_pass = !c.q4 && !c.lfm2 && m.fuse_gdn && gemv_path(m.tune, M) && n_patch == 0 && c.Dk == 128 && c.Dv == 128;
+  // (extended below to larger passes of short segments when fuse_gdn_rows allows)
+  const bool gdn_fused_ok = !c.q4 && !c.lfm2 && m.fuse_gdn && n_patch == 0 && c.Dk == 128 && c.Dv == 128;
+  bool gdn_fused_pass = gdn_fused_ok && gemv_path(m.tune, M);
   if (c.q4) {
     // The Qwen4-Exp path: roots, draft leaves and MTP rows; no decode chains.
     if (chained || m.chain_active) fail("qwen4_exp: decode chains are not supported yet");
@@ -2195,6 +2197,13 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   for (const DeltaSeg& sg : roots) max_root_len = std::max(max_root_len, sg.len);
   for (const DeltaSeg& sg : leaves) max_leaf_len = std::max(max_leaf_len, sg.len);
   upload(meta.conv_jobs, conv_jobs);
+  // fuse_gdn_rows: batched decode / verify passes of up to that many rows whose
+  // segments are all short (<= 8 tokens: one threadgroup per segment and value
+  // head walks them) run the fused kernel too, instead of conv_prep +
+  // conv_state_save + deltanet_tr + gated_rmsnorm (3 dispatches more per linear layer).
+  if (!gdn_fused_pass && gdn_fused_ok && M <= m.fuse_gdn_rows && std::max(max_root_len, max_leaf_len) <= 8 &&
+      roots.size() <= size_t(Model::kGdnCtrSegs))
+    gdn_fused_pass = true;
 
   // ---- attention plan, and the sparse attention plan of the Qwen4-Exp rows
   AttnPlan A;
