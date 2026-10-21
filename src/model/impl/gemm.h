@@ -72,7 +72,14 @@ struct Tuner {
   bool tune_clamp = true;
   // Experiment (prefill GEMMs): the tuned 32x4 / 32x8 / 16x4 tiles run as their
   // k2 / sg / k2sg variants (1 / 2 / 3; see gemm_variant_cfg). Same sums.
+  // Measured slower (k2: +5-10 %) or neutral (sg) on an M4 Max; the kernels
+  // are compiled only with ESPETERO_GEMM_VAR set.
   int gemm_var = 0;
+  // Split-K partials left to the consumer (SplitOut) only while a row's
+  // partials are at most this many floats: the consumer's one 256-thread
+  // threadgroup per row reads them serially. M4 Max, 16-row steps: 8 splits x
+  // 2048 (35B-A3B) -1.2 %, 8 x 5120 (27B) +0.7 %. "so_max" (0: no limit).
+  int so_max_floats = 16384;
   // GEMMs of more than 8 rows take the untuned tile (config 2, no split
   // K) whatever their row count, so a row's result does not depend on the
   // rows beside it (embedding passes, "gemm_fixed").
@@ -355,8 +362,8 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.wr(T.ws, 0, size_t(splits) * size_t(M) * size_t(w.out) * 4);
     E.groups(MTLSizeMake(size_t(M + g.bm - 1) / size_t(g.bm), size_t(w.out + g.bn - 1) / size_t(g.bn), size_t(splits)),
              MTLSizeMake(size_t(g.threads), 1, 1));
-    if (so && (epi == 0 || epi == 1)) {  // the consumer sums the partials (no reduce dispatch)
-      *so = SplitOut{T.ws, splits, M * w.out, w.out};
+    if (so && (epi == 0 || epi == 1) && (T.so_max_floats <= 0 || splits * w.out <= T.so_max_floats)) {
+      *so = SplitOut{T.ws, splits, M * w.out, w.out};  // the consumer sums the partials (no reduce dispatch)
       return;
     }
     GemmParams r{M, w.out, w.in, lda, ldy, per, M * w.out};

@@ -325,7 +325,8 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GDN_CONV_FOLD")) m.gdn_conv_fold = *v == '1';
     if (const char* v = std::getenv("ESPETERO_WIDEN6_M")) m.tune.widen6_m = std::atoi(v);
-    if (const char* v = std::getenv("ESPETERO_GEMM_VAR")) m.tune.gemm_var = std::max(0, std::min(3, std::atoi(v)));
+    if (const char* v = std::getenv("ESPETERO_GEMM_VAR"); v && m.gemm_var_kernels) m.tune.gemm_var = std::max(0, std::min(3, std::atoi(v)));
+    if (const char* v = std::getenv("ESPETERO_SO_MAX")) m.tune.so_max_floats = std::atoi(v);
     // The fused RMSNorm needs quantized decoder matrices (GEMV epilogues); the
     // MTP layer's passes use explicit norms and routers / shared gates never
     // take norm links, so their dense matrices do not count (the 27B
@@ -868,7 +869,8 @@ class MetalModel final : public NativeModel {
     else if (name == "gemv_max_m") m_.tune.gemv_max_m = std::max(1, std::min(m_.fma34 ? 4 : kGemvInstM, value));
     else if (name == "gemm_fixed") m_.tune.fixed = value != 0;  // embedding passes
     else if (name == "tune_clamp") m_.tune.tune_clamp = value != 0;
-    else if (name == "gemm_var") m_.tune.gemm_var = std::max(0, std::min(3, value));
+    else if (name == "gemm_var") m_.tune.gemm_var = m_.gemm_var_kernels ? std::max(0, std::min(3, value)) : 0;  // kernels compiled with ESPETERO_GEMM_VAR
+    else if (name == "so_max") m_.tune.so_max_floats = value;
     else if (name == "gemv_ks") m_.tune.gemv_ks = value == 16 ? 16 : 8;
     else if (name == "moe_down_comb") m_.moe_down_comb = value != 0;
     else if (name == "expert_cache_gb") m_.expert_cache_gb = m_.xpool.empty() ? double(value) : m_.expert_cache_gb;

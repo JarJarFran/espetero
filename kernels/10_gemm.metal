@@ -1564,7 +1564,14 @@ INSTANTIATE_RGEMM("8x8", 8, 8)
 INSTANTIATE_RGEMM("64x4", 64, 4)
 
 // Variants of the prefill tiles (gemm_var): k2 = 2 K steps per barrier pair,
-// sg = simdgroup_load A fragments, k2sg = both.
+// sg = simdgroup_load A fragments, k2sg = both. Compiled only with
+// ESPETERO_GEMM_VAR (M4 Max, 2048-row prefill: k2 +5.1 % on the 35B-A3B,
+// +9.6 % on the 27B; sg -0.2 / -0.3 %; k2sg +4.4 / +8.7 %; the 16-row 27B
+// step +10.6 % with k2).
+#ifndef ESPETERO_GEMM_VAR
+#define ESPETERO_GEMM_VAR 0
+#endif
+#if ESPETERO_GEMM_VAR
 #define INSTANTIATE_RGEMM_VB(PRE, TAG, BM, WN, BITS, KPB, SGL)                                 \
   template [[host_name(PRE TAG "_store")]] kernel void rgemm<BM, WN, 0, BITS, KPB, SGL>(      \
       device const half*, device const uint*, device const half4*,                           \
@@ -1589,6 +1596,7 @@ INSTANTIATE_RGEMM_V("16x4sg", 16, 4, 1, 1)
 INSTANTIATE_RGEMM_V("32x4k2sg", 32, 4, 2, 1)
 INSTANTIATE_RGEMM_V("32x8k2sg", 32, 8, 2, 1)
 INSTANTIATE_RGEMM_V("16x4k2sg", 16, 4, 2, 1)
+#endif
 
 
 // Quantized GPU layout (Wr, SB, Wh) -> dense fp16 hgemm layout (Hr), with

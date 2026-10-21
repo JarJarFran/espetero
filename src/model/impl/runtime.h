@@ -186,6 +186,7 @@ struct Runtime {
   bool profile = false;
   bool serial = false;  // serial dispatch, no barrier tracking
   bool fma34 = false;   // the library has the 3-4-row JIT FMA GEMVs (ESPETERO_FMA34=1)
+  bool gemm_var_kernels = false;  // the library has the rgemm k2 / sg variants (ESPETERO_GEMM_VAR set)
   bool barrier_all = false;  // experiment: concurrent encoder with a barrier before every dispatch
   // Decode chains: consecutive passes of a chain are separate command
   // buffers ordered on the GPU by chain_ev: a pass waits for value chain_wait
@@ -217,8 +218,11 @@ struct Runtime {
     // ESPETERO_FMA34=1 adds the 3-4-row JIT FMA GEMVs (served when gemv_max_m >= 3).
     const char* f34 = std::getenv("ESPETERO_FMA34");
     fma34 = f34 && *f34 == '1';
+    // ESPETERO_GEMM_VAR=1..3 also compiles the rgemm k2 / sg prefill-tile variants (measured slower or neutral).
+    const char* gv = std::getenv("ESPETERO_GEMM_VAR");
+    gemm_var_kernels = gv && *gv >= '1' && *gv <= '3';
     opts.preprocessorMacros = @{@"ESPETERO_PF" : @(pf && *pf == '1' ? 1 : 0), @"ESPETERO_DIAG" : @(dg && *dg == '1' ? 1 : 0),
-                                @"ESPETERO_FMA34" : @(fma34 ? 1 : 0)};
+                                @"ESPETERO_FMA34" : @(fma34 ? 1 : 0), @"ESPETERO_GEMM_VAR" : @(gemm_var_kernels ? 1 : 0)};
     NSError* error = nil;
     lib = [dev newLibraryWithSource:src options:opts error:&error];
     if (!lib) fail(std::string("kernel compile failed: ") + [[error localizedDescription] UTF8String]);
