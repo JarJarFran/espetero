@@ -333,6 +333,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITK")) m.tune.gemv_splitk = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITS")) m.tune.max_splits = std::max(2, std::min(64, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_SHARED")) m.fuse_shared = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FUSE_SHARED_ROWS")) m.fuse_shared_rows = std::max(1, std::min(16, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN")) m.fuse_gdn = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN_ROWS")) m.fuse_gdn_rows = std::max(8, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
@@ -911,6 +912,7 @@ class MetalModel final : public NativeModel {
     }
     else if (name == "moe_fma") m_.moe_fma = value != 0;
     else if (name == "fuse_shared") m_.fuse_shared = value != 0;
+    else if (name == "fuse_shared_rows") m_.fuse_shared_rows = std::max(1, std::min(16, value));
     else if (name == "gemv_splitk") m_.tune.gemv_splitk = value != 0;
     else if (name == "fuse_gdn") m_.fuse_gdn = value != 0;
     else if (name == "fuse_gdn_rows") m_.fuse_gdn_rows = std::max(8, value);

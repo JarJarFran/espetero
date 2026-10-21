@@ -460,7 +460,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // Same bits on every path; or an 8-bit shared expert beside 4/5/6-bit
   // routed experts on the 1-2-row FMA kernels (oQ4e-style files).
   const int tile_kind = moe_shared_tile_kind(c, L);
-  const bool shared_tiles = m.fuse_shared && rows <= 8 &&
+  // fuse_shared_rows (Fase 3, decision candidate above 8 rows): at 9-16 rows the shared
+  // expert's own rgemm GEMMs run 16 unsplit threadgroups (41 us per layer for 2.4 MB on the
+  // M4 Max); as two 8-row tiles of the grouped MMA kernel its sums take that kernel's order.
+  const bool shared_tiles = m.fuse_shared && rows <= std::max(8, m.fuse_shared_rows) && rows <= 16 &&
                             (tile_kind == 1 || (tile_kind == 2 && m.moe_fma && rows <= m.moe_fma_rows));
   if (!shared_tiles) {
     shared_mlp_in(m, E, L, X, act, rows);

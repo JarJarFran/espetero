@@ -629,6 +629,9 @@ struct Model : Runtime {
   bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
+  // ... on passes of up to this many rows (8 as before; 9-16: Fase 3 decision candidate, not
+  // output-preserving at those row counts). ESPETERO_FUSE_SHARED_ROWS, "fuse_shared_rows".
+  int fuse_shared_rows = 8;
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set
   // ... also on passes of up to this many rows when every segment is <= 8
   // tokens (batched decode steps, verify passes); 8 = GEMV-sized passes only,

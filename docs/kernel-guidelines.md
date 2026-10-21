@@ -355,6 +355,54 @@ Rules that keep the tiers honest:
 - **Session-to-session numbers drift ±3–5% with the thermal state**; A/B
   inside one session, alternating, and confirm on whole-model runs.
 
+### Measured facts: Fase 3 (M4 Max, 2026-10-22; exclusive gpuq runs, alternating against main dde1aa1's binary)
+
+- **A last-arriver finalizer must not read its partials serially.**
+  `moe_down_comb`'s finalizing threadgroup summed the 64 block partials of
+  the fused next norm with a loop of dependent atomic loads *in every
+  thread*: 37 of the kernel's 52 µs on the M4 Max (`bench_native --micro
+  moe`: `layer_down` 14.7 µs without the norm, `layer_down_n` 51.6 with it,
+  51.6 → 19.3 with the partials requested at once and staged in threadgroup
+  memory, summed in the same block order, and xn written four columns per
+  thread). Whole model, Qwen3.6-35B-A3B 4-bit, 1-row step: 7.60 / 7.66 /
+  7.65 → 6.31 / 6.33 / 6.31 ms GPU (127 → 152 tok/s; −17 %), logits
+  bit-identical (`moe_fin` 1, the default now). The same finalizer as its own
+  `norm_fin` dispatch (`moe_fin` 2) measures the same (6.31–6.38 ms): on this
+  GPU a dispatch boundary and an in-dispatch arrival counter cost alike at
+  one row. Fase 2's "preloading the epilogue operands made no difference"
+  had preloaded the tile positions and weights, not these loads. `rgemv`'s
+  EPI_ADDP finalizer already reads its partials lane-strided (2 loads per
+  lane): splitting it into a dispatch (`gemv_fin` 2) is neutral to slightly
+  slower (out projection in chain 14.8 → 15.9 µs; without any norm 12.9).
+- **Two K steps' loads in flight per simdgroup (`moe_pf`, the single-row FMA
+  expert kernels) are neutral on the M4 Max** (7.67 vs 7.65 ms; bit-identical),
+  as they were slower on the M1 Max: the loop is not load-latency-bound at
+  this occupancy.
+- **The expert kernels' bandwidth at one row** (in a dependent chain, main's
+  kernels): gate/up `moe_gemv4_1_swiglu_route_k4` 25–28 µs per layer for
+  10.6 MB (380–420 GB/s), the route finalize folded into its prologue
+  +2.5 µs, `moe_down_comb` without the norm 14.7 µs for 5.3 MB (360 GB/s),
+  `moe_route_par8` 4.3 µs; the dense in_proj 12352×2048 32.8 µs (434 GB/s),
+  the out projection 2048×4096 (64 threadgroups) 12.9 µs plain / 14.8 with the
+  fused norm (320–366 GB/s), the LM head 515 GB/s. Isolated (`--profile`)
+  numbers run 1.1–1.3× above these.
+- **Dispatch boundaries on the M4 Max**: none measurable at one row
+  (the 35B-A3B 1-row step 7.23 ms in pass against 7.50 isolated; Flash-Next
+  15.81 vs 16.09 over 871 dispatches) nor at 2048 rows; 3.8 µs each at 16
+  rows (24.98 vs 21.74 ms over 846).
+- **Thresholds re-measured on the M4 Max, all rejected** (`--verify-ab`, main):
+  the JIT FMA GEMV on 3–4-row passes (`ESPETERO_FMA34=1`, `gemv_max_m` 4)
+  verify pass +7.8 % (35B-A3B) / +12.8 % (27B); fused norms on 3–8-row passes
+  (`fuse_norm_max_m` 8) −0.2 % / +4.3 %; `attn_split` 256 / 512 / 1024 at
+  1K and 8K contexts within 0.1 % on both models with identical logits.
+- **The 9–16-row shared expert and its gate are the step's largest small
+  items**: at 16 rows the 1×2048 shared-gate GEMM (one threadgroup, one live
+  simdgroup streaming 32 K steps) takes 57 µs per layer (2.28 ms, 10.5 % of
+  the 24.98 ms step) and the shared gate_up `rgemm_8x4_swiglu` 1024×2048
+  (16 unsplit threadgroups) 41 µs (1.66 ms, 59 GB/s). `route_sg` (the gate as
+  row 257 of the router GEMM, not output-preserving) measures 24.87 / 25.03 /
+  24.92 → 21.65 / 22.23 / 22.12 ms (−11 %, 630 → 707–725 tok/s) on the M4 Max.
+
 ## 6. Numerics and determinism
 
 1. Operands fp16, accumulation fp32, residual stream fp32; dequantization is
