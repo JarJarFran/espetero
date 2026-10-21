@@ -945,7 +945,7 @@ class Dsv4Model final : public NativeModel {
   void alloc_scratch() {
     const size_t T = size_t(T_), P = size_t(P_), D = size_t(c_.D), A = P * size_t(c_.K), K = size_t(c_.K);
     auto F = [&](size_t n) { return rt_.buffer(n * 4); };
-    ids_ = F(T), pos_ = F(T), gpos_ = F(T);
+    ids_ = F(T), pos_ = F(T), gpos_ = F(T * 8);  // gpos_: a region per KV source (compress_seq writes them at encode time)
     mix0_ = F(T * 24);
     {
       float* m = static_cast<float*>([mix0_ contents]);
@@ -2644,7 +2644,11 @@ class Dsv4Model final : public NativeModel {
       const int r = w.ratio, si = w.src;
       const int g0 = p0 / r, G = (p0 + M) / r - g0;
       if (G > s.cap[size_t(si)] - g0) fail("deepseek_v41: compressed KV full");
-      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + r0;  // this part's own rows
+      // this part's own rows, in this source's region: the pass may be encoded whole before it runs, and the
+      // sources' positions differ (ratio 2 rounds down)
+      if (si < 0 || si >= 8) fail("deepseek_v41: more KV sources than gpos_ regions");
+      const size_t gbase = size_t(si) * size_t(T_);
+      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + gbase + r0;
       for (int g = 0; g < G; ++g) gp[g] = (g0 + g) * r;
       if (r == 1) {
         gemvb(E, w.c_wkv, X_, D, LAT_, HD, M, xo, ho);
@@ -2670,10 +2674,10 @@ class Dsv4Model final : public NativeModel {
         norm(E, LAT_, ho, w.c_norm, G, 1, HD, HD);
         gemvb(E, w.i_wk, LAT_, HD, IK_, c.IHD, G, ho, ko);  // index keys from the RoPE-free latent
         norm(E, IK_, ko, w.i_knorm, G, 1, c.IHD, c.IHD);
-        rope(E, IK_, ko, gpos_, po, invf, G, 1, c.IHD, c.IHD, false);
+        rope(E, IK_, ko, gpos_, po + gbase * 4, invf, G, 1, c.IHD, c.IHD, false);
         quant(E, IK_, ko, G, c.IHD, c.IHD, 1);
         store_half(E, IK_, ro, c.IHD, s.idxk[size_t(si)], 0, G, c.IHD, g0, 0);
-        rope(E, LAT_, ho, gpos_, po, invf, G, 1, HD, HD, false);
+        rope(E, LAT_, ho, gpos_, po + gbase * 4, invf, G, 1, HD, HD, false);
         quant(E, LAT_, ho, G, HD, HD, 2);
         store_half(E, LAT_, ro, HD, s.comp[size_t(si)], 0, G, HD, g0, 0);
       }
