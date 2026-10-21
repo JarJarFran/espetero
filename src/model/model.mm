@@ -305,6 +305,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_NBPT_DN")) m.moe_nbpt_dn = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_SWAP")) m.moe_swap = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_BM")) m.moe_bm = std::atoi(v);
+    if (const char* v = std::getenv("ESPETERO_MOE_BM_ROWS")) m.moe_bm_rows = std::max(9, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_SORT")) m.fuse_sort = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ATTN_MIN_CHUNK")) m.attn_min_chunk = std::max(32, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_RSUM")) m.fuse_rsum = *v == '1';
@@ -893,6 +894,7 @@ class MetalModel final : public NativeModel {
     else if (name == "fuse_gdn_rows") m_.fuse_gdn_rows = std::max(8, value);
     else if (name == "fuse_kvsave") m_.fuse_kvsave = value != 0;
     else if (name == "moe_bm") m_.moe_bm = value == 16 || value == 32 ? value : 8;
+    else if (name == "moe_bm_rows") m_.moe_bm_rows = std::max(9, value);
     else if (name == "fuse_sort") m_.fuse_sort = value != 0;
     else if (name == "fuse_rsum") m_.fuse_rsum = value != 0;
     else if (name == "fuse_nrm") m_.fuse_nrm = value != 0;

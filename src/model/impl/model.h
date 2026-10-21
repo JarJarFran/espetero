@@ -592,8 +592,12 @@ struct Model : Runtime {
   // expert tile, 8 (the 8-row kernel, as before), 16 or 32 (moe_gemm16 /
   // moe_gemm32: each expert's weights read and dequantized once per tile
   // instead of once per 8 rows; every row's sums are the same). ESPETERO_MOE_BM, "moe_bm".
-  // M4 Max, 35B-A3B 4-bit 2048-row prefill: 16 -2.1 % (878.7 -> 860.0 ms), 32 +13.6 % (spills).
+  // M4 Max, 2048-row prefill: 16 -1.4 % on the 35B-A3B 4-bit (861.9 -> 849.4 ms), -8.3 % on its
+  // UD-Q6_K GGUF (989.2 -> 906.8 ms); 32 +13.6 % (spills).
   int moe_bm = 16;
+  // Passes of fewer rows keep the 8-row tiles (M4 Max, 35B-A3B 4-bit, E 256 / k 8: 2048 rows
+  // -1.4 %, 512 rows +3.1 %, the 16-row step +24 %). ESPETERO_MOE_BM_ROWS, "moe_bm_rows".
+  int moe_bm_rows = 2048;
   // MoE passes of more than 8 rows: moe_topk's last-arriving row threadgroup
   // runs the sort (no moe_sort dispatch; same tables). ESPETERO_FUSE_SORT=1, "fuse_sort".
   bool fuse_sort = false;
@@ -603,8 +607,10 @@ struct Model : Runtime {
   // Passes without the fused norms (more than fuse_norm_max_m rows): the out /
   // down projections' split-K partials are added into the residual by the
   // RMSNorm that follows (rmsnorm_addk), not by a reduce dispatch, while a
-  // row's partials are at most tune.so_max_floats. ESPETERO_FUSE_NRM=0, "fuse_nrm".
-  bool fuse_nrm = true;
+  // row's partials are at most tune.so_max_floats. ESPETERO_FUSE_NRM=1, "fuse_nrm". Measured
+  // neutral on the M4 Max (35B-A3B 16-row step -1.2 %, -0.6 %, 0, 0 against a 0.7 % spread; 27B
+  // +0.7 %, hence so_max_floats): off; kept for the M1 Max, where a dispatch boundary costs more.
+  bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set

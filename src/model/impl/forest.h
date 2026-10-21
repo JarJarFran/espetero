@@ -480,7 +480,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   bool sort_folded = false;  // fuse_sort: the >8-row route's moe_topk also wrote the tile table
   // Rows per expert tile of the MMA kernel on a pass without the expert cache
   // (the pooled passes' staged records need the 8-row kernel; see `bm` below).
-  const int bm_nopool = (rows > 8 && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
+  // The wide tiles pay only once an expert holds tens of rows (moe_bm_rows); below that, and on
+  // the 16-row step, the half-empty fragments and the halved tile count cost more than the
+  // weight re-reads they save (M4 Max: 512 rows +3.1 %, 16-row step +24 %; 2048 rows -1.4 %).
+  const int bm_nopool = (rows > 8 && rows >= m.moe_bm_rows && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
   MoeRouteParParams route_p{};
   if ((m.moe_stages & 1) && par_route) {
     // Router GEMV over nblocks x nsl threadgroups (one k-step per simdgroup),
