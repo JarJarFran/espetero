@@ -1049,6 +1049,11 @@ struct MoeGemmParams {
   // are ready, 2 only those of experts still being read (flag != 0 in the
   // per-expert flags at buffer 15); 0: every tile.
   int split;
+  // Fase 3 (option moe_fma_mix, passes of 3-16 rows): tiles of at most this
+  // many rows run on the FMA kernel (moe_gemv, MM 2) and the MMA kernels skip
+  // them; 0: every tile on the pass's own kernel. Those rows' sums are the
+  // FMA kernel's (as on 1-2-row passes), not the MMA tile's.
+  int fma_rows;
 };
 
 // Grouped expert GEMM: one tile (expert, <= BM sorted rows) x 32 of the
@@ -1088,6 +1093,7 @@ kernel void moe_gemv8(
   const int4 ti = tiles[tgid.x];
   const int e = ti.x, r0 = ti.y, rows = ti.z;
   if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  if (p.fma_rows > 0 && rows <= p.fma_rows) return;  // the FMA kernel's tiles (moe_fma_mix)
   const int nloc = int(tgid.y) * 32;
   if (nloc >= p.Ne) return;
   const bool sh = e == p.shared_e;  // uniform per threadgroup
@@ -1221,6 +1227,7 @@ kernel void moe_gemm_bm(
   const int4 ti = tiles[tgid.x];
   const int e = ti.x, r0 = ti.y, rows = ti.z;
   if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  if (p.fma_rows > 0 && rows <= p.fma_rows) return;  // the FMA kernel's tiles (moe_fma_mix)
   const int nloc = int(tgid.y) * 32;
   if (nloc >= p.Ne) return;
   constexpr int FM = BM / 8;           // row fragments of the tile
@@ -1532,6 +1539,7 @@ kernel void moe_gemv(
     const int4 ti = tiles[tix];
     if (!p.direct && tix >= ntiles[0]) return;
     e = ti.x, r0 = ti.y, rows = ti.z;
+    if (p.fma_rows > 0 && rows > p.fma_rows) return;  // the MMA kernel's tiles (moe_fma_mix)
   }
   const bool sh = e == p.shared_e;  // uniform per threadgroup
   const int KGall = p.K / 64;
