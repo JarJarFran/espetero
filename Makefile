@@ -108,6 +108,10 @@ $(BUILD)/tok_load_test: tests/tok_load_test.cpp $(patsubst src/%.cpp,$(BUILD)/ob
 $(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/obj/engine/hidden_head.o $(BUILD)/obj/engine/pplx.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
+# GLM-5.3-Flash without a GPU: its tool-call format (glm_tools.cpp; chat.cpp's parse_tool_calls hands over to it).
+$(BUILD)/glm_test: tests/glm_test.cpp $(BUILD)/obj/engine/glm_tools.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
 $(BUILD)/topk_test: tests/topk_test.mm $(BUILD)/model.o $(BUILD)/json.o $(BUILD)/obj/engine/sampling.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
@@ -164,7 +168,7 @@ $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BU
 
 .PHONY: test
 test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http_test $(BUILD)/vision_limits_test $(BUILD)/hub_test $(BUILD)/model_meta_test $(BUILD)/api_test \
-      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/kev_test \
+      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/glm_test $(BUILD)/kev_test \
       $(BUILD)/tok_load_test
 	python3 tests/ref/json_ref.py $(BUILD)/json_cases.json && $(BUILD)/json_test $(BUILD)/json_cases.json
 	$(BUILD)/sampling_test
@@ -179,6 +183,7 @@ test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http
 	$(BUILD)/service_test
 	$(BUILD)/grammar_test "" $(BUILD)/grammar_samples.jsonl && python3 tests/ref/grammar_check.py $(BUILD)/grammar_samples.jsonl
 	$(BUILD)/gemma_test
+	$(BUILD)/glm_test
 	$(BUILD)/kev_test tests/ref/kev_fixtures.json
 	$(BUILD)/tok_load_test
 

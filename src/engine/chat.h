@@ -121,6 +121,10 @@ std::string parse_tool_calls(const std::string& content, const json::Value& tool
 // Tool calls in Gemma 4 format: <|tool_call>call:NAME{key:value,...}<tool_call|>,
 // strings between <|"|> marks, bare keys, numbers, booleans, objects and arrays.
 std::string parse_gemma_tool_calls(const std::string& content, json::Value& calls);
+// Tool calls in GLM-4.5 / GLM-5 format: <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
+// (glm_tools.cpp); parse_tool_calls hands over to it when a call's body has that shape.
+std::string parse_glm_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls);
+bool glm_tool_call_body(const std::string& body);  // "NAME" or "NAME<arg_key>...": not Qwen's "\n<function="
 
 // The chat markers of the model's family: the reasoning block of
 // generated text, the tool-call marks, and the turn header prompt checkpoints

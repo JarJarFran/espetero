@@ -406,6 +406,11 @@ std::string parse_tool_calls(const std::string& content, const json::Value& tool
   const std::string open = "<tool_call>", close = "</tool_call>";
   size_t at = content.find(open);
   if (at == std::string::npos) return content;
+  {  // GLM: <tool_call>NAME<arg_key>... (no <function=)
+    const size_t b0 = at + open.size(), e = content.find(close, b0);
+    if (glm_tool_call_body(content.substr(b0, e == std::string::npos ? std::string::npos : e - b0)))
+      return parse_glm_tool_calls(content, tools, calls);
+  }
   std::string before = content.substr(0, at);
   while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
   json::Value out = json::Value::array();
@@ -553,9 +558,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     // which the parser must understand: Qwen's XML calls (parse_tool_calls).
     const std::string& src = engine.tokenizer().chat_template();
     const bool dsml = src.find("｜DSML｜") != std::string::npos;
-    if (!dsml && (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos))
-      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...> or DSML calls; this "
-              "model's has another format (only \"auto\" and \"none\" here)");
+    const bool glm = src.find("<arg_key>") != std::string::npos;
+    if (!dsml && !glm && (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos))
+      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...>, GLM's "
+              "<tool_call>NAME<arg_key>... or DSML calls; this model's has another format (only \"auto\" and \"none\" here)");
     if (job.gen.ignore_eos) invalid("tool_choice: a forced call does not take ignore_eos");
   }
   const json::Value* msgs = body.get("messages");
@@ -696,7 +702,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     // DSML (DeepSeek): the template writes "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"NAME\">\n" after the content.
     const std::string dsml_open = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"";
     const bool dsml = job.tool_open == "<｜DSML｜ calls>";
+    // GLM (docs/glm5.md 7): "<tool_call>NAME<arg_key>" right after </think> or the content, no newlines.
+    const bool glm = !dsml && engine.tokenizer().chat_template().find("<arg_key>") != std::string::npos;
     const std::string open = dsml ? (choice.mode == ToolChoice::Named ? dsml_open + choice.name + "\">\n" : dsml_open)
+                             : glm ? (choice.mode == ToolChoice::Named ? "<tool_call>" + choice.name : std::string("<tool_call>"))
                              : choice.mode == ToolChoice::Named ? "<tool_call>\n<function=" + choice.name + ">\n"
                                                                 : std::string("<tool_call>\n<function");
     // Qwen opens the reasoning with "<think>\n", DeepSeek with "<think>".
@@ -704,11 +713,11 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     const bool think_open = ends("<think>\n") || ends("<think>");
     const int32_t think_end = engine.tokenizer().token_id("</think>");
     if (think_open && think_end >= 0) {
-      job.force_after_think = "\n\n" + open;
+      job.force_after_think = (glm ? "" : "\n\n") + open;
       job.think_end = think_end;
       job.gen.stop_ids.push_back(think_end);
     } else {
-      if (think_open) text += dsml ? "</think>" : "</think>\n\n";  // no single </think> token to stop at: no reasoning
+      if (think_open) text += dsml || glm ? "</think>" : "</think>\n\n";  // no single </think> token to stop at: no reasoning
       const std::string lead = dsml ? "\n\n" : "";
       text += lead + open;
       job.prefill = lead + open;
