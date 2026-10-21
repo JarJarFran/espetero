@@ -230,6 +230,25 @@ Rules that keep the tiers honest:
 
 ### Measured facts: the MoE path (Qwen3.6-35B-A3B unless noted)
 
+- **The grouped expert GEMM at prefill is MMA-bound, not bandwidth-bound**
+  (2026-10-21, M4 Max, 2048-row prefill 878 ms): `moe_gemv8r4_swiglu` takes
+  5.7 ms per layer = 68.7 GFLOP at ~12 TFLOPS while streaming the 268 MB
+  expert matrix about 8 times (one 8-row tile per 8 of the ~64 rows an
+  expert holds); the re-reads were hidden under the MMAs. Tiles of 16 rows
+  (`moe_gemm16`, the same K slices summed in the same order, bit-identical
+  on the 4-bit and the Q6_K files) take 861.9 → 849.4 ms (−1.4 %), and
+  989.2 → 906.8 ms (−8.3 %) on the UD-Q6_K GGUF, whose 6-bit codes cost
+  more unpacking per weight. Below that they lose: 1024 rows 433.6 → 434.9 ms
+  (0; Q6_K 502.6 → 501.8), 512 rows 226.3 → 233.4 ms (+3.1 %), and the 16-row decode step
+  26.99 → 33.38 ms (**+24 %**: one half-empty 16-row tile per expert does
+  twice the MMA work of the 8-row tile for the same weight read). Default:
+  16-row tiles from 2048 rows up (`moe_bm` 16, `moe_bm_rows` 2048), the
+  8-row tile below. 32-row tiles spill (acc[4][4] plus four gathered row
+  pointers): 997.8 ms (+13.6 %) on the 4-bit file.
+- **`moe_comb_ks` 2 loses on the M4 Max too**: 1-row step 7.70 → 8.89 ms
+  (+15 %); `gemv_ks` 16 for the 64-threadgroup projections 7.73 → 7.82 ms
+  (+1.2 %) and both change the sums (max |Δlogit| 0.009 and 0.61).
+
 - **One-row tiles must not use the 8×8 MMA.** The grouped expert GEMV at
   batch 1 runs 8-row MMA tiles with one live row: 151 M MACs per gate/up
   layer (~28 µs of matrix-unit time) that are *not* hidden under the weight
@@ -283,6 +302,56 @@ Rules that keep the tiers honest:
   bit-identical and **made no measurable difference**: 9.37 → 9.45 ms per
   1-row step, inside the runs' 9.28–9.50 ms spread. Those serial latencies
   were not on the critical path.
+- **Dispatch boundaries cost ~4 µs on an M4 Max at 16 rows and nothing
+  measurable at 1 row** (Fase 2, 2026-10-21, Studio M4 Max 128 GB through
+  gpuq, exclusive runs): the 35B-A3B 4-bit 16-row step is 25.3 ms in pass
+  against 21.9 ms of isolated kernel time over 846 dispatches; its 1-row step
+  7.68 ms against 7.5 ms (275 dispatches); the 27B 4-bit 1-row step 33.4 ms
+  (373 dispatches), 16-row 80.1 ms (838) with no gap at all. Folds that only
+  remove a dispatch therefore measure neutral there: `fuse_kvsave` (the K/V
+  pool write inside attn_prep, −1 per attention layer) 0 to −0.3 % on every
+  shape of both models; the router's split-K partials summed in moe_topk
+  (`fuse_rsum`) +0.1 %; the pair sort in moe_topk's last threadgroup
+  (`fuse_sort`) **+0.9 %** (its 256 threads sort slower than moe_sort's 1024).
+  All bit-identical; kept as options for the M1 Max, where a boundary costs
+  5–23 µs. The out / down projections' split-K partials added by the
+  following RMSNorm (`rmsnorm_addk`, `fuse_nrm`) measured −1.2 %, −0.6 %, 0
+  and 0 on the 35B-A3B 16-row step (8 splits × 2048 floats per row) against
+  a 0.7 % run-to-run spread, and 80.39 → 80.93 ms (+0.7 %) on the 27B
+  (8 × 5120: one 256-thread threadgroup per row reads 160 KB of partials
+  serially, slower than the parallel reduce dispatch; `so_max`, 16384
+  floats, keeps it off such rows): off by default as well.
+- **The fused GDN decode kernel loses on 16-row passes** (`fuse_gdn_rows`,
+  2026-10-21, M4 Max): 16 single-token segments as one threadgroup per
+  (segment, value head) instead of conv_prep + conv_state_save +
+  deltanet_tr16 + gated_rmsnorm: 35B-A3B 27.60 → 28.13 ms (+1.9 %), 27B
+  80.47 → 81.79 ms (+1.6 %); the recurrent state traffic (16 × Hv × 64 KB
+  read and written per layer) is the same either way and the kernel's
+  per-token barriers cost more than the three small dispatches. Stays at 8.
+- **Two K steps per barrier pair in rgemm lose** (`gemm_var` 1 and 3,
+  2026-10-21, M4 Max): 2048-row prefill +5.1 % (35B-A3B) and +9.6 % (27B),
+  the 27B 16-row step +10.6 %; the doubled weight words and scale registers
+  per lane cost more occupancy than the halved barriers return. A fragments
+  through `simdgroup_load` (variant 2) are neutral (−0.2 / −0.3 %). The
+  kernels compile only with ESPETERO_GEMM_VAR set.
+- **Templating a default kernel changes its generated code** (2026-10-21,
+  M4 Max): rgemm with KPB / SGL template parameters (1 / 0 for the default
+  tiles) and moe_gemv8 with a BM parameter (8) compiled to slower code than
+  main's text for the very same tiles: 35B-A3B 2048-row prefill 860 → 878 ms
+  (+2.1 %), 16-row step 24.9 → 25.3 ms (+1.6 %), 27B 2048-row prefill
+  6720 → 6758 ms (+0.6 %); the 1-row FMA GEMV path, untouched, measured the
+  same. With main's text restored the branch matches main's binary within
+  0.1 % on every shape it does not improve (27B 16-row step 80.12 vs
+  80.21 ms, 2048-row prefill 6718.7 vs 6719.3 ms; 35B-A3B 16-row step
+  24.86 / 24.89 vs 24.96 / 24.59 ms). Variants and larger tiles live in their own templates (`rgemm_v`,
+  `moe_gemm_bm`), and a whole-model A/B against main's binary belongs to
+  every pass over the default kernels: in-process option A/Bs cannot see a
+  regression that both arms share.
+- **Decode attention's 32-key split tiles are right at a 512-token
+  context** (`attn_min_chunk`, 2026-10-21, M4 Max): tiles of at least 128
+  keys +0.9 % (35B-A3B) / +0.2 % (27B), 512 keys +2.5 %, and the combine's
+  regrouping changes the logits (max |Δ| 0.37 on the MoE, argmax equal). Not
+  lossless, off.
 - **Session-to-session numbers drift ±3–5% with the thermal state**; A/B
   inside one session, alternating, and confirm on whole-model runs.
 

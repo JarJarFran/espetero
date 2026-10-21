@@ -17,36 +17,191 @@
 // mlx-vlm on the 8-bit 35B-A3B).
 // ---------------------------------------------------------------------------
 
+// Counting sort of the M * k (row, slot) pairs by expert, and the tile table:
+// one threadgroup, counting in threadgroup memory (no device-scope barriers).
+// Also writes the indirect dispatch arguments of the two grouped GEMVs
+// (tiles x column blocks), so their grids are exactly the tiles that exist.
+struct MoeSortParams {
+  int E;
+  int k;
+  int M;
+  int gu_blocks;    // column blocks (32 wide) per expert of the gate/up GEMV
+  int down_blocks;  // ... of the down GEMV
+  int shared;       // 1: append tiles of expert E (the shared expert) over every row
+  int remap;        // 1: ids are expert ids and map[id] is the pool slot the GEMVs read (Qwen4-Exp expert cache)
+  int bm;           // rows per tile: 8 (0 too), 16 or 32 (the moe_gemm16 / moe_gemm32 kernels)
+};
+
+// The sort proper, run by one threadgroup (moe_sort, or the last-arriving
+// threadgroup of moe_topk with the sort folded in: ATOMIC_IDS, since the other
+// threadgroups' ids are read inside that dispatch). The threadgroup tables
+// (tcnt / tfill [E], toff / ttile [E + 1], scan_c / scan_t [32]) are the caller's.
+template <int ATOMIC_IDS>
+static inline void moe_sort_body(device const int* ids, device int* offsets, device int4* tiles, device uint* indirect,
+                                 device int* rowmap, device int* slotpos, constant MoeSortParams& p, device const int* map,
+                                 uint tid, uint ntg, uint sg, uint lane, threadgroup atomic_int* tcnt,
+                                 threadgroup atomic_int* tfill, threadgroup int* toff, threadgroup int* ttile,
+                                 threadgroup int* scan_c, threadgroup int* scan_t) {
+  auto id_at = [&](int i) -> int {
+    return ATOMIC_IDS ? atomic_load_explicit((device atomic_int*)ids + i, memory_order_relaxed) : ids[i];
+  };
+  const int bm = p.bm > 0 ? p.bm : 8;
+  for (int e = tid; e < p.E; e += ntg) {
+    atomic_store_explicit(&tcnt[e], 0, memory_order_relaxed);
+    atomic_store_explicit(&tfill[e], 0, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int n = p.M * p.k;
+  for (int i = tid; i < n; i += ntg) atomic_fetch_add_explicit(&tcnt[p.remap ? map[id_at(i)] : id_at(i)], 1, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(ntg) >= p.E) {
+    // Exclusive prefix sums of the pair counts and tile counts over the
+    // experts, one expert per thread (simdgroup scans, then across simdgroups):
+    // the same integers the serial scan below produces.
+    const int e = int(tid);
+    const int c = e < p.E ? atomic_load_explicit(&tcnt[e], memory_order_relaxed) : 0;
+    const int t = (c + bm - 1) / bm;
+    const int cx = simd_prefix_exclusive_sum(c), tx = simd_prefix_exclusive_sum(t);
+    if (lane == 31) {
+      scan_c[sg] = cx + c;
+      scan_t[sg] = tx + t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      const int nsg = (int(ntg) + 31) / 32;
+      const int vc = int(lane) < nsg ? scan_c[lane] : 0, vt = int(lane) < nsg ? scan_t[lane] : 0;
+      const int xc = simd_prefix_exclusive_sum(vc), xt = simd_prefix_exclusive_sum(vt);
+      scan_c[lane] = xc;
+      scan_t[lane] = xt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e < p.E) {
+      toff[e] = scan_c[sg] + cx;
+      ttile[e] = scan_t[sg] + tx;
+    }
+    if (e == p.E - 1) {
+      toff[p.E] = scan_c[sg] + cx + c;
+      ttile[p.E] = scan_t[sg] + tx + t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (tid == 0) {
+    int o = 0, t = 0;
+    for (int e = 0; e < p.E; ++e) {
+      const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
+      toff[e] = o;
+      ttile[e] = t;
+      o += c;
+      t += (c + bm - 1) / bm;
+    }
+    toff[p.E] = o;
+    ttile[p.E] = t;
+  }
+  if (tid == 0) {
+    // The shared expert: tiles over the M token rows, placed after the pairs.
+    const int t = ttile[p.E];
+    const int ts = p.shared ? (p.M + bm - 1) / bm : 0;
+    indirect[0] = uint(t + ts);
+    indirect[1] = uint(p.gu_blocks);
+    indirect[2] = 1u;
+    indirect[3] = uint(t + ts);
+    indirect[4] = uint(p.down_blocks);
+    indirect[5] = 1u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = tid; e < p.E; e += ntg) {
+    offsets[e] = toff[e];
+    const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
+    for (int j = 0; j * bm < c; ++j)
+      tiles[ttile[e] + j] = int4(e, toff[e] + j * bm, min(bm, c - j * bm), 0);
+  }
+  if (p.shared) {
+    const int t0 = ttile[p.E];
+    for (int j = tid; j * bm < p.M; j += ntg) tiles[t0 + j] = int4(p.E, n + j * bm, min(bm, p.M - j * bm), 0);
+    for (int i = tid; i < p.M; i += ntg) rowmap[n + i] = i;
+  }
+  for (int i = tid; i < n; i += ntg) {
+    const int e = p.remap ? map[id_at(i)] : id_at(i);
+    const int pos = toff[e] + atomic_fetch_add_explicit(&tfill[e], 1, memory_order_relaxed);
+    rowmap[pos] = i / p.k;
+    slotpos[i] = pos;
+  }
+}
+
+kernel void moe_sort(
+    device const int* ids [[buffer(0)]],
+    device int* offsets [[buffer(1)]],
+    device int4* tiles [[buffer(2)]],
+    device uint* indirect [[buffer(3)]],   // [2][3] threadgroups per grid: gate/up, down
+    device int* rowmap [[buffer(4)]],
+    device int* slotpos [[buffer(5)]],
+    constant MoeSortParams& p [[buffer(6)]],
+    device const int* map [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup atomic_int tcnt[1024];
+  threadgroup atomic_int tfill[1024];
+  threadgroup int toff[1025];
+  threadgroup int ttile[1025];
+  threadgroup int scan_c[32], scan_t[32];
+  moe_sort_body<0>(ids, offsets, tiles, indirect, rowmap, slotpos, p, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
+                   scan_c, scan_t);
+}
+
 struct MoeRouteParams {
   int E;      // experts
   int k;      // experts per row
   int M;      // rows
   int ld;     // floats per logits row (E, or E + 1 with the shared gate's column)
   int sg;     // 1: column E is the shared-expert gate's logit, copied to sgate
+  int fold;   // 1: the last-arriving row threadgroup also runs moe_sort (buffers 5-12), so no sort dispatch follows
+  int splits;    // > 0: `logits` holds the router GEMM's split-K partials [splits][M][ld], summed here in split order
+  int z_stride;  // floats between partials
 };
 
 // One threadgroup per row, one thread per expert (E <= 1024): softmax over
 // the router logits, the k largest (ties to the lower index), renormalized.
 // With p.sg the router GEMM carried the shared gate as row E (router_sg,
 // passes of more than 8 rows): its logit goes to sgate[row] untouched.
+// With p.fold the ids are stored atomically and the row threadgroup that
+// arrives last (device-scope fence, self-resetting counter) runs the sort over
+// every row's ids: the same table moe_sort writes, one dispatch earlier.
 kernel void moe_topk(
     device const float* logits [[buffer(0)]],
     device int* ids [[buffer(1)]],
     device float* w [[buffer(2)]],
     constant MoeRouteParams& p [[buffer(3)]],
     device float* sgate [[buffer(4)]],
+    device int* offsets [[buffer(5)]],       // fold: moe_sort's buffers
+    device int4* tiles [[buffer(6)]],
+    device uint* indirect [[buffer(7)]],
+    device int* rowmap [[buffer(8)]],
+    device int* slotpos [[buffer(9)]],
+    constant MoeSortParams& sp [[buffer(10)]],
+    device const int* map [[buffer(11)]],
+    device atomic_int* ctr [[buffer(12)]],   // fold: arrival counter (one int, self-resetting)
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
-    uint ntg [[threads_per_threadgroup]]) {
+    uint ntg [[threads_per_threadgroup]],
+    uint ntgs [[threadgroups_per_grid]]) {
   threadgroup float redf[32];
   threadgroup int redi[32];
   threadgroup float picked_p[16];
   threadgroup int picked_i[16];
+  threadgroup int last_tg;
   const int e = int(tid);
-  if (p.sg && tid == 0) sgate[row] = logits[ulong(row) * p.ld + p.E];
-  float x = e < p.E ? logits[ulong(row) * p.ld + e] : -INFINITY;
+  // The split-K GEMM's partials summed in split order from 0, as splitk_reduce_store does.
+  auto logit = [&](int col) -> float {
+    if (p.splits <= 0) return logits[ulong(row) * p.ld + col];
+    float acc = 0.0f;
+    for (int z = 0; z < p.splits; ++z) acc += logits[ulong(z) * ulong(p.z_stride) + ulong(row) * p.ld + col];
+    return acc;
+  };
+  if (p.sg && tid == 0) sgate[row] = logit(p.E);
+  float x = e < p.E ? logit(e) : -INFINITY;
   float m = simd_max(x);
   if (lane == 0) redf[sg] = m;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -102,123 +257,27 @@ kernel void moe_topk(
     float sum = 0.0f;
     for (int r = 0; r < p.k; ++r) sum += picked_p[r];
     for (int r = 0; r < p.k; ++r) {
-      ids[ulong(row) * p.k + r] = picked_i[r];
+      if (p.fold) atomic_store_explicit((device atomic_int*)ids + ulong(row) * p.k + r, picked_i[r], memory_order_relaxed);
+      else ids[ulong(row) * p.k + r] = picked_i[r];
       w[ulong(row) * p.k + r] = picked_p[r] / sum;
     }
   }
-}
-
-// Counting sort of the M * k (row, slot) pairs by expert, and the tile table:
-// one threadgroup, counting in threadgroup memory (no device-scope barriers).
-// Also writes the indirect dispatch arguments of the two grouped GEMVs
-// (tiles x column blocks), so their grids are exactly the tiles that exist.
-struct MoeSortParams {
-  int E;
-  int k;
-  int M;
-  int gu_blocks;    // column blocks (32 wide) per expert of the gate/up GEMV
-  int down_blocks;  // ... of the down GEMV
-  int shared;       // 1: append tiles of expert E (the shared expert) over every row
-  int remap;        // 1: ids are expert ids and map[id] is the pool slot the GEMVs read (Qwen4-Exp expert cache)
-};
-
-kernel void moe_sort(
-    device const int* ids [[buffer(0)]],
-    device int* offsets [[buffer(1)]],
-    device int4* tiles [[buffer(2)]],
-    device uint* indirect [[buffer(3)]],   // [2][3] threadgroups per grid: gate/up, down
-    device int* rowmap [[buffer(4)]],
-    device int* slotpos [[buffer(5)]],
-    constant MoeSortParams& p [[buffer(6)]],
-    device const int* map [[buffer(7)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint ntg [[threads_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
+  if (!p.fold) return;
+  // The sort, by the last row threadgroup to arrive.
   threadgroup atomic_int tcnt[1024];
   threadgroup atomic_int tfill[1024];
   threadgroup int toff[1025];
   threadgroup int ttile[1025];
   threadgroup int scan_c[32], scan_t[32];
-  for (int e = tid; e < p.E; e += ntg) {
-    atomic_store_explicit(&tcnt[e], 0, memory_order_relaxed);
-    atomic_store_explicit(&tfill[e], 0, memory_order_relaxed);
-  }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const int n = p.M * p.k;
-  for (int i = tid; i < n; i += ntg) atomic_fetch_add_explicit(&tcnt[p.remap ? map[ids[i]] : ids[i]], 1, memory_order_relaxed);
+  if (tid == 0) last_tg = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed) == int(ntgs) - 1;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (int(ntg) >= p.E) {
-    // Exclusive prefix sums of the pair counts and tile counts over the
-    // experts, one expert per thread (simdgroup scans, then across simdgroups):
-    // the same integers the serial scan below produces.
-    const int e = int(tid);
-    const int c = e < p.E ? atomic_load_explicit(&tcnt[e], memory_order_relaxed) : 0;
-    const int t = (c + 7) / 8;
-    const int cx = simd_prefix_exclusive_sum(c), tx = simd_prefix_exclusive_sum(t);
-    if (lane == 31) {
-      scan_c[sg] = cx + c;
-      scan_t[sg] = tx + t;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-      const int nsg = (int(ntg) + 31) / 32;
-      const int vc = int(lane) < nsg ? scan_c[lane] : 0, vt = int(lane) < nsg ? scan_t[lane] : 0;
-      const int xc = simd_prefix_exclusive_sum(vc), xt = simd_prefix_exclusive_sum(vt);
-      scan_c[lane] = xc;
-      scan_t[lane] = xt;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (e < p.E) {
-      toff[e] = scan_c[sg] + cx;
-      ttile[e] = scan_t[sg] + tx;
-    }
-    if (e == p.E - 1) {
-      toff[p.E] = scan_c[sg] + cx + c;
-      ttile[p.E] = scan_t[sg] + tx + t;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  } else if (tid == 0) {
-    int o = 0, t = 0;
-    for (int e = 0; e < p.E; ++e) {
-      const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
-      toff[e] = o;
-      ttile[e] = t;
-      o += c;
-      t += (c + 7) / 8;
-    }
-    toff[p.E] = o;
-    ttile[p.E] = t;
-  }
-  if (tid == 0) {
-    // The shared expert: tiles over the M token rows, placed after the pairs.
-    const int t = ttile[p.E];
-    const int ts = p.shared ? (p.M + 7) / 8 : 0;
-    indirect[0] = uint(t + ts);
-    indirect[1] = uint(p.gu_blocks);
-    indirect[2] = 1u;
-    indirect[3] = uint(t + ts);
-    indirect[4] = uint(p.down_blocks);
-    indirect[5] = 1u;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int e = tid; e < p.E; e += ntg) {
-    offsets[e] = toff[e];
-    const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
-    for (int j = 0; j * 8 < c; ++j)
-      tiles[ttile[e] + j] = int4(e, toff[e] + j * 8, min(8, c - j * 8), 0);
-  }
-  if (p.shared) {
-    const int t0 = ttile[p.E];
-    for (int j = tid; j * 8 < p.M; j += ntg) tiles[t0 + j] = int4(p.E, n + j * 8, min(8, p.M - j * 8), 0);
-    for (int i = tid; i < p.M; i += ntg) rowmap[n + i] = i;
-  }
-  for (int i = tid; i < n; i += ntg) {
-    const int e = p.remap ? map[ids[i]] : ids[i];
-    const int pos = toff[e] + atomic_fetch_add_explicit(&tfill[e], 1, memory_order_relaxed);
-    rowmap[pos] = i / p.k;
-    slotpos[i] = pos;
-  }
+  if (!last_tg) return;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
+  if (tid == 0) atomic_store_explicit(ctr, 0, memory_order_relaxed);
+  moe_sort_body<1>(ids, offsets, tiles, indirect, rowmap, slotpos, sp, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
+                   scan_c, scan_t);
 }
 
 // A 32-column block of a quantized GEMV over the K steps [g_begin, g_end) for
@@ -992,10 +1051,17 @@ struct MoeGemmParams {
   int split;
 };
 
-// Grouped expert GEMM: one tile (expert, <= 8 sorted rows) x 32 of the
+// Grouped expert GEMM: one tile (expert, <= BM sorted rows) x 32 of the
 // expert's columns per threadgroup, in rgemv8's layout (K split over 8
 // simdgroups, 8x8 MMA accumulators, no barriers in the loop). Output rows are
 // the sorted positions; columns are local to the expert.
+// BM = 8 (moe_gemv8*: decode-sized passes, one row fragment) or 16 / 32
+// (moe_gemm16* / moe_gemm32*: passes of more than 8 rows, e.g. prefill, where
+// 2048 rows put ~64 rows on every expert). A tile of BM rows streams and
+// dequantizes the expert's weights once for BM rows instead of once per 8,
+// and each dequantized B fragment feeds BM / 8 MMAs. Every row's result is
+// the same whatever BM: each simdgroup accumulates its own K slice over the
+// same k steps, and the slices are summed in the same order.
 template <int BITS, int EPI>
 kernel void moe_gemv8(
     device const half* A [[buffer(0)]],
@@ -1126,6 +1192,160 @@ kernel void moe_gemv8(
   }
 }
 
+// moe_gemm_bm: the same tile with BM = 16 or 32 rows (moe_gemm16* / moe_gemm32*, option moe_bm) for
+// passes of more than 8 rows. Kept separate from moe_gemv8 so the default kernel stays main's code
+// (templating moe_gemv8 on BM changed the generated code of the 8-row tile: 2048-row prefill +2 %).
+template <int BITS, int EPI, int BM>
+kernel void moe_gemm_bm(
+    device const half* A [[buffer(0)]],
+    device const uint* Wr [[buffer(1)]],
+    device const half4* SB [[buffer(2)]],
+    device const uint* Wh [[buffer(3)]],
+    device void* Yv [[buffer(4)]],
+    constant MoeGemmParams& p [[buffer(5)]],
+    device const int4* tiles [[buffer(6)]],
+    device const uint* ntiles [[buffer(7)]],  // indirect arguments: [0] is the tile count
+    device const int* rowmap [[buffer(8)]],
+    device const uint* Wr2 [[buffer(9)]],     // the shared expert's matrix (same layout, bits and group)
+    device const half4* SB2 [[buffer(10)]],
+    device const uint* Wh2 [[buffer(11)]],
+    device const uint* Wr3 [[buffer(12)]],    // staged experts: one single-expert record each (p.st_*)
+    device const half4* SB3 [[buffer(13)]],
+    device const uint* Wh3 [[buffer(14)]],
+    device const uchar* loading [[buffer(15)]],  // per expert index: being read (p.split)
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int KS = 8;
+  if (!p.direct && tgid.x >= ntiles[0]) return;
+  const int4 ti = tiles[tgid.x];
+  const int e = ti.x, r0 = ti.y, rows = ti.z;
+  if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  const int nloc = int(tgid.y) * 32;
+  if (nloc >= p.Ne) return;
+  constexpr int FM = BM / 8;           // row fragments of the tile
+  constexpr int RPP = BM < 16 ? BM : 16;  // rows reduced per phase (part: KS x RPP x 32 floats)
+  constexpr int PH = (BM + RPP - 1) / RPP;
+  const bool sh = e == p.shared_e;  // uniform per threadgroup
+  const bool st = !sh && p.st_count > 0 && e >= p.st_first && e < p.st_first + p.st_count;
+  if (sh) {
+    Wr = Wr2;
+    SB = SB2;
+    Wh = Wh2;
+  } else if (st) {
+    const ulong s = ulong(e - p.st_first);
+    Wr = Wr3 + s * ulong(p.st_words);
+    SB = SB3 + s * ulong(p.st_half4);
+    Wh = Wh3 + s * ulong(p.st_words);
+  }
+  const int n0 = (sh || st) ? nloc : e * p.Ne + nloc;
+  const int nb = n0 / 32;
+  const int KGall = p.K / 64;
+  const int per = (KGall + KS - 1) / KS;
+  const int g_begin = int(sgid) * per;
+  const int g_end = min(KGall, g_begin + per);
+  const int Np2 = ((sh ? p.N2 : (st ? p.Ne : p.N)) + 31) / 32 * 16;
+  constexpr int MAXG = 4;
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+  constexpr int WPL = BITS == 8 ? 4 : 2;
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
+  device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  // This lane's row of each fragment: fm + 8 i (rows past the tile's read row 0, unused).
+  bool row_ok[FM];
+  device const half* arow[FM];
+  UNROLL for (int i = 0; i < FM; ++i) {
+    row_ok[i] = i * 8 + int(fm) < rows;
+    const int arow_i = row_ok[i] ? (p.gather ? rowmap[r0 + i * 8 + fm] : r0 + i * 8 + fm) : 0;
+    arow[i] = A + ulong(arow_i) * p.lda;
+  }
+  simdgroup_matrix<float, 8, 8> acc[FM][4];
+  UNROLL for (int i = 0; i < FM; ++i)
+    UNROLL for (int j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  uint words[4 * WPL], hw[4] = {0u, 0u, 0u, 0u};
+  if (ESPETERO_PF && g_begin < g_end) load_kstep<BITS, WPL>(wp, hp, g_begin, words, hw);
+  for (int g = g_begin; g < g_end; ++g) {
+    // Software pipeline: the next K step's weight words are requested before
+    // this step's dequantization and FMAs, so two steps' loads are in flight
+    // per simdgroup (the loop was latency-bound: ~2.7 us per 64-wide step).
+    uint wnext[4 * WPL], hnext[4] = {0u, 0u, 0u, 0u};
+    if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
+    if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
+    half2 s2[MAXG * 4], b2[MAXG * 4];
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    half2 av[FM][8];
+    UNROLL for (int i = 0; i < FM; ++i)
+      UNROLL for (int jj = 0; jj < 8; ++jj)
+        av[i][jj] = row_ok[i] ? *((device const half2*)(arow[i] + g * 64 + jj * 8 + fn)) : half2(0.0h);
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      simdgroup_matrix<half, 8, 8> a[FM];
+      UNROLL for (int i = 0; i < FM; ++i) {
+        a[i].thread_elements()[0] = av[i][jj].x;
+        a[i].thread_elements()[1] = av[i][jj].y;
+      }
+      UNROLL for (int j = 0; j < 4; ++j) {
+        half2 q;
+        if (BITS == 4) {
+          const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
+          q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
+        } else if (BITS == 6 || BITS == 5) {
+          const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
+          const uint h = BITS == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
+                                   : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+          q = as_type<half2>(x | (h << 4) | 0x64006400u);
+        } else {
+          const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
+          q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
+        }
+        const int gi = (jj * 8) / kGroup;
+        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        simdgroup_matrix<half, 8, 8> b;
+        b.thread_elements()[0] = wv.x;
+        b.thread_elements()[1] = wv.y;
+        UNROLL for (int i = 0; i < FM; ++i) simdgroup_multiply_accumulate(acc[i][j], a[i], b, acc[i][j]);
+      }
+    }
+    if (ESPETERO_PF) {
+      UNROLL for (int i = 0; i < 4 * WPL; ++i) words[i] = wnext[i];
+      UNROLL for (int i = 0; i < 4; ++i) hw[i] = hnext[i];
+    }
+  }
+  // The K slices are summed in slice order, RPP rows at a time (16 KB of
+  // threadgroup memory at most); simdgroup s outputs rows s, s + 8 of a phase.
+  threadgroup float part[KS][RPP][32];
+  const int c = int(lane);
+  UNROLL for (int ph = 0; ph < PH; ++ph) {
+    if (ph) threadgroup_barrier(mem_flags::mem_threadgroup);  // the previous phase's part was consumed
+    UNROLL for (int i = ph * (RPP / 8); i < (ph + 1) * (RPP / 8); ++i) {
+      UNROLL for (int j = 0; j < 4; ++j) {
+        part[sgid][(i - ph * (RPP / 8)) * 8 + fm][j * 8 + fn] = acc[i][j].thread_elements()[0];
+        part[sgid][(i - ph * (RPP / 8)) * 8 + fm][j * 8 + fn + 1] = acc[i][j].thread_elements()[1];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    UNROLL for (int rr = int(sgid); rr < RPP; rr += KS) {
+      const int row = ph * RPP + rr;  // tile row
+      if (row >= rows) break;
+      float v = 0.0f;
+      UNROLL for (int k = 0; k < KS; ++k) v += part[k][rr][c];
+      const ulong orow = ulong(r0 + row) * p.ldy;
+      if (EPI == EPI_SWIGLU) {
+        if ((c / 8) % 2 == 0 && nloc + c < p.Ne) {
+          float u = 0.0f;
+          UNROLL for (int k = 0; k < KS; ++k) u += part[k][rr][c + 8];
+          const int out = ((nloc + (c / 8) * 8) / 16) * 8 + (c % 8);
+          ((device half*)Yv)[orow + out] = half(glu_gate(v) * u);
+        }
+      } else if (nloc + c < p.Ne) {
+        device float* y = (device float*)Yv + orow + nloc + c;
+        *y = (EPI == EPI_ADD) ? *y + v : v;
+      }
+    }
+  }
+}
+
 #define INSTANTIATE_MOE(PRE, BITS)                                                        \
   template [[host_name(PRE "_store")]] kernel void moe_gemv8<BITS, 0>(                    \
       device const half*, device const uint*, device const half4*, device const uint*,   \
@@ -1139,10 +1359,32 @@ kernel void moe_gemv8(
       device const int*, device const uint*, device const half4*, device const uint*,    \
       device const uint*, device const half4*, device const uint*, device const uchar*,  \
       uint3, uint, uint);
+#define INSTANTIATE_MOE_BM(PRE, BITS, BM)                                                 \
+  template [[host_name(PRE "_store")]] kernel void moe_gemm_bm<BITS, 0, BM>(                \
+      device const half*, device const uint*, device const half4*, device const uint*,   \
+      device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
+      device const int*, device const uint*, device const half4*, device const uint*,    \
+      device const uint*, device const half4*, device const uint*, device const uchar*,  \
+      uint3, uint, uint);                                                                 \
+  template [[host_name(PRE "_swiglu")]] kernel void moe_gemm_bm<BITS, 2, BM>(               \
+      device const half*, device const uint*, device const half4*, device const uint*,   \
+      device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
+      device const int*, device const uint*, device const half4*, device const uint*,    \
+      device const uint*, device const half4*, device const uint*, device const uchar*,  \
+      uint3, uint, uint);
 INSTANTIATE_MOE("moe_gemv8r4", 4)
 INSTANTIATE_MOE("moe_gemv8r5", 5)
 INSTANTIATE_MOE("moe_gemv8r6", 6)
 INSTANTIATE_MOE("moe_gemv8r8", 8)
+// 16- and 32-row tiles (passes of more than 8 rows).
+INSTANTIATE_MOE_BM("moe_gemm16r4", 4, 16)
+INSTANTIATE_MOE_BM("moe_gemm16r5", 5, 16)
+INSTANTIATE_MOE_BM("moe_gemm16r6", 6, 16)
+INSTANTIATE_MOE_BM("moe_gemm16r8", 8, 16)
+INSTANTIATE_MOE_BM("moe_gemm32r4", 4, 32)
+INSTANTIATE_MOE_BM("moe_gemm32r5", 5, 32)
+INSTANTIATE_MOE_BM("moe_gemm32r6", 6, 32)
+INSTANTIATE_MOE_BM("moe_gemm32r8", 8, 32)
 
 // h[row] += sum over slots (fixed order) of w * y_sorted[slotpos] +
 // sigmoid(gate[row]) * shared[row]. Grid (rows, column slices): each

@@ -14,6 +14,10 @@ struct AttnPrepParams {
   int q_ld;    // Q output stride (H*256)
   int kv_ld;   // K/V output stride (Hkv*256)
   float eps;
+  int bt;      // tokens per KV block (save)
+  int save;    // 1: also write the saved rows' K/V into the paged pool (kv_save folded in)
+  int pad;
+  ulong kv_base;  // half offset of the layer's region in the pool
 };
 
 kernel void attn_prep(
@@ -27,6 +31,8 @@ kernel void attn_prep(
     device half* Vb [[buffer(7)]],
     constant AttnPrepParams& p [[buffer(8)]],
     device const int* rope_sel [[buffer(9)]],
+    device const int4* ktab [[buffer(10)]],   // save: per row (block, pos, block2, pos2) of its pool entries, -1 none
+    device half* kv [[buffer(11)]],           // save: the paged KV pool
     uint2 tgpig [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
@@ -70,9 +76,27 @@ kernel void attn_prep(
     device half* k = Kb + row * p.kv_ld + h * HD + lane * NPT;
     device const float* v = X + row * p.ld + p.k_off + p.Hkv * HD + h * HD + lane * NPT;
     device half* vo = Vb + row * p.kv_ld + h * HD + lane * NPT;
+    half kh[NPT], vh[NPT];
     UNROLL for (int i = 0; i < NPT; ++i) {
-      k[i] = half(x[i]);
-      vo[i] = half(v[i]);
+      kh[i] = half(x[i]);
+      vh[i] = half(v[i]);
+      k[i] = kh[i];
+      vo[i] = vh[i];
+    }
+    // kv_save folded in: the same halves into the row's pool entries (a row
+    // saved into two slots has two), so no copy dispatch follows the attention.
+    if (p.save) {
+      const int4 t = ktab[row];
+      const ulong blk = ulong(p.bt) * p.kv_ld;
+      UNROLL for (int w = 0; w < 2; ++w) {
+        const int b = w ? t.z : t.x, ps = w ? t.w : t.y;
+        if (b < 0) continue;
+        device half* dk = kv + p.kv_base + ulong(b) * 2 * blk + ulong(ps) * p.kv_ld + h * HD + lane * NPT;
+        UNROLL for (int i = 0; i < NPT; ++i) {
+          dk[i] = kh[i];
+          dk[blk + i] = vh[i];
+        }
+      }
     }
   }
 }

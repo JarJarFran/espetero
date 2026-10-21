@@ -596,7 +596,6 @@ int main(int argc, char** argv) {
           at += n;
         }
       }
-      const int s = slots[0];
       std::vector<int32_t> tok(slots.size(), 11), arg(slots.size(), 0);
       auto step = [&](double* wall) {
         std::vector<TreeSpec> ts;
@@ -636,48 +635,57 @@ int main(int argc, char** argv) {
       }
       std::printf("\n");
       if (nv > 1) {
-        // The same decode step (not saved) from this context under each value
-        // against the first: max |delta logit|, max |delta log-prob| and argmax
-        // agreement over 8 input tokens.
+        // The same decode step (not saved) from these contexts under each value
+        // against the first: one tree per sequence (a long_seqs-row pass), so
+        // the comparison covers the multi-row kernels; max |delta logit|, max
+        // |delta log-prob| and argmax agreement over 8 input tokens x sequences.
         std::vector<double> dl(nv, 0.0), dp(nv, 0.0);
         std::vector<int> same(nv, 0);
+        const size_t nq = slots.size();
         for (int q = 0; q < 8; ++q) {
-          int32_t in = int32_t((q * 7919 + 13) % 100000), am = 0;
-          std::vector<float> ref;
-          double ref_lse = 0;
+          std::vector<int32_t> in(nq), am(nq, 0);
+          for (size_t i = 0; i < nq; ++i) in[i] = int32_t((q * 7919 + 13 + int(i) * 131) % 100000);
+          std::vector<std::vector<float>> ref(nq);
+          std::vector<double> ref_lse(nq, 0.0);
           for (size_t v = 0; v < nv; ++v) {
             set_v(v);
-            TreeSpec d;
-            d.parent = s;
-            d.root = &in;
-            d.root_len = 1;
-            d.score_root = true;
-            d.want_logits = true;
-            d.out_argmax = &am;
-            m->run({d});
-            const float* L = m->logits(0, 0);
-            double mx = -1e30, se = 0;
-            for (int i = 0; i < I.vocab; ++i) mx = std::max(mx, double(L[i]));
-            for (int i = 0; i < I.vocab; ++i) se += std::exp(double(L[i]) - mx);
-            const double lse = mx + std::log(se);
-            if (v == 0) {
-              ref.assign(L, L + I.vocab);
-              ref_lse = lse;
-              continue;
+            std::vector<TreeSpec> ds;
+            for (size_t i = 0; i < nq; ++i) {
+              TreeSpec d;
+              d.parent = slots[i];
+              d.root = &in[i];
+              d.root_len = 1;
+              d.score_root = true;
+              d.want_logits = true;
+              d.out_argmax = &am[i];
+              ds.push_back(d);
             }
-            int a0 = 0, a1 = 0;
-            for (int i = 0; i < I.vocab; ++i) {
-              dl[v] = std::max(dl[v], double(std::fabs(L[i] - ref[size_t(i)])));
-              dp[v] = std::max(dp[v], std::fabs((double(L[i]) - lse) - (double(ref[size_t(i)]) - ref_lse)));
-              if (ref[size_t(i)] > ref[size_t(a0)]) a0 = i;
-              if (L[i] > L[a1]) a1 = i;
+            m->run(ds);
+            for (size_t i = 0; i < nq; ++i) {
+              const float* L = m->logits(int(i), 0);
+              double mx = -1e30, se = 0;
+              for (int t = 0; t < I.vocab; ++t) mx = std::max(mx, double(L[t]));
+              for (int t = 0; t < I.vocab; ++t) se += std::exp(double(L[t]) - mx);
+              const double lse = mx + std::log(se);
+              if (v == 0) {
+                ref[i].assign(L, L + I.vocab);
+                ref_lse[i] = lse;
+                continue;
+              }
+              int a0 = 0, a1 = 0;
+              for (int t = 0; t < I.vocab; ++t) {
+                dl[v] = std::max(dl[v], double(std::fabs(L[t] - ref[i][size_t(t)])));
+                dp[v] = std::max(dp[v], std::fabs((double(L[t]) - lse) - (double(ref[i][size_t(t)]) - ref_lse[i])));
+                if (ref[i][size_t(t)] > ref[i][size_t(a0)]) a0 = t;
+                if (L[t] > L[a1]) a1 = t;
+              }
+              same[v] += a0 == a1;
             }
-            same[v] += a0 == a1;
           }
         }
         for (size_t v = 1; v < nv; ++v)
-          std::printf("  logits %s=%d vs %d: max |dlogit| %.4g, max |dlogprob| %.4g, argmax equal %d/8\n", lab, lab_v[v], lab_v[0],
-                      dl[v], dp[v], same[v]);
+          std::printf("  logits %s=%d vs %d (%zu-row passes): max |dlogit| %.4g, max |dlogprob| %.4g, argmax equal %d/%d\n", lab, lab_v[v],
+                      lab_v[0], nq, dl[v], dp[v], same[v], 8 * int(nq));
       }
       if (profile)
         for (size_t v = 0; v < nv; ++v) {

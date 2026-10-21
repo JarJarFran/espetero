@@ -415,6 +415,7 @@ struct MoeScratch {
   id<MTLBuffer> act, ys, shared, sgate;
   id<MTLBuffer> cparts, cctr;  // combine: per-row partial sums of squares and arrival counters
   id<MTLBuffer> rparts, rctr;  // parallel route: per-row slice partial logits and arrival counters
+  id<MTLBuffer> sctr;          // fuse_sort: moe_topk's arrival counter (one int, self-resetting)
 };
 
 struct Scratch {
@@ -587,9 +588,42 @@ struct Model : Runtime {
   int moe_ks_dn = 4;         // as moe_ks / moe_nbpt, for the down projection (4 slices x 2 column blocks)
   int moe_nbpt_dn = 2;
   bool moe_swap = false;     // FMA expert GEMV: block-major grid (consecutive threadgroups stream one expert)
+  // MMA expert kernel on passes of more than 8 rows (prefill): rows per
+  // expert tile, 8 (the 8-row kernel, as before), 16 or 32 (moe_gemm16 /
+  // moe_gemm32: each expert's weights read and dequantized once per tile
+  // instead of once per 8 rows; every row's sums are the same). ESPETERO_MOE_BM, "moe_bm".
+  // M4 Max, 2048-row prefill: 16 -1.4 % on the 35B-A3B 4-bit (861.9 -> 849.4 ms), -8.3 % on its
+  // UD-Q6_K GGUF (989.2 -> 906.8 ms); 32 +13.6 % (spills).
+  int moe_bm = 16;
+  // Passes of fewer rows keep the 8-row tiles (M4 Max, 35B-A3B 4-bit, E 256 / k 8: 2048 rows
+  // -1.4 %, 512 rows +3.1 %, the 16-row step +24 %). ESPETERO_MOE_BM_ROWS, "moe_bm_rows".
+  int moe_bm_rows = 2048;
+  // MoE passes of more than 8 rows: moe_topk's last-arriving row threadgroup
+  // runs the sort (no moe_sort dispatch; same tables). ESPETERO_FUSE_SORT=1, "fuse_sort".
+  bool fuse_sort = false;
+  // MoE passes of more than 8 rows: a split-K router GEMM's partials are summed
+  // by moe_topk in split order (no splitk_reduce dispatch). ESPETERO_FUSE_RSUM=1, "fuse_rsum".
+  bool fuse_rsum = false;
+  // Passes without the fused norms (more than fuse_norm_max_m rows): the out /
+  // down projections' split-K partials are added into the residual by the
+  // RMSNorm that follows (rmsnorm_addk), not by a reduce dispatch, while a
+  // row's partials are at most tune.so_max_floats. ESPETERO_FUSE_NRM=1, "fuse_nrm". Measured
+  // neutral on the M4 Max (35B-A3B 16-row step -1.2 %, -0.6 %, 0, 0 against a 0.7 % spread; 27B
+  // +0.7 %, hence so_max_floats): off; kept for the M1 Max, where a dispatch boundary costs more.
+  bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set
+  // ... also on passes of up to this many rows when every segment is <= 8
+  // tokens (batched decode steps, verify passes); 8 = GEMV-sized passes only,
+  // as before. The kernel's sums differ from the three-dispatch path's in the
+  // last bits (another reduction order), as they do on 1-8-row passes already.
+  // ESPETERO_FUSE_GDN_ROWS, "fuse_gdn_rows".
+  int fuse_gdn_rows = 8;
+  // Full-attention layers: attn_prep also writes the saved rows' K/V into the
+  // paged pool (the kv_save dispatch folded in; same halves, one dispatch
+  // fewer per full layer). ESPETERO_FUSE_KVSAVE=1, "fuse_kvsave".
+  bool fuse_kvsave = false;
   bool gdn_conv_fold = true; // leaf-free fused passes also save the conv state (no conv_state_save dispatch)
   id<MTLBuffer> gdn_ctr = nil;  // arrival counters [segment][key head] (self-resetting)
   static constexpr int kGdnCtrSegs = 256;
@@ -598,6 +632,7 @@ struct Model : Runtime {
   bool ctr_dirty = false;
   bool all_quant = true;     // every decoder matrix quantized (fusion needs the GEMV kernels)
   int attn_split = 512;      // cached keys per split-K tile (0: never split)
+  int attn_min_chunk = 32;   // ... and at least this many per tile (a short context then runs unsplit, no combine). "attn_min_chunk"
   bool qsa = true;           // Qwen4-Exp: sparse attention past 2051 visible tokens (false: dense, the approximation before)
   int n_q4 = 0, n_q5 = 0, n_q6 = 0, n_q8 = 0, n_dense = 0;
   int n_dense_mtp = 0;       // dense matrices that never take a fused-norm link (the MTP layer's, MoE routers and shared gates)
