@@ -91,8 +91,9 @@ int main(int argc, char** argv) {
   o.kv_gb = std::max(4.0, (long_seqs + 1.0) * max_ctx * 72e3 / 1e9);
   auto m = NativeModel::load(argv[1], o);
   const ModelInfo& I = m->info();
-  std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)\n", argv[1], I.device.c_str(), I.layers,
-              I.vocab, int(I.mtp), I.load_ms, I.tune_ms);
+  std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)  boundary %.2f us (family %d%s)\n", argv[1],
+              I.device.c_str(), I.layers, I.vocab, int(I.mtp), I.load_ms, I.tune_ms, I.boundary_us, I.gpu_family,
+              I.devprof_measured ? ", measured" : ", cached");
   if (q4_steps > 0) {
     // Qwen4-Exp decode with streamed experts: random tokens, so routing
     // locality is lower than on real text (served benchmarks measure that).

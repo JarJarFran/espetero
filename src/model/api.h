@@ -79,6 +79,12 @@ struct ModelInfo {
   int image_token_id = -1;  // the placeholder the chat template writes for an image (-1: the layout's default)
   int vision_max_tokens = 0, vision_min_pixels = 0;  // deepseek: the run's token budget, the pixel floor
   double load_ms = 0, tune_ms = 0;
+  // Fase 3 device profile: the measured cost of a dependent dispatch boundary
+  // (us, tiny-kernel chain) and the GPU family (1 M1/M2, 2 M3/M4); measured
+  // now or read from the per-device cache.
+  double boundary_us = 0;
+  int gpu_family = 0;
+  bool devprof_measured = false;
   json::Value extra;        // format details (matrix widths, source types, ...)
   json::Value to_json() const;
 };

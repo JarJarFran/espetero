@@ -7,6 +7,7 @@
 
 #include "api.h"
 #include "impl/bench.h"
+#include "impl/devprof.h"
 #include "impl/forest.h"
 #include "impl/load.h"
 #include "impl/qwen4_load.h"
@@ -270,6 +271,12 @@ class MetalModel final : public NativeModel {
     mark("expert cache, sizing");
     make_pools(m, slots, kv_tokens, o.block_tokens);
     mark("slot and KV pools");
+    // Fase 3: the device profile (dispatch-boundary cost, measured once per
+    // GPU and cached) sets its thresholds first; the environment and
+    // set_option override them below.
+    devprof_ = device_profile(m);
+    apply_device_profile(m, devprof_);
+    mark("device profile");
     if (const char* v = std::getenv("ESPETERO_FUSE_NORM")) m.fuse_norm = *v == '1';
     // Draft vocabulary: a prefix of the LM head for MTP drafts; verification reads all of it.
     if (o.mtp_vocab > 0) m.mtp.vocab = o.mtp_vocab;
@@ -450,6 +457,9 @@ class MetalModel final : public NativeModel {
     }
     I.extra = d;
     I.tune_ms = m.tune.ms;
+    I.boundary_us = devprof_.boundary_us;
+    I.gpu_family = devprof_.family;
+    I.devprof_measured = devprof_.measured;
     I.load_ms = ms_since(t0);
   }
 
@@ -853,6 +863,8 @@ class MetalModel final : public NativeModel {
       }
     }
   }
+
+  DeviceProfile devprof_;
 
   bool set_option(const std::string& name, int value) override {
     if (name == "serial") m_.serial = value != 0;
