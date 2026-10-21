@@ -237,9 +237,11 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   host's before each layer's experts, the host resolves the route, reads the
   misses and fills the expert kernels' tables while it waits; opt-in
   `ESPETERO_DS4_DRIVE=1`: it **lost** too, wall time minus reads +15 / +23 /
-  +26 ms per token in 3 pairs against main's binary, so the 40 waits on a
-  host-signalled event cost far more than the 41 command-buffer launches they
-  replace, 5.6 ms), and one
+  +26 ms per token in 3 pairs against main's binary: the 40 waits on a
+  host-signalled event cost ~0.4 ms each to resume (`drive_gap_ms`: 55.7 ms
+  from host signal to the GPU's next signal for ~39 ms of GPU work, the same
+  with a spinning or a blocking host), far more than the 41 command-buffer
+  launches they replace, 5.6 ms in all), and one
   hyper-connection dispatch between sub-layers instead of four
   (`ds4_hc_fused`, opt-in `ESPETERO_DS4_HCFUSE=1`: it **lost**, GPU time
   40.1 → 44.2 ms per token in 3 of 3 pairs against main; one threadgroup per

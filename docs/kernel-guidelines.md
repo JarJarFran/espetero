@@ -231,8 +231,20 @@ Rules that keep the tiers honest:
   time per token 40.1 → 44.2 ms in every pair. The 24 × 20480 mix is 2 MB of
   reads per row that `ds4_hc_part` gives 20 threadgroups; one threadgroup
   does them, and its ~500 simd reductions, in series. At 1 row the boundary
-  it saves is free on this GPU (Fase 2), so there was nothing to win back.
-  Opt-in (`ESPETERO_DS4_HCFUSE=1`) for machines where a boundary costs 5–23 µs.
+  it saves is free on this GPU (Fase 2), so there was nothing to win back
+  (per-dispatch profile: the fused kernel 80 µs, the four it replaces 8 + 11 +
+  15 + 3 µs). Opt-in (`ESPETERO_DS4_HCFUSE=1`) for machines where a boundary
+  costs 5–23 µs.
+- **A GPU wait on a host-signalled shared event costs ~0.4 ms; a command
+  buffer launch ~0.1 ms** (DeepSeek-V4.1 GPU-driven decode, 2026-10-22, M4 Max):
+  a decode pass as one command buffer with `encodeWaitForEvent` before each
+  layer's experts, the host setting the `MTLSharedEvent`'s value once the
+  misses were read, measured wall minus reads +15 / +23 / +26 ms per token
+  against the 41 command buffers (whose launch and wake-up cost 5.6 ms in all);
+  the host signal → next GPU signal gap summed 55.7 ms for ~39 ms of GPU work
+  over 39 waits, the same whether the host spun or blocked. Hiding a host
+  round trip from the GPU is not worth a GPU-side wait on this driver;
+  commit the next command buffer instead.
 - **Idle GPU memory is compressed, whatever its storage mode; lock what a
   pass must find in place** (2026-10-22, Studio M4 Max 128 GB,
   Flash-Next's 77 GB of resident experts): with free memory exhausted by the
