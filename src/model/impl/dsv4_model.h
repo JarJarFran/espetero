@@ -616,6 +616,7 @@ class Dsv4Model final : public NativeModel {
     o.set("prefetch_wasted", int64_t(pf_wasted_));
     o.set("prefetch_wait_ms", pf_wait_ms_);
     o.set("flushes", int64_t(flushes_));
+    o.set("drive_gap_ms", drive_gap_ms_);
     o.set("spec_rounds", spec_rounds_);
     o.set("spec_drafts", spec_drafts_);
     o.set("spec_accepted", spec_accepted_);
@@ -633,7 +634,7 @@ class Dsv4Model final : public NativeModel {
   bool set_option(const std::string& name, int value) override {
     if (name == "expert_stats_reset") {
       xc_.hits = xc_.misses = 0;
-      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = wait_ms_ = wake_ms_ = fwd_ms_ = pf_wait_ms_ = 0;
+      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = wait_ms_ = wake_ms_ = fwd_ms_ = pf_wait_ms_ = drive_gap_ms_ = 0;
       pf_issued_ = pf_used_ = pf_wasted_ = 0;
       flushes_ = 0;
       spec_rounds_ = spec_drafts_ = spec_accepted_ = 0;
@@ -1441,12 +1442,16 @@ class Dsv4Model final : public NativeModel {
   static constexpr int kDriveRows = 8;
   id<MTLSharedEvent> route_ev_ = nil, exp_ev_ = nil;
   uint64_t drive_seq_ = 0;
-  void drive_wait(id<MTLSharedEvent> ev, uint64_t v) {  // spin briefly (a layer is ~1 ms), then block
+  double drive_gap_ms_ = 0;  // per pass: host signal -> the GPU's next route signal, summed (profile_json drive_gap_ms)
+  void drive_wait(id<MTLSharedEvent> ev, uint64_t v) {  // spin briefly (a layer is ~1 ms), then block (ESPETERO_DS4_DRIVE_SPIN=1: never)
+    static const bool spin_only = env_on("ESPETERO_DS4_DRIVE_SPIN");
     const double t0 = Enc::host_seconds();
     while (ev.signaledValue < v)
-      if (Enc::host_seconds() - t0 > 0.003) {
+      if (!spin_only && Enc::host_seconds() - t0 > 0.003) {
         if (![ev waitUntilSignaledValue:v timeoutMS:60000]) fail("deepseek_v41: the GPU did not reach a layer's route in 60 s");
         return;
+      } else if (Enc::host_seconds() - t0 > 60.0) {
+        fail("deepseek_v41: the GPU did not reach a layer's route in 60 s");
       }
   }
 
@@ -2241,7 +2246,9 @@ class Dsv4Model final : public NativeModel {
     // arrive and fills the expert kernels' tables then (their dispatches are encoded for M x K groups). The
     // layer's command buffer launch and the host's encode leave the critical path (5.5 ms per token of 82 on
     // the M4 Max). Not under the per-dispatch profile, dumps, prediction, drafts or streaming.
-    static const bool drive_on = !(std::getenv("ESPETERO_DS4_DRIVE") && std::atoi(std::getenv("ESPETERO_DS4_DRIVE")) == 0);
+    // Opt-in (ESPETERO_DS4_DRIVE=1): measured +16-28 ms per decoded token against the per-layer command buffers on
+    // the M4 Max (3 pairs): a GPU wait on a host-signalled event costs far more than a command buffer launch.
+    static const bool drive_on = std::getenv("ESPETERO_DS4_DRIVE") && std::atoi(std::getenv("ESPETERO_DS4_DRIVE")) == 1;
     const bool drive = drive_on && !draft && T <= kDriveRows && !streaming && !E.prof && dump_dir_.empty() && !dumpx && !pred_on;
     struct Drive {  // a layer whose route the host resolves while the GPU waits
       int l, key;
@@ -2475,10 +2482,12 @@ class Dsv4Model final : public NativeModel {
       // ---- the whole pass is committed; the host follows the GPU layer by layer: route, slots (reads), tables, signal
       E.submit_async();
       try {
+        double t_sig = 0;  // when the host signalled the previous layer's experts
         for (const Drive& d : drives) {
           const LayerW& w = LW[size_t(d.l)];
           const int K = w.topk;
           drive_wait(route_ev_, d.rsig);
+          if (t_sig > 0) drive_gap_ms_ += (Enc::host_seconds() - t_sig) * 1000.0;  // GPU resume + experts + next layer's phase 1
           const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
           std::vector<int> used(size_t(w.nE), 0);
           for (const Blk& bk : d.fb)
@@ -2498,6 +2507,7 @@ class Dsv4Model final : public NativeModel {
           }
           if (d.l + 1 < int(LW.size()) && LW[size_t(d.l + 1)].eg >= 0) eng_join();  // its rows before that layer runs
           exp_ev_.signaledValue = d.xsig;
+          t_sig = Enc::host_seconds();
         }
       } catch (...) {
         exp_ev_.signaledValue = drive_seq_;  // release the GPU (its remaining work reads stale tables) before failing
