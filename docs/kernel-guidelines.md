@@ -403,6 +403,14 @@ Rules that keep the tiers honest:
   kernel's 14–30 % per-call advantage at one row does not survive an
   indirect grid of ~110 × 32 threadgroups beside the MMA dispatch. Off, not
   output-preserving either (Fase 2's candidate 10, closed).
+- **`bench_native`'s 16-sequence step touches a quarter of the experts a
+  16-user server would**: the profile's tile count (`moe_tiles_gu`, read
+  back from the sort's indirect arguments in profile mode) is 25.6 per
+  layer (23.6 routed experts + 2 shared tiles) because the 16 random-token
+  contexts route alike, against 102 expected for independent routing. The
+  expert kernels then stream 1.2 GB (gate/up, 3.44 ms, 357 GB/s) and 0.6 GB
+  (down, 1.78 ms, 341 GB/s) per step; a real 16-row step would be ~30 ms, not
+  25. The 1-row step is representative (k + shared experts per layer).
 - **The device profile measures 2.12 µs per dependent tiny dispatch on the
   M4 Max** (`gather_rows_f32` over 2048 floats, 64-deep chain, serial
   encoder; family 2 = Apple9), cached in device-profile-r1-Apple_M4_Max.json.
