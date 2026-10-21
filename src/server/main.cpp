@@ -194,7 +194,7 @@ void usage_all() {
                "  --expert-store DIR|none  expert records for those models: one read per expert instead of nine\n"
                "                        (default: ~/Library/Caches/espetero/xstore.noindex/<model> when built)\n"
                "  --expert-store-build  write the records once where they are missing (~68 GB for Flash-Next)\n"
-               "  --mtp PATH|none       MTP draft head (default: the model's own)\n"
+               "  --mtp PATH|own|none   MTP draft head (default: the model's own, or a drafter directory beside a Flash-Next file)\n"
                "  --mmproj PATH|none    GGUF vision projector\n"
                "  --dense LIST          decoder matrices served as fp16 (gate_up,down,in_proj,out|all)\n\n"
                "scheduling:\n"
