@@ -2080,8 +2080,24 @@ class Dsv4Model final : public NativeModel {
           off += size_t(n) * size_t(D) * 4;
         }
     }
-    if (!no_engram_ && !draft)
-      for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0, img + g.r0);
+    // The Engram rows (SSD reads, ~1 ms per decoded token) are gathered while the GPU runs the layers before the
+    // first Engram layer; the thread is joined before that layer is encoded (ESPETERO_DS4_ENGRAM_BG=0: inline).
+    static const bool eng_bg = !(std::getenv("ESPETERO_DS4_ENGRAM_BG") && std::atoi(std::getenv("ESPETERO_DS4_ENGRAM_BG")) == 0);
+    struct Joiner {  // joined before the Engram layer is encoded, or on any exit from the pass
+      std::thread t;
+      ~Joiner() { join(); }
+      void join() {
+        if (t.joinable()) t.join();
+      }
+    } eng_th;
+    auto eng_join = [&] { eng_th.join(); };
+    if (!no_engram_ && !draft) {
+      auto gather = [&, img] {
+        for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0, img + g.r0);
+      };
+      if (eng_bg) eng_th.t = std::thread(gather);
+      else gather();
+    }
     std::vector<Blk> blks;
     for (int r0 = 0; r0 < T; r0 += P_) {
       Blk bk;
@@ -2204,6 +2220,7 @@ class Dsv4Model final : public NativeModel {
         Blk& bk = fb[ci];
         const int r0 = bk.r0, M = bk.M;
         if (w.eg >= 0) {
+          eng_join();  // its rows must be in ERAW_ before this command buffer is committed
           const int ncol = (c.eng_max_n - 1) * c.eng_heads, Ke = w.e_wkv.K;
           struct {
             int rows, ncol, hd;
@@ -2350,6 +2367,7 @@ class Dsv4Model final : public NativeModel {
       if (!dump_dir_.empty()) dump_rows(E, "h" + std::to_string(l), H_, size_t(T) * 4 * size_t(D));
     }
     prot_lo_ = -1, prot_hi_ = -2;
+    eng_join();  // no Engram layer (a partial model): the rows were still gathered
     // ---- logits of the segments' last rows
     int R = 0;
     for (const Seg& g : segs)
