@@ -73,6 +73,9 @@ GGUF_GEMMA4 = os.environ.get("TOK_REF_GGUF_GEMMA4") or _hub("unsloth/gemma-4-26B
 # LFM2 (Llama-3 pieces under another regex, no normalizer, ignore_merges); compared when cached.
 HF_LFM2 = os.environ.get("TOK_REF_LFM2") or _hub("LiquidAI/LFM2.5-VL-3B")
 HF_LFM2_16 = os.environ.get("TOK_REF_LFM2_16") or _hub("LiquidAI/LFM2.5-VL-1.6B")  # Llama-3's regex, a BOS template
+# GLM-5.3-Flash (Llama-3's regex, ignore_merges, 18 of its 36 added tokens not special): a directory with
+# its tokenizer.json, tokenizer_config.json and chat_template.jinja; compared when given or cached.
+HF_GLM5 = os.environ.get("TOK_REF_GLM5") or _hub("zai-org/GLM-5.3-Flash")
 LLAMA3_RE = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|"
              r"\s*[\r\n]+|\s+(?!\S)|\s+")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -638,6 +641,8 @@ def main():
         makers.append(("lfm2", lambda: hf_ref("lfm2", HF_LFM2)))
     if HF_LFM2_16:
         makers.append(("lfm2-1.6b", lambda: hf_ref("lfm2-1.6b", HF_LFM2_16)))
+    if HF_GLM5 and os.path.exists(os.path.join(HF_GLM5, "tokenizer.json")):
+        makers.append(("glm5", lambda: hf_ref("glm5", HF_GLM5)))
     if HF_GEMMA4 and GGUF_GEMMA4:  # <eos> is a normal token in the GGUF; the engine keeps it special, as tokenizer.json does
         makers.append(("gemma4-gguf", lambda: gguf_ref("gemma4-gguf", GGUF_GEMMA4, HF_GEMMA4, special_extra=("<eos>",))))
     keep = os.environ.get("TOK_REF_ONLY", "").split(",") if os.environ.get("TOK_REF_ONLY") else None  # e.g. gemma4,qwen35

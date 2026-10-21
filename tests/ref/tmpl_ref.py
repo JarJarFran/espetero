@@ -42,6 +42,8 @@ import warnings
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES = os.path.join(HERE, "tmpl_fixtures")
 SEARCH_ROOTS = [os.path.expanduser("~/models"), os.path.expanduser("~/.cache/huggingface/hub")]
+# TMPL_REF_ROOTS=dir:dir adds directories to search (a template kept outside the model caches).
+SEARCH_ROOTS += [p for p in os.environ.get("TMPL_REF_ROOTS", "").split(":") if p]
 FIXED_NOW = _dt.datetime(2026, 3, 15, 9, 5, 7)
 
 
@@ -191,6 +193,7 @@ PUBLIC_TEMPLATES = {
     "872be49dbb638044ad01b60388f48d469ff2980e5f0dccdc22ec907db54d0788": ("HuggingFaceTB__SmolLM2-135M-Instruct", "HuggingFaceTB/SmolLM2-135M-Instruct", "apache-2.0"),
     "830005085ddd94cec605b6e21b885b28ffad6e3f82ee6a212c523533e8f04f01": ("HuggingFaceTB__SmolVLM2-500M-Video-Instruct", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", "apache-2.0"),
     "705345721970da40e6aa56db548a46ecd1d8d94a5418808fa180ac19ee77a9ba": ("XHToken__Spark-X2.5-4B-6bit", "XHToken/Spark-X2.5-4B (6-bit MLX conversion)", "apache-2.0"),
+    "2614a3c896d53e265f564c23701173c0049f985dacfbae79fc4bcd9f5ba083f4": ("zai-org__GLM-5.3-Flash", "zai-org/GLM-5.3-Flash", "mit"),
 }
 SYNTHETIC_ORIGINS = {
     "synthetic__mistral_style": ("synthetic, after mistralai/Mistral-7B-Instruct-v0.3", "apache-2.0"),
@@ -948,7 +951,9 @@ def render_case(template, messages, tools, agp, kwargs, special_tokens):
         return {"error": {"type": type(e).__name__, "message": str(e)}}
 
 
-def build_fixtures(random_per_template=40):
+def build_fixtures(random_per_template=40, merge=False):
+    """merge: templates not found on this machine keep their existing fixtures (manifest entries,
+    cases, .jinja files) instead of being dropped; the rendered ones replace theirs."""
     warnings.filterwarnings("ignore")
     logging.disable(logging.WARNING)
     _pin_clock()
@@ -966,9 +971,29 @@ def build_fixtures(random_per_template=40):
 
     missing = sorted(v[0] for h, v in PUBLIC_TEMPLATES.items() if h not in found)
     if missing:
-        print("not on this machine (kept out of the fixtures):", ", ".join(missing), file=sys.stderr)
+        print("not on this machine (%s):" % ("their existing fixtures kept" if merge else "kept out of the fixtures"),
+              ", ".join(missing), file=sys.stderr)
     entries = sorted(((h, info) for h, info in found.items() if h in PUBLIC_TEMPLATES),
                      key=lambda kv: PUBLIC_TEMPLATES[kv[0]][0])
+    old_order = {}
+    if merge:  # the existing tables stay as they are (kept cases keep their indices), new renders dedup against them
+        rendered = {PUBLIC_TEMPLATES[h][0] for h, _ in entries} | set(EXTRA_TEMPLATES)
+        try:
+            with open(os.path.join(FIXTURES, "manifest.json"), encoding="utf-8") as f:
+                old_manifest = json.load(f)
+            with open(os.path.join(FIXTURES, "cases.json"), encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old_manifest, old = [], {"conversations": [], "outputs": [], "cases": []}
+        conversations.extend(old["conversations"])
+        for i, c in enumerate(conversations):
+            conv_index.setdefault(json.dumps([c["name"], c["messages"], c["tools"]], sort_keys=True, ensure_ascii=False), i)
+        outputs.extend(old["outputs"])
+        for i, t in enumerate(outputs):
+            output_index.setdefault(t, i)
+        old_order = {m["name"]: i for i, m in enumerate(old_manifest)}
+        manifest.extend(m for m in old_manifest if m["name"] not in rendered)
+        cases.extend(c for c in old["cases"] if c["template"] not in rendered)
     for xname, text in EXTRA_TEMPLATES.items():
         entries.append((hashlib.sha256(text.encode("utf-8")).hexdigest(),
                         {"text": text, "sources": ["synthetic:" + xname], "synthetic": True}))
@@ -1004,6 +1029,11 @@ def build_fixtures(random_per_template=40):
                     else:
                         case["error"] = res["error"]
                     cases.append(case)
+    if old_order:
+        def rank(name):
+            return old_order.get(name, len(old_order) + (list(EXTRA_TEMPLATES).index(name) + 1000 if name in EXTRA_TEMPLATES else 0))
+        manifest.sort(key=lambda m: rank(m["name"]))
+        cases.sort(key=lambda c: rank(c["template"]))
     with open(os.path.join(FIXTURES, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=1)
     with open(os.path.join(FIXTURES, "cases.json"), "w", encoding="utf-8") as f:
@@ -1133,6 +1163,8 @@ def main():
     ap.add_argument("--gen-unicode", metavar="OUT", help="write the Unicode tables for src/tmpl/unicode.cpp")
     ap.add_argument("--random", type=int, default=40, help="random conversations per template")
     ap.add_argument("--out", default=FIXTURES, help="output directory (default: tests/ref/tmpl_fixtures)")
+    ap.add_argument("--merge", action="store_true",
+                    help="keep the existing fixtures of templates not on this machine (add or refresh the rest)")
     args = ap.parse_args()
     FIXTURES = args.out
     if args.gen_unicode:
@@ -1142,7 +1174,7 @@ def main():
     warnings.filterwarnings("ignore")
     logging.disable(logging.WARNING)
     snippets = build_snippets()
-    manifest, cases = build_fixtures(args.random)
+    manifest, cases = build_fixtures(args.random, merge=args.merge)
     per = {}
     for c in cases:
         k = per.setdefault(c["template"], [0, 0])
