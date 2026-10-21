@@ -306,6 +306,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_SWAP")) m.moe_swap = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_BM")) m.moe_bm = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_FUSE_SORT")) m.fuse_sort = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_ATTN_MIN_CHUNK")) m.attn_min_chunk = std::max(32, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_RSUM")) m.fuse_rsum = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_NRM")) m.fuse_nrm = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FASE2")) m.fuse_kvsave = m.fuse_sort = m.fuse_rsum = m.fuse_nrm = *v == '1';
@@ -894,6 +895,7 @@ class MetalModel final : public NativeModel {
     else if (name == "gdn_conv_fold") m_.gdn_conv_fold = value != 0;
     else if (name == "widen6_m") m_.tune.widen6_m = std::max(0, value);
     else if (name == "attn_split") m_.attn_split = value;
+    else if (name == "attn_min_chunk") m_.attn_min_chunk = std::max(32, value);
     else if (name == "qsa") m_.qsa = value != 0;
     else if (name == "prune_last") m_.prune_last = value != 0;
     else return false;

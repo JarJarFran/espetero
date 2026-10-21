@@ -1031,7 +1031,10 @@ struct AttnPlan {
 // each; the last part is open-ended since the list length is known only on
 // the GPU), pad0 = 1, pad1 = the list. Splits assume 513 entries for one row
 // and 128 more per further row.
-inline void plan_tiles(AttnPlan& A, int Hkv, int split, const std::vector<std::vector<int>>* qt = nullptr, int groups = 256) {
+// min_chunk: the fewest cached keys a split tile takes (32: the kernels' key
+// block; larger values leave short contexts unsplit and save the combine).
+inline void plan_tiles(AttnPlan& A, int Hkv, int split, const std::vector<std::vector<int>>* qt = nullptr, int groups = 256,
+                       int min_chunk = 32) {
   A.tiles.clear();
   A.combine.clear();
   A.parts = 0;
@@ -1042,7 +1045,7 @@ inline void plan_tiles(AttnPlan& A, int Hkv, int split, const std::vector<std::v
     const AttnTreeRec& t = A.trees[size_t(ti)];
     int ns = 1;
     if (split > 0 && budget > 1 && t.P >= 64) {
-      const int chunk = std::max(32, std::min(split, ((t.P + budget - 1) / budget + 31) / 32 * 32));
+      const int chunk = std::max(std::max(32, min_chunk), std::min(split, ((t.P + budget - 1) / budget + 31) / 32 * 32));
       ns = std::min({(t.P + chunk - 1) / chunk, budget, 64});
     }
     for (int r = 0; r < t.M; r += 8) {
@@ -2304,7 +2307,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     meta.parts.ensure<float>(m, std::max<size_t>(q3m_parts_floats(c, g4g), 1));
   } else {
     if (qsa_idx) qsa_plan(m, meta.arena, qs, A.trees, desc, true);
-    plan_tiles(A, c.Hkv, m.attn_split, qs.n_sparse ? &qs.qt_of : nullptr);
+    plan_tiles(A, c.Hkv, m.attn_split, qs.n_sparse ? &qs.qt_of : nullptr, 256, m.attn_min_chunk);
     upload(meta.a_trees, A.trees);
     upload(meta.a_tiles, A.tiles);
     upload(meta.a_comb, A.combine);
@@ -4888,7 +4891,7 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
       qsa_index(m, E, qd, L, s.xn, posb, dtrees, zd, meta.blocks.buf, c.n_full, true);
       if (qd.n_sparse) qsa_select(m, E, qd, dtrees, zd, meta.blocks.buf, c.n_full, true);
     }
-    plan_tiles(plan, c.Hkv, m.attn_split, qd.n_sparse ? &qd.qt_of : nullptr);
+    plan_tiles(plan, c.Hkv, m.attn_split, qd.n_sparse ? &qd.qt_of : nullptr, 256, m.attn_min_chunk);
     upload(meta.m_trees, plan.trees);
     upload(meta.m_tiles, plan.tiles);
     upload(meta.m_comb, plan.combine);
@@ -5259,7 +5262,7 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
       E.wr(K.buf);
     }
     E.groups(MTLSizeMake(size_t(c.H + c.Hkv + 3) / 4, size_t(R), 1), MTLSizeMake(128, 1, 1));
-    plan_tiles(plan, c.Hkv, m.attn_split);
+    plan_tiles(plan, c.Hkv, m.attn_split, nullptr, 256, m.attn_min_chunk);
     upload(meta.m_trees, plan.trees);
     upload(meta.m_tiles, plan.tiles);
     upload(meta.m_comb, plan.combine);
