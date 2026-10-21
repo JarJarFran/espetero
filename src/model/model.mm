@@ -312,6 +312,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITS")) m.tune.max_splits = std::max(2, std::min(64, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_SHARED")) m.fuse_shared = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN")) m.fuse_gdn = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GDN_CONV_FOLD")) m.gdn_conv_fold = *v == '1';
     if (const char* v = std::getenv("ESPETERO_WIDEN6_M")) m.tune.widen6_m = std::atoi(v);
     // The fused RMSNorm needs quantized decoder matrices (GEMV epilogues); the
@@ -875,6 +876,7 @@ class MetalModel final : public NativeModel {
     else if (name == "fuse_shared") m_.fuse_shared = value != 0;
     else if (name == "gemv_splitk") m_.tune.gemv_splitk = value != 0;
     else if (name == "fuse_gdn") m_.fuse_gdn = value != 0;
+    else if (name == "fuse_kvsave") m_.fuse_kvsave = value != 0;
     else if (name == "gdn_conv_fold") m_.gdn_conv_fold = value != 0;
     else if (name == "widen6_m") m_.tune.widen6_m = std::max(0, value);
     else if (name == "attn_split") m_.attn_split = value;

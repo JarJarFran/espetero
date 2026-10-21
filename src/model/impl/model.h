@@ -590,6 +590,10 @@ struct Model : Runtime {
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set
+  // Full-attention layers: attn_prep also writes the saved rows' K/V into the
+  // paged pool (the kv_save dispatch folded in; same halves, one dispatch
+  // fewer per full layer). ESPETERO_FUSE_KVSAVE=1, "fuse_kvsave".
+  bool fuse_kvsave = false;
   bool gdn_conv_fold = true; // leaf-free fused passes also save the conv state (no conv_state_save dispatch)
   id<MTLBuffer> gdn_ctr = nil;  // arrival counters [segment][key head] (self-resetting)
   static constexpr int kGdnCtrSegs = 256;

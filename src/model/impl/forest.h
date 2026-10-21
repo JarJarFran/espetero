@@ -935,6 +935,8 @@ struct DeltaParams {
 struct AttnPrepParams {
   int32_t H, Hkv, ld, k_off, q_ld, kv_ld;
   float eps;
+  int32_t bt, save, pad;  // save: kv_save folded in (the rows' pool entries from ktab)
+  uint64_t kv_base;
 };
 struct DeltaFusedParams {
   int32_t Hk, Hv, C, ldx, a_off, tiled;
@@ -1293,6 +1295,8 @@ struct PassMeta {
   HostBuf a_comb{&arena};
   HostBuf kv_saves{&arena};
   HostBuf mtp_kv_saves{&arena};
+  HostBuf kv_rows{&arena};      // fuse_kvsave: per pass row (block, pos, block2, pos2) of its kv_saves entries, -1 none
+  HostBuf mtp_kv_rows{&arena};  // ... per MTP row
   HostBuf blocks{&arena};
   HostBuf cow{&arena};
   HostBuf readout_rows{&arena};
@@ -1332,6 +1336,20 @@ struct PassMeta {
   HostBuf ring_saves{&arena};
   HostBuf ring_copies{&arena};
 };
+
+// fuse_kvsave: per row the pool entries its K/V go to ((block, pos) x 2, -1
+// none), from the kv_save records (a row saved into two slots has two).
+inline void kv_row_table(Model& m, HostBuf& hb, const std::vector<KVSaveRec>& saves, int rows) {
+  int32_t* t = hb.ensure<int32_t>(m, size_t(std::max(rows, 1)) * 4);
+  std::fill(t, t + size_t(std::max(rows, 1)) * 4, -1);
+  for (const KVSaveRec& r : saves) {
+    int32_t* e = t + size_t(r.src_row) * 4;
+    const int j = e[0] < 0 ? 0 : 2;
+    if (j == 2 && e[2] >= 0) fail("fuse_kvsave: a row saved into more than two slots");
+    e[j] = r.block;
+    e[j + 1] = r.pos;
+  }
+}
 
 // One tree of a forest (host-side plan).
 struct TreePlan {
@@ -2424,7 +2442,11 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.rd(s.Vb);
     E.threads(MTLSizeMake(size_t(kvd / 8), n, 1), MTLSizeMake(64, 1, 1));
   };
-  auto attn_prep = [&](const Layer& L, const Buf& pos_b, size_t pos_off, int rows) {
+  // rows_tab: with fuse_kvsave, the rows' pool entries (kv_row_table) in KV
+  // layer kv_layer: the prep kernel writes the saved K/V itself and no kv_save
+  // dispatch follows the attention.
+  auto attn_prep = [&](const Layer& L, const Buf& pos_b, size_t pos_off, int rows, const HostBuf* rows_tab = nullptr,
+                       int kv_layer = 0) {
     E.pipe("attn_prep");
     E.set(0, s.proj);
     E.set(1, L.q_norm);
@@ -2434,15 +2456,28 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.set(5, s.Q);
     E.set(6, s.Kb);
     E.set(7, s.Vb);
-    AttnPrepParams ap{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps};
+    AttnPrepParams ap{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps, bt, rows_tab ? 1 : 0, 0,
+                      uint64_t(rows_tab ? K.layer_base(kv_layer) : 0)};
     E.bytes(8, ap);
     E.set(9, m.rope_sel);
+    E.set(10, rows_tab ? rows_tab->buf : meta.pos.buf);
+    E.set(11, K.buf);
     E.rd(s.proj);
     E.wr(s.Q);
     E.wr(s.Kb);
     E.wr(s.Vb);
+    if (rows_tab) {
+      E.rd(rows_tab->buf, rows_tab->bytes);
+      E.wr(K.buf);
+    }
     E.groups(MTLSizeMake(size_t(c.H + c.Hkv + 3) / 4, size_t(rows), 1), MTLSizeMake(128, 1, 1));
   };
+  // fuse_kvsave: the decoder rows' and the MTP rows' pool entries, read by attn_prep.
+  const bool kvfold = m.fuse_kvsave && !c.q4;
+  if (kvfold) {
+    kv_row_table(m, meta.kv_rows, kv_saves, M);
+    if (mtp_rows > 0) kv_row_table(m, meta.mtp_kv_rows, mtp_saves, mtp_rows);
+  }
 
   // Norm partials of the fused path: point 2l = layer l's input norm, 2l + 1
   // its post-attention norm; [point][row][P] floats.
@@ -3512,11 +3547,11 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     } else {
       const int k = L.index_in_kind;
       gemm_runs(E, m.tune, L.in_proj, x_in, 0, c.D, s.proj, 0, ldf, M, 0, nin);
-      attn_prep(L, meta.pos.buf, 0, M);
+      attn_prep(L, meta.pos.buf, 0, M, kvfold ? &meta.kv_rows : nullptr, k);
       if (qsa_idx) qsa_index(m, E, qs, L, x_in, meta.pos.buf, meta.a_trees.buf, meta.desc.buf, meta.blocks.buf, k, false);
       if (qs.n_sparse) qsa_select(m, E, qs, meta.a_trees.buf, meta.desc.buf, meta.blocks.buf, k, false);
       attention(A, meta.a_trees, meta.a_tiles, meta.a_comb, meta.desc.buf, k, qs.n_sparse ? &qs : nullptr);
-      kv_save(meta.kv_saves, kv_saves.size(), k);
+      if (!kvfold) kv_save(meta.kv_saves, kv_saves.size(), k);
       if (qsa_idx) qsa_save(m, E, qs, meta.pos.buf, meta.kv_saves.buf, kv_saves.size(), k, false);
       if (last_layer) {
         if (N == 0) break;
@@ -4010,8 +4045,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       gemm(E, m.tune, MT.fc, s.act, 0, 2 * c.D, meta.m_x.buf.b, meta.m_x.buf.off, c.D, R, 0);
       rmsnorm(meta.m_x.buf, L.in_norm, s.xn, R, nil);
       gemm_runs(E, m.tune, L.in_proj, s.xn, 0, c.D, s.proj, 0, ldf, R, 0);
-      attn_prep(L, meta.m_pos.buf, 0, R);
-      kv_save(meta.mtp_kv_saves, mtp_saves.size(), c.n_full);
+      attn_prep(L, meta.m_pos.buf, 0, R, kvfold ? &meta.mtp_kv_rows : nullptr, c.n_full);
+      if (!kvfold) kv_save(meta.mtp_kv_saves, mtp_saves.size(), c.n_full);
     }
     // Hidden rows drafting starts from: mh (last saved row) and lh (first leaf rows).
     {
@@ -4729,9 +4764,11 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
     E.set(5, s.Q);
     E.set(6, s.Kb);
     E.set(7, s.Vb);
-    AttnPrepParams app{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps};
+    AttnPrepParams app{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps, bt, 0, 0, 0};
     E.bytes(8, app);
     E.set(9, m.rope_sel);
+    E.set(10, meta.m_pos.buf);  // unread (save = 0)
+    E.set(11, K.buf);
     E.rd(s.proj);
     E.wr(s.Q);
     E.wr(s.Kb);
@@ -5093,6 +5130,9 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
     gemm(E, m.tune, MT.fc, s.act, 0, 2 * c.D, meta.m_x.buf.b, meta.m_x.buf.off, c.D, R, 0);
     rmsnorm(meta.m_x.buf.b, meta.m_x.buf.off, L.in_norm, s.xn, R);
     gemm_runs(E, m.tune, L.in_proj, s.xn, 0, c.D, s.proj, 0, ldf, R, 0);
+    // fuse_kvsave: the step's K/V entries written by the prep kernel (kv_save folded in).
+    const bool kvfold = m.fuse_kvsave;
+    if (kvfold) kv_row_table(m, meta.mtp_kv_rows, saves, R);
     E.pipe("attn_prep");
     E.set(0, s.proj);
     E.set(1, L.q_norm);
@@ -5102,13 +5142,20 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
     E.set(5, s.Q);
     E.set(6, s.Kb);
     E.set(7, s.Vb);
-    AttnPrepParams app{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps};
+    AttnPrepParams app{c.H, c.Hkv, ldf, 2 * qdim, qdim, kvd, c.eps, bt, kvfold ? 1 : 0, 0,
+                       uint64_t(kvfold ? K.layer_base(c.n_full) : 0)};
     E.bytes(8, app);
     E.set(9, m.rope_sel);
+    E.set(10, kvfold ? meta.mtp_kv_rows.buf : meta.m_pos.buf);
+    E.set(11, K.buf);
     E.rd(s.proj);
     E.wr(s.Q);
     E.wr(s.Kb);
     E.wr(s.Vb);
+    if (kvfold) {
+      E.rd(meta.mtp_kv_rows.buf, meta.mtp_kv_rows.bytes);
+      E.wr(K.buf);
+    }
     E.groups(MTLSizeMake(size_t(c.H + c.Hkv + 3) / 4, size_t(R), 1), MTLSizeMake(128, 1, 1));
     plan_tiles(plan, c.Hkv, m.attn_split);
     upload(meta.m_trees, plan.trees);
@@ -5152,17 +5199,19 @@ inline void run_draft(Model& m, PassMeta& meta, const std::vector<DraftRequest>&
       E.wr(s.O);
       E.threads(MTLSizeMake(64, size_t(c.H), plan.combine.size() * 8), MTLSizeMake(64, 1, 1));
     }
-    upload(meta.mtp_kv_saves, saves);
-    E.pipe("kv_save");
-    E.set(0, s.Kb);
-    E.set(1, s.Vb);
-    E.set(2, K.buf);
-    E.set(3, meta.mtp_kv_saves.buf);
-    E.bytes(4, ap);
-    E.rd(s.Kb);
-    E.rd(s.Vb);
-    E.wr(K.buf);
-    E.threads(MTLSizeMake(size_t(kvd / 8), saves.size(), 1), MTLSizeMake(64, 1, 1));
+    if (!kvfold) {
+      upload(meta.mtp_kv_saves, saves);
+      E.pipe("kv_save");
+      E.set(0, s.Kb);
+      E.set(1, s.Vb);
+      E.set(2, K.buf);
+      E.set(3, meta.mtp_kv_saves.buf);
+      E.bytes(4, ap);
+      E.rd(s.Kb);
+      E.rd(s.Vb);
+      E.wr(K.buf);
+      E.threads(MTLSizeMake(size_t(kvd / 8), saves.size(), 1), MTLSizeMake(64, 1, 1));
+    }
     gemm(E, m.tune, L.out, s.O, 0, qdim, meta.m_x.buf.b, meta.m_x.buf.off, c.D, R, 1);
     rmsnorm(meta.m_x.buf.b, meta.m_x.buf.off, L.post_norm, s.xn, R);
     if (L.moe) {
