@@ -309,7 +309,10 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_ATTN_MIN_CHUNK")) m.attn_min_chunk = std::max(32, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_RSUM")) m.fuse_rsum = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_NRM")) m.fuse_nrm = *v == '1';
-    if (const char* v = std::getenv("ESPETERO_FASE2")) m.fuse_kvsave = m.fuse_sort = m.fuse_rsum = m.fuse_nrm = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FASE2")) {  // 1: the four lossless dispatch folds; 2: without the sort fold
+      m.fuse_kvsave = m.fuse_rsum = m.fuse_nrm = *v == '1' || *v == '2';
+      m.fuse_sort = *v == '1';
+    }
     if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) m.expert_cache_gb = std::atof(v);
     // Qwen4-Exp: split K for the few-column decode GEMVs (the hyper-connection
     // reads [324 x 10240]: 32 us unsplit; decode GPU -9 %). Off elsewhere.
@@ -891,7 +894,10 @@ class MetalModel final : public NativeModel {
     else if (name == "fuse_sort") m_.fuse_sort = value != 0;
     else if (name == "fuse_rsum") m_.fuse_rsum = value != 0;
     else if (name == "fuse_nrm") m_.fuse_nrm = value != 0;
-    else if (name == "fase2") m_.fuse_kvsave = m_.fuse_sort = m_.fuse_rsum = m_.fuse_nrm = value != 0;  // the lossless dispatch folds together
+    else if (name == "fase2") {  // the lossless dispatch folds together: 1 all four, 2 without the sort fold, 0 none
+      m_.fuse_kvsave = m_.fuse_rsum = m_.fuse_nrm = value != 0;
+      m_.fuse_sort = value == 1;
+    }
     else if (name == "gdn_conv_fold") m_.gdn_conv_fold = value != 0;
     else if (name == "widen6_m") m_.tune.widen6_m = std::max(0, value);
     else if (name == "attn_split") m_.attn_split = value;
