@@ -306,6 +306,9 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_SWAP")) m.moe_swap = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_BM")) m.moe_bm = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_FUSE_SORT")) m.fuse_sort = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FUSE_RSUM")) m.fuse_rsum = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FUSE_NRM")) m.fuse_nrm = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FASE2")) m.fuse_kvsave = m.fuse_sort = m.fuse_rsum = m.fuse_nrm = *v == '1';
     if (const char* v = std::getenv("ESPETERO_EXPERT_CACHE_GB")) m.expert_cache_gb = std::atof(v);
     // Qwen4-Exp: split K for the few-column decode GEMVs (the hyper-connection
     // reads [324 x 10240]: 32 us unsplit; decode GPU -9 %). Off elsewhere.
@@ -885,6 +888,9 @@ class MetalModel final : public NativeModel {
     else if (name == "fuse_kvsave") m_.fuse_kvsave = value != 0;
     else if (name == "moe_bm") m_.moe_bm = value == 16 || value == 32 ? value : 8;
     else if (name == "fuse_sort") m_.fuse_sort = value != 0;
+    else if (name == "fuse_rsum") m_.fuse_rsum = value != 0;
+    else if (name == "fuse_nrm") m_.fuse_nrm = value != 0;
+    else if (name == "fase2") m_.fuse_kvsave = m_.fuse_sort = m_.fuse_rsum = m_.fuse_nrm = value != 0;  // the lossless dispatch folds together
     else if (name == "gdn_conv_fold") m_.gdn_conv_fold = value != 0;
     else if (name == "widen6_m") m_.tune.widen6_m = std::max(0, value);
     else if (name == "attn_split") m_.attn_split = value;
@@ -1001,7 +1007,7 @@ class MetalModel final : public NativeModel {
     if (m.cfg.gemma) g4_pipelines(m, list);
     if (m.cfg.q3moe) q3m_pipelines(m, list);
     if (m.cfg.lfm2) lfm2_pipelines(m, list);
-    for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "conv_prep", "conv_state_save",
+    for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "rmsnorm_addk", "conv_prep", "conv_state_save",
                           "gated_rmsnorm", "attn_prep", "attention_combine", "kv_save", "kv_copy_blocks",
                           "gather_rows_f32", "gather_rows_f16", "scatter_rows_f32", "lse_rows", "argmax_rows",
                           "gather_cands", "splitk_reduce_store", "splitk_reduce_add", "swiglu_f32", "mtp_prep",

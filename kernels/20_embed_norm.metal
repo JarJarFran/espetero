@@ -102,6 +102,52 @@ kernel void rmsnorm(
   for (int i = tid; i < D4; i += ntg) y[i] = half4(x[i] * inv * w[i]);
 }
 
+// RMSNorm after a split-K residual GEMM: X += sum of the `splits` partials
+// (in split order from 0, as splitk_reduce_add does), then Y = rmsnorm(X) * W
+// as `rmsnorm` computes it (the same thread -> element mapping and sums), so
+// one dispatch stands for splitk_reduce_add + rmsnorm. One threadgroup per row.
+kernel void rmsnorm_addk(
+    device float* X [[buffer(0)]],
+    device const float* Wt [[buffer(1)]],
+    device half* Y [[buffer(2)]],
+    constant int& D [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    device const float* ws [[buffer(5)]],   // partials [splits][rows][ldw]
+    constant int& splits [[buffer(6)]],
+    constant int& z_stride [[buffer(7)]],
+    constant int& ldw [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float partial[32];
+  device float4* x = (device float4*)(X + ulong(row) * D);
+  device const float* w0 = ws + ulong(row) * ldw;
+  const int D4 = D / 4;
+  float ss = 0.0f;
+  for (int i = tid; i < D4; i += ntg) {
+    float4 acc = float4(0.0f);
+    for (int z = 0; z < splits; ++z) acc += *((device const float4*)(w0 + ulong(z) * ulong(z_stride)) + i);
+    const float4 v = x[i] + acc;
+    x[i] = v;
+    ss += dot(v, v);
+  }
+  ss = simd_sum(ss);
+  if (lane == 0) partial[sg] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float t = (lane < (ntg + 31) / 32) ? partial[lane] : 0.0f;
+    t = simd_sum(t);
+    if (lane == 0) partial[0] = t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(D) + eps);
+  device const float4* w = (device const float4*)Wt;
+  device half4* y = (device half4*)(Y + ulong(row) * D);
+  for (int i = tid; i < D4; i += ntg) y[i] = half4(x[i] * inv * w[i]);
+}
+
 // MTP input row: Y = [enorm(E) | hnorm(pre(H))] (half, 2D wide), where `pre`
 // (optional) is the RMSNorm the hidden row still needs: the decoder's final
 // norm for decoder rows, the MTP norm for chained draft rows.

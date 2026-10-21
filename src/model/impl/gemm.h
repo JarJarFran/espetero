@@ -168,6 +168,15 @@ struct NormParamsHost {
   int32_t out_ld;
 };
 
+// A split-K GEMM's partials left unreduced for the consumer (gemm_q's `so`):
+// [splits][M][ld] floats in `ws`, z_stride apart; the consumer sums them in
+// split order from 0, as splitk_reduce does (same sums). splits 0: the GEMM
+// was not split and its output is in Y as usual.
+struct SplitOut {
+  id<MTLBuffer> ws = nil;
+  int splits = 0, z_stride = 0, ld = 0;
+};
+
 // True when a GEMM of M rows runs as a GEMV kernel (fusion is possible).
 inline bool gemv_path(const Tuner& T, int M) { return (M <= T.gemv_max_m && T.gemv) || (M <= 8 && T.gemv && T.gemv8); }
 
@@ -177,7 +186,8 @@ inline bool gemv_path(const Tuner& T, int M) { return (M <= T.gemv_max_m && T.ge
 // + normalized fp16 rows for the next norm (GEMV paths only).
 inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, int lda, id<MTLBuffer> Y,
                    size_t yoff, int ldy, int M, int epi, int n_cols = 0, const NormLink* nin = nullptr,
-                   const NormLink* nout = nullptr) {
+                   const NormLink* nout = nullptr, SplitOut* so = nullptr) {
+  if (so) *so = SplitOut{};
   if (M <= 0) return;
   // Inputs are fp16 (plain rows, or the fp16 residual copy of the fused RMSNorm);
   // the gated per-head norm (kind 2) reads fp32 rows.
@@ -345,6 +355,10 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.wr(T.ws, 0, size_t(splits) * size_t(M) * size_t(w.out) * 4);
     E.groups(MTLSizeMake(size_t(M + g.bm - 1) / size_t(g.bm), size_t(w.out + g.bn - 1) / size_t(g.bn), size_t(splits)),
              MTLSizeMake(size_t(g.threads), 1, 1));
+    if (so && (epi == 0 || epi == 1)) {  // the consumer sums the partials (no reduce dispatch)
+      *so = SplitOut{T.ws, splits, M * w.out, w.out};
+      return;
+    }
     GemmParams r{M, w.out, w.in, lda, ldy, per, M * w.out};
     E.pipe(epi == 1 ? "splitk_reduce_add" : "splitk_reduce_store");
     E.set(0, T.ws);
@@ -418,12 +432,13 @@ inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, i
 // Decoder matrices: epi 0 store, 1 add, 2 SwiGLU.
 inline void gemm(Enc& E, Tuner& T, const Mat& m, id<MTLBuffer> A, size_t aoff, int lda, id<MTLBuffer> Y,
                  size_t yoff, int ldy, int M, int epi, int n_cols = 0, const NormLink* nin = nullptr,
-                 const NormLink* nout = nullptr) {
+                 const NormLink* nout = nullptr, SplitOut* so = nullptr) {
   if (m.dense) {
     if (nin || nout) fail("fused norm on a dense matrix");
+    if (so) *so = SplitOut{};
     gemm_h(E, m.d, A, aoff, lda, Y, yoff, ldy, M, epi == 2 ? (m.d.act == 1 ? 5 : 4) : epi);
   } else {
-    gemm_q(E, T, m.q, A, aoff, lda, Y, yoff, ldy, M, epi, n_cols, nin, nout);
+    gemm_q(E, T, m.q, A, aoff, lda, Y, yoff, ldy, M, epi, n_cols, nin, nout, so);
   }
 }
 

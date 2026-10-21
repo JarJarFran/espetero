@@ -156,6 +156,8 @@ struct MoeRouteParams {
   int ld;     // floats per logits row (E, or E + 1 with the shared gate's column)
   int sg;     // 1: column E is the shared-expert gate's logit, copied to sgate
   int fold;   // 1: the last-arriving row threadgroup also runs moe_sort (buffers 5-12), so no sort dispatch follows
+  int splits;    // > 0: `logits` holds the router GEMM's split-K partials [splits][M][ld], summed here in split order
+  int z_stride;  // floats between partials
 };
 
 // One threadgroup per row, one thread per expert (E <= 1024): softmax over
@@ -191,8 +193,15 @@ kernel void moe_topk(
   threadgroup int picked_i[16];
   threadgroup int last_tg;
   const int e = int(tid);
-  if (p.sg && tid == 0) sgate[row] = logits[ulong(row) * p.ld + p.E];
-  float x = e < p.E ? logits[ulong(row) * p.ld + e] : -INFINITY;
+  // The split-K GEMM's partials summed in split order from 0, as splitk_reduce_store does.
+  auto logit = [&](int col) -> float {
+    if (p.splits <= 0) return logits[ulong(row) * p.ld + col];
+    float acc = 0.0f;
+    for (int z = 0; z < p.splits; ++z) acc += logits[ulong(z) * ulong(p.z_stride) + ulong(row) * p.ld + col];
+    return acc;
+  };
+  if (p.sg && tid == 0) sgate[row] = logit(p.E);
+  float x = e < p.E ? logit(e) : -INFINITY;
   float m = simd_max(x);
   if (lane == 0) redf[sg] = m;
   threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -596,6 +596,13 @@ struct Model : Runtime {
   // MoE passes of more than 8 rows: moe_topk's last-arriving row threadgroup
   // runs the sort (no moe_sort dispatch; same tables). ESPETERO_FUSE_SORT=1, "fuse_sort".
   bool fuse_sort = false;
+  // MoE passes of more than 8 rows: a split-K router GEMM's partials are summed
+  // by moe_topk in split order (no splitk_reduce dispatch). ESPETERO_FUSE_RSUM=1, "fuse_rsum".
+  bool fuse_rsum = false;
+  // Passes without the fused norms (more than fuse_norm_max_m rows): the out /
+  // down projections' split-K partials are added into the residual by the
+  // RMSNorm that follows (rmsnorm_addk), not by a reduce dispatch. ESPETERO_FUSE_NRM=1, "fuse_nrm".
+  bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set

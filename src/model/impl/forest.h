@@ -252,6 +252,7 @@ struct MoeRouteParams {
   int32_t ld;  // floats per logits row (E, or E + 1 with the shared gate's column)
   int32_t sg;  // 1: column E is the shared gate's logit, copied to sgate
   int32_t fold = 0;  // 1: moe_topk's last-arriving row threadgroup runs the sort (no moe_sort dispatch)
+  int32_t splits = 0, z_stride = 0;  // > 0: the logits are a split-K GEMM's partials [splits][M][ld] (fuse_rsum)
 };
 struct MoeSortParams {
   int32_t E, k, M, gu_blocks, down_blocks, shared, remap;
@@ -617,7 +618,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     // threadgroup; 0.23 ms per layer isolated at 16 rows); moe_topk moves
     // column E to z.sgate.
     const int sg = m.route_sg && rows > 8 && L.router_sg.out() == c.E + 1 ? 1 : 0;
-    if (!sg) gemm(E, m.tune, L.shared_gate, X, 0, c.D, z.sgate, 0, 1, rows, 0);
+    // fuse_rsum: a split-K router GEMM leaves its partials to moe_topk, which
+    // sums them in split order (no splitk_reduce dispatch); the shared gate's
+    // GEMM runs after the top-k, so it cannot reuse the workspace before.
+    SplitOut rso;
     static const bool router_gemv = !env_on("ESPETERO_Q4_NO_ROUTER_GEMV");
     if (router_gemv && L.router_f16 && rows <= 8) {  // dense router, few rows (Qwen4-Exp): the plain GEMV
       E.pipe("q4_router_gemv");
@@ -630,20 +634,22 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
       E.wr(z.logits);
       E.groups(MTLSizeMake(size_t((c.E + 7) / 8), size_t(rows), 1), MTLSizeMake(256, 1, 1));
     } else {
-      gemm(E, m.tune, sg ? L.router_sg : L.router, X, 0, c.D, z.logits, 0, c.E + sg, rows, 0);
+      gemm(E, m.tune, sg ? L.router_sg : L.router, X, 0, c.D, z.logits, 0, c.E + sg, rows, 0, 0, nullptr, nullptr,
+           m.fuse_rsum ? &rso : nullptr);
     }
     // fuse_sort: the row threadgroup that finishes last also sorts the pairs
     // and writes the tile table (moe_sort's work, one dispatch fewer per MoE
     // layer); not with the expert cache, whose host remaps the ids first.
     sort_folded = m.fuse_sort && !m.moe_after_route && c.E <= 1024;
-    const MoeRouteParams rp{c.E, c.k, rows, c.E + sg, sg, sort_folded ? 1 : 0};
+    const MoeRouteParams rp{c.E, c.k, rows, rso.splits ? rso.ld : c.E + sg, sg, sort_folded ? 1 : 0, rso.splits, rso.z_stride};
     E.pipe("moe_topk");
-    E.set(0, z.logits);
+    E.set(0, rso.splits ? rso.ws : z.logits);
     E.set(1, z.ids);
     E.set(2, z.w);
     E.bytes(3, rp);
     E.set(4, z.sgate);
-    E.rd(z.logits);
+    if (rso.splits) E.rd(rso.ws, 0, size_t(rso.splits) * size_t(rso.z_stride) * 4);
+    else E.rd(z.logits);
     E.wr(z.ids);
     E.wr(z.w);
     if (sg) E.wr(z.sgate);
@@ -670,6 +676,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
       E.bytes(10, fsp);
     }
     E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(size_t((c.E + 31) / 32 * 32), 1, 1));
+    if (!sg) gemm(E, m.tune, L.shared_gate, X, 0, c.D, z.sgate, 0, 1, rows, 0);
   }
   // Expert cache: the hook brings the routed experts into the layer's
   // pool and remaps the ids to its slots; the MoE then runs on the pool (E = S).
@@ -2388,6 +2395,45 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.wr(Y.b);
     E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
   };
+  // fuse_nrm (passes without the fused norms): the out / down projections' split-K
+  // partials stay in the GEMM workspace and the RMSNorm that follows adds them
+  // into the residual itself (rmsnorm_addk: splitk_reduce_add's sums, then
+  // rmsnorm's), one dispatch instead of two.
+  const bool nrm_fold = m.fuse_nrm && !fuse && !c.q4 && !c.gemma && !c.q3moe && !c.lfm2;
+  SplitOut hpend;  // partials not yet added to s.h
+  auto settle_h = [&]() {
+    if (!hpend.splits) return;
+    GemmParams r{M, c.D, 0, 0, c.D, 0, hpend.z_stride};
+    E.pipe("splitk_reduce_add");
+    E.set(0, hpend.ws);
+    E.set(1, s.h);
+    E.bytes(2, r);
+    E.bytes(3, hpend.splits);
+    E.rd(hpend.ws, 0, size_t(hpend.splits) * size_t(hpend.z_stride) * 4);
+    E.rd(s.h);
+    E.wr(s.h);
+    E.threads(MTLSizeMake(size_t(c.D + 3) / 4, size_t(M), 1), MTLSizeMake(64, 1, 1));
+    hpend = SplitOut{};
+  };
+  auto rmsnorm_h = [&](const Buf& w, const Buf& Y, int rows) {  // rmsnorm of s.h, with the pending add folded in
+    if (!hpend.splits) return rmsnorm(s.h, w, Y, rows, nil);
+    E.pipe("rmsnorm_addk");
+    E.set(0, s.h);
+    E.set(1, w);
+    E.set(2, Y);
+    E.bytes(3, c.D);
+    E.bytes(4, c.eps);
+    E.set(5, hpend.ws);
+    E.bytes(6, hpend.splits);
+    E.bytes(7, hpend.z_stride);
+    E.bytes(8, hpend.ld);
+    E.rd(hpend.ws, 0, size_t(hpend.splits) * size_t(hpend.z_stride) * 4);
+    E.rd(s.h);
+    E.wr(s.h);
+    E.wr(Y.b);
+    E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
+    hpend = SplitOut{};
+  };
   auto gather = [&](id<MTLBuffer> src, id<MTLBuffer> dst, int width, bool f32) {
     E.pipe(f32 ? "gather_rows_f32" : "gather_rows_f16");
     E.set(0, src);
@@ -3428,7 +3474,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       if (li == c.ple_layer) q4_ple();
       q4_read(L.hca, true, m.q4s.H, M, s.xn);
     } else if (!fuse || li == 0) {
-      rmsnorm(s.h, L.in_norm, s.xn, M, nil);
+      rmsnorm_h(L.in_norm, s.xn, M);
     }
     id<MTLBuffer> x_in = s.xn;
     const NormLink* out_link = fuse ? &l_post : nullptr;
@@ -3572,7 +3618,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
           gather(s.h, s.hc, c.D, true);
           gemm(E, m.tune, L.out, s.mixc, 0, Vd, s.hc, 0, c.D, N, 1);
         } else {
-          gemm(E, m.tune, L.out, s.yn, 0, Vd, s.h, 0, c.D, M, 1, 0, nullptr, out_link);
+          gemm(E, m.tune, L.out, s.yn, 0, Vd, s.h, 0, c.D, M, 1, 0, nullptr, out_link, nrm_fold ? &hpend : nullptr);
         }
       } else {
       E.pipe(c.gate_sigmoid ? "gated_rmsnorm_sig" : "gated_rmsnorm");
@@ -3595,7 +3641,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       } else if (c.q4) {
         gemm(E, m.tune, L.out, s.yn, 0, Vd, m.q4s.y, 0, c.D, M, 0);
       } else {
-        gemm(E, m.tune, L.out, s.yn, 0, Vd, s.h, 0, c.D, M, 1, 0, nullptr, out_link);
+        gemm(E, m.tune, L.out, s.yn, 0, Vd, s.h, 0, c.D, M, 1, 0, nullptr, out_link, nrm_fold ? &hpend : nullptr);
       }
       }
     } else {
@@ -3615,7 +3661,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       } else if (c.q4) {
         gemm(E, m.tune, L.out, s.O, 0, qdim, m.q4s.y, 0, c.D, M, 0);
       } else {
-        gemm(E, m.tune, L.out, s.O, 0, qdim, s.h, 0, c.D, M, 1, 0, nullptr, out_link);
+        gemm(E, m.tune, L.out, s.O, 0, qdim, s.h, 0, c.D, M, 1, 0, nullptr, out_link, nrm_fold ? &hpend : nullptr);
       }
     }
     if (c.q4) {
@@ -3698,15 +3744,17 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       }
       break;
     }
-    if (!fuse) rmsnorm(s.h, L.post_norm, s.xn, M, nil);
+    if (!fuse) rmsnorm_h(L.post_norm, s.xn, M);
     const NormLink* next_link = fuse && li + 1 < c.L ? &l_next : nullptr;
     if (L.moe) {
       moe_mlp(m, E, L, s.xn, s.act, s.h, M, next_link);
     } else {
       mlp_in(L, s.xn, s.act, M);
-      gemm(E, m.tune, L.down, s.act, 0, L.I, s.h, 0, c.D, M, 1, 0, nullptr, next_link);
+      // (the next layer's input norm adds the partials; the last layer's go through settle_h below)
+      gemm(E, m.tune, L.down, s.act, 0, L.I, s.h, 0, c.D, M, 1, 0, nullptr, next_link, nrm_fold ? &hpend : nullptr);
     }
   }
+  settle_h();
 
   bool want_lse = false, want_argmax = false;
   int topk_k = 0;
