@@ -6,6 +6,7 @@
 // ESPETERO_DS4_DUMP=dir writes each layer's residual streams of the prefill.
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -111,7 +112,23 @@ int main(int argc, char** argv) {
     m->run({t});
     const double pf = ms(t1);
     TopK k = m->topk(0, 0);
-    std::printf("prefill %zu tokens: %.1f s (%.1f tok/s); argmax %d; top5:", ids.size(), pf / 1e3, ids.size() / (pf / 1e3), arg);
+    // DS4_RUN_HASH=1: a hash of every logit after the prefill and each step (exact comparisons between runs).
+    static const bool want_hash = std::getenv("DS4_RUN_HASH") && std::atoi(std::getenv("DS4_RUN_HASH")) != 0;
+    auto hash = [&]() -> std::string {
+      if (!want_hash) return "";
+      const float* L = m->logits(0, 0);
+      uint64_t h = 1469598103934665603ull;
+      for (int i = 0; i < m->info().vocab; ++i) {
+        uint32_t u;
+        std::memcpy(&u, L + i, 4);
+        h = (h ^ u) * 1099511628211ull;
+      }
+      char buf[32];
+      std::snprintf(buf, sizeof buf, " hash %016llx", (unsigned long long)h);
+      return buf;
+    };
+    std::printf("prefill %zu tokens: %.1f s (%.1f tok/s); argmax %d%s; top5:", ids.size(), pf / 1e3, ids.size() / (pf / 1e3), arg,
+                hash().c_str());
     for (int i = 0; i < k.n; ++i) std::printf(" %d(%.3f)", k.ids[i], k.x[i]);
     std::printf("\n%s\n", m->profile_json().c_str());
     std::fflush(stdout);
@@ -165,7 +182,7 @@ int main(int argc, char** argv) {
       auto t2 = std::chrono::steady_clock::now();
       const int32_t tok = arg;
       m->run({d});
-      std::printf("step %d: token %d -> %d  %.0f ms  %s\n", i, tok, arg, ms(t2), m->profile_json().c_str());
+      std::printf("step %d: token %d -> %d  %.0f ms %s %s\n", i, tok, arg, ms(t2), hash().c_str(), m->profile_json().c_str());
       std::fflush(stdout);
       out.push_back(arg);
     }
