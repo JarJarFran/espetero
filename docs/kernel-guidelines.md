@@ -447,7 +447,21 @@ Rules that keep the tiers honest:
   max |Δ| 0.12, no argmax flip. Both together: 20.45 / 20.09 / 20.42 ms
   (−18 %, 770–782 tok/s). Both are the arithmetic other shapes already use
   (the router's split-K order; the grouped kernel's tile order) and wait for
-  a decision; off by default.
+  a decision; off by default. **Their quality cost on real text**
+  (`tests/batch_kld.mm`: 3,072 teacher-forced tokens of 16-row passes on the
+  KLD harness's wikitext2 + code windows, the full distribution of every
+  readout against the defaults in one process): KLD mean 8.1e-4 / 1.3e-3 /
+  1.5e-3 (shared tiles / route_sg / both), median 6.5e-5 / 2.5e-4 / 2.8e-4,
+  p99 0.012 / 0.016 / 0.017, top-1 agreement 99.06 / 98.86 / 98.80 %, top-1
+  accuracy on the true next token unchanged (56.97 → 57.00 / 57.10 /
+  56.90 %); a lock-step greedy decode of the 16 sequences (64 tokens) stays
+  identical for 10 / 9 / 9 of them and diverges at near-tie tokens in the
+  rest. For scale, the EQ references on the same text give the 4-bit MLX
+  file itself KLD mean 0.069 / median 0.026 against fp32, and a bf16 run
+  against the bf16 reference mean 0.0034 / median 0.0007: the options' drift
+  is below the bf16 arithmetic noise floor. Flash-Next oQ4e is untouched by
+  both (bf16 router: no `router_sg`; 8-bit shared expert: no grouped tile
+  above 2 rows): KLD 0, identical dispatches and replies.
 
 ## 6. Numerics and determinism
 
