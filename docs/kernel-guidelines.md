@@ -244,10 +244,13 @@ Rules that keep the tiers honest:
   threadgroups) 12.0 → 13.5 ms, with the prefetch 15.9, the 2-row kernel with
   the prefetch 12.7. The hardware already overlaps the loads a lane issues;
   what the two kernels lack against 546 GB/s (420 and 375 GB/s) is not loads
-  in flight. All variants keep each row's summation order (bit-identical) and
-  stay as options (`ESPETERO_DS4_GEMV_PF=1`, `ESPETERO_DS4_XGEMV_ROWS`,
-  `ESPETERO_DS4_XGEMV_PF=1`). Enqueuing each command buffer at creation
-  (`ESPETERO_DS4_ENQUEUE=1`) did not shorten its launch (5.4 → 5.9 ms per token).
+  in flight. The variants were written to keep each row's summation order,
+  yet 543 of 800 residual dumps differed from main with both on: under
+  Metal's fast math the compiler reassociates a restructured loop's sums, so
+  "the same expression" is not the same bits. They are removed (in the
+  branch's history, commit "fp8 GEMV with the next chunk's loads in flight").
+  Enqueuing each command buffer at creation (`ESPETERO_DS4_ENQUEUE=1`) did not
+  shorten its launch (5.4 → 5.9 ms per token).
 - **A GPU wait on a host-signalled shared event costs ~0.4 ms; a command
   buffer launch ~0.1 ms** (DeepSeek-V4.1 GPU-driven decode, 2026-10-22, M4 Max):
   a decode pass as one command buffer with `encodeWaitForEvent` before each

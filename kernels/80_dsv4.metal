@@ -108,9 +108,7 @@ struct Ds4GemvP {
 };
 constant constexpr int kDs4GemvM = 8;
 
-// PF: the one-row fp8 path loads the next chunk's weights and scales before it uses this chunk's (the same
-// sums in the same order; more bytes in flight per lane).
-template <int FMT, int PF = 0>
+template <int FMT>
 static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, device const float* X, device float* Y,
                                  constant Ds4GemvP& p, device const int* xrow, device const int* yrow,
                                  device const float* ysc, uint2 tg, uint sg, uint lane) {
@@ -136,17 +134,10 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
     for (int nb = int(tg.x) * p.nrow_tg + int(sg); nb < n_end; nb += 8 * NR) {
       float acc[NR];
       device const uint4* wr[NR];
-      device const uchar* sr[NR];
       for (int k = 0; k < NR; ++k) {
         acc[k] = 0.0f;
-        const int n = min(nb + 8 * k, n_end - 1);
-        wr[k] = (device const uint4*)(W + ulong(n) * row_bytes);
-        sr[k] = S + ulong(n / 32) * ulong(kb);
+        wr[k] = (device const uint4*)(W + ulong(min(nb + 8 * k, n_end - 1)) * row_bytes);
       }
-      uint4 wn[NR];
-      uchar sn[NR];
-      if (PF && int(lane) < chunks)
-        for (int k = 0; k < NR; ++k) wn[k] = wr[k][lane], sn[k] = sr[k][lane / 2];
       for (int c = int(lane); c < chunks; c += 32) {
         device const float4* xv = (device const float4*)(x0 + c * E);
         float xs[E];
@@ -155,16 +146,10 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
           xs[4 * j] = x4.x, xs[4 * j + 1] = x4.y, xs[4 * j + 2] = x4.z, xs[4 * j + 3] = x4.w;
         }
         uint4 w[NR];
-        uchar sb[NR];
-        if (PF) {
-          for (int k = 0; k < NR; ++k) w[k] = wn[k], sb[k] = sn[k];
-          if (c + 32 < chunks)
-            for (int k = 0; k < NR; ++k) wn[k] = wr[k][c + 32], sn[k] = sr[k][(c + 32) / 2];
-        } else {
-          for (int k = 0; k < NR; ++k) w[k] = wr[k][c], sb[k] = sr[k][c / 2];
-        }
+        for (int k = 0; k < NR; ++k) w[k] = wr[k][c];
         for (int k = 0; k < NR; ++k) {
-          const float sc = ds4_e8m0(sb[k]) * 256.0f;
+          const int n = min(nb + 8 * k, n_end - 1);
+          const float sc = ds4_e8m0(S[ulong(n / 32) * ulong(kb) + ulong(c / 2)]) * 256.0f;
           const uint ws[4] = {w[k].x, w[k].y, w[k].z, w[k].w};
           float s = 0.0f;
           for (int j = 0; j < 4; ++j) {
@@ -261,17 +246,7 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
                    uint lane [[thread_index_in_simdgroup]]) {                                                    \
     ds4_gemv_impl<FMT>(W, S, X, Y, p, xrow, yrow, ysc, tg, sg, lane);                                            \
   }
-#define DS4_GEMV_PF(NAME, FMT)                                                                                    \
-  kernel void NAME(device const uchar* W [[buffer(0)]], device const uchar* S [[buffer(1)]],                      \
-                   device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],                           \
-                   constant Ds4GemvP& p [[buffer(4)]], device const int* xrow [[buffer(5)]],                     \
-                   device const int* yrow [[buffer(6)]], device const float* ysc [[buffer(7)]],                  \
-                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],        \
-                   uint lane [[thread_index_in_simdgroup]]) {                                                    \
-    ds4_gemv_impl<FMT, 1>(W, S, X, Y, p, xrow, yrow, ysc, tg, sg, lane);                                         \
-  }
 DS4_GEMV(ds4_gemv_f8, 0)
-DS4_GEMV_PF(ds4_gemv_f8p, 0)
 DS4_GEMV(ds4_gemv_f4, 1)
 DS4_GEMV(ds4_gemv_bf16, 2)
 DS4_GEMV(ds4_gemv_f32, 3)
@@ -1615,27 +1590,25 @@ kernel void ds4_embed_rows(device const float* src [[buffer(0)]], device float* 
   for (int s = 0; s < 4; ++s) H[(ulong(p.z + k) * 4 + ulong(s)) * ulong(p.x) + ulong(d)] = v;
 }
 
-// ds4_xgemv with NR output rows per simdgroup step (NR times the loads in flight;
-// the down projection's 1152-byte rows leave lanes idle otherwise). Each row's
-// chunks are still summed by the same lanes in the same order, then simd_sum:
-// the result does not depend on NR. PF: the next chunk's weights and scales
-// are loaded before this chunk's are used.
-template <int NR, int PF>
-static inline void ds4_xgemv_impl(device const uchar* P0, device const uchar* P1, device const uchar* P2,
-                                  device const Ds4XGroup* G, device const float* X, device float* Y,
-                                  device const int* xrow, constant Ds4XP& p, uint2 tg, uint sg, uint lane) {
+// ds4_xgemv with two output rows per simdgroup step (twice the loads in flight;
+// the down projection's 1152-byte rows leave lanes idle otherwise).
+kernel void ds4_xgemv_b(device const uchar* P0 [[buffer(0)]], device const uchar* P1 [[buffer(1)]],
+                        device const uchar* P2 [[buffer(2)]], device const Ds4XGroup* G [[buffer(3)]],
+                        device const float* X [[buffer(4)]], device float* Y [[buffer(5)]],
+                        device const int* xrow [[buffer(6)]], constant Ds4XP& p [[buffer(7)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
   const Ds4XGroup g = G[tg.y];
   device const uchar* base = (g.part == 0 ? P0 : g.part == 1 ? P1 : P2) + g.off;
   const int rows_out = p.mode == 0 ? 2 * p.N : p.N;
   const int kb = p.K / 32, chunks = p.K / 32;
   const ulong row_bytes = ulong(p.K / 2);
   const int n_end = min(rows_out, int(tg.x + 1) * p.nrow_tg);
-  for (int r = int(tg.x) * p.nrow_tg + NR * int(sg); r < n_end; r += 8 * NR) {
-    int rr[NR];
-    device const uint4* wr[NR];
-    device const uchar* S[NR];
-    for (int q = 0; q < NR; ++q) {
-      rr[q] = min(r + q, n_end - 1);
+  for (int r = int(tg.x) * p.nrow_tg + 2 * int(sg); r < n_end; r += 16) {
+    const int rr[2] = {r, min(r + 1, n_end - 1)};
+    device const uint4* wr[2];
+    device const uchar* S[2];
+    for (int q = 0; q < 2; ++q) {
       int mat, n;
       if (p.mode == 0) mat = rr[q] < p.N ? 0 : 2, n = rr[q] < p.N ? rr[q] : rr[q] - p.N;
       else mat = 1, n = rr[q];
@@ -1644,43 +1617,32 @@ static inline void ds4_xgemv_impl(device const uchar* P0, device const uchar* P1
     }
     for (int m0 = 0; m0 < g.n; m0 += kDs4GemvM) {
       const int mr = min(kDs4GemvM, g.n - m0);
-      float acc[NR][kDs4GemvM];
-      for (int q = 0; q < NR; ++q)
+      float acc[2][kDs4GemvM];
+      for (int q = 0; q < 2; ++q)
         for (int m = 0; m < kDs4GemvM; ++m) acc[q][m] = 0.0f;
-      uint4 wn[NR];
-      uchar sn[NR];
-      if (PF && int(lane) < chunks)
-        for (int q = 0; q < NR; ++q) wn[q] = wr[q][lane], sn[q] = S[q][lane];
       for (int c = int(lane); c < chunks; c += 32) {
-        uint4 w[NR];
-        float sc[NR];
-        if (PF) {
-          for (int q = 0; q < NR; ++q) w[q] = wn[q], sc[q] = ds4_e8m0(sn[q]) * 16384.0f;
-          if (c + 32 < chunks)
-            for (int q = 0; q < NR; ++q) wn[q] = wr[q][c + 32], sn[q] = S[q][c + 32];
-        } else {
-          for (int q = 0; q < NR; ++q) w[q] = wr[q][c], sc[q] = ds4_e8m0(S[q][c]) * 16384.0f;
-        }
+        const uint4 w0 = wr[0][c], w1 = wr[1][c];
+        const float sc0 = ds4_e8m0(S[0][c]) * 16384.0f, sc1 = ds4_e8m0(S[1][c]) * 16384.0f;
         for (int m = 0; m < kDs4GemvM; ++m) {
           if (m >= mr) break;
           const int a = g.a0 + m0 + m;
           device const float4* xv = (device const float4*)(X + ulong(p.mode == 0 ? xrow[a] : a) * ulong(p.xs) + ulong(c * 32));
-          float s[NR];
-          for (int q = 0; q < NR; ++q) s[q] = 0.0f;
+          float s0 = 0.0f, s1 = 0.0f;
+          const uint ws0[4] = {w0.x, w0.y, w0.z, w0.w}, ws1[4] = {w1.x, w1.y, w1.z, w1.w};
           for (int j = 0; j < 4; ++j)
             for (int h = 0; h < 2; ++h) {
               const float4 x4 = xv[2 * j + h];
-              for (int q = 0; q < NR; ++q) {
-                const uint wq = j == 0 ? w[q].x : j == 1 ? w[q].y : j == 2 ? w[q].z : w[q].w;
-                const half2 a0 = ds4_e2m1x2(wq >> (16 * h)), b0 = ds4_e2m1x2(wq >> (16 * h + 8));
-                s[q] += float(a0.x) * x4.x + float(a0.y) * x4.y + float(b0.x) * x4.z + float(b0.y) * x4.w;
-              }
+              const half2 a0 = ds4_e2m1x2(ws0[j] >> (16 * h)), b0 = ds4_e2m1x2(ws0[j] >> (16 * h + 8));
+              const half2 a1 = ds4_e2m1x2(ws1[j] >> (16 * h)), b1 = ds4_e2m1x2(ws1[j] >> (16 * h + 8));
+              s0 += float(a0.x) * x4.x + float(a0.y) * x4.y + float(b0.x) * x4.z + float(b0.y) * x4.w;
+              s1 += float(a1.x) * x4.x + float(a1.y) * x4.y + float(b1.x) * x4.z + float(b1.y) * x4.w;
             }
-          for (int q = 0; q < NR; ++q) acc[q][m] += s[q] * sc[q];
+          acc[0][m] += s0 * sc0;
+          acc[1][m] += s1 * sc1;
         }
       }
-      for (int q = 0; q < NR; ++q) {
-        if (q > 0 && rr[q] == rr[q - 1]) break;
+      for (int q = 0; q < 2; ++q) {
+        if (q == 1 && rr[1] == rr[0]) break;
         for (int m = 0; m < kDs4GemvM; ++m) {
           if (m >= mr) break;
           const float v = simd_sum(acc[q][m]);
@@ -1690,19 +1652,6 @@ static inline void ds4_xgemv_impl(device const uchar* P0, device const uchar* P1
     }
   }
 }
-#define DS4_XGEMV(NAME, NR, PF)                                                                                   \
-  kernel void NAME(device const uchar* P0 [[buffer(0)]], device const uchar* P1 [[buffer(1)]],                    \
-                   device const uchar* P2 [[buffer(2)]], device const Ds4XGroup* G [[buffer(3)]],                 \
-                   device const float* X [[buffer(4)]], device float* Y [[buffer(5)]],                           \
-                   device const int* xrow [[buffer(6)]], constant Ds4XP& p [[buffer(7)]],                        \
-                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],        \
-                   uint lane [[thread_index_in_simdgroup]]) {                                                    \
-    ds4_xgemv_impl<NR, PF>(P0, P1, P2, G, X, Y, xrow, p, tg, sg, lane);                                          \
-  }
-DS4_XGEMV(ds4_xgemv_b, 2, 0)
-DS4_XGEMV(ds4_xgemv_b4, 4, 0)
-DS4_XGEMV(ds4_xgemv_b2p, 2, 1)
-DS4_XGEMV(ds4_xgemv_b4p, 4, 1)
 
 // ---------------------------------------------------------------------------
 // Fused vector epilogues (decode passes are hundreds of small dispatches).

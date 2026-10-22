@@ -1234,12 +1234,9 @@ class Dsv4Model final : public NativeModel {
       return;
     }
     static const char* names[4] = {"ds4_gemv_f8", "ds4_gemv_f4", "ds4_gemv_bf16", "ds4_gemv_f32"};
+    E.pipe(names[fmt]);
     static const bool g1 = env_on("ESPETERO_DS4_GEMV1");  // one output row per simdgroup always
-    // ESPETERO_DS4_GEMV_PF=1: the one-row fp8 path with the next chunk's loads in flight (measured +2 % per step
-    // on the M4 Max: 16.2 -> 16.6 ms of fp8 GEMVs per token; the hardware already overlaps them)
-    static const bool pf = std::getenv("ESPETERO_DS4_GEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_GEMV_PF")) == 1;
     const int nrow = fmt == 0 && M == 1 && !grp && !g1 ? 32 : 8;  // one row of X: 4 output rows per simdgroup
-    E.pipe(fmt == 0 && nrow == 32 && pf ? "ds4_gemv_f8p" : names[fmt]);
     GemvP p{N, K, M, xs, ys, grp, gstr, accum ? 1 : 0, xrow ? 1 : 0, nrow};
     E.set(0, W);
     E.set(1, S.b ? S : W);
@@ -2994,20 +2991,12 @@ class Dsv4Model final : public NativeModel {
         E.groups(size_t(rows / 64), size_t(nt[q]), 1, 128);
       }
       if (!tiled) {
-        // Rows per simdgroup (ESPETERO_DS4_XGEMV_ROWS 1, 2 or 4; ESPETERO_DS4_XGEMV1=1: one): two measured 345 -> 419
-        // GB/s gate/up, 236 -> 328 GB/s down against one; four keep the sums (each row's chunks by the same lanes in
-        // the same order) but measured 12.0 -> 13.5 ms of expert GEMVs per token on the M4 Max (fewer threadgroups),
-        // and the next chunk's loads in flight (ESPETERO_DS4_XGEMV_PF=1) 12.7 at two rows, 15.9 at four (registers).
-        static const int rows_sg = [] {
-          if (env_on("ESPETERO_DS4_XGEMV1")) return 1;
-          const char* v = std::getenv("ESPETERO_DS4_XGEMV_ROWS");
-          const int r = v ? std::atoi(v) : 2;
-          return r == 1 || r == 4 ? r : 2;
-        }();
-        static const bool xpf = std::getenv("ESPETERO_DS4_XGEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_XGEMV_PF")) == 1;
+        // two rows per simdgroup (ds4_xgemv_b): 345 -> 419 GB/s gate/up, 236 -> 328 GB/s down; ESPETERO_DS4_XGEMV1=1: one.
+        // Four rows per simdgroup and the next chunk's loads in flight were measured slower (kernel-guidelines).
+        static const bool one = env_on("ESPETERO_DS4_XGEMV1");
         auto q = xp;
-        q.nrow_tg = 8 * rows_sg;
-        E.pipe(rows_sg == 1 ? "ds4_xgemv" : rows_sg == 2 ? (xpf ? "ds4_xgemv_b2p" : "ds4_xgemv_b") : (xpf ? "ds4_xgemv_b4p" : "ds4_xgemv_b4"));
+        q.nrow_tg = one ? 8 : 16;
+        E.pipe(one ? "ds4_xgemv" : "ds4_xgemv_b");
         for (int b = 0; b < 3; ++b) E.set(b, xc_.bufs[size_t(std::min<int>(b, int(xc_.bufs.size()) - 1))]);
         E.set(3, XGRP_, go);
         E.set(4, X);
