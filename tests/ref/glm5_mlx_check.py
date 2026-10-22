@@ -68,6 +68,17 @@ def main():
             arr = ck.get(name).astype(np.float32)
         w["language_model.model." + name[len("model.language_model."):]] = mx.array(arr)
     w = model.sanitize(w)
+    # sanitize keeps the outer Model's "language_model." prefix; this is the LanguageModel itself
+    w = {k[len("language_model."):] if k.startswith("language_model.") else k: v for k, v in w.items()}
+    from mlx.utils import tree_flatten
+    params = {k for k, _ in tree_flatten(model.parameters())}
+    unknown = sorted(set(w) - params)
+    if unknown:
+        sys.exit(f"checkpoint tensors with no parameter: {unknown[:8]}")
+    # every parameter of the layers must come from the checkpoint, but the routed experts (set below)
+    missing = sorted(k for k in params if k.startswith("model.layers.") and k not in w and ".switch_mlp." not in k)
+    if missing:
+        sys.exit(f"parameters left at their random initialization: {missing[:8]}")
     model.load_weights(list(w.items()), strict=False)
 
     # MoE layers: only the routed experts, the router's indices remapped
