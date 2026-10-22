@@ -6,6 +6,8 @@
 // Objective-C++ translation unit.
 #pragma once
 
+#include <execinfo.h>
+
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -33,7 +35,22 @@ namespace espetero::native {
 
 using Clock = std::chrono::steady_clock;
 
-[[noreturn]] inline void fail(const std::string& msg) { throw std::runtime_error(msg); }
+// ESPETERO_FAIL_BT=1: the call stack of every engine failure on stderr before
+// it is thrown (symbol names as the binary carries them; a diagnostic for
+// failures in harnesses that cannot run under a debugger).
+[[noreturn]] inline void fail(const std::string& msg) {
+  static const bool bt = [] {
+    const char* v = std::getenv("ESPETERO_FAIL_BT");
+    return v && *v == '1';
+  }();
+  if (bt) {
+    void* frames[64];
+    const int n = backtrace(frames, 64);
+    std::fprintf(stderr, "[espetero] fail: %s\n", msg.c_str());
+    backtrace_symbols_fd(frames, n, 2);
+  }
+  throw std::runtime_error(msg);
+}
 
 inline double ms_since(Clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
