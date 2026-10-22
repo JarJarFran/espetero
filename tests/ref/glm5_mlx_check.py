@@ -9,8 +9,11 @@ glm5_next) against an independent implementation: mlx-vlm's glm5_next decoder la
     python tests/ref/glm5_mlx_check.py MODEL REF                        # then (MLX: through gpuq)
 
 Each mlx-vlm layer l gets the reference's input streams (REF/h<l-1>.f32, the
-embedding rows for l = 0) and its output streams are compared with REF/h<l>.f32,
-so a disagreement points at one layer. Weights: the checkpoint's FP8 tensors
+embedding rows for l = 0); its mixing branch (KDA / DSA, whole sequence) is
+compared with the reference's streams after that branch (rebuilt from REF/a<l>.f32),
+its MLP branch (row-independent: run in chunks of 256 rows) is fed the reference's
+streams and compared with REF/h<l>.f32, so a disagreement points at one branch
+of one layer. Weights: the checkpoint's FP8 tensors
 dequantized with their 128 x 128 block scales in float32; a MoE layer gets only
 the experts the reference routed to (REF/route<l>.i32), its router's indices
 remapped onto them, in float16 (mlx-vlm stacks all 288 experts: 29 GB per layer in float32).
@@ -38,6 +41,8 @@ def main():
     ap.add_argument("model")
     ap.add_argument("ref")
     a = ap.parse_args()
+    global REF
+    REF = a.ref
     case = json.load(open(os.path.join(a.ref, "case.json")))
     ids, N = case["ids"], case["layers"]
     T = len(ids)
@@ -118,18 +123,36 @@ def main():
     h_in = np.repeat(emb[:, None, :], cfg.hc_mult, 1)
     worst = 0.0
     topk = None
-    for l, layer in enumerate(model.model.layers):
-        x = mx.array(h_in[None])
-        out, topk = layer(x, None, None, topk)
-        mx.eval(out)
-        got = np.array(out[0]).astype(np.float32)
-        want = np.fromfile(os.path.join(a.ref, f"h{l}.f32"), np.float32).reshape(T, cfg.hc_mult, D)
-        # the layer's own contribution: compare the change it made, relative to its size
-        dw, dg = want - h_in, got - h_in
-        rel = np.abs(dg - dw).max() / max(np.abs(dw).max(), 1e-30)
+    CH = 256  # rows per chunk of the MLP branch (row-independent; mlx-vlm's MoE over all rows at once peaks at ~100 GB)
+
+    def report(l, what, got, base, want):
+        nonlocal worst
+        dw, dg = want - base, got - base  # the branch's own contribution
         rows = np.sqrt(((dg - dw) ** 2).sum((1, 2)) / np.maximum((dw ** 2).sum((1, 2)), 1e-30))
         worst = max(worst, float(rows.max()))
-        print(f"layer {l}: max |diff| / max |delta| {rel:.3g}; per-row relative L2 max {rows.max():.3g}, median {np.median(rows):.3g}")
+        print(f"layer {l} {what}: per-row relative L2 of its update max {rows.max():.3g}, median {np.median(rows):.3g}")
+
+    for l, layer in enumerate(model.model.layers):
+        p = f"model.language_model.layers.{l}."
+        # mixing branch (KDA / DSA) over the whole sequence, against the reference's streams after it
+        if layer.is_linear:
+            mid = layer.attn_hc.apply_branch(mx.array(h_in[None]), layer.input_layernorm, layer.self_attn, None, None)
+        else:
+            mid, topk = layer.attn_hc.apply_branch(mx.array(h_in[None]), layer.input_layernorm, layer.self_attn, None, None, topk)
+        mx.eval(mid)
+        got_mid = np.array(mid[0]).astype(np.float32)
+        a_ref = np.fromfile(os.path.join(REF, f"a{l}.f32"), np.float32).reshape(T, D)
+        post, comb, _ = r.hc_coeffs(h_in, p, "attn")
+        want_mid = r.hc_post(a_ref, h_in, post, comb)
+        report(l, "mixing", got_mid, h_in, want_mid)
+        # MLP branch in row chunks, from the reference's streams
+        outs = []
+        for r0 in range(0, T, CH):
+            o = layer.ffn_hc.apply_branch(mx.array(want_mid[None, r0:r0 + CH]), layer.post_attention_layernorm, layer.mlp)
+            mx.eval(o)
+            outs.append(np.array(o[0]).astype(np.float32))
+        want = np.fromfile(os.path.join(REF, f"h{l}.f32"), np.float32).reshape(T, cfg.hc_mult, D)
+        report(l, "MLP", np.concatenate(outs, 0), want_mid, want)
         h_in = want
     print("OK" if worst < 1e-2 else "MISMATCH", f"(worst per-row relative L2 {worst:.3g})")
     return 0 if worst < 1e-2 else 1
