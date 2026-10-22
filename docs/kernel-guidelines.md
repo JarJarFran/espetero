@@ -235,6 +235,19 @@ Rules that keep the tiers honest:
   (per-dispatch profile: the fused kernel 80 µs, the four it replaces 8 + 11 +
   15 + 3 µs). Opt-in (`ESPETERO_DS4_HCFUSE=1`) for machines where a boundary
   costs 5–23 µs.
+- **The one-row fp8 and fp4 GEMVs are at their load-level optimum; more
+  loads in flight or more rows per simdgroup lose** (DeepSeek-V4.1 decode,
+  2026-10-22, M4 Max, every dispatch timed alone, same binary, switches):
+  loading the next chunk's weights and scales before using this chunk's
+  (`ds4_gemv_f8p`) 16.2 → 16.6 ms of fp8 GEMVs per token; the expert GEMV with
+  4 output rows per simdgroup instead of 2 (`ds4_xgemv_b4`, half the
+  threadgroups) 12.0 → 13.5 ms, with the prefetch 15.9, the 2-row kernel with
+  the prefetch 12.7. The hardware already overlaps the loads a lane issues;
+  what the two kernels lack against 546 GB/s (420 and 375 GB/s) is not loads
+  in flight. All variants keep each row's summation order (bit-identical) and
+  stay as options (`ESPETERO_DS4_GEMV_PF=1`, `ESPETERO_DS4_XGEMV_ROWS`,
+  `ESPETERO_DS4_XGEMV_PF=1`). Enqueuing each command buffer at creation
+  (`ESPETERO_DS4_ENQUEUE=1`) did not shorten its launch (5.4 → 5.9 ms per token).
 - **A GPU wait on a host-signalled shared event costs ~0.4 ms; a command
   buffer launch ~0.1 ms** (DeepSeek-V4.1 GPU-driven decode, 2026-10-22, M4 Max):
   a decode pass as one command buffer with `encodeWaitForEvent` before each

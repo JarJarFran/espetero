@@ -247,6 +247,15 @@ M4 Max (128 GB, 97 GB expert cache, internal SSD at ~6–7 GB/s):
   40.1 → 44.2 ms per token in 3 of 3 pairs against main; one threadgroup per
   row serializes the 24 × 20480 mix that `ds4_hc_part` spreads over 20, and at
   1 row the 240 dispatches it saves cost nothing on the M4 Max).
+* **The 41 command buffers per token** cost 5.6 ms: ~85 µs from commit to the
+  GPU's start and ~51 µs from the GPU's end to the host noticing (spinning),
+  per buffer. Fewer buffers need either a GPU-side wait on the host (above:
+  ~0.4 ms each, lost) or speculation: encoding a layer's experts from a
+  GPU-side slot map and letting the GPU run on, redoing the layers after a
+  miss. With ~12 misses in ~10 of 40 layers per token a two-layer buffer has
+  a miss 44 % of the time and the wasted layer (~1 ms) outweighs the launch
+  it saved; longer buffers are worse. The route is the only thing the host
+  needs, and nothing cheaper than a command buffer boundary carries it.
 * **The expert cache's size** (the access trace of the run above replayed with
   `tools/dsv4_xsim.py`, which starts cold, so the counts are relative):
   LRU misses per decoded token 28.7 at 4745 slots (89 GB), 26.5 at 5168

@@ -1057,8 +1057,8 @@ class Dsv4Model final : public NativeModel {
     explicit Enc2(Runtime& r) : rt(r) { begin(); }
     // ESPETERO_DS4_CONC=1: concurrent dispatch with a buffer barrier before every dispatch (experiment).
     bool conc = env_on("ESPETERO_DS4_CONC");
-    // ESPETERO_DS4_ENQUEUE=1: reserve the command buffer's place on the queue as soon as it is created (experiment:
-    // does the launch after commit get shorter?).
+    // ESPETERO_DS4_ENQUEUE=1: reserve the command buffer's place on the queue as soon as it is created (measured:
+    // launch + wake-up per token 5.4 -> 5.9 ms on the M4 Max, no gain).
     bool enq = env_on("ESPETERO_DS4_ENQUEUE");
     void begin() {
       cb = [rt.queue commandBufferWithUnretainedReferences];
@@ -1235,8 +1235,9 @@ class Dsv4Model final : public NativeModel {
     }
     static const char* names[4] = {"ds4_gemv_f8", "ds4_gemv_f4", "ds4_gemv_bf16", "ds4_gemv_f32"};
     static const bool g1 = env_on("ESPETERO_DS4_GEMV1");  // one output row per simdgroup always
-    // ESPETERO_DS4_GEMV_PF=0: the one-row fp8 path without the next chunk's loads in flight
-    static const bool pf = !(std::getenv("ESPETERO_DS4_GEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_GEMV_PF")) == 0);
+    // ESPETERO_DS4_GEMV_PF=1: the one-row fp8 path with the next chunk's loads in flight (measured +2 % per step
+    // on the M4 Max: 16.2 -> 16.6 ms of fp8 GEMVs per token; the hardware already overlaps them)
+    static const bool pf = std::getenv("ESPETERO_DS4_GEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_GEMV_PF")) == 1;
     const int nrow = fmt == 0 && M == 1 && !grp && !g1 ? 32 : 8;  // one row of X: 4 output rows per simdgroup
     E.pipe(fmt == 0 && nrow == 32 && pf ? "ds4_gemv_f8p" : names[fmt]);
     GemvP p{N, K, M, xs, ys, grp, gstr, accum ? 1 : 0, xrow ? 1 : 0, nrow};
@@ -2995,14 +2996,15 @@ class Dsv4Model final : public NativeModel {
       if (!tiled) {
         // Rows per simdgroup (ESPETERO_DS4_XGEMV_ROWS 1, 2 or 4; ESPETERO_DS4_XGEMV1=1: one): two measured 345 -> 419
         // GB/s gate/up, 236 -> 328 GB/s down against one; four keep the sums (each row's chunks by the same lanes in
-        // the same order). ESPETERO_DS4_XGEMV_PF=0: without the next chunk's loads in flight.
+        // the same order) but measured 12.0 -> 13.5 ms of expert GEMVs per token on the M4 Max (fewer threadgroups),
+        // and the next chunk's loads in flight (ESPETERO_DS4_XGEMV_PF=1) 12.7 at two rows, 15.9 at four (registers).
         static const int rows_sg = [] {
           if (env_on("ESPETERO_DS4_XGEMV1")) return 1;
           const char* v = std::getenv("ESPETERO_DS4_XGEMV_ROWS");
-          const int r = v ? std::atoi(v) : 4;
-          return r == 1 || r == 2 ? r : 4;
+          const int r = v ? std::atoi(v) : 2;
+          return r == 1 || r == 4 ? r : 2;
         }();
-        static const bool xpf = !(std::getenv("ESPETERO_DS4_XGEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_XGEMV_PF")) == 0);
+        static const bool xpf = std::getenv("ESPETERO_DS4_XGEMV_PF") && std::atoi(std::getenv("ESPETERO_DS4_XGEMV_PF")) == 1;
         auto q = xp;
         q.nrow_tg = 8 * rows_sg;
         E.pipe(rows_sg == 1 ? "ds4_xgemv" : rows_sg == 2 ? (xpf ? "ds4_xgemv_b2p" : "ds4_xgemv_b") : (xpf ? "ds4_xgemv_b4p" : "ds4_xgemv_b4"));
