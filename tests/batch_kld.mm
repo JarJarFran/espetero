@@ -18,7 +18,9 @@
 // readout after each input is scored against the following token too (top-1
 // accuracy, as a sanity check). Options are set with NativeModel::set_option
 // (every value in A is set before the A runs, every value in B before the B
-// runs, and A's values are restored before the next B).
+// runs, and A's values are restored before the next B: list in A the default
+// of every option any B touches, since nothing else resets it). "seqs=N" in a
+// set runs that set N sequences per pass (the engine's own batch-shape drift).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -241,36 +243,40 @@ int main(int argc, char** argv) {
   // Lock-step greedy decode under one option set: [seq][greedy] ids.
   auto greedy_run = [&](const OptSet& set) {
     apply(*m, set);
-    std::vector<int> sl(static_cast<size_t>(seqs));
+    const int group = set_seqs(set, seqs);  // sequences per pass (seqs=N)
     std::vector<int32_t> out(size_t(seqs) * size_t(greedy));
-    for (int s = 0; s < seqs; ++s) {
-      sl[size_t(s)] = m->slot_alloc();
-      TreeSpec t;
-      t.root = &win[size_t(s) * size_t(wlen)];
-      t.root_len = prompt;
-      t.save = sl[size_t(s)];
-      m->run({t});
-    }
-    std::vector<int32_t> cur(static_cast<size_t>(seqs)), nxt(static_cast<size_t>(seqs));
-    for (int s = 0; s < seqs; ++s) cur[size_t(s)] = tok(s, prompt);
-    for (int k = 0; k < greedy; ++k) {
-      std::vector<TreeSpec> ts;
-      for (int s = 0; s < seqs; ++s) {
-        TreeSpec d;
-        d.parent = d.save = sl[size_t(s)];
-        d.root = &cur[size_t(s)];
-        d.root_len = 1;
-        d.score_root = true;
-        d.out_argmax = &nxt[size_t(s)];
-        ts.push_back(d);
+    for (int s0 = 0; s0 < seqs; s0 += group) {
+      const int ns = std::min(group, seqs - s0);
+      std::vector<int> sl(static_cast<size_t>(ns));
+      for (int i = 0; i < ns; ++i) {
+        sl[static_cast<size_t>(i)] = m->slot_alloc();
+        TreeSpec t;
+        t.root = &win[size_t(s0 + i) * size_t(wlen)];
+        t.root_len = prompt;
+        t.save = sl[static_cast<size_t>(i)];
+        m->run({t});
       }
-      m->run(ts);
-      for (int s = 0; s < seqs; ++s) {
-        out[size_t(s) * size_t(greedy) + size_t(k)] = nxt[size_t(s)];
-        cur[size_t(s)] = nxt[size_t(s)];
+      std::vector<int32_t> cur(static_cast<size_t>(ns)), nxt(static_cast<size_t>(ns));
+      for (int i = 0; i < ns; ++i) cur[static_cast<size_t>(i)] = tok(s0 + i, prompt);
+      for (int k = 0; k < greedy; ++k) {
+        std::vector<TreeSpec> ts;
+        for (int i = 0; i < ns; ++i) {
+          TreeSpec d;
+          d.parent = d.save = sl[static_cast<size_t>(i)];
+          d.root = &cur[static_cast<size_t>(i)];
+          d.root_len = 1;
+          d.score_root = true;
+          d.out_argmax = &nxt[static_cast<size_t>(i)];
+          ts.push_back(d);
+        }
+        m->run(ts);
+        for (int i = 0; i < ns; ++i) {
+          out[size_t(s0 + i) * size_t(greedy) + size_t(k)] = nxt[static_cast<size_t>(i)];
+          cur[static_cast<size_t>(i)] = nxt[static_cast<size_t>(i)];
+        }
       }
+      for (int i = 0; i < ns; ++i) m->slot_free(sl[static_cast<size_t>(i)]);
     }
-    for (int s = 0; s < seqs; ++s) m->slot_free(sl[size_t(s)]);
     return out;
   };
 
