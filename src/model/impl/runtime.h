@@ -119,8 +119,8 @@ class Arena {
   // Private (GPU-only buffers) or Locked (shared buffers over mmap'd pages
   // locked with mlock: macOS compresses the idle GPU's memory, private or
   // shared, once free memory runs out, and the next pass pays to bring it
-  // back; locked pages it leaves alone). Private and Locked arenas are
-  // written by kernels only (no copy()).
+  // back; locked pages it leaves alone). A Private arena is written by
+  // kernels only (no copy()).
   enum class Mem { Shared, Private, Locked };
   explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false, Mem mem = Mem::Shared)
       : dev_(dev), chunk_(chunk), resident_(resident), mem_(mem) {}
@@ -193,7 +193,7 @@ class Arena {
   }
 
   Buf copy(const void* src, size_t n) {
-    if (mem_ != Mem::Shared) fail("Arena::copy into a GPU-only arena");
+    if (mem_ == Mem::Private) fail("Arena::copy into a GPU-only arena");
     Buf b = alloc(n);
     parallel_copy(ptr(b), src, n);
     return b;
@@ -267,7 +267,9 @@ struct Runtime {
     NSError* error = nil;
     lib = [dev newLibraryWithSource:src options:opts error:&error];
     if (!lib) fail(std::string("kernel compile failed: ") + [[error localizedDescription] UTF8String]);
-    arena = std::make_unique<Arena>(dev, size_t(1) << 30, true);
+    // ESPETERO_WEIGHTS_LOCK=1: the weights in memory locked with mlock, so an idle GPU's weights are not compressed
+    // (measured on Flash-Next: the first pass after 90 s of idle; a default would change every model's footprint).
+    arena = std::make_unique<Arena>(dev, size_t(1) << 30, true, env_on("ESPETERO_WEIGHTS_LOCK") ? Arena::Mem::Locked : Arena::Mem::Shared);
   }
 
   static std::string key_of(const std::string& name, int fc) { return fc ? name + "#" + std::to_string(fc) : name; }
