@@ -160,6 +160,13 @@ inline std::string gemv_micro_bench(Model& m) {
     add("gate", &L.gate);
     add("up", &L.up);
     add("down", &L.down);
+    // Qwen4-Exp hyper-connections (Flash-Next): the low-rank read [324 x 10240] (split-K in production) and
+    // the up projection [10240 x 320] (the hcmix GEMV in production: the same loads plus the mix epilogue).
+    for (const HCBlock* B : {&L.hca, &L.hcm})
+      if (B->present()) {
+        add("hc.down", &B->down);
+        add("hc.up", &B->up);
+      }
   }
   add("lm_head", &m.lm_head);
   int K = 64, N = 64;
