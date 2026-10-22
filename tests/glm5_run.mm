@@ -5,7 +5,11 @@
 // of the token ids tools/glm5_ref.py used (its case.json), every layer dumped
 // for tests/ref/glm5_compare.py.
 //
-//   build/glm5_run MODEL_DIR REF_DIR OUT_DIR [layers]
+//   build/glm5_run MODEL_DIR REF_DIR OUT_DIR [layers] [split]
+//
+// split P > 0: a pass over the first P ids, then one decode pass per remaining id (the state carried across
+// passes: KDA and conv states, latent and pooled-key caches, pending pool rows); the passes' dumps are merged
+// row by row into OUT_DIR, so the same comparison checks decoding.
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -29,13 +33,45 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids;
     for (const json::Value& v : cs.get("ids")->as_array()) ids.push_back(int32_t(v.as_int()));
     const int layers = argc > 4 ? std::atoi(argv[4]) : int(cs.get_int("layers", 0));
-    ::mkdir(argv[3], 0755);
+    const int split = argc > 5 ? std::atoi(argv[5]) : 0;
+    const std::string out = argv[3];
+    ::mkdir(out.c_str(), 0755);
     glm5::DevModel m(argv[1], std::string(espetero_kernels_metal, espetero_kernels_metal_len), layers,
                      std::max(4096, int(ids.size()) + 64));
     const auto t0 = Clock::now();
-    m.prefill(ids, argv[3]);
-    std::fprintf(stderr, "prefill of %zu tokens over %d layers: %.1f s (GPU %.1f ms)\n", ids.size(), m.layers(),
-                 ms_since(t0) / 1e3, m.gpu_ms());
+    if (split <= 0 || split >= int(ids.size())) {
+      m.prefill(ids, out);
+      std::fprintf(stderr, "prefill of %zu tokens over %d layers: %.1f s (GPU %.1f ms)\n", ids.size(), m.layers(),
+                   ms_since(t0) / 1e3, m.gpu_ms());
+      return 0;
+    }
+    std::vector<std::string> dirs;
+    auto pass = [&](const std::vector<int32_t>& v) {
+      const std::string d = out + "/pass" + std::to_string(dirs.size());
+      ::mkdir(d.c_str(), 0755);
+      m.prefill(v, d);
+      dirs.push_back(d);
+    };
+    pass(std::vector<int32_t>(ids.begin(), ids.begin() + split));
+    const double pre_ms = m.gpu_ms();
+    for (size_t i = size_t(split); i < ids.size(); ++i) pass({ids[i]});
+    const int nd = int(ids.size()) - split;
+    std::fprintf(stderr, "prefill of %d tokens, then %d decode steps over %d layers: GPU %.1f ms + %.2f ms per step\n", split, nd,
+                 m.layers(), pre_ms, (m.gpu_ms() - pre_ms) / nd);
+    // merge: every dump file of the passes, concatenated in pass order (rows); sel rows keep their width
+    for (int l = 0; l < m.layers(); ++l)
+      for (const char* kind : {"a", "f", "h", "route", "sel"}) {
+        const std::string name = std::string(kind) + std::to_string(l) + (kind[0] == 'r' || kind[0] == 's' ? ".i32" : ".f32");
+        std::string all;
+        bool any = false;
+        for (const std::string& d : dirs)
+          if (file_exists(d + "/" + name)) any = true, all += read_file(d + "/" + name);
+        if (!any) continue;
+        if (FILE* f = std::fopen((out + "/" + name).c_str(), "wb")) {
+          std::fwrite(all.data(), 1, all.size(), f);
+          std::fclose(f);
+        }
+      }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
