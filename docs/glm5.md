@@ -554,6 +554,25 @@ checked contiguous, the split expert recorded as two pieces).
    a chat, a tool call, an MTP-drafted decode; tok/s, first-token time at
    256 / 4 K tokens, memory (`--expert-cache-gb` default), cache hit rate.
 
+**Results so far** (2026-10-22, layers 0–3 of the FP8 checkpoint fetched by
+range: KDA, dense MLP, the first DSA layer with its indexer, the first MoE
+layer; Mac Studio M4 Max):
+
+| Check | 21-token chat | 2,138-token prompt |
+|:--|--:|--:|
+| `tools/glm5_ref.py` vs mlx-vlm 0.7.6's own layers (`tests/ref/glm5_mlx_check.py`), worst per-row relative L2 of a branch's update | 2.7e-4 | 3.1e-4 |
+| Espetero tier 0 (`build/glm5_run`) vs `tools/glm5_ref.py`, worst per-row relative L2 of the streams | 1.8e-4 | 9.2e-3 (median 1.4e-5) |
+| … the same, one prefill + decode steps (8 / 18 tokens) | identical bits | identical bits |
+| indexer selections, Espetero vs reference | identical | identical (all rows, top-512 regime included) |
+| routes (top-8 sets), Espetero vs reference | identical | 1 row differs (a near-tie: its row carries the 9.2e-3) |
+
+Layers 0–2 agree to 3e-6 (fp32 noise); layer 3's attention to 3.6e-4 (half
+latents); mlx-vlm's layer-3 MLP differs by 2–3e-4 because the check holds its
+expert stacks in float16. GPU time at tier 0: 55 ms for 21 tokens, 5.6 s for
+2,138 (KDA token by token, GEMVs per row), 4.3–6.0 ms per decoded token for
+these four layers. The native GGUF-block GEMVs (`tests/gguf_gemv_test.mm`)
+match gguf-py on random and real blocks of all nine types to ~1e-8.
+
 Determinism as DSv4: bit-reproducible passes except the pipelined MoE of long
 passes (its row sums depend on which experts were cached); exact comparisons
 run with `ESPETERO_*_PREFETCH=0 ESPETERO_*_PIPE=0`.
