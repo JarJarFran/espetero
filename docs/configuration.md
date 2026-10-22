@@ -131,7 +131,7 @@ stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.1; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.2; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers
 ```
 
 Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models with their
