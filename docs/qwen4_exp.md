@@ -474,12 +474,31 @@ next draft step: (argmax/sampled token, H^m pre-mixer) → same computation  ([M
   (a sibling whose config says `qwen4_exp_mtp`, e.g.
   `Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16`) is beside the model, loading it as
   stored (~1.5 GB resident; `--mtp own` forces it, `--mtp DIR` a drafter, whose
-  bf16 matrices become 8-bit copies, ~2.7 GB). Measured on the M4 Max (128 GB,
-  resident experts, three greedy 256-token replies through the server,
-  2026-10-22): the 4-bit head accepts 44 / 67 / 56 % of its drafts against the
-  bf16 drafter's 44 / 69 / 52 % and decodes at 66 / 89 / 77 tokens/s against
-  65 / 90 / 73 (plain decoding 58–59); the two heads' replies were identical on
-  the three prompts. Drafts are verified, but greedy replies still depend on
+  bf16 matrices become 8-bit copies, ~2.7 GB). The drafts score the coarse 2-bit
+  copy of the LM head over the draft vocabulary and the LM head over each row's
+  256 shortlisted column blocks (`--mtp-coarse`, the server's default, as the
+  Qwen3.5 models do; `--mtp-coarse 0` the 4-bit copy; both built at load): a
+  draft step 1.9 → 1.0 ms (the 4-bit copy 1.3), the verify passes unchanged
+  (21.9 / 25.0 / 25.6 ms for 1 / 2 / 3 drafts against a 16.7 ms plain step).
+  Measured on the M4 Max (128 GB, resident experts, three greedy 256-token
+  replies through the server, 2026-10-22):
+
+  | drafting | tokens/s on the three prompts | drafts accepted |
+  |:--|:--|:--|
+  | none (`--mtp none --speculation off --no-lookup`) | 58.7 / 59.5 / 58.9 | – |
+  | own 4-bit head, coarse LM head (default) | 71.7 / 97.2 / 84.3 | 44 / 67 / 56 % |
+  | own head, 4-bit LM head copy (`--mtp-coarse 0`) | 70.2 / 96.0 / 80.1 | 45 / 70 / 56 % |
+  | own head, whole 8-bit LM head (before) | 63.9 / 88.9 / 77.0 | 44 / 67 / 56 % |
+  | bf16 drafter directory, coarse LM head | 71.1 / 98.1 / 79.1 | 44 / 69 / 52 % |
+
+  The own head's replies equal the drafter's on the three prompts, and the
+  coarse shortlist gave the same drafts as the whole head (same pass counts).
+  With 8 users decoding at once (256 tokens each) the aggregate is 142.8
+  tokens/s with the own head against 167.2 with no drafting: the per-request
+  back-off (engine.cpp) judges a draft with the load-time single-user costs,
+  so a few requests keep drafting while every pass carries their verify rows;
+  a policy for concurrent decoding is W7's. Drafts are verified, but greedy
+  replies still depend on
   the decoding mode: a verify pass of 2–4 rows takes other expert kernels
   than the 1-row step (another summation order, like `route_par`'s), so plain
   decoding and the two heads diverge at near-ties on some prompts (one of
