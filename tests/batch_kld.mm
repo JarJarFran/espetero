@@ -83,9 +83,20 @@ OptSet parse_opts(const char* s) {
   return o;
 }
 
+// "seqs=N" in a set is not a model option: the set's teacher-forced passes
+// run N sequences at a time (N-row passes) instead of all of them together,
+// so a set "seqs=1" measures the batch-shape drift of the engine itself (the
+// 1-row kernels against the 16-row ones) with the same reference.
 void apply(NativeModel& m, const OptSet& o) {
-  for (const auto& [k, v] : o.kv)
+  for (const auto& [k, v] : o.kv) {
+    if (k == "seqs") continue;
     if (!m.set_option(k, v)) throw std::runtime_error("unknown option " + k);
+  }
+}
+int set_seqs(const OptSet& o, int dflt) {
+  for (const auto& [k, v] : o.kv)
+    if (k == "seqs") return std::max(1, std::min(dflt, v));
+  return dflt;
 }
 
 // log-softmax of a logits row into out (double accumulation for the sum).
@@ -165,62 +176,67 @@ int main(int argc, char** argv) {
   std::vector<float> row(static_cast<size_t>(V)), lsm(static_cast<size_t>(V));
   auto teacher = [&](const OptSet& set, bool fill, Stats& st) {
     apply(*m, set);
-    std::vector<int> sl(static_cast<size_t>(seqs));
-    for (int s = 0; s < seqs; ++s) {
-      sl[size_t(s)] = m->slot_alloc();
-      if (sl[size_t(s)] < 0) throw std::runtime_error("no free slot");
-      TreeSpec t;
-      t.root = &win[size_t(s) * size_t(wlen)];
-      t.root_len = prompt;
-      t.save = sl[size_t(s)];
-      m->run({t});
-    }
-    std::vector<int32_t> next(static_cast<size_t>(seqs));
-    for (int k = 0; k < steps; ++k) {
-      std::vector<TreeSpec> ts;
-      for (int s = 0; s < seqs; ++s) {
-        next[size_t(s)] = tok(s, prompt + k);
-        TreeSpec d;
-        d.parent = d.save = sl[size_t(s)];
-        d.root = &next[size_t(s)];
-        d.root_len = 1;
-        d.score_root = true;
-        d.want_logits = true;
-        ts.push_back(d);
+    const int group = set_seqs(set, seqs);  // sequences per pass
+    for (int s0 = 0; s0 < seqs; s0 += group) {
+      const int ns = std::min(group, seqs - s0);
+      std::vector<int> sl(static_cast<size_t>(ns));
+      for (int i = 0; i < ns; ++i) {
+        sl[static_cast<size_t>(i)] = m->slot_alloc();
+        if (sl[static_cast<size_t>(i)] < 0) throw std::runtime_error("no free slot");
+        TreeSpec t;
+        t.root = &win[size_t(s0 + i) * size_t(wlen)];
+        t.root_len = prompt;
+        t.save = sl[static_cast<size_t>(i)];
+        m->run({t});
       }
-      PassStats ps;
-      m->run(ts, &ps);
-      if (k == 1) st.dispatches = ps.dispatches;
-      for (int s = 0; s < seqs; ++s) {
-        const float* lg = m->logits(s, 0);
-        std::memcpy(row.data(), lg, size_t(V) * 4);
-        log_softmax(row.data(), V, lsm.data());
-        const int am = int(std::max_element(lsm.begin(), lsm.end()) - lsm.begin());
-        const int32_t truth = tok(s, prompt + k + 1);
-        const size_t base = (size_t(k) * size_t(seqs) + size_t(s)) * size_t(V);
-        if (fill) {
-          std::memcpy(ref.data() + base, lsm.data(), size_t(V) * 4);
-          ref_argmax[size_t(k) * size_t(seqs) + size_t(s)] = am;
-          st.top1_true_a += am == truth;
-        } else {
-          const float* la = ref.data() + base;
-          double kl = 0.0, mdlp = 0.0;
-          for (int i = 0; i < V; ++i) {
-            const double d = double(la[i]) - double(lsm[size_t(i)]);
-            kl += std::exp(double(la[i])) * d;
-            mdlp = std::max(mdlp, std::fabs(d));
-          }
-          st.kld.push_back(kl);
-          st.max_dlp = std::max(st.max_dlp, mdlp);
-          const int ama = ref_argmax[size_t(k) * size_t(seqs) + size_t(s)];
-          st.top1_agree += am == ama;
-          st.top1_true_b += am == truth;
-          st.top1_true_a += ama == truth;
+      std::vector<int32_t> next(static_cast<size_t>(ns));
+      for (int k = 0; k < steps; ++k) {
+        std::vector<TreeSpec> ts;
+        for (int i = 0; i < ns; ++i) {
+          next[static_cast<size_t>(i)] = tok(s0 + i, prompt + k);
+          TreeSpec d;
+          d.parent = d.save = sl[static_cast<size_t>(i)];
+          d.root = &next[static_cast<size_t>(i)];
+          d.root_len = 1;
+          d.score_root = true;
+          d.want_logits = true;
+          ts.push_back(d);
         }
-        ++st.n;
+        PassStats ps;
+        m->run(ts, &ps);
+        if (k == 1 && s0 == 0) st.dispatches = ps.dispatches;
+        for (int i = 0; i < ns; ++i) {
+          const int s = s0 + i;
+          const float* lg = m->logits(i, 0);
+          std::memcpy(row.data(), lg, size_t(V) * 4);
+          log_softmax(row.data(), V, lsm.data());
+          const int am = int(std::max_element(lsm.begin(), lsm.end()) - lsm.begin());
+          const int32_t truth = tok(s, prompt + k + 1);
+          const size_t base = (size_t(k) * size_t(seqs) + size_t(s)) * size_t(V);
+          if (fill) {
+            std::memcpy(ref.data() + base, lsm.data(), size_t(V) * 4);
+            ref_argmax[size_t(k) * size_t(seqs) + size_t(s)] = am;
+            st.top1_true_a += am == truth;
+          } else {
+            const float* la = ref.data() + base;
+            double kl = 0.0, mdlp = 0.0;
+            for (int j = 0; j < V; ++j) {
+              const double d = double(la[j]) - double(lsm[size_t(j)]);
+              kl += std::exp(double(la[j])) * d;
+              mdlp = std::max(mdlp, std::fabs(d));
+            }
+            st.kld.push_back(kl);
+            st.max_dlp = std::max(st.max_dlp, mdlp);
+            const int ama = ref_argmax[size_t(k) * size_t(seqs) + size_t(s)];
+            st.top1_agree += am == ama;
+            st.top1_true_b += am == truth;
+            st.top1_true_a += ama == truth;
+          }
+          ++st.n;
+        }
       }
+      for (int i = 0; i < ns; ++i) m->slot_free(sl[static_cast<size_t>(i)]);
     }
-    for (int s = 0; s < seqs; ++s) m->slot_free(sl[size_t(s)]);
   };
   // Lock-step greedy decode under one option set: [seq][greedy] ids.
   auto greedy_run = [&](const OptSet& set) {
