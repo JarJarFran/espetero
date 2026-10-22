@@ -1064,7 +1064,13 @@ static inline void load_kstep(device const uint4* wp, device const uint* hp, int
 // front, so a lane holds MM x 8 accumulators but only MM activations.
 // LIST (store epilogue, no K split): threadgroup i computes column block
 // blist[i] (-1: nothing), so a GEMV can cover a shortlist of blocks.
-template <int BITS, int MM, int EPI, int KS, int NRM, int JIT = 0, int LIST = 0>
+// SEP (Fase 3, short-K matrices of at most 8 K steps, e.g. Flash-Next's
+// hyper-connection up projection 10240 x 320): the KS simdgroups take the K
+// steps round-robin and reduce every step on its own into part[step], and
+// the block sum runs over the 8 step slots in step order: the same sums the
+// 8-simdgroup kernel forms (simdgroup s = step s, zeros past the last step)
+// from a threadgroup of 32 * KS threads instead of 256. No PF, no K split.
+template <int BITS, int MM, int EPI, int KS, int NRM, int JIT = 0, int LIST = 0, int SEP = 0>
 kernel void rgemv(
     device const void* Av [[buffer(0)]],
     device const uint* Wr [[buffer(1)]],
@@ -1128,9 +1134,14 @@ kernel void rgemv(
   float acc[MM][8];
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
+  threadgroup float part[SEP ? 8 : KS][MM][32];
+  if (SEP) {  // every step slot starts at zero (steps past the last stay zero, as idle simdgroups' would)
+    for (int i = int(sgid) * 32 + int(lane); i < 8 * MM * 32; i += KS * 32) (&part[0][0][0])[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   uint words[4 * WPL], hw[4] = {0u, 0u, 0u, 0u};
   if (ESPETERO_PF && g_begin < g_end) load_kstep<BITS, WPL>(wp, hp, g_begin, words, hw);
-  for (int g = g_begin; g < g_end; ++g) {
+  for (int g = SEP ? gk0 + int(sgid) : g_begin; g < (SEP ? gk1 : g_end); g += SEP ? KS : 1) {
     // Software pipeline: the next K step's weight words are requested before
     // this step's dequantization and FMAs, so two steps' loads are in flight
     // per simdgroup (the loop was latency-bound: ~2.7 us per 64-wide step).
@@ -1201,7 +1212,30 @@ kernel void rgemv(
       UNROLL for (int i = 0; i < 4 * WPL; ++i) words[i] = wnext[i];
       UNROLL for (int i = 0; i < 4; ++i) hw[i] = hnext[i];
     }
+    if (SEP) {
+      // This step's partial on its own: the 8 k-row lanes reduced, stored in
+      // the step's slot (the 8-simdgroup kernel's simdgroup = step layout).
+      UNROLL for (int m = 0; m < MM; ++m)
+        UNROLL for (int c = 0; c < 8; ++c) {
+          float v = acc[m][c];
+          v += simd_shuffle_xor(v, ushort(2));
+          v += simd_shuffle_xor(v, ushort(4));
+          v += simd_shuffle_xor(v, ushort(16));
+          acc[m][c] = v;
+        }
+      const int slot = min(7, g - gk0);
+      if (fm == 0) {
+        UNROLL for (int m = 0; m < MM; ++m)
+          UNROLL for (int j = 0; j < 4; ++j) {
+            part[slot][m][j * 8 + fn] = acc[m][2 * j];
+            part[slot][m][j * 8 + fn + 1] = acc[m][2 * j + 1];
+          }
+      }
+      UNROLL for (int m = 0; m < MM; ++m)
+        UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
+    }
   }
+  if (!SEP) {
   // Sum the 8 lanes that hold different k rows (fm: lane bits 1, 2 and 4).
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) {
@@ -1211,7 +1245,6 @@ kernel void rgemv(
       v += simd_shuffle_xor(v, ushort(16));
       acc[m][c] = v;
     }
-  threadgroup float part[KS][MM][32];
   if (fm == 0) {
     UNROLL for (int m = 0; m < MM; ++m)
       UNROLL for (int j = 0; j < 4; ++j) {
@@ -1219,12 +1252,13 @@ kernel void rgemv(
         part[sgid][m][j * 8 + fn + 1] = acc[m][2 * j + 1];
       }
   }
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   threadgroup float red[MM][32];  // the block's 32 column sums per row
   const int c = lane;
   if (sgid == 0) UNROLL for (int m = 0; m < MM; ++m) {
     float v = 0.0f;
-    UNROLL for (int k = 0; k < KS; ++k) v += part[k][m][c];
+    UNROLL for (int k = 0; k < (SEP ? 8 : KS); ++k) v += part[k][m][c];
     red[m][c] = v;
   }
   if (nsplit > 1) {
@@ -1357,6 +1391,15 @@ INSTANTIATE_RGEMV("rgemv8_", 8)
 #define INSTANTIATE_RGEMV_HCMIX(PRE, BITS)                                                           \
   template [[host_name(PRE "1_hcmix")]] kernel void rgemv<BITS, 1, 4, 8, 3>(RGEMV_ARGS);            \
   template [[host_name(PRE "2_hcmix")]] kernel void rgemv<BITS, 2, 4, 8, 3>(RGEMV_ARGS);
+// Fase 3 (option hc_sep): short-K variants, 32 * KS threads, per-step partials (SEP).
+#define INSTANTIATE_RGEMV_SEP(PRE, BITS, KS)                                                         \
+  template [[host_name(PRE "1sep" #KS "_hcmix")]] kernel void rgemv<BITS, 1, 4, KS, 3, 0, 0, 1>(RGEMV_ARGS); \
+  template [[host_name(PRE "1sep" #KS "_store")]] kernel void rgemv<BITS, 1, 0, KS, 0, 0, 0, 1>(RGEMV_ARGS);
+#define INSTANTIATE_RGEMV_SEPS(PRE, BITS) INSTANTIATE_RGEMV_SEP(PRE, BITS, 1) INSTANTIATE_RGEMV_SEP(PRE, BITS, 2) INSTANTIATE_RGEMV_SEP(PRE, BITS, 4)
+INSTANTIATE_RGEMV_SEPS("rgemv4_", 4)
+INSTANTIATE_RGEMV_SEPS("rgemv5_", 5)
+INSTANTIATE_RGEMV_SEPS("rgemv6_", 6)
+INSTANTIATE_RGEMV_SEPS("rgemv8_", 8)
 INSTANTIATE_RGEMV_HCMIX("rgemv4_", 4)
 INSTANTIATE_RGEMV_HCMIX("rgemv5_", 5)
 INSTANTIATE_RGEMV_HCMIX("rgemv6_", 6)

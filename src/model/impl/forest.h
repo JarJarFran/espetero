@@ -1621,7 +1621,10 @@ inline void q4_hc_read(Model& m, Enc& E, const HCBlock& B, bool inject, const Bu
   static const bool hcmix = !(std::getenv("ESPETERO_Q4_HCMIX") && *std::getenv("ESPETERO_Q4_HCMIX") == '0');
   if (hcmix && rows <= std::min(2, m.tune.gemv_max_m) && m.tune.gemv && !B.up.dense) {
     const QW& w = B.up.q;
-    const std::string name = "rgemv" + std::to_string(w.bits) + "_" + std::to_string(rows) + "_hcmix";
+    // hc_sep (Fase 3): the short-K kernel (K <= 8 steps, 32 * hc_sep threads, the same sums), single row.
+    const int sep = (m.hc_sep > 0 && rows == 1 && w.in / 64 <= 8) ? m.hc_sep : 0;
+    const std::string name = "rgemv" + std::to_string(w.bits) + "_" + std::to_string(rows) +
+                             (sep ? "sep" + std::to_string(sep) : "") + "_hcmix";
     E.pipe(name, w.fc());
     gemm_tag(E, name, w.out, w.in, rows);
     const GemmParams gp{rows, w.out, w.in, dn_ld, c.D, 0, 0};
@@ -1643,7 +1646,7 @@ inline void q4_hc_read(Model& m, Enc& E, const HCBlock& B, bool inject, const Bu
     E.rd(q.N16);
     E.wr(q.inj);
     E.wr(xout);
-    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
+    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(size_t(sep ? 32 * sep : 256), 1, 1));
     return;
   }
   E.pipe("q4_hc_gates");

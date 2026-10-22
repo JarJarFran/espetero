@@ -302,6 +302,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_COMB_KS")) m.moe_comb_ks = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_FIN")) m.moe_fin = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX")) m.moe_fma_mix = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_HC_SEP")) m.hc_sep = std::atoi(v) == 1 || std::atoi(v) == 2 || std::atoi(v) == 4 ? std::atoi(v) : 0;
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX_ROWS")) m.moe_fma_mix_rows = std::max(3, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_MOE_PF")) m.moe_pf = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GEMV_FIN")) m.tune.gemv_fin = std::max(0, std::min(2, std::atoi(v)));
@@ -898,6 +899,7 @@ class MetalModel final : public NativeModel {
     else if (name == "moe_comb_ks") m_.moe_comb_ks = value;
     else if (name == "moe_fin") m_.moe_fin = std::max(0, std::min(2, value));
     else if (name == "moe_fma_mix") m_.moe_fma_mix = value != 0;
+    else if (name == "hc_sep") m_.hc_sep = value == 1 || value == 2 || value == 4 ? value : 0;
     else if (name == "moe_fma_mix_rows") m_.moe_fma_mix_rows = std::max(3, value);
     else if (name == "moe_pf") m_.moe_pf = value != 0;
     else if (name == "gemv_fin") m_.tune.gemv_fin = std::max(0, std::min(2, value));

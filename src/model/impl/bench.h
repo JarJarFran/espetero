@@ -190,6 +190,7 @@ inline std::string gemv_micro_bench(Model& m) {
       {"m4_nomma", 4, "rgemv8r%_d1_store"}, {"m4_noload", 4, "rgemv8r%_d2_store"}, {"m4_nodq", 4, "rgemv8r%_d3_store"},
       {"m3_fma", 3, "rgemv%_3_store"}, {"m4_fma", 4, "rgemv%_4_store"},
       {"m3_fmajit", 3, "rgemv%_3j_store"}, {"m4_fmajit", 4, "rgemv%_4j_store"},
+      {"m1_sep1", 1, "rgemv%_1sep1_store"}, {"m1_sep2", 1, "rgemv%_1sep2_store"}, {"m1_sep4", 1, "rgemv%_1sep4_store"},
   };
   const bool serial0 = m.serial, ball0 = m.barrier_all;
   const std::string diag0 = m.tune.diag_kernel;
@@ -216,6 +217,7 @@ inline std::string gemv_micro_bench(Model& m) {
   auto available = [&](const Kind& k, const Variant& v) {
     if (!*v.kernel) return true;
     std::string name = v.kernel;
+    if (name.find("sep") != std::string::npos && k.mats[0]->in() / 64 > 8) return false;  // short-K kernels only
     name.replace(name.find('%'), 1, std::to_string(k.mats[0]->q.bits));
     try {
       (void)m.kernel(name, k.mats[0]->q.fc());

@@ -277,7 +277,9 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.bytes(5, p);
     E.rd(A, aoff, aoff + a_bytes);
     E.wr(Y, yoff, yoff + y_bytes);
-    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
+    const size_t sp = name.find("sep");  // the SEP variants run 32 * KS threads
+    const int sep_ks = sp != std::string::npos ? name[sp + 3] - '0' : 0;
+    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(size_t(sep_ks > 0 ? 32 * sep_ks : 256), 1, 1));
     return;
   }
   if (M <= T.gemv_max_m && (T.gemv || n_cols > 0)) {
