@@ -356,7 +356,8 @@ class DevModel {
             id<MTLBuffer> ysc = nil, size_t yso = 0) {
     if (M <= 0) return;
     E.pipe(m.fmt == kF8B ? "ds4_gemv_f8b" : m.fmt == kBF16 ? "ds4_gemv_bf16" : "ds4_gemv_f32");
-    GemvP p{m.N, m.K, M, xs, ys, 0, 0, accum ? 1 : 0, xrow ? 1 : 0, 8};
+    // indexed rows when any of xrow / yrow / ysc is given (the others default to the identity and 1.0)
+    GemvP p{m.N, m.K, M, xs, ys, 0, 0, accum ? 1 : 0, xrow || yrow || ysc ? 1 : 0, 8};
     E.set(0, m.w);
     E.set(1, m.s.b ? m.s : m.w);
     E.set(2, X, xoff);
