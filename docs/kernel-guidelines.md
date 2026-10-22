@@ -411,6 +411,17 @@ Rules that keep the tiers honest:
   expert kernels then stream 1.2 GB (gate/up, 3.44 ms, 357 GB/s) and 0.6 GB
   (down, 1.78 ms, 341 GB/s) per step; a real 16-row step would be ~30 ms, not
   25. The 1-row step is representative (k + shared experts per layer).
+- **Flash-Next's hyper-connection GEMVs are latency-bound, not occupancy-bound**
+  (M4 Max, `bench_native --micro gemv`, 16-deep dependent chains): the up /
+  mix projection 10240×320 (5 K steps) runs 6.1–7.6 µs per call (300–350
+  GB/s; 512 GB/s for the 8-bit one) and the low-rank read 324×10240 (split-K
+  8) 7.7–10.7 µs (230–250 GB/s; 376 for 8-bit); the isolated `--profile`
+  numbers (13 / 12 µs) are mostly command-buffer overhead. A short-K kernel
+  with per-step partials on 1–4 simdgroups (`hc_sep`, the same sums as the
+  256-thread kernel's step-ordered simdgroup partials) measures the same in
+  chain (5.8–8.2 µs) and on the whole step (GPU 15.87–15.92 → 15.81–16.05 ms),
+  bit-identical: off. The 96 blocks' GEMVs cost ~1.6 ms of the 15.9 ms step;
+  at 500 GB/s they would cost 0.9.
 - **The device profile measures 2.12 µs per dependent tiny dispatch on the
   M4 Max** (`gather_rows_f32` over 2048 floats, 64-deep chain, serial
   encoder; family 2 = Apple9), cached in device-profile-r1-Apple_M4_Max.json.
