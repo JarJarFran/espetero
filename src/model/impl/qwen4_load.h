@@ -468,7 +468,9 @@ inline void ensure_ngram_preload(const NgramTable& T) {
   }).detach();
 }
 
-inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision) {
+// draft_head: an MTP head will draft; its 2-bit coarse LM head (mtp.coarse_c > 0) and 4-bit head (mtp.head4)
+// are built from the LM head as load_decoder does (a draft step read the whole 8-bit head, 675 MB, before).
+inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head) {
   Config& c = m.cfg;
   c.validate();
   const std::string pre = "language_model.model.";
@@ -477,8 +479,16 @@ inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision) {
     load_embedding(m, tmp, src, pre + "embed_tokens.weight");
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    m.lm_head = finish(m, e, tmp, q4_mat(m, tmp, src, c.tie ? pre + "embed_tokens.weight" : "language_model.lm_head.weight",
-                                           c.V, c.D));
+    const HostMat h = q4_mat(m, tmp, src, c.tie ? pre + "embed_tokens.weight" : "language_model.lm_head.weight", c.V, c.D);
+    if (draft_head && m.mtp.head4) {
+      m.mtp.head = finish(m, e, tmp, requant4(tmp, h));
+      --m.n_q4;  // not a decoder matrix
+    }
+    if (draft_head && m.mtp.coarse_c > 0 && !h.dense) {
+      m.mtp.coarse = finish(m, e, tmp, requant<2>(tmp, h));
+      --m.n_q8;  // not a decoder matrix (finish counts widths without a counter as 8-bit)
+    }
+    m.lm_head = finish(m, e, tmp, h);
     [e endEncoding];
     commit_wait(cb);
   }
