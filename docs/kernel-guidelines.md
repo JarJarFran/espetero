@@ -459,7 +459,13 @@ Rules that keep the tiers honest:
   rest. For scale, the EQ references on the same text give the 4-bit MLX
   file itself KLD mean 0.069 / median 0.026 against fp32, and a bf16 run
   against the bf16 reference mean 0.0034 / median 0.0007: the options' drift
-  is below the bf16 arithmetic noise floor. Flash-Next oQ4e is untouched by
+  is below the bf16 arithmetic noise floor. The engine's own batch-shape
+  drift measured the same way (the same tokens through 1-row passes against
+  the 16-row ones: the FMA expert kernels, fused norms and the parallel
+  route against the MMA tiles, split-K GEMMs and the router GEMM) is KLD
+  mean 9.2e-4 / median 7.9e-5, top-1 agreement 99.15 %, greedy replies
+  identical for 10 of 16 sequences (835 of 1024 tokens): the shared-tile
+  option drifts exactly that much, route_sg 1.4× it, both 1.6×. Flash-Next oQ4e is untouched by
   both (bf16 router: no `router_sg`; 8-bit shared expert: no grouped tile
   above 2 rows): KLD 0, identical dispatches and replies.
 
