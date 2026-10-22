@@ -422,6 +422,13 @@ Rules that keep the tiers honest:
   chain (5.8–8.2 µs) and on the whole step (GPU 15.87–15.92 → 15.81–16.05 ms),
   bit-identical: off. The 96 blocks' GEMVs cost ~1.6 ms of the 15.9 ms step;
   at 500 GB/s they would cost 0.9.
+- **Flash-Next's 0.88 ms of encode per step is a warm-up, not a steady cost**:
+  `bench_native --q4` reports 0.82–0.90 ms over its first 128–200 steps and
+  0.28 ms (1.7 % of the step) as the median over 1500; a CPU sample of the
+  loop shows the main thread waiting on the GPU with Metal's own
+  `setBuffer` / enqueue calls as the remaining encode work (`ngram_read_row`
+  is the only engine function in the top of the stack). The server hides it
+  anyway with `chain_steps` 8 on greedy decode.
 - **The device profile measures 2.12 µs per dependent tiny dispatch on the
   M4 Max** (`gather_rows_f32` over 2048 floats, 64-deep chain, serial
   encoder; family 2 = Apple9), cached in device-profile-r1-Apple_M4_Max.json.
