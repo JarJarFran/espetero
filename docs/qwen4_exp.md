@@ -548,7 +548,9 @@ fills it) and the GPU goes idle, macOS unwires its memory (`iogpu.wired_lwm_mb`
 0) and compresses it, private or shared (51–55 GB in the compressor), and the
 next pass decompresses it before its command buffer can start; locked pages are
 left alone, and the 2.1 s that remain after an idle are the rest of the model's
-memory (weights, pools) going the same way. `ESPETERO_XRES_MEM=private|shared`
+memory going the same way: with the weights arena locked too
+(`ESPETERO_WEIGHTS_LOCK=1`, an option: it would change every model's footprint)
+1.24 s, the rest being the pools and scratch. `ESPETERO_XRES_MEM=private|shared`
 selects the other kinds; `ESPETERO_BENCH_SLEEP=S` idles `bench_native --q4`
 between the load and its first pass to reproduce the effect.
 

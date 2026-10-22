@@ -272,7 +272,8 @@ Rules that keep the tiers honest:
   set does not prevent it. Pages locked with `mlock` and wrapped with
   `newBufferWithBytesNoCopy` (the DeepSeek-V4.1 expert pool, now the
   resident experts) are never compressed: 0.38 s, and 2.1 s after the idle
-  (the weights and pools, not locked, still are).
+  (the weights and pools, not locked, still are; the weights locked as well,
+  `ESPETERO_WEIGHTS_LOCK=1`: 1.24 s).
 - **Two multi-row switches measured slower, off by default:**
   `ESPETERO_FUSE_NORM_MAXM=8` (fused norms up to 8 rows) +2.4% per step at
   4 rows, +4.7% at 8; `ESPETERO_FMA34=1 ESPETERO_GEMV_MAXM=4` (FMA GEMV up
