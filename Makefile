@@ -119,6 +119,14 @@ $(BUILD)/topk_test: tests/topk_test.mm $(BUILD)/model.o $(BUILD)/json.o $(BUILD)
 $(BUILD)/gguf_iq_test: tests/gguf_iq_test.mm $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
+# Native GGUF-block GEMVs on the GPU against gguf-py (python3 tests/ref/gguf_iq_ref.py OUT --types ...; a GPU job)
+$(BUILD)/gguf_gemv_test: tests/gguf_gemv_test.mm $(BUILD)/kernels_src.h $(MODEL_HDRS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -I$(BUILD) tests/gguf_gemv_test.mm $(FRAMEWORKS) -o $@
+
+# GLM-5.3-Flash development driver: build/glm5_run MODEL_DIR REF_DIR OUT_DIR [layers] (tools/glm5_ref.py's case)
+$(BUILD)/glm5_run: tests/glm5_run.mm $(BUILD)/kernels_src.h $(BUILD)/json.o $(MODEL_HDRS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -I$(BUILD) tests/glm5_run.mm $(BUILD)/json.o $(FRAMEWORKS) -o $@
+
 # GLM-5.3-Flash loader skeleton without a GPU: config and checkpoint index on a (fake) checkpoint directory
 # (python3 -I tests/ref/glm5_ref.py fake-ckpt DIR; build/glm5_load_test DIR).
 $(BUILD)/glm5_load_test: tests/glm5_load_test.mm $(BUILD)/json.o

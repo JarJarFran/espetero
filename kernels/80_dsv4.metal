@@ -95,7 +95,8 @@ kernel void ds4_quant(device float* x [[buffer(0)]], constant Ds4QuantP& p [[buf
 // ---------------------------------------------------------------------------
 // GEMV over up to 8 activation rows: Y[yrow[m]][n] (=|+=) scale_m * sum_k W[n][k] X[xrow[m]][k].
 // FMT 0: fp8 e4m3, scales [N/32][K/32]; 1: fp4 e2m1 rows of K/2 bytes, scales
-// [N][K/32]; 2: bf16; 3: fp32. A simdgroup computes one output row at a time,
+// [N][K/32]; 2: bf16; 3: fp32; 4: fp8 e4m3 with one fp32 scale per 128 x 128
+// block, [N/128][K/128] (GLM-5.3-Flash, docs/glm5.md 10). A simdgroup computes one output row at a time,
 // each lane reading 16-byte chunks along K. Grid: (ceil(N / 8), ceil(M / 8)),
 // 256 threads (8 simdgroups, one row each per step).
 struct Ds4GemvP {
@@ -112,7 +113,7 @@ template <int FMT>
 static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, device const float* X, device float* Y,
                                  constant Ds4GemvP& p, device const int* xrow, device const int* yrow,
                                  device const float* ysc, uint2 tg, uint sg, uint lane) {
-  constexpr int E = FMT == 0 ? 16 : FMT == 1 ? 32 : FMT == 2 ? 8 : 4;  // elements per 16-byte chunk
+  constexpr int E = FMT == 0 || FMT == 4 ? 16 : FMT == 1 ? 32 : FMT == 2 ? 8 : 4;  // elements per 16-byte chunk
   const int m0 = int(tg.y) * kDs4GemvM;
   const int mr = min(kDs4GemvM, p.M - m0);
   if (mr <= 0) return;
@@ -124,7 +125,7 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
   }
   const int kb = p.K / 32;
   const int chunks = p.K / E;
-  const ulong row_bytes = FMT == 0 ? ulong(p.K) : FMT == 1 ? ulong(p.K / 2) : FMT == 2 ? ulong(p.K) * 2 : ulong(p.K) * 4;
+  const ulong row_bytes = FMT == 0 || FMT == 4 ? ulong(p.K) : FMT == 1 ? ulong(p.K / 2) : FMT == 2 ? ulong(p.K) * 2 : ulong(p.K) * 4;
   const int n_end = min(p.N, int(tg.x + 1) * p.nrow_tg);
   if (mr == 1 && !p.grp && FMT == 0 && p.nrow_tg == 32) {
     // one row of X (decode): each simdgroup takes 4 output rows at once, so a chunk of X is read once for
@@ -181,8 +182,9 @@ static inline void ds4_gemv_impl(device const uchar* W, device const uchar* S, d
       const uint4 w = wr[c];
       float wv[E];
       float sc = 1.0f;
-      if (FMT == 0) {
-        sc = ds4_e8m0(S[ulong(n / 32) * ulong(kb) + ulong(c / 2)]) * 256.0f;
+      if (FMT == 0 || FMT == 4) {
+        sc = FMT == 0 ? ds4_e8m0(S[ulong(n / 32) * ulong(kb) + ulong(c / 2)]) * 256.0f
+                      : ((device const float*)S)[ulong(n / 128) * ulong(p.K / 128) + ulong(c / 8)] * 256.0f;
         const uint ws[4] = {w.x, w.y, w.z, w.w};
         for (int j = 0; j < 4; ++j) {
           const half2 a = ds4_e4m3x2(ws[j]), b = ds4_e4m3x2(ws[j] >> 16);
@@ -250,6 +252,7 @@ DS4_GEMV(ds4_gemv_f8, 0)
 DS4_GEMV(ds4_gemv_f4, 1)
 DS4_GEMV(ds4_gemv_bf16, 2)
 DS4_GEMV(ds4_gemv_f32, 3)
+DS4_GEMV(ds4_gemv_f8b, 4)
 
 // ---------------------------------------------------------------------------
 struct Ds4HcP {
