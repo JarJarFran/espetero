@@ -566,6 +566,9 @@ layer; Mac Studio M4 Max):
 | indexer selections, Espetero vs reference | identical | identical (all rows, top-512 regime included) |
 | routes (top-8 sets), Espetero vs reference | identical | 1 row differs (a near-tie: its row carries the 9.2e-3) |
 
+| UD-IQ3_XXS slice (blocks 0–3, GGUF through the native block kernels) vs `tools/glm5_ref.py` on the same GGUF weights | 1.0e-4 | 1.5e-4 (prefill + 18 decode steps; routes identical, selections differ in 2 rows) |
+| UD-IQ3_XXS's own distance from the FP8 weights (the two references) | 2–3 % in layers 0–2, 20 % after the IQ2_S / IQ3_S MoE (routes differ in 9 / 21 rows) | |
+
 Layers 0–2 agree to 3e-6 (fp32 noise); layer 3's attention to 3.6e-4 (half
 latents); mlx-vlm's layer-3 MLP differs by 2–3e-4 because the check holds its
 expert stacks in float16. GPU time at tier 0: 55 ms for 21 tokens, 5.6 s for
