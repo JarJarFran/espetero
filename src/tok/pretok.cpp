@@ -42,6 +42,10 @@ std::optional<SplitPattern> split_pattern_from_gguf_pre(std::string_view pre) {
   if (pre == "qwen35") return SplitPattern::kQwen35;
   if (pre == "qwen2" || pre == "deepseek-r1-qwen") return SplitPattern::kQwen2;
   if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe") return SplitPattern::kLlama3;
+  // GLM-4.5 / GLM-5 (llama.cpp's CHATGLM4 type): Llama-3's pieces, contractions spelled case by case (the same
+  // pieces but for U+017F, which (?i) folds to 's'); llama.cpp also sets ignore_merges for these, as the
+  // Llama-3 pattern does here.
+  if (pre == "glm4" || pre == "glm5") return SplitPattern::kLlama3;
   if (pre == "deepseek-v3") return SplitPattern::kDeepSeekV3;
   if (pre == "lfm2") return SplitPattern::kLfm2;
   return std::nullopt;

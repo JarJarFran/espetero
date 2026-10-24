@@ -36,8 +36,13 @@ int main(int argc, char** argv) {
     const int split = argc > 5 ? std::atoi(argv[5]) : 0;
     const std::string out = argv[3];
     ::mkdir(out.c_str(), 0755);
+    const char* cslots = std::getenv("ESPETERO_GLM5_CACHE_SLOTS");  // a small expert cache (eviction tests)
     glm5::DevModel m(argv[1], std::string(espetero_kernels_metal, espetero_kernels_metal_len), layers,
-                     std::max(4096, int(ids.size()) + 64));
+                     std::max(4096, int(ids.size()) + 64), 1, 4096, 0, cslots ? std::atoi(cslots) : 0);
+    struct Report {
+      glm5::DevModel& m;
+      ~Report() { std::fprintf(stderr, "expert cache: %s\n", m.cache_json().c_str()); }
+    } report{m};
     const auto t0 = Clock::now();
     if (split <= 0 || split >= int(ids.size())) {
       m.prefill(ids, out);

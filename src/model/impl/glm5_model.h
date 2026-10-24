@@ -24,6 +24,7 @@
 
 #include "glm5.h"
 #include "gguf.h"
+#include "../api.h"
 
 namespace espetero::native::glm5 {
 
@@ -90,6 +91,15 @@ inline const char* gguf_suffix(int t) {
   fail("glm5: GGUF type " + std::to_string(t) + " has no native kernel");
 }
 
+// A sequence's state (a slot): per KDA layer the recurrent state [H][128 v][128 k] and the conv state [3][3C]
+// (fp32); per DSA layer the latents (half [cap][512]), the pooled indexer keys (half [cap / 4][128]) and the
+// key | gate rows of the incomplete pool (fp32 [4][256]).
+struct Seq {
+  bool used = false;
+  int len = 0;
+  std::vector<id<MTLBuffer>> kda, conv, lat, pooled, pend;
+};
+
 struct LayerW {
   bool dsa = false, moe = false;
   Buf attn_norm, ffn_norm, hca_fn, hca_base, hca_scale, hcf_fn, hcf_base, hcf_scale;
@@ -104,12 +114,47 @@ struct LayerW {
   Mat gate, up, down;           // dense, or the shared expert
   Mat router;                   // bf16 [E, D]
   Buf bias;                     // e_score_correction_bias
-  std::vector<Mat> xg, xu, xd;  // routed experts (development: all of a loaded layer's experts in memory)
+  int xl = -1;  // the routed experts' entry in the expert cache (ExpertCache::layers)
+};
+
+// The routed experts stay in the checkpoint files (docs/glm5.md 8): a pool of equal slots in shared Metal
+// buffers, each holding one expert's three matrices as stored (codes, then fp8 scales for the FP8
+// checkpoint); after a layer's routing the missing experts are read with parallel preads (F_NOCACHE) into the
+// least recently used slots. A layer that needs more experts than the pool holds runs them in groups.
+struct XMat {
+  int fmt = 0, gg = 0, N = 0, K = 0;
+  uint64_t woff = 0, soff = 0;  // in the slot
+};
+struct XPiece {
+  int fd = -1;
+  uint64_t off = 0, nbytes = 0, dst = 0;
+};
+struct XLayer {
+  XMat m[3];                                // gate, up, down
+  std::vector<std::vector<XPiece>> pieces;  // [expert]
+  uint64_t bytes = 0;                       // per expert
+};
+struct ExpertCache {
+  std::vector<XLayer> layers;
+  uint64_t slot_bytes = 0, total_bytes = 0;
+  int n = 0, per_buf = 0, total_experts = 0, E = 0;
+  std::vector<id<MTLBuffer>> bufs;
+  std::vector<int> key;            // slot -> xl * E + e, -1 free
+  std::vector<uint64_t> stamp;     // slot -> last use
+  std::unordered_map<int, int> where;
+  uint64_t clock = 0, hits = 0, misses = 0;
+  double read_ms = 0, read_gb = 0;
+  uint8_t* host(int s) const { return static_cast<uint8_t*>([bufs[size_t(s / per_buf)] contents]) + size_t(s % per_buf) * slot_bytes; }
+  Buf at(int s, uint64_t off) const { return Buf{bufs[size_t(s / per_buf)], size_t(s % per_buf) * slot_bytes + off}; }
 };
 
 class DevModel {
  public:
-  DevModel(const std::string& dir, const std::string& kernels, int layers, int max_ctx) {
+  // layers: the first `layers` (0: all present); slots: sequence states (the first one is used by prefill());
+  // max_rows: rows per GPU pass (longer segments run in chunks); cache_gb / cache_slots: the expert cache
+  // (0: automatic; slots override for tests).
+  DevModel(const std::string& dir, const std::string& kernels, int layers, int max_ctx, int slots = 1, int max_rows = 4096,
+           double cache_gb = 0, int cache_slots = 0, int max_reads = 64) {
     gguf_ = !file_exists(dir + "/config.json") || !file_exists(dir + "/model.safetensors.index.json");
     if (gguf_) {
       open_gguf(dir);
@@ -120,28 +165,113 @@ class DevModel {
     L_ = std::min(layers > 0 ? layers : c_.L, gguf_ ? gg_layers_ : idx_.layers);
     if (L_ <= 0) fail("glm5: no complete layer in " + dir);
     max_ctx_ = max_ctx;
+    T_ = std::max(16, std::min(max_rows, max_ctx));
+    max_reads_ = std::max(1, max_reads);
     rt_.init(kernels);
+    rt_.serial = true;
     const auto t0 = Clock::now();
     load();
-    std::fprintf(stderr, "glm5: %d layers loaded (%.2f GB) in %.1f s\n", L_, double(rt_.arena->total()) / 1e9,
-                 ms_since(t0) / 1e3);
-    alloc_seq();
+    const double wgb = double(rt_.arena->total()) / 1e9;
+    alloc_common();
+    seqs_.resize(size_t(std::max(1, slots)));
+    for (Seq& q : seqs_) alloc_seq(q);
+    ensure_scratch(T_);
+    make_cache(cache_gb, cache_slots);
+    std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: %d slots of %.1f MB (%.1f GB) for %d "
+                         "experts (%.1f GB) read from %s\n",
+                 L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.slot_bytes) / 1e6, double(xc_.n) * double(xc_.slot_bytes) / 1e9,
+                 xc_.total_experts, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
   }
 
   int layers() const { return L_; }
   const Cfg& cfg() const { return c_; }
 
-  // One pass over `ids` continuing the sequence; dumps per layer when dump_dir is set; returns the logits of
-  // the last `nlog` rows when every layer is loaded and the head is in the checkpoint (else empty).
+  // Development: one pass over `ids` continuing sequence 0 (dumps per layer when dump_dir is set); the logits of
+  // its last `nlog` rows when every layer is loaded and the head is in the checkpoint (else empty).
   std::vector<float> prefill(const std::vector<int32_t>& ids, const std::string& dump_dir, int nlog = 1) {
-    const int T = int(ids.size()), D = c_.D, p0 = len_;
-    if (T <= 0) return {};
-    if (p0 + T > max_ctx_) fail("glm5: context full");
-    ensure_scratch(T);
+    std::vector<float> out(size_t(std::clamp(nlog, 1, std::max(1, int(ids.size())))) * size_t(c_.V));
+    const bool head = L_ == c_.L && head_m_.w.b;
+    forward(seqs_[0], ids.data(), int(ids.size()), head ? out.data() : nullptr, int(out.size() / size_t(c_.V)), dump_dir);
+    if (!head) out.clear();
+    return out;
+  }
+
+  int nseq() const { return int(seqs_.size()); }
+  Seq& seq(int i) { return seqs_.at(size_t(i)); }
+  const Seq& seq(int i) const { return seqs_.at(size_t(i)); }
+  int max_ctx() const { return max_ctx_; }
+  int max_rows() const { return T_; }
+  int max_reads() const { return max_reads_; }
+  size_t seq_bytes() const { return seq_bytes_; }
+  size_t weight_bytes() const { return rt_.arena->total(); }
+  bool has_head() const { return L_ == c_.L && head_m_.w.b; }
+  Runtime& rt() { return rt_; }
+  std::string cache_json() const {
+    char b[256];
+    std::snprintf(b, sizeof b, "{\"slots\":%d,\"slot_mb\":%.2f,\"hits\":%llu,\"misses\":%llu,\"read_gb\":%.3f,\"read_ms\":%.1f}",
+                  xc_.n, double(xc_.slot_bytes) / 1e6, (unsigned long long)xc_.hits, (unsigned long long)xc_.misses,
+                  xc_.read_gb, xc_.read_ms);
+    return b;
+  }
+
+  // An empty sequence, and a copy of one (the GPU is idle between passes: plain copies of the shared buffers).
+  void reset(Seq& q) {
+    for (size_t l = 0; l < q.kda.size(); ++l) {
+      if (q.kda[l]) std::memset([q.kda[l] contents], 0, [q.kda[l] length]);
+      if (q.conv[l]) std::memset([q.conv[l] contents], 0, [q.conv[l] length]);
+      if (q.pend[l]) std::memset([q.pend[l] contents], 0, [q.pend[l] length]);
+    }
+    q.len = 0;
+  }
+  void fork(Seq& d, const Seq& s) {
+    if (&d == &s) return;
+    for (size_t l = 0; l < s.kda.size(); ++l) {
+      auto cp = [](id<MTLBuffer> dst, id<MTLBuffer> src, size_t n) {
+        if (src && n) parallel_copy([dst contents], [src contents], n);
+      };
+      if (s.kda[l]) cp(d.kda[l], s.kda[l], [s.kda[l] length]);
+      if (s.conv[l]) cp(d.conv[l], s.conv[l], [s.conv[l] length]);
+      if (s.pend[l]) cp(d.pend[l], s.pend[l], [s.pend[l] length]);
+      if (s.lat[l]) cp(d.lat[l], s.lat[l], size_t(s.len) * size_t(c_.KVR) * 2);
+      if (s.pooled[l]) cp(d.pooled[l], s.pooled[l], size_t(s.len / c_.KPOOL) * size_t(c_.IHD) * 2);
+    }
+    d.len = s.len;
+  }
+  // The state of a sequence as a list of (buffer, bytes): what a checkpoint file holds, in order.
+  std::vector<std::pair<id<MTLBuffer>, size_t>> state_parts(const Seq& q, int len) const {
+    std::vector<std::pair<id<MTLBuffer>, size_t>> v;
+    for (size_t l = 0; l < q.kda.size(); ++l) {
+      if (q.kda[l]) v.push_back({q.kda[l], [q.kda[l] length]}), v.push_back({q.conv[l], [q.conv[l] length]});
+      if (q.lat[l]) {
+        v.push_back({q.lat[l], size_t(len) * size_t(c_.KVR) * 2});
+        v.push_back({q.pooled[l], size_t(len / c_.KPOOL) * size_t(c_.IHD) * 2});
+        v.push_back({q.pend[l], [q.pend[l] length]});
+      }
+    }
+    return v;
+  }
+
+  // n tokens continuing sequence q, in passes of up to max_rows rows; `logits` (when given) gets the last `nlog`
+  // rows' logits [nlog][V] (they must lie in the last pass).
+  void forward(Seq& q, const int32_t* toks, int n, float* logits, int nlog, const std::string& dump_dir = "") {
+    for (int i = 0; i < n;) {
+      const int m = std::min(T_, n - i);
+      const bool last = i + m == n;
+      pass(q, toks + i, m, last ? logits : nullptr, std::min(nlog, m), dump_dir);
+      i += m;
+    }
+  }
+
+  void pass(Seq& q, const int32_t* toks, int T, float* logits, int nlog, const std::string& dump_dir) {
+    const int D = c_.D, p0 = q.len;
+    if (T <= 0) return;
+    if (p0 + T > max_ctx_) fail("glm5: context full (" + std::to_string(max_ctx_) + " tokens)");
     for (int i = 0; i < T; ++i) {
-      static_cast<int32_t*>([ids_ contents])[i] = ids[size_t(i)];
+      if (toks[i] < 0 || toks[i] >= c_.V) fail("glm5: token id out of range");
+      static_cast<int32_t*>([ids_ contents])[i] = toks[i];
       static_cast<int32_t*>([pos_ contents])[i] = p0 + i;
     }
+    S_ = &q;
     Enc E(rt_);
     if (embed_gg_) {
       E.pipe((std::string("gguf_embed_") + gguf_suffix(embed_gg_)).c_str());
@@ -175,9 +305,8 @@ class DevModel {
       hc_post(E, T);
       dump(E, dump_dir, "h" + std::to_string(l), H_, size_t(T) * 4 * D * 4);
     }
-    std::vector<float> out;
     nlog = std::clamp(nlog, 1, T);
-    if (L_ == c_.L && head_m_.w.b) {
+    if (logits && L_ == c_.L && head_m_.w.b) {
       E.pipe("glm5_hc_mean");
       E.set(0, H_, size_t(T - nlog) * 4 * D * 4);
       E.set(1, X_);
@@ -186,21 +315,23 @@ class DevModel {
       norm(E, X_, 0, norm_, nlog, 1, D, D);
       gemv(E, head_m_, X_, 0, D, LOG_, 0, c_.V, nlog);
       E.end();
-      out.assign(static_cast<const float*>([LOG_ contents]), static_cast<const float*>([LOG_ contents]) + size_t(nlog) * c_.V);
-      if (!dump_dir.empty()) write_file(dump_dir + "/logits.f32", out.data(), out.size() * 4);
+      std::memcpy(logits, [LOG_ contents], size_t(nlog) * size_t(c_.V) * 4);
+      if (!dump_dir.empty()) write_file(dump_dir + "/logits.f32", logits, size_t(nlog) * size_t(c_.V) * 4);
     } else {
       E.end();
     }
-    len_ += T;
+    q.len += T;
+    S_ = nullptr;
     gpu_ms_ += E.gpu_ms;
-    return out;
   }
   double gpu_ms() const { return gpu_ms_; }
 
  private:
   Index idx_;
   Cfg c_;
-  int L_ = 0, max_ctx_ = 4096, len_ = 0, T_cap_ = 0;
+  int L_ = 0, max_ctx_ = 4096, T_ = 4096, T_cap_ = 0, max_reads_ = 64;
+  std::vector<Seq> seqs_;
+  size_t seq_bytes_ = 0;
   Runtime rt_;
   std::vector<LayerW> L;
   Buf embed_, norm_;
@@ -212,9 +343,9 @@ class DevModel {
   std::unordered_map<std::string, std::pair<const GGUFFile*, const GGUFFile::Tensor*>> gt_;
   int gg_layers_ = 0;
   double gpu_ms_ = 0;
-  // sequence state (one slot for now)
-  std::vector<id<MTLBuffer>> kda_state_, conv_state_;           // per layer (KDA)
-  std::vector<id<MTLBuffer>> lat_, pooled_, pend_;              // per layer (DSA): latents (half), pooled keys (half), pending key|gate rows
+  Seq* S_ = nullptr;  // the sequence of the pass being encoded
+  ExpertCache xc_;
+  std::vector<int> nc_fds_;  // F_NOCACHE descriptors of the GGUF files (the safetensors ones are ds4::Ckpt's)
   id<MTLBuffer> zeros_ = nil, ninf_ = nil, ident_ = nil, ones_ = nil;
   // pass scratch
   id<MTLBuffer> ids_ = nil, pos_ = nil, H_ = nil, X_ = nil, Y_ = nil, MIX_ = nil, HCP_ = nil, P1_ = nil, P2_ = nil, P3_ = nil,
@@ -327,12 +458,23 @@ class DevModel {
         w.router = bf16(m + "gate.weight");
         w.bias = vecf(m + "gate.e_score_correction_bias");
         w.gate = f8(m + "shared_experts.gate_proj"), w.up = f8(m + "shared_experts.up_proj"), w.down = f8(m + "shared_experts.down_proj");
+        // the routed experts stay in the shards: a slot is their run there, codes down | gate | up then scales
+        XLayer xl;
+        const uint64_t ID = uint64_t(c_.IE) * uint64_t(c_.D), SC = uint64_t(c_.IE / 128) * uint64_t(c_.D / 128) * 4;
+        xl.m[0] = XMat{kF8B, 0, c_.IE, c_.D, ID, idx_.codes_bytes + SC};          // gate
+        xl.m[1] = XMat{kF8B, 0, c_.IE, c_.D, 2 * ID, idx_.codes_bytes + 2 * SC};  // up
+        xl.m[2] = XMat{kF8B, 0, c_.D, c_.IE, 0, idx_.codes_bytes};               // down
+        xl.bytes = idx_.codes_bytes + idx_.scales_bytes;
         for (int e = 0; e < c_.E; ++e) {
-          const std::string x = m + "experts." + std::to_string(e) + ".";
-          w.xg.push_back(f8(x + "gate_proj"));
-          w.xu.push_back(f8(x + "up_proj"));
-          w.xd.push_back(f8(x + "down_proj"));
+          std::vector<XPiece> ps;
+          for (const Piece& pc : idx_.experts[size_t(l)][size_t(e)].pieces) {
+            const int fd = idx_.ck.fds_nc[size_t(pc.file)] >= 0 ? idx_.ck.fds_nc[size_t(pc.file)] : idx_.ck.fds[size_t(pc.file)];
+            ps.push_back(XPiece{fd, pc.off, pc.nbytes, pc.dst});
+          }
+          xl.pieces.push_back(std::move(ps));
         }
+        w.xl = int(xc_.layers.size());
+        xc_.layers.push_back(std::move(xl));
       }
     }
   }
@@ -349,7 +491,7 @@ class DevModel {
     if (DIR* d = ::opendir(dir.c_str())) {
       while (dirent* e = ::readdir(d)) {
         const std::string n = e->d_name;
-        if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) files.push_back(dir + "/" + n);
+        if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0 && n.rfind("mmproj", 0) != 0) files.push_back(dir + "/" + n);
       }
       ::closedir(d);
     }
@@ -411,6 +553,19 @@ class DevModel {
         if (int(b.as_int()) == n) ++n;
       gg_layers_ = n;
     }
+  }
+  int gfd(const GGUFFile* f) {  // an F_NOCACHE descriptor of the file, opened once
+    for (size_t i = 0; i < gf_.size(); ++i)
+      if (gf_[i].get() == f) {
+        if (nc_fds_.size() < gf_.size()) nc_fds_.assign(gf_.size(), -1);
+        if (nc_fds_[i] < 0) {
+          nc_fds_[i] = ::open(f->path().c_str(), O_RDONLY);
+          if (nc_fds_[i] < 0) fail("glm5: cannot open " + f->path());
+          ::fcntl(nc_fds_[i], F_NOCACHE, 1);
+        }
+        return nc_fds_[i];
+      }
+    fail("glm5: unknown GGUF file");
   }
   Buf gcopy(const std::string& n) {
     const GGUFFile* f = nullptr;
@@ -523,54 +678,149 @@ class DevModel {
         w.router = gmat(b + "ffn_gate_inp.weight");
         w.bias = gvec(b + "exp_probs_b.bias");
         w.gate = gmat(b + "ffn_gate_shexp.weight"), w.up = gmat(b + "ffn_up_shexp.weight"), w.down = gmat(b + "ffn_down_shexp.weight");
-        // the routed experts: one 3-D tensor per matrix ([K, N, E]); expert e's rows are contiguous
+        // the routed experts stay in the files: one 3-D tensor per matrix ([K, N, E]), expert e's rows contiguous;
+        // a slot holds gate | up | down
+        XLayer xl;
+        xl.pieces.resize(size_t(c_.E));
+        uint64_t at = 0;
+        int mi = 0;
         for (const char* nm : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}) {
-          const GGUFFile::Tensor& t = gtensor(b + nm + ".weight");
-          Mat all = gmat(b + nm + ".weight");
-          const int N = int(t.dims[1]);
-          const size_t per = all.fmt == kF32 ? size_t(N) * size_t(all.K) * 4 : t.nbytes / size_t(t.dims[2]);
-          std::vector<Mat>& dst = nm[4] == 'g' ? w.xg : nm[4] == 'u' ? w.xu : w.xd;
-          for (int e = 0; e < int(t.dims[2]); ++e) {
-            Mat x = all;
-            x.N = N;
-            x.w = Buf{all.w.b, all.w.off + size_t(e) * per};
-            dst.push_back(x);
-          }
+          const GGUFFile* f = nullptr;
+          const GGUFFile::Tensor& t = gtensor(b + nm + ".weight", &f);
+          if (t.dims.size() != 3 || int(t.dims[2]) != c_.E) fail("glm5: GGUF " + b + nm + " is not [K, N, E]");
+          gguf_suffix(t.type);
+          const uint64_t per = t.nbytes / uint64_t(c_.E);
+          xl.m[mi++] = XMat{kGG, t.type, int(t.dims[1]), int(t.dims[0]), at, 0};
+          const int fd = gfd(f);
+          for (int e = 0; e < c_.E; ++e) xl.pieces[size_t(e)].push_back(XPiece{fd, t.offset + uint64_t(e) * per, per, at});
+          at += (per + 255) / 256 * 256;
         }
+        xl.bytes = at;
+        w.xl = int(xc_.layers.size());
+        xc_.layers.push_back(std::move(xl));
       }
     }
   }
 
-  void alloc_seq() {
+  void make_cache(double gb, int slots) {
+    ExpertCache& x = xc_;
+    x.E = c_.E;
+    for (const XLayer& xl : x.layers) {
+      x.slot_bytes = std::max(x.slot_bytes, (xl.bytes + 255) / 256 * 256);
+      x.total_bytes += xl.bytes * uint64_t(c_.E);
+      x.total_experts += c_.E;
+    }
+    if (x.layers.empty()) return;
+    if (slots <= 0) {
+      if (gb <= 0) {  // what the GPU working set leaves after the weights, sequences and scratch, keeping 6 GB
+        const double ws = double([rt_.dev recommendedMaxWorkingSetSize]), mine = double([rt_.dev currentAllocatedSize]);
+        gb = (ws - mine - 6e9) / 1e9;
+      }
+      slots = int(std::max(1.0, gb * 1e9 / double(x.slot_bytes)));
+    }
+    x.n = std::min(slots, x.total_experts);
+    x.per_buf = int(std::max<uint64_t>(1, (uint64_t(2) << 30) / x.slot_bytes));
+    for (int s = 0; s < x.n; s += x.per_buf) x.bufs.push_back(rt_.buffer(size_t(std::min(x.per_buf, x.n - s)) * x.slot_bytes));
+    x.key.assign(size_t(x.n), -1);
+    x.stamp.assign(size_t(x.n), 0);
+  }
+  // Slots for experts `es` of cache layer `xl` (at most xc_.n of them), reading the missing ones; the slots of
+  // this call are not evicted by it. The GPU must not be reading the evicted slots (callers flush first).
+  std::vector<int> ensure(int xl, const std::vector<int>& es) {
+    ExpertCache& x = xc_;
+    const uint64_t now = ++x.clock;
+    std::vector<int> slot(es.size(), -1);
+    std::vector<size_t> miss;
+    for (size_t i = 0; i < es.size(); ++i) {
+      auto it = x.where.find(xl * x.E + es[i]);
+      if (it != x.where.end()) {
+        slot[i] = it->second;
+        x.stamp[size_t(it->second)] = now;
+        ++x.hits;
+      } else {
+        miss.push_back(i);
+      }
+    }
+    if (miss.empty()) return slot;
+    // victims: free slots first, then the oldest stamps below now
+    std::vector<int> order(size_t(x.n));
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+      const bool fa = x.key[size_t(a)] < 0, fb = x.key[size_t(b)] < 0;
+      if (fa != fb) return fa;
+      return x.stamp[size_t(a)] < x.stamp[size_t(b)];
+    });
+    size_t vi = 0;
+    for (size_t i : miss) {
+      while (vi < order.size() && x.stamp[size_t(order[vi])] == now) ++vi;
+      if (vi >= order.size()) fail("glm5: expert cache too small for one group");
+      const int s = order[vi++];
+      if (x.key[size_t(s)] >= 0) x.where.erase(x.key[size_t(s)]);
+      x.key[size_t(s)] = xl * x.E + es[i];
+      x.where[x.key[size_t(s)]] = s;
+      x.stamp[size_t(s)] = now;
+      slot[i] = s;
+      ++x.misses;
+    }
+    const auto t0 = Clock::now();
+    std::atomic<bool> ok{true};
+    std::atomic<uint64_t> bytes{0};
+    std::vector<std::tuple<int, uint64_t, uint64_t, uint8_t*>> reads;  // fd, file offset, bytes, destination
+    for (size_t i : miss)
+      for (const XPiece& pc : x.layers[size_t(xl)].pieces[size_t(es[i])])
+        for (uint64_t o = 0; o < pc.nbytes; o += (4u << 20))
+          reads.push_back({pc.fd, pc.off + o, std::min<uint64_t>(4u << 20, pc.nbytes - o), x.host(slot[i]) + pc.dst + o});
+    parallel_for(reads.size(), [&](size_t j) {
+      const auto& [fd, off, nb, dst] = reads[j];
+      if (!pread_all(fd, dst, size_t(nb), size_t(off))) ok = false;
+      bytes += nb;
+    });
+    if (!ok) fail("glm5: expert read failed");
+    x.read_ms += ms_since(t0);
+    x.read_gb += double(bytes.load()) / 1e9;
+    return slot;
+  }
+  Mat xmat(int xl, int slot, int m) const {
+    const XMat& a = xc_.layers[size_t(xl)].m[m];
+    Mat r;
+    r.fmt = a.fmt, r.gg = a.gg, r.N = a.N, r.K = a.K;
+    r.w = xc_.at(slot, a.woff);
+    if (a.fmt == kF8B) r.s = xc_.at(slot, a.soff);
+    return r;
+  }
+
+  void alloc_common() {
+    float ninf[64];
+    for (float& x : ninf) x = -INFINITY;
+    ninf_ = rt_.buffer(sizeof ninf);
+    std::memcpy([ninf_ contents], ninf, sizeof ninf);
+    zeros_ = rt_.buffer(4096);
+    std::memset([zeros_ contents], 0, 4096);
+  }
+  void alloc_seq(Seq& q) {
     auto zero = [&](size_t n) {
       id<MTLBuffer> b = rt_.buffer(n);
       std::memset([b contents], 0, n);
       return b;
     };
     const int C = c_.kH * c_.kD;
+    size_t bytes = 0;
+    q.kda.assign(size_t(L_), nil), q.conv.assign(size_t(L_), nil), q.lat.assign(size_t(L_), nil);
+    q.pooled.assign(size_t(L_), nil), q.pend.assign(size_t(L_), nil);
     for (int l = 0; l < L_; ++l) {
       if (!L[size_t(l)].dsa) {
-        kda_state_.push_back(zero(size_t(c_.kH) * 128 * 128 * 4));
-        conv_state_.push_back(zero(size_t(3) * 3 * C * 4));
-        lat_.push_back(nil), pooled_.push_back(nil), pend_.push_back(nil);
+        q.kda[size_t(l)] = zero(size_t(c_.kH) * 128 * 128 * 4);
+        q.conv[size_t(l)] = zero(size_t(3) * 3 * C * 4);
+        bytes += size_t(c_.kH) * 128 * 128 * 4 + size_t(9) * C * 4;
       } else {
-        kda_state_.push_back(nil), conv_state_.push_back(nil);
-        lat_.push_back(zero(size_t(max_ctx_) * c_.KVR * 2));
-        pooled_.push_back(zero(size_t(max_ctx_ / 4 + 1) * c_.IHD * 2));
-        pend_.push_back(zero(size_t(4) * 256 * 4));
+        q.lat[size_t(l)] = zero(size_t(max_ctx_) * c_.KVR * 2);
+        q.pooled[size_t(l)] = zero(size_t(max_ctx_ / 4 + 1) * c_.IHD * 2);
+        q.pend[size_t(l)] = zero(size_t(4) * 256 * 4);
+        bytes += size_t(max_ctx_) * c_.KVR * 2 + size_t(max_ctx_ / 4 + 1) * c_.IHD * 2 + 4096;
       }
     }
-    const float ninf[64] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY,
-                            -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    ninf_ = rt_.buffer(sizeof ninf);
-    std::memcpy([ninf_ contents], ninf, sizeof ninf);
-    zeros_ = zero(4096);
+    seq_bytes_ = bytes;
+    q.len = 0;
   }
 
   void ensure_scratch(int T) {
@@ -585,7 +835,7 @@ class DevModel {
     P1_ = F(size_t(T) * big), P2_ = F(size_t(T) * big), P3_ = F(size_t(T) * big);
     P4_ = F(size_t(T) * std::max(size_t(c_.H) * 256, size_t(c_.I_dense))), P5_ = F(size_t(T) * 512), P6_ = F(size_t(T) * 512);
     RL_ = F(size_t(T) * c_.E), RSEL_ = F(size_t(T) * c_.K), RW_ = F(size_t(T) * c_.K), XR_ = F(size_t(T) * c_.K * 3 + 64);
-    LOG_ = F(size_t(T) * c_.V);
+    LOG_ = F(size_t(std::max(1, max_reads_)) * c_.V);
     ident_ = F(size_t(T) * c_.K), ones_ = F(size_t(T) * c_.K);
     for (int i = 0; i < T * c_.K; ++i) {
       static_cast<int32_t*>([ident_ contents])[i] = i;
@@ -695,7 +945,7 @@ class DevModel {
       const Glm5Conv p{T, C3, 3 * H, H};
       E.pipe("glm5_kda_conv");
       E.set(0, P1_);
-      E.set(1, conv_state_[size_t(l)]);
+      E.set(1, S_->conv[size_t(l)]);
       E.set(2, w.conv_w);
       E.set(3, P2_);
       E.bytes(4, p);
@@ -703,7 +953,7 @@ class DevModel {
       const int32_t q[2] = {T, C3};
       E.pipe("glm5_conv_save");
       E.set(0, P1_);
-      E.set(1, conv_state_[size_t(l)]);
+      E.set(1, S_->conv[size_t(l)]);
       E.bytes(2, q);
       E.threads(size_t(C3), 1, 1, 256);
     }
@@ -732,7 +982,7 @@ class DevModel {
       E.set(0, P2_);
       E.set(1, P3_);
       E.set(2, P6_);
-      E.set(3, kda_state_[size_t(l)]);
+      E.set(3, S_->kda[size_t(l)]);
       E.set(4, P1_);  // o (the projections are no longer needed)
       E.bytes(5, p);
       E.groups(16, size_t(H), 1, 256);
@@ -769,7 +1019,7 @@ class DevModel {
       } p{T, KVR, KVR, p0, 0, 0};
       E.pipe("ds4_store_half");
       E.set(0, P5_);
-      E.set(1, lat_[size_t(l)]);
+      E.set(1, S_->lat[size_t(l)]);
       E.bytes(2, p);
       E.threads(size_t(KVR), size_t(T), 1, 256);
     }
@@ -795,9 +1045,9 @@ class DevModel {
       } p{p0, T, KG, b0, b1 - b0};
       E.pipe("glm5_kpool");
       E.set(0, P6_);
-      E.set(1, pend_[size_t(l)]);
+      E.set(1, S_->pend[size_t(l)]);
       E.set(2, w.ape);
-      E.set(3, pooled_[size_t(l)]);
+      E.set(3, S_->pooled[size_t(l)]);
       E.bytes(4, p);
       E.threads(128, size_t(b1 - b0), 1, 128);
     }
@@ -805,7 +1055,7 @@ class DevModel {
       const int32_t p[3] = {p0, T, KG};
       E.pipe("glm5_kpool_pend");
       E.set(0, P6_);
-      E.set(1, pend_[size_t(l)]);
+      E.set(1, S_->pend[size_t(l)]);
       E.bytes(2, p);
       E.threads(256, 3, 1, 256);
     }
@@ -833,7 +1083,7 @@ class DevModel {
         E.pipe("ds4_index_score");
         E.set(0, P2_);
         E.set(1, P3_);
-        E.set(2, pooled_[size_t(l)]);
+        E.set(2, S_->pooled[size_t(l)]);
         E.set(3, SC_);
         E.set(4, pos_);
         E.bytes(5, p);
@@ -896,8 +1146,8 @@ class DevModel {
       E.pipe("ds4_attn");
       E.set(0, P2_);
       E.set(1, P5_);  // window rows (unused: win 0)
-      E.set(2, lat_[size_t(l)]);
-      E.set(3, lat_[size_t(l)]);
+      E.set(2, S_->lat[size_t(l)]);
+      E.set(3, S_->lat[size_t(l)]);
       E.set(4, sparse ? SC_ : zeros_, sel_off);
       E.set(5, ninf_);  // no sink
       E.set(6, P2_);
@@ -957,18 +1207,419 @@ class DevModel {
     }
     int32_t* xr = static_cast<int32_t*>([XR_ contents]);
     float* ws = reinterpret_cast<float*>(xr + T * K);
+    std::vector<int> need;
     int at = 0;
+    std::vector<int> first(size_t(c_.E), 0);
     for (int e = 0; e < c_.E; ++e) {
       const int n = int(rows[size_t(e)].size());
       if (!n) continue;
+      need.push_back(e);
+      first[size_t(e)] = at;
       for (int j = 0; j < n; ++j) xr[at + j] = rows[size_t(e)][size_t(j)].first, ws[at + j] = rows[size_t(e)][size_t(j)].second;
-      const size_t ro = size_t(at) * 4, wo = size_t(T * K + at) * 4;
-      gemv(E, w.xg[size_t(e)], X_, 0, D, P1_, 0, c_.IE, n, false, XR_, ro);
-      gemv(E, w.xu[size_t(e)], X_, 0, D, P2_, 0, c_.IE, n, false, XR_, ro);
-      swiglu(E, P1_, P2_, P1_, n, c_.IE);
-      gemv(E, w.xd[size_t(e)], P1_, 0, c_.IE, Y_, 0, D, n, true, nil, 0, XR_, ro, XR_, wo);
       at += n;
     }
+    // the experts in groups the cache holds at once; each group's reads wait for the GPU to finish the previous one
+    const size_t G = size_t(std::max(1, xc_.n));
+    for (size_t g0 = 0; g0 < need.size(); g0 += G) {
+      const std::vector<int> grp(need.begin() + long(g0), need.begin() + long(std::min(need.size(), g0 + G)));
+      if (g0 > 0) E.flush();
+      const std::vector<int> slots = ensure(w.xl, grp);
+      for (size_t i = 0; i < grp.size(); ++i) {
+        const int e = grp[i], n = int(rows[size_t(e)].size());
+        const size_t ro = size_t(first[size_t(e)]) * 4, wo = size_t(T * K + first[size_t(e)]) * 4;
+        gemv(E, xmat(w.xl, slots[i], 0), X_, 0, D, P1_, 0, c_.IE, n, false, XR_, ro);
+        gemv(E, xmat(w.xl, slots[i], 1), X_, 0, D, P2_, 0, c_.IE, n, false, XR_, ro);
+        swiglu(E, P1_, P2_, P1_, n, c_.IE);
+        gemv(E, xmat(w.xl, slots[i], 2), P1_, 0, c_.IE, Y_, 0, D, n, true, nil, 0, XR_, ro, XR_, wo);
+      }
+    }
+  }
+};
+
+
+// ---------------------------------------------------------------- the engine's model (NativeModel)
+// Slots are sequences of the DevModel (user slots, then scratch slots for trees without one and for leaves); a
+// pass runs its trees' segments one after another (one sequence per GPU pass for now). Trees, leaves, readouts
+// and checkpoints follow DeepSeek-V4.1's model (dsv4_model.h).
+class Glm5Model final : public NativeModel {
+ public:
+  Glm5Model(const std::string& dir, const LoadOptions& o, const std::string& kernels) {
+    const auto t0 = Clock::now();
+    max_ctx_ = std::max(256, o.max_ctx > 0 ? o.max_ctx : 32768);
+    nuser_ = o.slots > 0 ? o.slots : 4;
+    const char* cs = std::getenv("ESPETERO_GLM5_CACHE_SLOTS");
+    const char* lay = std::getenv("ESPETERO_GLM5_LAYERS");  // development: the first n layers (no head)
+    m_ = std::make_unique<DevModel>(dir, kernels, lay ? std::atoi(lay) : 0, max_ctx_, nuser_ + kScratch,
+                                    std::max(64, std::min(o.max_rows > 0 ? o.max_rows : 4096, 8192)), o.expert_cache_gb,
+                                    cs ? std::atoi(cs) : 0, std::max(1, std::min(o.max_readouts > 0 ? o.max_readouts : 64, 256)));
+    const Cfg& c = m_->cfg();
+    if (!m_->has_head() && !lay) fail("glm5: the checkpoint has no LM head (or not every layer)");
+    info_.device = [[m_->rt().dev name] UTF8String];
+    info_.format = "glm5_next";
+    info_.path = dir;
+    info_.hidden = c.D;
+    info_.intermediate = c.IE;
+    info_.layers = m_->layers();
+    info_.full_layers = c.n_dsa();
+    info_.linear_layers = c.n_kda();
+    info_.heads = c.H;
+    info_.kv_heads = 1;
+    info_.vocab = c.V;
+    info_.eos_token_id = c.eos.empty() ? 154820 : c.eos[0];
+    info_.end_ids = c.eos.empty() ? std::vector<int>{154820, 154827, 154829} : c.eos;
+    info_.slots = nuser_;
+    info_.block_tokens = 64;
+    info_.kv_blocks = nuser_ * max_ctx_ / 64;
+    info_.max_ctx = max_ctx_;
+    info_.max_rows = m_->max_rows();
+    info_.max_readouts = m_->max_reads();
+    info_.weight_bytes = m_->weight_bytes();
+    info_.kv_bytes = m_->seq_bytes() * size_t(nuser_);
+    info_.slot_state_bytes = m_->seq_bytes();
+    info_.leaves = true;
+    info_.prompt_lookup = false;  // verifying drafts as leaves forks whole states
+    info_.commit = false;
+    info_.hidden_states = false;
+    info_.mtp = false;
+    info_.vision = false;
+    info_.load_ms = ms_since(t0);
+    out_.clear();
+  }
+
+  const ModelInfo& info() const override { return info_; }
+
+  // ---- slots
+  int slot_alloc() override {
+    for (int i = 0; i < nuser_; ++i)
+      if (!m_->seq(i).used) {
+        m_->seq(i).used = true;
+        m_->reset(m_->seq(i));
+        return i;
+      }
+    return -1;
+  }
+  void slot_free(int s) override {
+    Seq& q = user(s);
+    q.used = false;
+    m_->reset(q);
+  }
+  void slot_reset(int s) override { m_->reset(user(s)); }
+  void slot_fork(int dst, int src) override { m_->fork(user(dst), user(src)); }
+  int slot_len(int s) const override { return m_->seq(s).len; }
+  int slot_next_pos(int s) const override { return m_->seq(s).len; }
+  bool slot_mtp(int) const override { return false; }
+  int free_slots() const override {
+    int n = 0;
+    for (int i = 0; i < nuser_; ++i) n += m_->seq(i).used ? 0 : 1;
+    return n;
+  }
+  int free_kv_tokens() const override {
+    int n = 0;
+    for (int i = 0; i < nuser_; ++i) n += max_ctx_ - (m_->seq(i).used ? m_->seq(i).len : 0);
+    return n;
+  }
+  int pass_kv_tokens(const std::vector<TreeSpec>&) const override { return 0; }
+  int freed_kv_tokens(const std::vector<int>& slots) const override {
+    int n = 0;
+    for (int s : slots) n += m_->seq(s).used ? m_->seq(s).len : 0;
+    return n;
+  }
+  struct CkptHead {
+    char magic[8];
+    int32_t version, len, layers, max_ctx;
+    uint64_t bytes;
+  };
+  bool slot_save(int slot, const std::string& path) override {
+    const Seq& q = m_->seq(slot);
+    const auto parts = m_->state_parts(q, q.len);
+    CkptHead h{};
+    std::memcpy(h.magic, "ESPGLM5C", 8);
+    h.version = 1, h.len = q.len, h.layers = m_->layers(), h.max_ctx = max_ctx_;
+    for (const auto& [b, n] : parts) h.bytes += n;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
+    for (const auto& [b, n] : parts) ok = ok && std::fwrite([b contents], 1, n, f) == n;
+    return std::fclose(f) == 0 && ok;
+  }
+  int slot_load(const std::string& path) override {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    struct Closer {
+      FILE* f;
+      ~Closer() { std::fclose(f); }
+    } closer{f};
+    CkptHead h{};
+    if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "ESPGLM5C", 8) != 0 || h.version != 1 ||
+        h.layers != m_->layers() || h.len < 0 || h.len > max_ctx_)
+      return -1;
+    const int slot = slot_alloc();
+    if (slot < 0) return -2;
+    Seq& q = m_->seq(slot);
+    const auto parts = m_->state_parts(q, h.len);
+    uint64_t total = 0;
+    for (const auto& [b, n] : parts) total += n;
+    bool ok = total == h.bytes;
+    for (const auto& [b, n] : parts) ok = ok && std::fread([b contents], 1, n, f) == n;
+    if (!ok) {
+      slot_free(slot);
+      return -1;
+    }
+    q.len = h.len;
+    return slot;
+  }
+  std::string state_signature() const override {
+    return "glm5_next-1|" + info_.path + "|" + std::to_string(max_ctx_) + "|" + std::to_string(m_->layers());
+  }
+
+  // ---- passes
+  void run(const std::vector<TreeSpec>& trees, PassStats* stats) override {
+    @autoreleasepool {
+      const auto t0 = Clock::now();
+      run_trees(trees);
+      int rows = 0;
+      for (const TreeSpec& t : trees) rows += t.root_len;
+      if (stats) {
+        stats->wall_ms = stats->gpu_ms = ms_since(t0);
+        stats->rows = rows;
+        stats->readouts = int(trees.size());
+      }
+    }
+  }
+  void run_chain(const std::vector<TreeSpec>& first, int steps, int32_t* out, PassStats* stats) override {
+    @autoreleasepool {
+      const auto t0 = Clock::now();
+      const size_t n = first.size();
+      std::vector<TreeSpec> cur = first;
+      std::vector<int32_t> tok(n);
+      for (int j = 0; j < steps; ++j) {
+        for (size_t t = 0; t < n; ++t) {
+          if (j > 0) {
+            tok[t] = out[size_t(j - 1) * n + t];
+            cur[t].root = &tok[t];
+            cur[t].draw_pos0 = first[t].draw_pos0 + j;
+          }
+          cur[t].out_argmax = nullptr;
+        }
+        run_trees(cur);
+        for (size_t t = 0; t < n; ++t) out[size_t(j) * n + t] = draw_token(cur[t], out_[t].back().logits.data(), cur[t].draw_pos0);
+      }
+      if (stats) {
+        stats->wall_ms = stats->gpu_ms = ms_since(t0);
+        stats->rows = int(n) * steps;
+        stats->readouts = int(n) * steps;
+      }
+    }
+  }
+  const float* logits(int tree, int readout) const override { return out_.at(size_t(tree)).at(size_t(readout)).logits.data(); }
+  TopK topk(int tree, int readout) const override {
+    TopK r;
+    if (size_t(tree) >= out_.size() || size_t(readout) >= out_[size_t(tree)].size()) return r;
+    const Readout& o = out_[size_t(tree)][size_t(readout)];
+    r.ids = o.tk_ids.data();
+    r.x = o.tk_x.data();
+    r.n = int(o.tk_ids.size());
+    r.max = o.tk_max;
+    r.total = o.tk_total;
+    r.sampled = o.sampled;
+    return r;
+  }
+  void draft(const std::vector<DraftRequest>&, PassStats*) override { fail("glm5: no MTP drafts yet"); }
+  void commit(const std::vector<CommitRequest>&, PassStats*) override { fail("glm5: no verify-commit"); }
+  void encode_images(const std::vector<ImageRef>&, float*, PassStats*) override { fail("glm5: text only (no vision tower yet)"); }
+  void set_profile(bool) override {}
+  std::string profile_json() override { return "{\"expert_cache\":" + m_->cache_json() + "}"; }
+  bool set_option(const std::string&, int) override { return false; }
+  std::string bench_json(const std::string&) override { return profile_json(); }
+
+ private:
+  static constexpr int kScratch = 4;  // trees without a slot, and leaves (in rounds)
+  struct Readout {
+    std::vector<float> logits;
+    int32_t argmax = -1, sampled = -1;
+    float lse = 0;
+    std::vector<int32_t> tk_ids;
+    std::vector<float> tk_x;
+    float tk_max = 0, tk_total = 0;
+  };
+  std::unique_ptr<DevModel> m_;
+  ModelInfo info_;
+  int max_ctx_ = 32768, nuser_ = 4;
+  std::vector<std::vector<Readout>> out_;  // [tree][readout]: leaves first, then the root
+
+  Seq& user(int s) {
+    if (s < 0 || s >= nuser_) fail("glm5: bad slot " + std::to_string(s));
+    return m_->seq(s);
+  }
+  Seq& any(int s) { return m_->seq(s); }
+
+  // One segment: n tokens continuing q, the last row's logits into `logits` (null: none).
+  void segment(Seq& q, const int32_t* toks, int n, float* logits) { m_->forward(q, toks, n, logits, 1); }
+
+  void run_trees(const std::vector<TreeSpec>& trees) {
+    out_.assign(trees.size(), {});
+    int scratch = nuser_;
+    auto take_scratch = [&]() -> Seq& {
+      if (scratch >= m_->nseq()) fail("glm5: too many trees without a slot in one pass");
+      return m_->seq(scratch++);
+    };
+    std::vector<Seq*> base(trees.size(), nullptr);
+    for (size_t i = 0; i < trees.size(); ++i) {
+      const TreeSpec& t = trees[i];
+      if (t.commit_chain > 0) fail("glm5: no verify-commit");
+      if (t.n_images > 0) fail("glm5: text only (no vision tower yet)");
+      if (t.out_hidden || t.out_last_hidden || t.out_rows_hidden) fail("glm5: hidden-state readouts are not supported");
+      if (t.root_len <= 0 && t.n_leaves <= 0) fail("glm5: empty tree");
+      out_[i].resize(size_t(std::max(0, t.n_leaves)) + (t.score_root ? 1 : 0));
+      if (t.root_len <= 0) {  // leaves straight off the parent
+        if (t.parent < 0) fail("glm5: leaves without a root need a parent");
+        base[i] = &any(t.parent);
+        continue;
+      }
+      const int save_len = t.save_len > 0 ? std::min(t.save_len, t.root_len) : t.root_len;
+      Seq& tgt = t.save >= 0 ? user(t.save) : t.work >= 0 ? user(t.work) : take_scratch();
+      if (t.parent >= 0) m_->fork(tgt, any(t.parent));
+      else m_->reset(tgt);
+      const int first = t.save >= 0 ? save_len : t.root_len;
+      float* lg = nullptr;
+      if (t.score_root && first == t.root_len) {
+        out_[i].back().logits.resize(size_t(m_->cfg().V));
+        lg = out_[i].back().logits.data();
+      }
+      segment(tgt, t.root, first, lg);
+      base[i] = &tgt;
+      if (first < t.root_len) {  // the checkpoint at save_len is taken: the rest continues in the work slot
+        Seq& rest = (t.work >= 0 && &user(t.work) != &tgt) ? user(t.work) : take_scratch();
+        m_->fork(rest, tgt);
+        float* lg2 = nullptr;
+        if (t.score_root) {
+          out_[i].back().logits.resize(size_t(m_->cfg().V));
+          lg2 = out_[i].back().logits.data();
+        }
+        segment(rest, t.root + first, t.root_len - first, lg2);
+        base[i] = &rest;
+      } else if (t.work >= 0 && &user(t.work) != &tgt) {
+        m_->fork(user(t.work), tgt);
+      }
+    }
+    // leaves: each continues its tree's root in a scratch slot, never seeing the others
+    for (size_t i = 0; i < trees.size(); ++i) {
+      const TreeSpec& t = trees[i];
+      for (int k = 0; k < t.n_leaves; ++k) {
+        const int n = t.leaf_offsets[k + 1] - t.leaf_offsets[k];
+        if (n <= 0) fail("glm5: empty leaf");
+        Seq& s = scratch < m_->nseq() ? m_->seq(scratch) : take_scratch();
+        m_->fork(s, *base[i]);
+        Readout& r = out_[i][size_t(k)];
+        r.logits.resize(size_t(m_->cfg().V));
+        segment(s, t.leaf_tokens + t.leaf_offsets[k], n, r.logits.data());
+      }
+    }
+    for (size_t i = 0; i < trees.size(); ++i)
+      for (size_t r = 0; r < out_[i].size(); ++r)
+        if (!out_[i][r].logits.empty()) finish_readout(trees[i], out_[i][r], int(r));
+  }
+
+  static uint64_t tk_mix(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+  }
+  static float tk_uniform(uint64_t seed, uint64_t pos, uint64_t id) {
+    uint64_t x = tk_mix(seed + 0x9E3779B97F4A7C15ull);
+    x = tk_mix(x ^ (pos * 0xD1B54A32D192ED03ull));
+    x = tk_mix(x ^ id);
+    return float(x >> 40) * 0x1.0p-24f + 0x1.0p-25f;
+  }
+  int32_t draw_token(const TreeSpec& t, const float* L, int64_t pos) {
+    const int V = m_->cfg().V;
+    if (!(t.topk > 0 && t.gpu_draw)) {
+      int am = 0;
+      for (int i = 1; i < V; ++i)
+        if (L[i] > L[am]) am = i;
+      return am;
+    }
+    TreeSpec u = t;
+    u.draw_pos0 = pos;
+    u.out_argmax = nullptr, u.out_lse = nullptr, u.out_cand_logits = nullptr;
+    Readout r;
+    r.logits.assign(L, L + V);
+    finish_readout(u, r);
+    return r.sampled >= 0 ? r.sampled : r.argmax;
+  }
+  // Readout ri of tree t (leaves first, then the root): DeepSeek-V4.1's (dsv4_model.h finish_readout).
+  void finish_readout(const TreeSpec& t, Readout& o, int ri = 0) {
+    const bool leaf = ri < t.n_leaves;
+    const int64_t pos = t.draw_pos0 + (leaf ? int64_t(t.leaf_offsets[ri + 1] - t.leaf_offsets[ri]) : 0);
+    const int V = m_->cfg().V;
+    const float* L = o.logits.data();
+    int am = 0;
+    float mx = L[0];
+    for (int i = 1; i < V; ++i)
+      if (L[i] > mx) mx = L[i], am = i;
+    o.argmax = am;
+    double se = 0;
+    for (int i = 0; i < V; ++i) se += std::exp(double(L[i] - mx));
+    o.lse = float(double(mx) + std::log(se));
+    if (t.out_argmax) t.out_argmax[ri] = am;
+    if (t.out_lse) t.out_lse[ri] = o.lse;
+    const int K = std::min(32, std::max(t.topk, t.topk_min));
+    if (K > 0) {
+      const float it = (t.topk > 0 && t.temperature > 0) ? 1.0f / t.temperature : 1.0f;
+      std::vector<int32_t> id(static_cast<size_t>(V));
+      std::iota(id.begin(), id.end(), 0);
+      std::partial_sort(id.begin(), id.begin() + K, id.end(), [&](int a, int b) {
+        const float xa = L[a] * it, xb = L[b] * it;
+        return xa > xb || (xa == xb && a < b);
+      });
+      o.tk_ids.assign(id.begin(), id.begin() + K);
+      o.tk_x.resize(size_t(K));
+      for (int i = 0; i < K; ++i) o.tk_x[size_t(i)] = L[o.tk_ids[size_t(i)]] * it;
+      const float M = o.tk_x[0];
+      float tot = 0.0f;
+      for (int i = 0; i < V; ++i) tot += std::exp(L[i] * it - M);
+      o.tk_max = M, o.tk_total = tot;
+      o.sampled = -1;
+      if (t.topk > 0 && t.gpu_draw) {
+        const int head = std::min(K, std::max(1, t.topk));
+        float pr[32];
+        for (int q = 0; q < head; ++q) pr[q] = std::exp(o.tk_x[size_t(q)] - M) / tot;
+        int keep = head;
+        if (t.min_p > 0.0f) {
+          const float fl = t.min_p * pr[0];
+          keep = 0;
+          while (keep < head && pr[keep] >= fl) ++keep;
+        }
+        if (t.top_p < 1.0f) {
+          float sum = 0.0f;
+          for (int q = 0; q < keep; ++q) sum += pr[q];
+          const float target = t.top_p * sum;
+          float acc = 0.0f;
+          int cut = keep;
+          for (int q = 0; q < keep; ++q) {
+            acc += pr[q];
+            if (acc >= target) {
+              cut = q + 1;
+              break;
+            }
+          }
+          keep = cut;
+        }
+        float best = -INFINITY;
+        int sampled = o.tk_ids[0];
+        for (int q = 0; q < std::max(keep, 1); ++q) {
+          if (!(pr[q] > 0.0f)) continue;
+          const float g = -std::log(-std::log(tk_uniform(t.seed, uint64_t(pos), uint64_t(int64_t(o.tk_ids[size_t(q)])))));
+          const float sc = std::log(pr[q]) + g;
+          if (sc > best) best = sc, sampled = o.tk_ids[size_t(q)];
+        }
+        o.sampled = sampled;
+      }
+    }
+    if (leaf && t.out_cand_logits && t.cand_offsets && t.cand_ids)
+      for (int j = t.cand_offsets[ri]; j < t.cand_offsets[ri + 1]; ++j) t.out_cand_logits[j] = L[t.cand_ids[j]];
   }
 };
 

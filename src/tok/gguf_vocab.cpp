@@ -110,7 +110,7 @@ std::unique_ptr<Tokenizer> Tokenizer::from_vocab(std::vector<std::string> tokens
                                                  const std::vector<std::string>& merges, const std::string& pre) {
   const auto pattern = tok::split_pattern_from_gguf_pre(pre);
   if (!pattern)
-    fail("unsupported tokenizer.ggml.pre '" + pre + "' (supported: qwen35, qwen2, deepseek-r1-qwen, llama3, llama-bpe, lfm2)");
+    fail("unsupported tokenizer.ggml.pre '" + pre + "' (supported: qwen35, qwen2, deepseek-r1-qwen, llama3, llama-bpe, glm4, glm5, lfm2)");
   if (!types.empty() && types.size() != tokens.size()) fail("token_type count does not match the token count");
 
   tok::BuildInput in;
