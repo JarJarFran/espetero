@@ -190,7 +190,7 @@ class DevModel {
   // its last `nlog` rows when every layer is loaded and the head is in the checkpoint (else empty).
   std::vector<float> prefill(const std::vector<int32_t>& ids, const std::string& dump_dir, int nlog = 1) {
     std::vector<float> out(size_t(std::clamp(nlog, 1, std::max(1, int(ids.size())))) * size_t(c_.V));
-    const bool head = L_ == c_.L && head_m_.w.b;
+    const bool head = has_head();
     forward(seqs_[0], ids.data(), int(ids.size()), head ? out.data() : nullptr, int(out.size() / size_t(c_.V)), dump_dir);
     if (!head) out.clear();
     return out;
@@ -204,7 +204,7 @@ class DevModel {
   int max_reads() const { return max_reads_; }
   size_t seq_bytes() const { return seq_bytes_; }
   size_t weight_bytes() const { return rt_.arena->total(); }
-  bool has_head() const { return L_ == c_.L && head_m_.w.b; }
+  bool has_head() const { return (L_ == c_.L || head_partial_) && head_m_.w.b; }
   Runtime& rt() { return rt_; }
   std::string cache_json() const {
     char b[256];
@@ -306,7 +306,7 @@ class DevModel {
       dump(E, dump_dir, "h" + std::to_string(l), H_, size_t(T) * 4 * D * 4);
     }
     nlog = std::clamp(nlog, 1, T);
-    if (logits && L_ == c_.L && head_m_.w.b) {
+    if (logits && (L_ == c_.L || head_partial_) && head_m_.w.b) {
       E.pipe("glm5_hc_mean");
       E.set(0, H_, size_t(T - nlog) * 4 * D * 4);
       E.set(1, X_);
@@ -330,6 +330,9 @@ class DevModel {
   Index idx_;
   Cfg c_;
   int L_ = 0, max_ctx_ = 4096, T_ = 4096, T_cap_ = 0, max_reads_ = 64;
+  // development (ESPETERO_GLM5_HEAD_ANY=1): the LM head after the layers loaded, even when that is not all of them
+  // (a serving smoke test on a slice: the text is meaningless, the pipeline is the real one)
+  bool head_partial_ = env_on("ESPETERO_GLM5_HEAD_ANY");
   std::vector<Seq> seqs_;
   size_t seq_bytes_ = 0;
   Runtime rt_;
@@ -413,7 +416,7 @@ class DevModel {
     if (gguf_) return load_gguf();
     const std::string top = "model.language_model.";
     embed_ = raw(top + "embed_tokens.weight");
-    if (idx_.ck.has("lm_head.weight") && L_ == c_.L) head_m_ = Mat{kBF16, c_.V, c_.D, raw("lm_head.weight"), {}};
+    if (idx_.ck.has("lm_head.weight") && (L_ == c_.L || head_partial_)) head_m_ = Mat{kBF16, c_.V, c_.D, raw("lm_head.weight"), {}};
     norm_ = vecf(top + "norm.weight");
     L.resize(size_t(L_));
     for (int l = 0; l < L_; ++l) {
@@ -639,7 +642,7 @@ class DevModel {
       gguf_suffix(embed_gg_);
     }
     norm_ = gvec("output_norm.weight");
-    if (L_ == c_.L && gt_.count("output.weight")) head_m_ = gmat("output.weight");
+    if ((L_ == c_.L || head_partial_) && gt_.count("output.weight") && gtensor("output.weight").nbytes) head_m_ = gmat("output.weight");
     L.resize(size_t(L_));
     for (int l = 0; l < L_; ++l) {
       LayerW& w = L[size_t(l)];
@@ -1253,7 +1256,7 @@ class Glm5Model final : public NativeModel {
                                     std::max(64, std::min(o.max_rows > 0 ? o.max_rows : 4096, 8192)), o.expert_cache_gb,
                                     cs ? std::atoi(cs) : 0, std::max(1, std::min(o.max_readouts > 0 ? o.max_readouts : 64, 256)));
     const Cfg& c = m_->cfg();
-    if (!m_->has_head() && !lay) fail("glm5: the checkpoint has no LM head (or not every layer)");
+    if (!m_->has_head()) fail("glm5: no LM head after the layers loaded (a partial checkpoint needs ESPETERO_GLM5_HEAD_ANY=1 and the head)");
     info_.device = [[m_->rt().dev name] UTF8String];
     info_.format = "glm5_next";
     info_.path = dir;

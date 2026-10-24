@@ -193,7 +193,7 @@ def gguf_header(data):
     return out, start
 
 
-def fake_gguf(out, quant, blocks, repo="unsloth/GLM-5.3-Flash-GGUF", jobs=8, piece=64 << 20):
+def fake_gguf(out, quant, blocks, repo="unsloth/GLM-5.3-Flash-GGUF", jobs=8, piece=64 << 20, extra=()):
     os.makedirs(out, exist_ok=True)
     api = json.loads(_get(f"https://huggingface.co/api/models/{repo}"))
     files = sorted(s["rfilename"] for s in api["siblings"] if s["rfilename"].startswith(quant + "/") and s["rfilename"].endswith(".gguf"))
@@ -218,7 +218,7 @@ def fake_gguf(out, quant, blocks, repo="unsloth/GLM-5.3-Flash-GGUF", jobs=8, pie
                 fh.truncate(end)
             os.rename(p + ".part", p)
         for name, (dims, t, o, n) in ts.items():
-            keep = name in ("token_embd.weight", "output_norm.weight")
+            keep = name in ("token_embd.weight", "output_norm.weight") or name in extra
             if name.startswith("blk."):
                 keep = int(name.split(".")[1]) in blocks
             if keep:
@@ -274,9 +274,10 @@ def main():
     fg.add_argument("out_dir")
     fg.add_argument("--quant", default="UD-IQ3_XXS")
     fg.add_argument("--fill-blocks", default="0-3")
+    fg.add_argument("--extra", default="", help="more tensors to fetch, comma-separated (e.g. output.weight)")
     args = ap.parse_args()
     if args.cmd == "fake-gguf":
-        fake_gguf(args.out_dir, args.quant, _layers(args.fill_blocks))
+        fake_gguf(args.out_dir, args.quant, _layers(args.fill_blocks), extra=tuple(x for x in args.extra.split(",") if x))
         return
     if args.cmd == "fake-ckpt":
         fake_ckpt(args.out_dir, args.repo, args.revision)
