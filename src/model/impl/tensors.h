@@ -7,6 +7,8 @@
 #pragma once
 
 #include "../../util/json.h"
+#include <sys/sysctl.h>
+
 #include "common.h"
 
 namespace espetero::native {
@@ -73,7 +75,7 @@ class SafetensorsSource : public WeightSource {
     } else {
       add_file(dir + "/model.safetensors");
     }
-    if (env_on("ESPETERO_LOAD_WARM")) warm();
+    warm();
     config_ = json::parse(read_file(dir + "/config.json"));
     const json::Value* qz = config_.get("quantization");
     if (!qz || !qz->is_object()) qz = config_.get("quantization_config");
@@ -222,20 +224,28 @@ class SafetensorsSource : public WeightSource {
     files_.push_back(std::move(mf));
   }
 
-  // Every file on a slow volume read front to back into the file cache, so
-  // the loader's reads (layer order, not the files' name order) find it there.
+  // The files on a slow volume read front to back into the file cache, so
+  // the loader's reads (layer order, not the files' name order: layers 0, 1,
+  // 10, ...) find them there: 20.4 GB from the USB HDD loaded in 78 s this
+  // way, 92 s in file order per tensor, 136-143 s in parallel pieces
+  // (docs/storage.md 3.1). Skipped when the files exceed half the RAM (the
+  // cache would evict them before the loader reads them) or with
+  // ESPETERO_LOAD_WARM=0.
   void warm() const {
+    if (const char* v = std::getenv("ESPETERO_LOAD_WARM"); v && *v == '0') return;
+    std::vector<const MappedFile*> slow;
+    size_t total = 0;
+    for (const auto& f : files_)
+      if (load_readers(f->fd) > 0) slow.push_back(f.get()), total += f->size;
+    uint64_t ram = 0;
+    size_t len = sizeof(ram);
+    if (slow.empty() || ::sysctlbyname("hw.memsize", &ram, &len, nullptr, 0) != 0 || total > ram / 2) return;
     const auto t0 = Clock::now();
     std::vector<uint8_t> scratch(kSeqPiece);
-    size_t total = 0;
-    for (const auto& f : files_) {
-      if (load_readers(f->fd) == 0) continue;
+    for (const MappedFile* f : slow)
       for (size_t off = 0; off < f->size; off += kSeqPiece)
         if (!pread_all(f->fd, scratch.data(), std::min(kSeqPiece, f->size - off), off)) break;
-      total += f->size;
-    }
-    if (total)
-      std::fprintf(stderr, "[espetero] warmed %.1f GB in file order (%.1f s)\n", double(total) / 1e9, ms_since(t0) / 1000);
+    std::fprintf(stderr, "[espetero] warmed %.1f GB in file order (%.1f s)\n", double(total) / 1e9, ms_since(t0) / 1000);
   }
 
   std::string dir_;
