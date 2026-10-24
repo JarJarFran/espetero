@@ -429,6 +429,15 @@ Rules that keep the tiers honest:
   `setBuffer` / enqueue calls as the remaining encode work (`ngram_read_row`
   is the only engine function in the top of the stack). The server hides it
   anyway with `chain_steps` 8 on greedy decode.
+- **What a dependent boundary costs on the M4 Max by kernel size**
+  (`bench_native --quick --gap`, 35B-A3B 4-bit, per dispatch: alone / in a
+  32-deep dependent chain / 32 independent dispatches concurrently encoded):
+  a tiny gather 2.5 / 1.4 / 0.0 µs; a 32-threadgroup GEMV 7.8 / 4.8 / 1.5;
+  the 64-threadgroup out projection 12.5 / 9.7 / 5.1; a 256-threadgroup
+  GEMV 17.1 / 17.8 / 10.1; the 386-threadgroup in_proj 21.5 / 22.7 / 16.8;
+  the 7760-threadgroup LM head 543 / 551 / 545. So a dependent boundary adds
+  3–4 µs to a GEMV of 16–64 threadgroups (the drain and refill of a nearly
+  empty GPU) and nothing measurable from ~250 threadgroups up.
 - **The device profile measures 2.12 µs per dependent tiny dispatch on the
   M4 Max and 4.20 µs on the M1 Max** (`gather_rows_f32` over 2048 floats,
   64-deep chain, serial encoder; family 2 = Apple9, family 1 = Apple7),
