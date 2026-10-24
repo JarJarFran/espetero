@@ -329,20 +329,9 @@ class GGUFSource : public WeightSource {
     const int fd = ::open(f_.path().c_str(), O_RDONLY);
     if (fd < 0) fail("cannot open " + f_.path());
     ::fcntl(fd, F_NOCACHE, 1);
-    const size_t step = size_t(64) << 20;
-    const size_t n = (t->nbytes + step - 1) / step;
-    std::atomic<bool> bad{false};
-    parallel_for(n, [&](size_t i) {
-      size_t off = i * step, left = std::min(step, t->nbytes - off);
-      while (left) {
-        const ssize_t r = ::pread(fd, buf.data() + off, left, off_t(t->offset + off));
-        if (r <= 0) { bad = true; return; }
-        off += size_t(r);
-        left -= size_t(r);
-      }
-    });
+    const bool ok = read_pieces(fd, buf.data(), t->nbytes, size_t(t->offset), size_t(64) << 20);
     ::close(fd);
-    if (bad) fail("read failed: " + g);
+    if (!ok) fail("read failed: " + g);
     v.data = buf.data();
     return v;
   }

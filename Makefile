@@ -18,7 +18,7 @@ NPROC := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 .PHONY: default
 default:
 	@$(MAKE) --no-print-directory -j$(NPROC) all
-FRAMEWORKS = -framework Metal -framework Foundation -framework CoreFoundation -framework ImageIO -framework CoreGraphics
+FRAMEWORKS = -framework Metal -framework Foundation -framework CoreFoundation -framework IOKit -framework ImageIO -framework CoreGraphics
 
 KERNELS := $(sort $(wildcard kernels/*.metal))
 

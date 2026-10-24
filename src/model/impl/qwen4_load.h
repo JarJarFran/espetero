@@ -65,25 +65,16 @@ inline HostMat hcmix_rows(Arena& tmp, const HostMat& h, int S, int D) {
   return o;
 }
 
-// A file range read with F_NOCACHE preads (64 MB pieces in parallel), so
-// tens of GB of resident experts do not also fill the file cache.
+// A file range read with F_NOCACHE preads (64 MB pieces in parallel, or in
+// file order from a slow disk), so tens of GB of resident experts do not also
+// fill the file cache.
 inline void pread_uncached(const std::string& path, uint64_t off, size_t n, uint8_t* dst) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) fail("cannot open " + path);
   ::fcntl(fd, F_NOCACHE, 1);
-  const size_t step = size_t(64) << 20;
-  std::atomic<bool> bad{false};
-  parallel_for((n + step - 1) / step, [&](size_t i) {
-    size_t o = i * step, left = std::min(step, n - o);
-    while (left) {
-      const ssize_t r = ::pread(fd, dst + o, left, off_t(off + o));
-      if (r <= 0) { bad = true; return; }
-      o += size_t(r);
-      left -= size_t(r);
-    }
-  });
+  const bool ok = read_pieces(fd, dst, n, size_t(off), size_t(64) << 20);
   ::close(fd);
-  if (bad) fail("read failed: " + path);
+  if (!ok) fail("read failed: " + path);
 }
 
 inline HCBlock load_hc(Model& m, const WeightSource& src, const std::string& p, bool inject, int rq = 0) {
@@ -588,9 +579,8 @@ inline void load_q4_ple_gguf(Model& m, const GGUFSource& src, const std::string&
       if (!buf) fail("n-gram table: Metal allocation of " + std::to_string(len >> 20) + " MB failed");
       Residency::get().add(buf);
       uint8_t* dst = static_cast<uint8_t*>([buf contents]);
-      const size_t step = size_t(64) << 20;
-      parallel_for((len + step - 1) / step, [&](size_t i) { pread_all(rfd, dst + i * step, std::min(step, len - i * step),
-                                                                     S.w + uint64_t(r0) * rb + i * step); });
+      if (!read_pieces(rfd, dst, len, size_t(S.w + uint64_t(r0) * rb), size_t(64) << 20))
+        fail("n-gram table: read failed (" + f.path() + ")");
       T.gpu.push_back(buf);
     }
     ::close(rfd);

@@ -5,7 +5,7 @@
 // decode latency, batched decode throughput, a decision-shaped tree, and a
 // per-kernel profile of a decode step and a prefill pass.
 //
-//   build/bench_native <model> [--quick] [--profile] [--gap] [--encoders] [--sustain] [--batch 1,4,16,64] [--ctx 128]
+//   build/bench_native <model> [--quick] [--load-only] [--profile] [--gap] [--encoders] [--sustain] [--batch 1,4,16,64] [--ctx 128]
 //   build/bench_native <model> --long 1024,8192,32768 [--long-ab OPTION V1,V2,...] [--long-seqs N] [--profile]
 #include <algorithm>
 #include <climits>
@@ -36,10 +36,10 @@ static std::vector<int> parse_list(const char* s) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <model> [--quick] [--profile] [--gap] [--encoders] [--sustain] [--batch 1,4,16,64] [--ctx N]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s <model> [--quick] [--load-only] [--profile] [--gap] [--encoders] [--sustain] [--batch 1,4,16,64] [--ctx N]\n", argv[0]);
     return 2;
   }
-  bool quick = false, profile = false, gap = false, encoders = false, sustain = false;
+  bool quick = false, profile = false, gap = false, encoders = false, sustain = false, load_only = false;  // --load-only: stop after the load
   std::vector<int> batches = {1, 4, 16, 64};
   int ctx = 128;
   const char* micro = nullptr;
@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
   int long_seqs = 1;             // --long-seqs N: N sequences of the --long contexts decoded together
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--quick")) quick = true;
+    else if (!std::strcmp(argv[i], "--load-only")) load_only = true;
     else if (!std::strcmp(argv[i], "--profile")) profile = true;
     else if (!std::strcmp(argv[i], "--gap")) gap = true;
     else if (!std::strcmp(argv[i], "--encoders")) encoders = true;
@@ -93,6 +94,7 @@ int main(int argc, char** argv) {
   const ModelInfo& I = m->info();
   std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)\n", argv[1], I.device.c_str(), I.layers,
               I.vocab, int(I.mtp), I.load_ms, I.tune_ms);
+  if (load_only) return 0;
   if (q4_steps > 0) {
     // Qwen4-Exp decode with streamed experts: random tokens, so routing
     // locality is lower than on real text (served benchmarks measure that).
