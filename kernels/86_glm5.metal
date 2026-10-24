@@ -54,20 +54,21 @@ kernel void glm5_conv_save(device const float* X [[buffer(0)]], device float* st
   for (int j = 0; j < 3; ++j) state[ulong(j) * ulong(p.y) + c] = v[j];
 }
 
-// g = lower_bound * sigmoid(exp(A_log[h]) * (f + dt_bias)) per channel, beta = sigmoid(b) per head.
+// g = lower_bound * sigmoid(A[h] * (f + dt_bias)) per channel (A = exp(A_log), computed at load), beta = sigmoid(b)
+// per head.
 struct Glm5GateP {
   int rows, H, fs, bs;  // fs, bs: row strides of F and B (floats)
   float lb;
 };
 kernel void glm5_kda_gate(device const float* F [[buffer(0)]], device const float* B [[buffer(1)]],
-                          device const float* A_log [[buffer(2)]], device const float* dt [[buffer(3)]],
+                          device const float* A [[buffer(2)]], device const float* dt [[buffer(3)]],
                           device float* G [[buffer(4)]], device float* Beta [[buffer(5)]],
                           constant Glm5GateP& p [[buffer(6)]], uint2 g [[thread_position_in_grid]]) {
   const int c = int(g.x), r = int(g.y);
   const int C = p.H * 128;
   if (c >= C || r >= p.rows) return;
   const int h = c / 128;
-  const float x = exp(A_log[h]) * (F[ulong(r) * ulong(p.fs) + ulong(c)] + dt[c]);
+  const float x = A[h] * (F[ulong(r) * ulong(p.fs) + ulong(c)] + dt[c]);
   G[ulong(r) * ulong(C) + ulong(c)] = p.lb / (1.0f + exp(-x));
   if (c % 128 == 0) Beta[ulong(r) * ulong(p.H) + ulong(h)] = 1.0f / (1.0f + exp(-B[ulong(r) * ulong(p.bs) + ulong(h)]));
 }
@@ -437,6 +438,7 @@ kernel void gguf_gemv(device const uchar* W [[buffer(0)]], device const float* X
   const int n = int(tg.x) * 8 + int(sg);
   if (mr <= 0 || n >= p.N) return;
   device const uchar* row = W + ulong(n) * gguf_row_bytes<T>(p.K);
+  const int xoff = p.grp ? (n / p.grp) * p.gstr : 0;  // per-head matrices stacked (attn_k_b / attn_v_b)
   float acc[8];
   for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
   float w[32];
@@ -444,7 +446,7 @@ kernel void gguf_gemv(device const uchar* W [[buffer(0)]], device const float* X
     gguf_piece<T>(row, c, w);
     for (int m = 0; m < 8; ++m) {
       if (m >= mr) break;
-      device const float4* xv = (device const float4*)(X + ulong(p.idx ? xrow[m0 + m] : m0 + m) * ulong(p.xs) + ulong(c * 32));
+      device const float4* xv = (device const float4*)(X + ulong(p.idx ? xrow[m0 + m] : m0 + m) * ulong(p.xs) + ulong(xoff + c * 32));
       float s = 0.0f;
       for (int j = 0; j < 8; ++j) {
         const float4 x4 = xv[j];
@@ -477,3 +479,24 @@ GGUF_GEMV("gguf_gemv_q6_k", 14)
 GGUF_GEMV("gguf_gemv_iq3_s", 21)
 GGUF_GEMV("gguf_gemv_iq2_s", 22)
 GGUF_GEMV("gguf_gemv_iq4_xs", 23)
+
+// Token embeddings from a GGUF matrix (token_embd, quantized rows of D): H[m][s][:] = E[ids[m]] for the 4 streams.
+// Grid (D / 32 pieces, rows).
+template <int T>
+kernel void gguf_embed(device const uchar* E [[buffer(0)]], device const int* ids [[buffer(1)]], device float* H [[buffer(2)]],
+                       constant int& D [[buffer(3)]], uint2 g [[thread_position_in_grid]]) {
+  const int c = int(g.x), m = int(g.y);
+  if (c >= D / 32) return;
+  float w[32];
+  gguf_piece<T>(E + ulong(ids[m]) * gguf_row_bytes<T>(D), c, w);
+  for (int s = 0; s < 4; ++s) {
+    device float* h = H + (ulong(m) * 4 + ulong(s)) * ulong(D) + ulong(c * 32);
+    for (int j = 0; j < 32; ++j) h[j] = w[j];
+  }
+}
+#define GGUF_EMBED(NAME, T) \
+  template [[host_name(NAME)]] kernel void gguf_embed<T>(device const uchar*, device const int*, device float*, constant int&, uint2);
+GGUF_EMBED("gguf_embed_q8_0", 8)
+GGUF_EMBED("gguf_embed_q4_k", 12)
+GGUF_EMBED("gguf_embed_q5_k", 13)
+GGUF_EMBED("gguf_embed_q6_k", 14)

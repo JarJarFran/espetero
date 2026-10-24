@@ -13,7 +13,9 @@ the k-pool indexer's selection (every token below 2052 visible ones).
     python3 -I tools/glm5_ref.py MODEL_DIR --tokens 154822,154824,... [--layers N] [--out DIR]
     python3 -I tools/glm5_ref.py MODEL_DIR --text "Hello" [--chat] ...
 
-MODEL_DIR may be a partial checkpoint (tests/ref/glm5_ref.py fake-ckpt
+MODEL_DIR may also hold unsloth's GGUF split files (with the checkpoint's config.json copied next
+to them): the reference then runs on their weights, dequantized with gguf-py (GGUF_PY=dir if it
+is not installed). MODEL_DIR may be a partial checkpoint (tests/ref/glm5_ref.py fake-ckpt
 --fill-layers 0-3): run --layers up to the layers present. Writes DIR/h<l>.f32
 (the residual streams after layer l, [T, 4, D]), DIR/a<l>.f32 and DIR/f<l>.f32
 (the attention / KDA block's and the MLP's outputs, [T, D]), DIR/route<l>.i32
@@ -82,6 +84,163 @@ class Ckpt:
         raise ValueError(f"{name}: dtype {dt}")
 
 
+class GgufCkpt:
+    """unsloth's GGUF split files under the transformers names (docs/glm5.md 8.2), every tensor dequantized
+    with gguf-py (`pip install gguf`, or GGUF_PY=dir holding its gguf package): the reference on the very
+    weights a GGUF run uses."""
+
+    BLOCK = {0: (1, 4), 1: (1, 2), 30: (1, 2), 8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144),
+             13: (256, 176), 14: (256, 210), 20: (32, 18), 21: (256, 110), 22: (256, 82), 23: (256, 136)}
+
+    def __init__(self, d):
+        if os.environ.get("GGUF_PY"):
+            sys.path.insert(0, os.environ["GGUF_PY"])
+        from gguf.quants import dequantize  # noqa: F401 (checked here, used in get)
+        self.t, self.maps = {}, {}
+        for f in sorted(x for x in os.listdir(d) if x.endswith(".gguf")):
+            path = os.path.join(d, f)
+            m = np.memmap(path, dtype=np.uint8, mode="r")
+            self.maps[f] = m
+            for name, (dims, typ, off, nb) in _gguf_tensors(m).items():
+                self.t[name] = (f, dims, typ, off, nb)
+        self.loc = {}
+        self.filled = None
+
+    @staticmethod
+    def _map(name):
+        """transformers name -> (GGUF name, transform)"""
+        import re
+        if name == "model.language_model.embed_tokens.weight":
+            return "token_embd.weight", None
+        if name == "model.language_model.norm.weight":
+            return "output_norm.weight", None
+        if name == "lm_head.weight":
+            return "output.weight", None
+        m = re.match(r"model\.language_model\.layers\.(\d+)\.(.*)$", name)
+        b, rest = f"blk.{m.group(1)}.", m.group(2)
+        e = re.match(r"mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$", rest)
+        if e:
+            return b + f"ffn_{e.group(2)}_exps.weight", ("expert", int(e.group(1)))
+        table = {
+            "input_layernorm.weight": "attn_norm.weight", "post_attention_layernorm.weight": "ffn_norm.weight",
+            "hc_attn_fn": "hc_attn_fn.weight", "hc_attn_base": "hc_attn_base.weight", "hc_attn_scale": "hc_attn_scale.weight",
+            "hc_ffn_fn": "hc_ffn_fn.weight", "hc_ffn_base": "hc_ffn_base.weight", "hc_ffn_scale": "hc_ffn_scale.weight",
+            "self_attn.q_proj.weight": "attn_q.weight", "self_attn.k_proj.weight": "attn_k.weight",
+            "self_attn.v_proj.weight": "attn_v.weight", "self_attn.o_proj.weight": "attn_output.weight",
+            "self_attn.q_conv1d.weight": "ssm_conv1d_q.weight", "self_attn.k_conv1d.weight": "ssm_conv1d_k.weight",
+            "self_attn.v_conv1d.weight": "ssm_conv1d_v.weight", "self_attn.f_a_proj.weight": "ssm_f_a.weight",
+            "self_attn.f_b_proj.weight": "ssm_f_b.weight", "self_attn.g_a_proj.weight": "ssm_g_a.weight",
+            "self_attn.g_b_proj.weight": "ssm_g_b.weight", "self_attn.b_proj.weight": "ssm_beta.weight",
+            "self_attn.dt_bias": "ssm_dt.bias", "self_attn.o_norm.weight": "ssm_norm.weight",
+            "self_attn.q_a_proj.weight": "attn_q_a.weight", "self_attn.q_a_layernorm.weight": "attn_q_a_norm.weight",
+            "self_attn.q_b_proj.weight": "attn_q_b.weight", "self_attn.kv_a_proj_with_mqa.weight": "attn_kv_a_mqa.weight",
+            "self_attn.kv_a_layernorm.weight": "attn_kv_a_norm.weight",
+            "self_attn.indexer.wq_b.weight": "indexer.attn_q_b.weight", "self_attn.indexer.wk.weight": "indexer.attn_k.weight",
+            "self_attn.indexer.k_norm.weight": "indexer.k_norm.weight", "self_attn.indexer.k_norm.bias": "indexer.k_norm.bias",
+            "self_attn.indexer.weights_proj.weight": "indexer.proj.weight",
+            "self_attn.indexer.index_kpool_compress_gate": "indexer_compressor_gate.weight",
+            "self_attn.indexer.index_kpool_compress_ape": "indexer_compressor_ape.weight",
+            "mlp.gate_proj.weight": "ffn_gate.weight", "mlp.up_proj.weight": "ffn_up.weight", "mlp.down_proj.weight": "ffn_down.weight",
+            "mlp.gate.weight": "ffn_gate_inp.weight", "mlp.gate.e_score_correction_bias": "exp_probs_b.bias",
+            "mlp.shared_experts.gate_proj.weight": "ffn_gate_shexp.weight", "mlp.shared_experts.up_proj.weight": "ffn_up_shexp.weight",
+            "mlp.shared_experts.down_proj.weight": "ffn_down_shexp.weight",
+        }
+        if rest == "self_attn.A_log":
+            return b + "ssm_a", ("neglog",)
+        if rest == "self_attn.kv_b_proj.weight":
+            return b + "attn_k_b.weight", ("kv_b",)
+        if rest in table:
+            return b + table[rest], None
+        raise KeyError(name)
+
+    def _raw(self, gname, row0=0, rows=None):
+        from gguf.quants import dequantize
+        f, dims, typ, off, nb = self.t[gname]
+        K = dims[0]
+        n_rows = int(np.prod(dims[1:])) if len(dims) > 1 else 1
+        bv, bb = self.BLOCK[typ]
+        rb = K // bv * bb
+        rows = n_rows - row0 if rows is None else rows
+        raw = np.asarray(self.maps[f][off + row0 * rb: off + (row0 + rows) * rb]).reshape(rows, rb)
+        if typ == 0:
+            return raw.view(np.float32).reshape(rows, K).copy()
+        return dequantize(raw, typ).astype(np.float32).reshape(rows, K)
+
+    def has(self, name):
+        try:
+            g, _ = self._map(name)
+        except (KeyError, AttributeError):
+            return False
+        return g in self.t
+
+    def get(self, name):
+        g, tr = self._map(name)
+        f, dims, typ, off, nb = self.t[g]
+        if tr and tr[0] == "expert":  # rows of expert e of a [K, N, E] tensor
+            N = dims[1]
+            return self._raw(g, tr[1] * N, N)
+        if tr and tr[0] == "neglog":
+            return np.log(-self._raw(g).reshape(-1)).astype(np.float32)
+        if tr and tr[0] == "kv_b":  # rebuilt from the per-head halves: rows h*512+i = k_b[h][:, i], rows h*512+256+d = v_b[h][d]
+            kb = self._raw(g).reshape(dims[2], dims[1], dims[0])                      # [H][512][256]
+            vd = self.t[g.replace("attn_k_b", "attn_v_b")][1]
+            vb = self._raw(g.replace("attn_k_b", "attn_v_b")).reshape(vd[2], vd[1], vd[0])  # [H][256][512]
+            return np.concatenate([kb.transpose(0, 2, 1), vb], 1).reshape(-1, dims[1]).astype(np.float32)
+        x = self._raw(g)
+        if len(dims) == 1:
+            return x.reshape(-1)
+        if name.endswith("_conv1d.weight"):  # ggml [4, 1, C] -> [C, 1, 4]
+            return x.reshape(dims[2], 1, dims[0])
+        return x.reshape(int(np.prod(dims[1:])), dims[0])
+
+
+def _gguf_tensors(m):
+    """{name: (dims, type, absolute offset, nbytes)} of a mapped GGUF file."""
+    p = [4]
+
+    def take(fmt):
+        v = struct.unpack_from(fmt, m, p[0])
+        p[0] += struct.calcsize(fmt)
+        return v[0]
+
+    def string():
+        n = take("<Q")
+        v = bytes(m[p[0]:p[0] + n]).decode("utf-8", "replace")
+        p[0] += n
+        return v
+
+    fmts = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+    def value(t):
+        if t == 8:
+            return string()
+        if t == 9:
+            et, n = take("<I"), take("<Q")
+            return [value(et) for _ in range(n)]
+        return take(fmts[t])
+
+    take("<I")
+    nt, nkv = take("<Q"), take("<Q")
+    align = 32
+    for _ in range(nkv):
+        k = string()
+        v = value(take("<I"))
+        if k == "general.alignment":
+            align = v
+    infos = []
+    for _ in range(nt):
+        name = string()
+        dims = [take("<Q") for _ in range(take("<I"))]
+        t = take("<I")
+        infos.append((name, dims, t, take("<Q")))
+    start = (p[0] + align - 1) // align * align
+    out = {}
+    for name, dims, t, off in infos:
+        bv, bb = GgufCkpt.BLOCK[t]
+        out[name] = (dims, t, start + off, int(np.prod(dims)) // bv * bb)
+    return out
+
+
 class Lin:
     """y = x W^T with W dequantized once (fp8: times its 128 x 128 block scale)."""
 
@@ -91,7 +250,7 @@ class Lin:
     def dense(self):
         if self._w is None:
             w = self.ck.get(self.name + ".weight")
-            if self.ck.loc[self.name + ".weight"][3] == "F8_E4M3":
+            if self.name + ".weight" in self.ck.loc and self.ck.loc[self.name + ".weight"][3] == "F8_E4M3":
                 s = self.ck.get(self.name + ".weight_scale_inv")
                 N, K = w.shape
                 w = w * np.repeat(np.repeat(s, 128, 0)[:N], 128, 1)[:, :K]
@@ -131,7 +290,8 @@ def softmax(x, axis=-1):
 
 class Ref:
     def __init__(self, d):
-        self.ck = Ckpt(d)
+        gguf = not os.path.exists(os.path.join(d, "model.safetensors.index.json"))
+        self.ck = GgufCkpt(d) if gguf else Ckpt(d)
         root = json.load(open(os.path.join(d, "config.json")))
         tc = root.get("text_config", root)
         self.c = tc

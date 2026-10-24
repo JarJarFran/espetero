@@ -20,7 +20,10 @@
 
 #include <sys/stat.h>
 
+#include <dirent.h>
+
 #include "glm5.h"
+#include "gguf.h"
 
 namespace espetero::native::glm5 {
 
@@ -66,21 +69,37 @@ struct Enc {
   }
 };
 
-enum Fmt : int { kBF16 = 2, kF32 = 3, kF8B = 4 };  // ds4_gemv formats
+enum Fmt : int { kBF16 = 2, kF32 = 3, kF8B = 4, kGG = 5 };  // ds4_gemv formats; kGG: GGUF blocks (gguf_gemv_*)
 struct Mat {
   int fmt = kBF16, N = 0, K = 0;
   Buf w, s;
+  int gg = 0;  // kGG: the ggml type
 };
+inline const char* gguf_suffix(int t) {
+  switch (t) {
+    case GGML_Q8_0: return "q8_0";
+    case GGML_Q2_K: return "q2_k";
+    case GGML_Q3_K: return "q3_k";
+    case GGML_Q4_K: return "q4_k";
+    case GGML_Q5_K: return "q5_k";
+    case GGML_Q6_K: return "q6_k";
+    case GGML_IQ3_S: return "iq3_s";
+    case GGML_IQ2_S: return "iq2_s";
+    case GGML_IQ4_XS: return "iq4_xs";
+  }
+  fail("glm5: GGUF type " + std::to_string(t) + " has no native kernel");
+}
 
 struct LayerW {
   bool dsa = false, moe = false;
   Buf attn_norm, ffn_norm, hca_fn, hca_base, hca_scale, hcf_fn, hcf_base, hcf_scale;
   // KDA
   Mat qkv, fgb, f_b, g_b, o;  // fgb: [f_a 128 | g_a 128 | b 64] rows
-  Buf conv_w, a_log, dt_bias, o_norm;
+  Buf conv_w, a_rate, dt_bias, o_norm;  // a_rate = exp(A_log) (GGUF: -ssm_a)
   // DSA
   Mat q_a, q_b, kv_a, o_dsa, ikg, iw, iq;  // ikg: [wk 128 | compress_gate 128] rows; iw: weights_proj; iq: wq_b
   Buf q_a_norm, kv_a_norm, kv_b, ik_w, ik_b, ape;
+  Mat k_b, v_b;  // GGUF: kv_b_proj's halves as stored there, per head [512][256] and [256][512] (absorbed layout)
   // MLP
   Mat gate, up, down;           // dense, or the shared expert
   Mat router;                   // bf16 [E, D]
@@ -91,9 +110,14 @@ struct LayerW {
 class DevModel {
  public:
   DevModel(const std::string& dir, const std::string& kernels, int layers, int max_ctx) {
-    idx_.open(dir, true);
-    c_ = idx_.c;
-    L_ = std::min(layers > 0 ? layers : c_.L, idx_.layers);
+    gguf_ = !file_exists(dir + "/config.json") || !file_exists(dir + "/model.safetensors.index.json");
+    if (gguf_) {
+      open_gguf(dir);
+    } else {
+      idx_.open(dir, true);
+      c_ = idx_.c;
+    }
+    L_ = std::min(layers > 0 ? layers : c_.L, gguf_ ? gg_layers_ : idx_.layers);
     if (L_ <= 0) fail("glm5: no complete layer in " + dir);
     max_ctx_ = max_ctx;
     rt_.init(kernels);
@@ -119,7 +143,14 @@ class DevModel {
       static_cast<int32_t*>([pos_ contents])[i] = p0 + i;
     }
     Enc E(rt_);
-    {
+    if (embed_gg_) {
+      E.pipe((std::string("gguf_embed_") + gguf_suffix(embed_gg_)).c_str());
+      E.set(0, embed_);
+      E.set(1, ids_);
+      E.set(2, H_);
+      E.bytes(3, D);
+      E.threads(size_t(D / 32), size_t(T), 1, 64);
+    } else {
       const int32_t p[2] = {D, 4};
       E.pipe("ds4_embed");
       E.set(0, ids_);
@@ -146,14 +177,14 @@ class DevModel {
     }
     std::vector<float> out;
     nlog = std::clamp(nlog, 1, T);
-    if (L_ == c_.L && head_.b) {
+    if (L_ == c_.L && head_m_.w.b) {
       E.pipe("glm5_hc_mean");
       E.set(0, H_, size_t(T - nlog) * 4 * D * 4);
       E.set(1, X_);
       E.bytes(2, D);
       E.threads(size_t(D), size_t(nlog), 1, 256);
       norm(E, X_, 0, norm_, nlog, 1, D, D);
-      gemv(E, Mat{kBF16, c_.V, D, head_, {}}, X_, 0, D, LOG_, 0, c_.V, nlog);
+      gemv(E, head_m_, X_, 0, D, LOG_, 0, c_.V, nlog);
       E.end();
       out.assign(static_cast<const float*>([LOG_ contents]), static_cast<const float*>([LOG_ contents]) + size_t(nlog) * c_.V);
       if (!dump_dir.empty()) write_file(dump_dir + "/logits.f32", out.data(), out.size() * 4);
@@ -172,7 +203,14 @@ class DevModel {
   int L_ = 0, max_ctx_ = 4096, len_ = 0, T_cap_ = 0;
   Runtime rt_;
   std::vector<LayerW> L;
-  Buf embed_, head_, norm_;
+  Buf embed_, norm_;
+  Mat head_m_;
+  int embed_gg_ = 0;  // GGUF: token_embd's type (0: bf16 rows)
+  // GGUF split files (unsloth's): every shard mapped, tensors by name
+  bool gguf_ = false;
+  std::vector<std::unique_ptr<GGUFFile>> gf_;
+  std::unordered_map<std::string, std::pair<const GGUFFile*, const GGUFFile::Tensor*>> gt_;
+  int gg_layers_ = 0;
   double gpu_ms_ = 0;
   // sequence state (one slot for now)
   std::vector<id<MTLBuffer>> kda_state_, conv_state_;           // per layer (KDA)
@@ -241,9 +279,10 @@ class DevModel {
   }
 
   void load() {
+    if (gguf_) return load_gguf();
     const std::string top = "model.language_model.";
     embed_ = raw(top + "embed_tokens.weight");
-    if (idx_.ck.has("lm_head.weight") && L_ == c_.L) head_ = raw("lm_head.weight");
+    if (idx_.ck.has("lm_head.weight") && L_ == c_.L) head_m_ = Mat{kBF16, c_.V, c_.D, raw("lm_head.weight"), {}};
     norm_ = vecf(top + "norm.weight");
     L.resize(size_t(L_));
     for (int l = 0; l < L_; ++l) {
@@ -267,7 +306,10 @@ class DevModel {
           cw.insert(cw.end(), f.begin(), f.end());
         }
         w.conv_w = rt_.arena->copy(cw.data(), cw.size() * 4);
-        w.a_log = vecf(a + "A_log"), w.dt_bias = vecf(a + "dt_bias"), w.o_norm = vecf(a + "o_norm.weight");
+        std::vector<float> ar = floats(a + "A_log");
+        for (float& x : ar) x = std::exp(x);
+        w.a_rate = rt_.arena->copy(ar.data(), ar.size() * 4);
+        w.dt_bias = vecf(a + "dt_bias"), w.o_norm = vecf(a + "o_norm.weight");
       } else {
         w.q_a = f8(a + "q_a_proj"), w.q_b = f8(a + "q_b_proj"), w.kv_a = f8(a + "kv_a_proj_with_mqa"), w.o_dsa = f8(a + "o_proj");
         w.q_a_norm = vecf(a + "q_a_layernorm.weight"), w.kv_a_norm = vecf(a + "kv_a_layernorm.weight");
@@ -290,6 +332,210 @@ class DevModel {
           w.xg.push_back(f8(x + "gate_proj"));
           w.xu.push_back(f8(x + "up_proj"));
           w.xd.push_back(f8(x + "down_proj"));
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- GGUF (unsloth's split files)
+  const GGUFFile::Tensor& gtensor(const std::string& n, const GGUFFile** f = nullptr) const {
+    auto it = gt_.find(n);
+    if (it == gt_.end()) fail("glm5: GGUF tensor " + n + " missing");
+    if (f) *f = it->second.first;
+    return *it->second.second;
+  }
+  void open_gguf(const std::string& dir) {
+    std::vector<std::string> files;
+    if (DIR* d = ::opendir(dir.c_str())) {
+      while (dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) files.push_back(dir + "/" + n);
+      }
+      ::closedir(d);
+    }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) fail("glm5: no config.json or .gguf files in " + dir);
+    for (const std::string& f : files) gf_.push_back(std::make_unique<GGUFFile>(f));
+    for (const auto& g : gf_)
+      for (const auto& [n, t] : g->tensors()) gt_[n] = {g.get(), &t};
+    const GGUFFile& m = *gf_[0];  // metadata in the first shard
+    if (m.get_string("general.architecture", "") != "glm5-next") fail("glm5: " + files[0] + " is not a glm5-next GGUF");
+    const std::string a = "glm5-next.";
+    Cfg c;
+    c.n_mtp = int(m.get_int(a + "nextn_predict_layers", 1));
+    c.L = int(m.get_int(a + "block_count", 46)) - c.n_mtp;
+    c.D = int(m.get_int(a + "embedding_length", 4096));
+    c.V = int(m.get_int(a + "vocab_size", 154880));
+    c.eps = float(m.get_float(a + "attention.layer_norm_rms_epsilon", 1e-5));
+    c.kH = int(m.get_int(a + "attention.head_count", 64));
+    c.kD = int(m.get_int(a + "kda.head_dim", 128));
+    c.conv = int(m.get_int(a + "ssm.conv_kernel", 4));
+    c.gate_lb = float(m.get_float(a + "kda.gate_lower_bound", -5.0));
+    c.H = c.kH;
+    c.QR = int(m.get_int(a + "attention.q_lora_rank", 1536));
+    c.KVR = int(m.get_int(a + "attention.kv_lora_rank", 512));
+    c.NOPE = int(m.get_int(a + "attention.key_length_mla", 256));
+    c.VD = int(m.get_int(a + "attention.value_length_mla", 256));
+    c.ROPE = int(m.get_int(a + "rope.dimension_count", 0));
+    c.IH = int(m.get_int(a + "attention.indexer.head_count", 32));
+    c.IHD = int(m.get_int(a + "attention.indexer.key_length", 128));
+    c.ITOPK = int(m.get_int(a + "attention.indexer.top_k", 2048));
+    c.KPOOL = int(m.get_int(a + "attention.indexer.kpool", 4));
+    c.I_dense = int(m.get_int(a + "feed_forward_length", 12288));
+    c.IE = int(m.get_int(a + "expert_feed_forward_length", 2048));
+    c.E = int(m.get_int(a + "expert_count", 288));
+    c.K = int(m.get_int(a + "expert_used_count", 8));
+    c.NSH = int(m.get_int(a + "expert_shared_count", 1));
+    c.route_scale = float(m.get_float(a + "expert_weights_scale", 2.5));
+    const std::vector<double> clamp = m.get_floats(a + "swiglu_clamp_exp");
+    c.swiglu = clamp.empty() ? 10.0f : float(clamp[0]);
+    c.hc = int(m.get_int(a + "hyper_connection.count", 4));
+    c.hc_iters = int(m.get_int(a + "hyper_connection.sinkhorn_iterations", 20));
+    c.hc_eps = float(m.get_float(a + "hyper_connection.epsilon", 1e-6));
+    const std::vector<int64_t> kv = m.get_ints(a + "attention.head_count_kv");
+    const int dense = int(m.get_int(a + "leading_dense_block_count", 3));
+    c.is_dsa.assign(size_t(c.L), 0), c.is_moe.assign(size_t(c.L), 0), c.idx_full.assign(size_t(c.L), 1);
+    for (int l = 0; l < c.L; ++l) {
+      c.is_dsa[size_t(l)] = l < int(kv.size()) ? kv[size_t(l)] != 0 : l % 4 == 3;
+      c.is_moe[size_t(l)] = l >= dense;
+    }
+    if (m.get_int(a + "expert_gating_func", 2) != 2) fail("glm5: GGUF expert gating is not sigmoid");
+    if (c.hc != 4 || c.ROPE != 0 || c.kD != 128) fail("glm5: unsupported GGUF geometry");
+    c_ = c;
+    // a partial slice (tests/ref/glm5_ref.py fake-gguf --fill-blocks): only those blocks hold data
+    gg_layers_ = c.L;
+    if (file_exists(dir + "/.slice.json")) {
+      const json::Value sl = json::parse(read_file(dir + "/.slice.json"));
+      int n = 0;
+      for (const json::Value& b : sl.get("blocks")->as_array())
+        if (int(b.as_int()) == n) ++n;
+      gg_layers_ = n;
+    }
+  }
+  Buf gcopy(const std::string& n) {
+    const GGUFFile* f = nullptr;
+    const GGUFFile::Tensor& t = gtensor(n, &f);
+    return rt_.arena->copy(f->data(t), t.nbytes);
+  }
+  std::vector<float> gfloats(const std::string& n) {
+    const GGUFFile* f = nullptr;
+    const GGUFFile::Tensor& t = gtensor(n, &f);
+    std::vector<float> v;
+    if (t.type == GGML_F32) {
+      v.resize(t.nbytes / 4);
+      std::memcpy(v.data(), f->data(t), t.nbytes);
+    } else if (t.type == GGML_Q8_0) {  // (the hyper-connection fn matrices)
+      const uint8_t* p = f->data(t);
+      v.resize(t.nbytes / 34 * 32);
+      for (size_t b = 0; b < v.size() / 32; ++b) {
+        const float d = h2f(p + b * 34);
+        for (int j = 0; j < 32; ++j) v[b * 32 + size_t(j)] = d * float(int8_t(p[b * 34 + 2 + size_t(j)]));
+      }
+    } else {
+      fail("glm5: GGUF " + n + ": type " + std::to_string(t.type) + " where floats were expected");
+    }
+    return v;
+  }
+  Buf gvec(const std::string& n) {
+    const std::vector<float> v = gfloats(n);
+    return rt_.arena->copy(v.data(), v.size() * 4);
+  }
+  // A GGUF matrix (ggml dims [K, N]); F32 ones run through ds4_gemv_f32.
+  Mat gmat(const std::string& n) {
+    const GGUFFile::Tensor& t = gtensor(n);
+    Mat m;
+    m.K = int(t.dims[0]);
+    m.N = int(t.nbytes / (t.type == GGML_F32 ? size_t(m.K) * 4 : size_t(m.K / ggml_type_info(t.type)->block * ggml_type_info(t.type)->bytes)));
+    m.w = gcopy(n);
+    if (t.type == GGML_F32) m.fmt = kF32;
+    else m.fmt = kGG, m.gg = t.type;
+    gguf_suffix(m.fmt == kGG ? m.gg : GGML_Q8_0);  // fails early for a type without a kernel
+    return m;
+  }
+  // Matrices of one type and width stacked by rows (q | k | v, f_a | g_a | beta, wk | compress_gate).
+  Mat gcat(const std::vector<std::string>& ns) {
+    const GGUFFile::Tensor& t0 = gtensor(ns[0]);
+    size_t bytes = 0;
+    for (const auto& n : ns) {
+      const GGUFFile::Tensor& t = gtensor(n);
+      if (t.type != t0.type || t.dims[0] != t0.dims[0]) fail("glm5: GGUF " + n + " cannot be stacked with " + ns[0]);
+      bytes += t.nbytes;
+    }
+    Mat m = gmat(ns[0]);
+    Buf b = rt_.arena->alloc(bytes);
+    size_t o = 0;
+    int N = 0;
+    for (const auto& n : ns) {
+      const GGUFFile* f = nullptr;
+      const GGUFFile::Tensor& t = gtensor(n, &f);
+      std::memcpy(static_cast<uint8_t*>(ptr(b)) + o, f->data(t), t.nbytes);
+      o += t.nbytes;
+      N += int(t.nbytes / (t.type == GGML_F32 ? size_t(t.dims[0]) * 4 : size_t(t.dims[0] / ggml_type_info(t.type)->block * ggml_type_info(t.type)->bytes)));
+    }
+    m.w = b, m.N = N;
+    return m;
+  }
+  void load_gguf() {
+    {
+      const GGUFFile::Tensor& t = gtensor("token_embd.weight");
+      if (t.type == GGML_F32 || t.type == GGML_F16 || t.type == GGML_BF16) fail("glm5: dense GGUF embeddings not handled yet");
+      embed_ = gcopy("token_embd.weight");
+      embed_gg_ = t.type;
+      gguf_suffix(embed_gg_);
+    }
+    norm_ = gvec("output_norm.weight");
+    if (L_ == c_.L && gt_.count("output.weight")) head_m_ = gmat("output.weight");
+    L.resize(size_t(L_));
+    for (int l = 0; l < L_; ++l) {
+      LayerW& w = L[size_t(l)];
+      const std::string b = "blk." + std::to_string(l) + ".";
+      w.dsa = c_.dsa(l), w.moe = c_.moe(l);
+      w.attn_norm = gvec(b + "attn_norm.weight"), w.ffn_norm = gvec(b + "ffn_norm.weight");
+      w.hca_fn = gvec(b + "hc_attn_fn.weight"), w.hca_base = gvec(b + "hc_attn_base.weight"), w.hca_scale = gvec(b + "hc_attn_scale.weight");
+      w.hcf_fn = gvec(b + "hc_ffn_fn.weight"), w.hcf_base = gvec(b + "hc_ffn_base.weight"), w.hcf_scale = gvec(b + "hc_ffn_scale.weight");
+      if (!w.dsa) {
+        w.qkv = gcat({b + "attn_q.weight", b + "attn_k.weight", b + "attn_v.weight"});
+        w.fgb = gcat({b + "ssm_f_a.weight", b + "ssm_g_a.weight", b + "ssm_beta.weight"});
+        w.f_b = gmat(b + "ssm_f_b.weight"), w.g_b = gmat(b + "ssm_g_b.weight"), w.o = gmat(b + "attn_output.weight");
+        std::vector<float> cw;
+        for (const char* n : {"ssm_conv1d_q", "ssm_conv1d_k", "ssm_conv1d_v"}) {
+          const std::vector<float> f = gfloats(b + n + ".weight");  // ggml [4, 1, C]: 4 taps per channel
+          cw.insert(cw.end(), f.begin(), f.end());
+        }
+        w.conv_w = rt_.arena->copy(cw.data(), cw.size() * 4);
+        std::vector<float> ar = gfloats(b + "ssm_a");  // -exp(A_log)
+        for (float& x : ar) x = -x;
+        w.a_rate = rt_.arena->copy(ar.data(), ar.size() * 4);
+        w.dt_bias = gvec(b + "ssm_dt.bias"), w.o_norm = gvec(b + "ssm_norm.weight");
+      } else {
+        w.q_a = gmat(b + "attn_q_a.weight"), w.q_b = gmat(b + "attn_q_b.weight"), w.kv_a = gmat(b + "attn_kv_a_mqa.weight");
+        w.o_dsa = gmat(b + "attn_output.weight");
+        w.q_a_norm = gvec(b + "attn_q_a_norm.weight"), w.kv_a_norm = gvec(b + "attn_kv_a_norm.weight");
+        w.k_b = gmat(b + "attn_k_b.weight"), w.v_b = gmat(b + "attn_v_b.weight");
+        w.ikg = gcat({b + "indexer.attn_k.weight", b + "indexer_compressor_gate.weight"});
+        w.iw = gmat(b + "indexer.proj.weight"), w.iq = gmat(b + "indexer.attn_q_b.weight");
+        w.ik_w = gvec(b + "indexer.k_norm.weight"), w.ik_b = gvec(b + "indexer.k_norm.bias");
+        w.ape = gvec(b + "indexer_compressor_ape.weight");
+      }
+      if (!w.moe) {
+        w.gate = gmat(b + "ffn_gate.weight"), w.up = gmat(b + "ffn_up.weight"), w.down = gmat(b + "ffn_down.weight");
+      } else {
+        w.router = gmat(b + "ffn_gate_inp.weight");
+        w.bias = gvec(b + "exp_probs_b.bias");
+        w.gate = gmat(b + "ffn_gate_shexp.weight"), w.up = gmat(b + "ffn_up_shexp.weight"), w.down = gmat(b + "ffn_down_shexp.weight");
+        // the routed experts: one 3-D tensor per matrix ([K, N, E]); expert e's rows are contiguous
+        for (const char* nm : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}) {
+          const GGUFFile::Tensor& t = gtensor(b + nm + ".weight");
+          Mat all = gmat(b + nm + ".weight");
+          const int N = int(t.dims[1]);
+          const size_t per = all.fmt == kF32 ? size_t(N) * size_t(all.K) * 4 : t.nbytes / size_t(t.dims[2]);
+          std::vector<Mat>& dst = nm[4] == 'g' ? w.xg : nm[4] == 'u' ? w.xu : w.xd;
+          for (int e = 0; e < int(t.dims[2]); ++e) {
+            Mat x = all;
+            x.N = N;
+            x.w = Buf{all.w.b, all.w.off + size_t(e) * per};
+            dst.push_back(x);
+          }
         }
       }
     }
@@ -353,11 +599,12 @@ class DevModel {
   };
   void gemv(Enc& E, const Mat& m, id<MTLBuffer> X, size_t xoff, int xs, id<MTLBuffer> Y, size_t yoff, int ys, int M,
             bool accum = false, id<MTLBuffer> xrow = nil, size_t xro = 0, id<MTLBuffer> yrow = nil, size_t yro = 0,
-            id<MTLBuffer> ysc = nil, size_t yso = 0) {
+            id<MTLBuffer> ysc = nil, size_t yso = 0, int grp = 0, int gstr = 0) {
     if (M <= 0) return;
-    E.pipe(m.fmt == kF8B ? "ds4_gemv_f8b" : m.fmt == kBF16 ? "ds4_gemv_bf16" : "ds4_gemv_f32");
+    if (m.fmt == kGG) E.pipe((std::string("gguf_gemv_") + gguf_suffix(m.gg)).c_str());
+    else E.pipe(m.fmt == kF8B ? "ds4_gemv_f8b" : m.fmt == kBF16 ? "ds4_gemv_bf16" : "ds4_gemv_f32");
     // indexed rows when any of xrow / yrow / ysc is given (the others default to the identity and 1.0)
-    GemvP p{m.N, m.K, M, xs, ys, 0, 0, accum ? 1 : 0, xrow || yrow || ysc ? 1 : 0, 8};
+    GemvP p{m.N, m.K, M, xs, ys, grp, gstr, accum ? 1 : 0, xrow || yrow || ysc ? 1 : 0, 8};
     E.set(0, m.w);
     E.set(1, m.s.b ? m.s : m.w);
     E.set(2, X, xoff);
@@ -472,7 +719,7 @@ class DevModel {
       E.pipe("glm5_kda_gate");
       E.set(0, P3_);
       E.set(1, P5_, size_t(2 * c_.kD) * 4);
-      E.set(2, w.a_log);
+      E.set(2, w.a_rate);
       E.set(3, w.dt_bias);
       E.set(4, P3_);  // g in place over f (each thread reads its f before writing its g)
       E.set(5, P6_);
@@ -627,7 +874,9 @@ class DevModel {
       write_file(dump_dir + "/sel" + std::to_string(l) + ".i32", sel.data(), sel.size() * 4);
     }
     // absorbed queries [T][H][512], latent attention, the heads' outputs, o_proj
-    {
+    if (gguf_) {
+      gemv(E, w.k_b, P1_, 0, H * c_.NOPE, P2_, 0, H * KVR, T, false, nil, 0, nil, 0, nil, 0, KVR, c_.NOPE);
+    } else {
       struct {
         int rows, H, xs, ys;
       } p{T, H, H * c_.NOPE, H * KVR};
@@ -656,7 +905,9 @@ class DevModel {
       E.bytes(8, p);
       E.groups(size_t((H + 7) / 8), size_t(T), 1, 256);
     }
-    {
+    if (gguf_) {
+      gemv(E, w.v_b, P2_, 0, H * KVR, P1_, 0, H * c_.VD, T, false, nil, 0, nil, 0, nil, 0, c_.VD, KVR);
+    } else {
       struct {
         int rows, H, xs, ys;
       } p{T, H, H * KVR, H * c_.VD};
