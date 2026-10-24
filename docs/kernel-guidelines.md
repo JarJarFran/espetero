@@ -430,8 +430,15 @@ Rules that keep the tiers honest:
   is the only engine function in the top of the stack). The server hides it
   anyway with `chain_steps` 8 on greedy decode.
 - **The device profile measures 2.12 µs per dependent tiny dispatch on the
-  M4 Max** (`gather_rows_f32` over 2048 floats, 64-deep chain, serial
-  encoder; family 2 = Apple9), cached in device-profile-r1-Apple_M4_Max.json.
+  M4 Max and 4.20 µs on the M1 Max** (`gather_rows_f32` over 2048 floats,
+  64-deep chain, serial encoder; family 2 = Apple9, family 1 = Apple7),
+  cached in device-profile-r1-<device>.json; `dear_boundary()` (≥ 3 µs)
+  separates the two.
+- **`moe_fin` 1 also wins on the M1 Max** (2026-10-24, MacBook, 35B-A3B
+  4-bit, three alternating pairs against main dde1aa1's binary): 1-row step
+  9.86 / 9.31 / 9.49 → 9.25 / 9.11 / 9.15 ms GPU (−3 to −6 %, 96–101 →
+  98–102 tok/s); 16 rows 46.1–49.5 vs 46.3–50.7 (equal within the
+  MacBook's thermal spread).
 - **The 9–16-row shared expert and its gate are the step's largest small
   items**: at 16 rows the 1×2048 shared-gate GEMM (one threadgroup, one live
   simdgroup streaming 32 K steps) takes 57 µs per layer (2.28 ms, 10.5 % of
