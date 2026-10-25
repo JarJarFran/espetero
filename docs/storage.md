@@ -213,4 +213,4 @@ Crecer el cluster:
 | F2 | MacBook → almacén por TB: HF cache, `models`, `modelos`, `ultra-metal/runs`, `espetero-work` | necesita SMB montado |
 | F3 | Espetero: lectura secuencial desde HDD en el loader (§3.1) y medir carga real HDD vs SSD | pendiente |
 | F4 | gputurn: `vaults`, cola de carga por disco, comprobación de montaje, `fetch`, `--out` | pendiente |
-| F5 | Reglas de §8 en CLAUDE.md global y en `gputurn agents --install` | pendiente |
+| F5 | Reglas de §8 en CLAUDE.md global y en `gputurn agents --install` | CLAUDE.md global de ambos Macs hecho 2026-10-25 (bloque `almacen:begin/end`); `gputurn agents --install` (opencode/Codex) pendiente |
