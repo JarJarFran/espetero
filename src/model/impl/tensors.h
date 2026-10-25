@@ -228,7 +228,7 @@ class SafetensorsSource : public WeightSource {
   // the loader's reads (layer order, not the files' name order: layers 0, 1,
   // 10, ...) find them there: 20.4 GB from the USB HDD loaded in 78 s this
   // way, 92 s in file order per tensor, 136-143 s in parallel pieces
-  // (docs/storage.md 3.1). Skipped when the files exceed half the RAM (the
+  // (docs/almacen/storage.md 3.1). Skipped when the files exceed half the RAM (the
   // cache would evict them before the loader reads them) or with
   // ESPETERO_LOAD_WARM=0.
   void warm() const {
