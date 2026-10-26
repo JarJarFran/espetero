@@ -168,7 +168,7 @@ class DevModel {
   // max_rows: rows per GPU pass (longer segments run in chunks); cache_gb / cache_slots: the expert cache
   // (0: automatic; slots override for tests).
   DevModel(const std::string& dir, const std::string& kernels, int layers, int max_ctx, int slots = 1, int max_rows = 4096,
-           double cache_gb = 0, int cache_slots = 0, int max_reads = 64) {
+           double cache_gb = 0, int cache_slots = 0, int max_reads = 64, int eager = 0) {
     gguf_ = !file_exists(dir + "/config.json") || !file_exists(dir + "/model.safetensors.index.json");
     if (gguf_) {
       open_gguf(dir);
@@ -198,8 +198,10 @@ class DevModel {
     load();
     const double wgb = double(rt_.arena->total()) / 1e9;
     alloc_common();
+    // the first `eager` sequences now (0: all), the others (scratch) on first use: at 128K each is ~1.7 GB
     seqs_.resize(size_t(std::max(1, slots)));
-    for (Seq& q : seqs_) alloc_seq(q);
+    for (int i = 0; i < int(seqs_.size()); ++i)
+      if (eager <= 0 || i < eager) alloc_seq(seqs_[size_t(i)]);
     ensure_scratch(T_);
     make_cache(cache_gb, cache_slots);
     if (xc_.resident)
@@ -226,7 +228,11 @@ class DevModel {
   }
 
   int nseq() const { return int(seqs_.size()); }
-  Seq& seq(int i) { return seqs_.at(size_t(i)); }
+  Seq& seq(int i) {
+    Seq& q = seqs_.at(size_t(i));
+    if (q.kda.empty()) alloc_seq(q);
+    return q;
+  }
   const Seq& seq(int i) const { return seqs_.at(size_t(i)); }
   int max_ctx() const { return max_ctx_; }
   int max_rows() const { return T_; }
@@ -843,10 +849,15 @@ class DevModel {
       // every expert, packed per layer, in what the working set leaves keeping 1.5 GB: resident
       uint64_t packed = 0;
       for (const XLayer& xl : x.layers) packed += (xl.bytes + 255) / 256 * 256 * uint64_t(c_.E);
-      if ((gb <= 0 && double(packed) <= ws - mine - 1.5e9) || (gb > 0 && double(packed) <= gb * 1e9)) {
+      // ESPETERO_GLM5_RESIDENT=1 / 0 forces the choice (1: past the working set's recommendation if need be)
+      const char* rs = std::getenv("ESPETERO_GLM5_RESIDENT");
+      const int force = rs ? std::atoi(rs) : -1;
+      if (force == 1 || (force < 0 && ((gb <= 0 && double(packed) <= ws - mine - 1.5e9) || (gb > 0 && double(packed) <= gb * 1e9)))) {
         make_resident();
         return;
       }
+      std::fprintf(stderr, "glm5: the experts (%.1f GB) do not fit in the %.1f GB the working set leaves: LRU pool\n",
+                   double(packed) / 1e9, (ws - mine) / 1e9);
       if (gb <= 0) gb = (ws - mine - 6e9) / 1e9;  // otherwise an LRU pool, keeping 6 GB
       slots = int(std::max(1.0, gb * 1e9 / double(x.slot_bytes)));
     }
@@ -1464,7 +1475,8 @@ class Glm5Model final : public NativeModel {
     const char* lay = std::getenv("ESPETERO_GLM5_LAYERS");  // development: the first n layers (no head)
     m_ = std::make_unique<DevModel>(dir, kernels, lay ? std::atoi(lay) : 0, max_ctx_, nuser_ + kScratch,
                                     std::max(64, std::min(o.max_rows > 0 ? o.max_rows : 4096, 8192)), o.expert_cache_gb,
-                                    cs ? std::atoi(cs) : 0, std::max(1, std::min(o.max_readouts > 0 ? o.max_readouts : 64, 256)));
+                                    cs ? std::atoi(cs) : 0, std::max(1, std::min(o.max_readouts > 0 ? o.max_readouts : 64, 256)),
+                                    nuser_);
     const Cfg& c = m_->cfg();
     if (!m_->has_head()) fail("glm5: no LM head after the layers loaded (a partial checkpoint needs ESPETERO_GLM5_HEAD_ANY=1 and the head)");
     info_.device = [[m_->rt().dev name] UTF8String];
