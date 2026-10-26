@@ -127,11 +127,12 @@ constexpr size_t kCopyPiece = size_t(8) << 20;
 // ---------------------------------------------------------------- slow disks
 // A spinning disk reads a weight file fastest front to back on one thread:
 // a USB HDD read 264-278 MB/s that way and 176 MB/s in the loader's
-// parallel pieces, which make the head seek between them. load_readers(fd): the threads that read weights from fd's volume,
+// parallel pieces, which make the head seek between them.
+// load_readers(fd): the threads that read weights from fd's volume,
 // 0 = all cores in parallel pieces (SSDs). ESPETERO_LOAD_THREADS=N sets it
 // for every file; otherwise it is 1 on a rotational or USB disk, a network
-// share, or a volume under a vault root (ESPETERO_VAULT_ROOTS, colon
-// separated, default /Volumes/Almacen).
+// share, or a volume listed in ESPETERO_VAULT_ROOTS (mount points, colon
+// separated; none by default).
 constexpr size_t kSeqPiece = size_t(64) << 20;
 
 // Rotational medium or USB interconnect anywhere above the BSD disk `bsd`
@@ -164,7 +165,7 @@ inline std::string slow_volume(const struct statfs& sf) {
   const std::string type = sf.f_fstypename, mnt = sf.f_mntonname, from = sf.f_mntfromname;
   if (type == "smbfs" || type == "nfs" || type == "afpfs" || type == "webdav") return "network share";
   const char* rv = std::getenv("ESPETERO_VAULT_ROOTS");
-  const std::string roots = rv ? rv : "/Volumes/Almacen";
+  const std::string roots = rv ? rv : "";
   for (size_t a = 0; a <= roots.size();) {
     size_t b = roots.find(':', a);
     if (b == std::string::npos) b = roots.size();
