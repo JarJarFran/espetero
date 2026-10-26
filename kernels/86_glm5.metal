@@ -410,6 +410,30 @@ static inline void gguf_piece(device const uchar* row, int c, thread float* w) {
       const float dl = l < 2 ? db0 : db1;
       for (int j = 0; j < 8; ++j) w[8 * l + j] = dl * float((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
     }
+  } else if (T == 17) {  // IQ2_XS: d qs[32] (u16: 9-bit grid index | 7-bit sign code) scales[8]
+    device const uchar* x = row + ulong(b) * 74;
+    const float d = gguf_h(x);
+    const float db0 = d * (0.5f + float(x[66 + s] & 0xF)) * 0.25f, db1 = d * (0.5f + float(x[66 + s] >> 4)) * 0.25f;
+    for (int l = 0; l < 4; ++l) {
+      const uint q = uint(x[2 + 2 * (4 * s + l)]) | (uint(x[3 + 2 * (4 * s + l)]) << 8);
+      const ulong g = gguf_iq2xs_grid[q & 511];
+      const uchar sg = gguf_ksigns_iq2xs[q >> 9];
+      const float dl = l < 2 ? db0 : db1;
+      for (int j = 0; j < 8; ++j) w[8 * l + j] = dl * float((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+    }
+  } else if (T == 18) {  // IQ3_XXS: d qs[64] (grid indices) scales_and_signs[32] (u32: 4 x 7-bit sign codes | 4-bit scale)
+    device const uchar* x = row + ulong(b) * 98;
+    const float d = gguf_h(x);
+    device const uchar* ss = x + 66 + 4 * s;
+    const uint aux = uint(ss[0]) | (uint(ss[1]) << 8) | (uint(ss[2]) << 16) | (uint(ss[3]) << 24);
+    const float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+    device const uchar* qs = x + 2 + 8 * s;
+    for (int l = 0; l < 4; ++l) {
+      const uchar sg = gguf_ksigns_iq2xs[(aux >> (7 * l)) & 127];
+      const uint g1 = gguf_iq3xxs_grid[qs[2 * l]], g2 = gguf_iq3xxs_grid[qs[2 * l + 1]];
+      for (int j = 0; j < 8; ++j)
+        w[8 * l + j] = db * float(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF) * ((sg >> j) & 1 ? -1.0f : 1.0f);
+    }
   } else if (T == 21) {  // IQ3_S: d qs[64] qh[8] signs[32] scales[4]
     device const uchar* x = row + ulong(b) * 110;
     const float d = gguf_h(x);
@@ -427,7 +451,8 @@ static inline void gguf_piece(device const uchar* row, int c, thread float* w) {
 template <int T>
 static inline ulong gguf_row_bytes(int K) {
   return T == 8 ? ulong(K / 32) * 34
-         : ulong(K / 256) * (T == 10 ? 84 : T == 11 ? 110 : T == 12 ? 144 : T == 13 ? 176 : T == 14 ? 210 : T == 23 ? 136 : T == 22 ? 82 : 110);
+         : ulong(K / 256) * (T == 10 ? 84 : T == 11 ? 110 : T == 12 ? 144 : T == 13 ? 176 : T == 14 ? 210 : T == 23 ? 136 : T == 22 ? 82
+                             : T == 17 ? 74 : T == 18 ? 98 : 110);
 }
 template <int T>
 kernel void gguf_gemv(device const uchar* W [[buffer(0)]], device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
@@ -479,6 +504,8 @@ GGUF_GEMV("gguf_gemv_q6_k", 14)
 GGUF_GEMV("gguf_gemv_iq3_s", 21)
 GGUF_GEMV("gguf_gemv_iq2_s", 22)
 GGUF_GEMV("gguf_gemv_iq4_xs", 23)
+GGUF_GEMV("gguf_gemv_iq2_xs", 17)
+GGUF_GEMV("gguf_gemv_iq3_xxs", 18)
 
 // Token embeddings from a GGUF matrix (token_embd, quantized rows of D): H[m][s][:] = E[ids[m]] for the 4 streams.
 // Grid (D / 32 pieces, rows).

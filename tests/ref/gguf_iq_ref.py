@@ -33,7 +33,7 @@ from gguf.quants import dequantize  # noqa: E402
 # block size in values and bytes; byte offsets of the fp16 super-scale(s) in a block
 BLOCK = {T.Q8_0: (32, 34, (0,)), T.Q2_K: (256, 84, (80, 82)), T.Q3_K: (256, 110, (108,)), T.Q4_K: (256, 144, (0, 2)),
          T.Q5_K: (256, 176, (0, 2)), T.Q6_K: (256, 210, (208,)), T.IQ4_XS: (256, 136, (0,)), T.IQ2_S: (256, 82, (0,)),
-         T.IQ3_S: (256, 110, (0,))}
+         T.IQ3_S: (256, 110, (0,)), T.IQ2_XS: (256, 74, (0,)), T.IQ3_XXS: (256, 98, (0,))}
 
 
 def random_blocks(t, rows, cols, rng):

@@ -25,7 +25,7 @@ namespace espetero::native {
 enum GGMLType : int {
   GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
   GGML_Q8_0 = 8, GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14,
-  GGML_IQ4_NL = 20, GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_BF16 = 30,
+  GGML_IQ2_XS = 17, GGML_IQ3_XXS = 18, GGML_IQ4_NL = 20, GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_BF16 = 30,
 };
 
 struct GGMLTypeInfo {
@@ -49,6 +49,8 @@ const GGMLTypeInfo* ggml_type_info(int t) {
       // codebook types (gguf_iq_grids.h): IQ3_S magnitudes are odd 1..15, so +-v is 2c - 15 with a 4-bit
       // c (scale 2 db, bias -15 db); IQ2_S magnitudes are 8 / 25 / 43, so +-v takes an 8-bit code v + 43.
       {GGML_IQ3_S, {"IQ3_S", 256, 110, 4, 32}},  {GGML_IQ2_S, {"IQ2_S", 256, 82, 8, 16}},
+      // IQ2_XS magnitudes are IQ2_S's (8 / 25 / 43); IQ3_XXS's are 4 .. 52 step 8 and 62: 8-bit codes v + 62
+      {GGML_IQ2_XS, {"IQ2_XS", 256, 74, 8, 16}}, {GGML_IQ3_XXS, {"IQ3_XXS", 256, 98, 8, 32}},
   };
   auto it = table.find(t);
   return it == table.end() ? nullptr : &it->second;
@@ -822,6 +824,48 @@ void convert_row(int type, const uint8_t* src, int64_t cols, RowSink& out) {
         }
       }
       break;
+    case GGML_IQ2_XS:
+      for (int64_t b = 0; b < cols / 256; ++b) {
+        const uint8_t* x = src + b * 74;
+        const float d = h2f(x);
+        for (int ib = 0; ib < 8; ++ib) {
+          for (int half = 0; half < 2; ++half) {
+            const float db = d * (0.5f + float((x[66 + ib] >> (4 * half)) & 0xF)) * 0.25f;
+            out.group(b * 16 + ib * 2 + half, db, -43.0f * db);
+          }
+          for (int l = 0; l < 4; ++l) {
+            uint16_t q;
+            std::memcpy(&q, x + 2 + 2 * (4 * ib + l), 2);
+            const uint64_t g = kIQ2XSGrid[q & 511];
+            const uint8_t sg = kKSignsIQ2XS[q >> 9];
+            for (int j = 0; j < 8; ++j) {
+              const int v = int((g >> (8 * j)) & 0xFF);
+              out.code(b * 256 + ib * 32 + l * 8 + j, uint32_t(((sg >> j) & 1 ? -v : v) + 43));
+            }
+          }
+        }
+      }
+      break;
+    case GGML_IQ3_XXS:
+      for (int64_t b = 0; b < cols / 256; ++b) {
+        const uint8_t* x = src + b * 98;
+        const float d = h2f(x);
+        for (int ib = 0; ib < 8; ++ib) {
+          uint32_t aux;
+          std::memcpy(&aux, x + 66 + 4 * ib, 4);
+          const float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+          out.group(b * 8 + ib, db, -62.0f * db);
+          for (int l = 0; l < 4; ++l) {
+            const uint8_t sg = kKSignsIQ2XS[(aux >> (7 * l)) & 127];
+            const uint32_t g1 = kIQ3XXSGrid[x[2 + 8 * ib + 2 * l]], g2 = kIQ3XXSGrid[x[2 + 8 * ib + 2 * l + 1]];
+            for (int j = 0; j < 8; ++j) {
+              const int v = int(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF);
+              out.code(b * 256 + ib * 32 + l * 8 + j, uint32_t(((sg >> j) & 1 ? -v : v) + 62));
+            }
+          }
+        }
+      }
+      break;
     case GGML_Q2_K:
       for (int64_t b = 0; b < cols / 256; ++b) {
         const uint8_t* x = src + b * 84;
@@ -986,6 +1030,37 @@ inline void dequant_iq_row(int type, const uint8_t* src, int64_t cols, float* y)
           const uint32_t g2 = kIQ3SGrid[qs[8 * ib + 2 * l + 1] | ((qh[ib] << (7 - 2 * l)) & 256)];
           for (int j = 0; j < 8; ++j)
             *y++ = db * float(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF) * ((signs[4 * ib + l] >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+  } else if (type == GGML_IQ2_XS) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+      const uint8_t* x = src + b * 74;
+      const float d = h2f(x);
+      for (int ib = 0; ib < 8; ++ib) {
+        const float db[2] = {d * (0.5f + float(x[66 + ib] & 0xF)) * 0.25f, d * (0.5f + float(x[66 + ib] >> 4)) * 0.25f};
+        for (int l = 0; l < 4; ++l) {
+          uint16_t q;
+          std::memcpy(&q, x + 2 + 2 * (4 * ib + l), 2);
+          const uint64_t g = kIQ2XSGrid[q & 511];
+          const uint8_t sg = kKSignsIQ2XS[q >> 9];
+          for (int j = 0; j < 8; ++j) *y++ = db[l / 2] * float((g >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+  } else if (type == GGML_IQ3_XXS) {
+    for (int64_t b = 0; b < cols / 256; ++b) {
+      const uint8_t* x = src + b * 98;
+      const float d = h2f(x);
+      for (int ib = 0; ib < 8; ++ib) {
+        uint32_t aux;
+        std::memcpy(&aux, x + 66 + 4 * ib, 4);
+        const float db = d * (0.5f + float(aux >> 28)) * 0.5f;
+        for (int l = 0; l < 4; ++l) {
+          const uint8_t sg = kKSignsIQ2XS[(aux >> (7 * l)) & 127];
+          const uint32_t g1 = kIQ3XXSGrid[x[2 + 8 * ib + 2 * l]], g2 = kIQ3XXSGrid[x[2 + 8 * ib + 2 * l + 1]];
+          for (int j = 0; j < 8; ++j)
+            *y++ = db * float(((j < 4 ? g1 : g2) >> (8 * (j & 3))) & 0xFF) * ((sg >> j) & 1 ? -1.f : 1.f);
         }
       }
     }

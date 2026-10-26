@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Francisco José García Barbero
 
-// GGUF codebook blocks (IQ2_S, IQ3_S) converted into the engine's affine
+// GGUF codebook blocks (IQ2_S, IQ3_S, IQ2_XS, IQ3_XXS) converted into the engine's affine
 // layout (gguf.h convert_row: w = scale * code + bias, half scale and bias per
 // group) against gguf-py's dequantization of the same blocks
 // (tests/ref/gguf_iq_ref.py). The only allowed difference is the fp16

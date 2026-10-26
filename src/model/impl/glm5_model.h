@@ -87,6 +87,8 @@ inline const char* gguf_suffix(int t) {
     case GGML_IQ3_S: return "iq3_s";
     case GGML_IQ2_S: return "iq2_s";
     case GGML_IQ4_XS: return "iq4_xs";
+    case GGML_IQ2_XS: return "iq2_xs";
+    case GGML_IQ3_XXS: return "iq3_xxs";
   }
   fail("glm5: GGUF type " + std::to_string(t) + " has no native kernel");
 }

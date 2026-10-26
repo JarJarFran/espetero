@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Francisco José García Barbero
 
 // The native GGUF-block GEMV kernels (86_glm5.metal gguf_gemv_*: Q8_0, Q2_K-Q6_K,
-// IQ4_XS, IQ2_S, IQ3_S) on the GPU against gguf-py's dequantization of the same
+// IQ4_XS, IQ2_S, IQ3_S, IQ2_XS, IQ3_XXS) on the GPU against gguf-py's dequantization of the same
 // blocks (tests/ref/gguf_iq_ref.py): y = W x for 1, 3, 8 and 13 rows of x, plain
 // and with indexed rows (xrow / yrow / ysc, accumulating), compared with the
 // reference weights times x in double. Allowed: fp32 summation order.
 //
-//   python3 tests/ref/gguf_iq_ref.py /tmp/gg.bin --types Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,IQ4_XS,IQ2_S,IQ3_S [--real ...]
+//   python3 tests/ref/gguf_iq_ref.py /tmp/gg.bin --types Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,IQ4_XS,IQ2_S,IQ3_S,IQ2_XS,IQ3_XXS [--real ...]
 //   build/gguf_gemv_test /tmp/gg.bin        (a GPU job: through gpuq)
 #include <cmath>
 #include <cstdio>
@@ -35,6 +35,8 @@ const char* kernel_for(int type) {
     case 21: return "gguf_gemv_iq3_s";
     case 22: return "gguf_gemv_iq2_s";
     case 23: return "gguf_gemv_iq4_xs";
+    case 17: return "gguf_gemv_iq2_xs";
+    case 18: return "gguf_gemv_iq3_xxs";
   }
   return nullptr;
 }
