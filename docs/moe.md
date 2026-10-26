@@ -171,8 +171,10 @@ the shared expert as tile `E` reading its own matrices), and `moe_combine`
 over column slices with the next RMSNorm finished by the last-arriving
 threadgroup (relaxed atomics for everything another threadgroup reads),
 summing in slot order. For more than 8 rows the route is a router GEMM +
-`moe_topk` + `moe_sort` (threadgroup atomics) and the shared expert runs its
-own GEMMs.
+`moe_topk` + `moe_sort` (threadgroup atomics); the shared expert runs as
+tiles of the grouped MMA kernel up to 16 rows (`fuse_shared_rows`, Fase 3:
+its own GEMMs were 16 unsplit threadgroups, 49 µs per layer on an M4 Max)
+and as its own GEMMs above.
 
 ### 3.3 Prefill kernels
 

@@ -634,11 +634,15 @@ struct Model : Runtime {
   bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
-  // ... on passes of up to this many rows (8 as before; 9-16: Fase 3 decision candidate, not
-  // output-preserving at those row counts: M4 Max 16-row step 24.6-24.9 -> 23.2 ms, -6.2 %, max
-  // |dlogit| 0.12 on the dump cases, no argmax flip; with route_sg 20.1-20.5 ms, -18 %).
-  // ESPETERO_FUSE_SHARED_ROWS, "fuse_shared_rows".
-  int fuse_shared_rows = 8;
+  // ... on passes of up to this many rows: 16 (Fase 3, Fran's decision 2026-10-26). At 9-16 rows
+  // the shared expert's own rgemm GEMMs ran 16 unsplit threadgroups (41 + 8 us per layer); as two
+  // 8-row tiles of the grouped MMA kernel its sums take that kernel's order, so 9-16-row passes
+  // are not bit-identical to 0.1.2's: M4 Max 16-row step 24.6-24.9 -> 23.2 ms (-6.2 %), and on
+  // real text (tests/batch_kld.mm, 3,072 teacher-forced tokens of 16-row passes) KLD mean 8.1e-4,
+  // median 6.5e-5, top-1 agreement 99.06 %, the same drift as serving a request alone instead of
+  // in a batch of 16 already has (9.2e-4, 99.15 %). 8: 0.1.2's behaviour. ESPETERO_FUSE_SHARED_ROWS,
+  // "fuse_shared_rows".
+  int fuse_shared_rows = 16;
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set
   // ... also on passes of up to this many rows when every segment is <= 8
   // tokens (batched decode steps, verify passes); 8 = GEMV-sized passes only,

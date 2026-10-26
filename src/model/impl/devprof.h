@@ -138,16 +138,39 @@ inline DeviceProfile device_profile(Model& m) {
 
 // The kernel-selection thresholds the profile sets (before the environment
 // and set_option override them). Every entry is a measured fact recorded in
-// docs/kernel-guidelines.md; a threshold without a measurement on a device
-// class keeps the engine's default there.
+// docs/kernel-guidelines.md ("Measured facts: device profile"); a threshold
+// without a measurement on a device class keeps the engine's default there.
+//
+// Measured boundary costs (a tiny dependent dispatch in a 64-deep chain):
+// M1 Max 4.20 us, M4 Max 2.12 us; dear_boundary() is >= 3 us.
 inline void apply_device_profile(Model& m, const DeviceProfile& p) {
   if (!p.enabled) return;
-  // Dispatch folds (Fase 2, lossless): neutral on the M4 Max (boundary ~0 at
-  // 1 row); expected to pay where a boundary is dear (M1 Max measurements
-  // pending: kept off until they are in).
-  (void)m;
-  // Fused-norm finalizers as their own dispatch (Fase 3, lossless): measured
-  // on the M4 Max first (see the Fase 3 facts); off until measured.
+  // Split-K partials of the out / down projections summed by the following
+  // RMSNorm (fuse_nrm, Fase 2, bit-identical): pays where a boundary is dear.
+  // M1 Max (MacBook, 35B-A3B 4-bit 16-row step, three alternating
+  // --long-ab fuse_nrm 0,1 pairs, exclusive, all clean): 64.24 -> 62.60,
+  // 63.15 -> 63.10, 69.58 -> 67.90 ms GPU (median -2.4 %); the 27B (fold
+  // idle: so_max) and 1-row steps (fused norms) within +-0.45 %. M4 Max
+  // (Fase 2): -1.2 / -0.6 / 0 / 0 % against a 0.7 % spread, 27B +0.7 %: off.
+  m.fuse_nrm = p.dear_boundary();
+  // The other dispatch folds of Fase 2 (fuse_kvsave, fuse_rsum, fuse_sort):
+  // neutral or slower on the M4 Max; on the M1 Max measured only together
+  // with fuse_nrm (fase2 0,2): not set until measured alone.
+  // Not device-dependent (the same value measured right on both Macs; set
+  // here so the table is explicit):
+  // - moe_bm_rows 2048: 16-row expert tiles from 2048 rows up (M4 Max
+  //   -1.4 % 4-bit / -8.3 % Q6_K at 2048 rows, 1024 rows neutral, 512 rows
+  //   +3.1 %; M1 Max -3.1 % / -6.8 % at 2048 rows).
+  // - gemv_max_m 2: the FMA GEMV on 3-4-row passes loses on both (M1 +22 %
+  //   at 4 sequences; M4 verify pass +7.8 % 35B / +12.8 % 27B).
+  // - fuse_norm_max_m 2: fused norms on 3-8-row passes lose on both (M1
+  //   +2.4 % / +4.7 % at 4 / 8 rows; M4 -0.2 % 35B / +4.3 % 27B).
+  // - attn_split 512, attn_min_chunk 32: 256 / 512 / 1024 keys per tile
+  //   measure alike on the M4 Max (within 0.1 %, identical logits); larger
+  //   minimum chunks are not output-preserving and lose (+0.9 / +2.5 %).
+  m.moe_bm_rows = 2048;
+  m.tune.gemv_max_m = std::min(m.tune.gemv_max_m, 2);
+  m.fuse_norm_max_m = std::min(m.fuse_norm_max_m, 2);
 }
 
 }  // namespace espetero::native
