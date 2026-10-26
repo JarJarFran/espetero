@@ -375,7 +375,8 @@ def run_tests(code, tests, timeout=20):
 # ---------------------------------------------------------------- workloads
 def run_decode(c, rows, a):
     for i, p in enumerate(PROMPTS[:a.decode_prompts]):
-        r = drop_text(c.chat(p + LONG_ANSWER, 512))
+        r = c.chat(p + LONG_ANSWER, 512)
+        r = r if a.keep_text else drop_text(r)
         rows.append({"workload": "decode", "i": i, **r})
         print(f"  decode {i}: {r['completion_tokens']} tok, ttft {r['ttft']:.2f} s, "
               f"{r['decode_tps'] or 0:.1f} tok/s", file=sys.stderr)
@@ -383,7 +384,8 @@ def run_decode(c, rows, a):
 
 def run_code(c, rows, a):
     for i, p in enumerate(CODE_PROMPTS):
-        r = drop_text(c.chat(p, 512))
+        r = c.chat(p, 512)
+        r = r if a.keep_text else drop_text(r)
         rows.append({"workload": "code", "i": i, **r})
         print(f"  code {i}: {r['completion_tokens']} tok, ttft {r['ttft']:.2f} s, "
               f"{r['decode_tps'] or 0:.1f} tok/s", file=sys.stderr)
@@ -756,6 +758,7 @@ def main():
     ap.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE", help="extra field on every row")
     ap.add_argument("--watch", metavar="PIDFILE", help="sample the memory of this server until it exits")
     ap.add_argument("--out")
+    ap.add_argument("--keep-text", action="store_true", help="keep the decode and code replies in the rows (to compare them)")
     ap.add_argument("--table", nargs="+", metavar="JSONL")
     ap.add_argument("--report", nargs="+", metavar="JSONL")
     a = ap.parse_args()
