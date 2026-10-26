@@ -448,11 +448,11 @@ Rules that keep the tiers honest:
   | threshold | M1 Max (boundary 4.20 µs) | M4 Max (2.12 µs) | measured |
   |:--|:--|:--|:--|
   | `fuse_nrm` (split-K partials summed by the next RMSNorm; bit-identical) | **on** | off | M1: 35B-A3B 16-row step 64.24 → 62.60, 63.15 → 63.10, 69.58 → 67.90 ms (median −2.4 %; 27B and 1-row steps ±0.45 %; session youthful-edison, 2026-10-24). M4: −1.2 / −0.6 / 0 / 0 % vs a 0.7 % spread, 27B +0.7 % (Fase 2) |
-  | `moe_bm_rows` | 2048 | 2048 | 16-row expert tiles pay from 2048 rows up on both (M4 −1.4 % / −8.3 % Q6_K; M1 −3.1 % / −6.8 %); 1024 rows neutral on the M4 |
+  | `moe_bm_rows` | 2048 | 2048 | 16-row expert tiles pay from 2048 rows up on both (M4 −1.4 % / −8.3 % Q6_K; M1 −3.1 % / −6.8 %); at 1024 rows neutral on the M4 and +3.7 % on the M1 (983.9 → 1020.7 ms, 2026-10-26) |
   | `gemv_max_m` | 2 | 2 | the FMA GEMV on 3–4-row passes loses on both (M1 +22 % at 4 sequences; M4 verify +7.8 % / +12.8 %) |
   | `fuse_norm_max_m` | 2 | 2 | fused norms on 3–8-row passes lose on both (M1 +2.4 / +4.7 %; M4 −0.2 / +4.3 %) |
-  | `attn_split` / `attn_min_chunk` | 512 / 32 | 512 / 32 | 256 / 512 / 1024 keys per tile alike on the M4 (within 0.1 %, identical logits); larger minimum chunks are not output-preserving and lose (+0.9 / +2.5 %) |
-  | `fuse_kvsave`, `fuse_rsum`, `fuse_sort` | off | off | M4 neutral / +0.9 % (Fase 2); on the M1 Max measured only together with fuse_nrm so far |
+  | `attn_split` / `attn_min_chunk` | 512 / 32 | 512 / 32 | 256 / 512 / 1024 keys per tile alike on both Macs (M4 within 0.1 %; M1 8.97 / 8.97 / 8.96 ms at 1K and 9.91 / 9.98 / 9.90 at 8K context), identical logits; larger minimum chunks are not output-preserving and lose (+0.9 / +2.5 % on the M4) |
+  | `fuse_kvsave`, `fuse_rsum`, `fuse_sort` | off | off | M4 neutral / +0.9 % (Fase 2); M1 Max `fase2` 0 vs 2 (kvsave + rsum + nrm) 52.83 → 52.41 and 49.50 → 49.80 ms on the 16-row step (neutral, a disturbed day: the same step varied 44–53 ms within the job; fuse_nrm alone 44.45 → 44.30 there against the −2.4 % median of three clean pairs) |
 - **`moe_fin` 1 also wins on the M1 Max** (2026-10-24, MacBook, 35B-A3B
   4-bit, three alternating pairs against main dde1aa1's binary): 1-row step
   9.86 / 9.31 / 9.49 → 9.25 / 9.11 / 9.15 ms GPU (−3 to −6 %, 96–101 →
