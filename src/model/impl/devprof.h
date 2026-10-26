@@ -57,7 +57,12 @@ inline DeviceProfile measure_device_profile(Model& m) {
   p.device = [[m.dev name] UTF8String];
   p.family = gpu_family_of(m.dev);
   constexpr int W = 2048, CHAIN = 64;
-  id<MTLBuffer> P = m.buffer(size_t(W) * 4), Q = m.buffer(size_t(W) * 4), rows = m.buffer(16);
+  // Scratch outside the model's arena (released with this scope), so the
+  // measurement leaves the arena's layout, and every later buffer's
+  // placement, exactly as without it.
+  id<MTLBuffer> P = [m.dev newBufferWithLength:size_t(W) * 4 options:kShared];
+  id<MTLBuffer> Q = [m.dev newBufferWithLength:size_t(W) * 4 options:kShared];
+  id<MTLBuffer> rows = [m.dev newBufferWithLength:16 options:kShared];
   std::memset([P contents], 0, size_t(W) * 4);
   std::memset([rows contents], 0, 16);
   const bool serial0 = m.serial, ball0 = m.barrier_all;
