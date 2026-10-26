@@ -323,6 +323,9 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_FUSE_SHARED")) m.fuse_shared = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN")) m.fuse_gdn = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN_ROWS")) m.fuse_gdn_rows = std::max(8, std::atoi(v));
+    if (const char* v = std::getenv("ESPETERO_GDN_CHAIN")) m.gdn_chain = std::atoi(v) != 0;
+    if (const char* v = std::getenv("ESPETERO_GDN_R8")) m.gdn_r8 = std::atoi(v) != 0;
+    if (const char* v = std::getenv("ESPETERO_COMMIT_FOLD")) m.commit_fold = std::atoi(v) != 0;
     if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GDN_CONV_FOLD")) m.gdn_conv_fold = *v == '1';
     if (const char* v = std::getenv("ESPETERO_WIDEN6_M")) m.tune.widen6_m = std::atoi(v);
@@ -892,6 +895,9 @@ class MetalModel final : public NativeModel {
     else if (name == "gemv_splitk") m_.tune.gemv_splitk = value != 0;
     else if (name == "fuse_gdn") m_.fuse_gdn = value != 0;
     else if (name == "fuse_gdn_rows") m_.fuse_gdn_rows = std::max(8, value);
+    else if (name == "gdn_chain") m_.gdn_chain = value != 0;
+    else if (name == "gdn_r8") m_.gdn_r8 = value != 0;
+    else if (name == "commit_fold") m_.commit_fold = value != 0;
     else if (name == "fuse_kvsave") m_.fuse_kvsave = value != 0;
     else if (name == "moe_bm") m_.moe_bm = value == 16 || value == 32 ? value : 8;
     else if (name == "moe_bm_rows") m_.moe_bm_rows = std::max(9, value);
