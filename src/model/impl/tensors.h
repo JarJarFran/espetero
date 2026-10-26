@@ -169,8 +169,8 @@ class SafetensorsSource : public WeightSource {
       t.scales = files_[size_t(s->second.file)]->at(s->second.offset);
       t.biases = files_[size_t(z->second.file)]->at(z->second.offset);
       t.dtype = s->second.dtype;
-    } else if (e.dtype != "F32" && e.dtype != "F16" && e.dtype != "BF16") {
-      fail(name + ": unsupported dtype " + e.dtype);
+    } else if (e.dtype != "F32" && e.dtype != "F16" && e.dtype != "BF16" && name.find(".vq_") == std::string::npos) {
+      fail(name + ": unsupported dtype " + e.dtype);  // (EQV planes .vq_lo / .vq_hi are raw U8 / U32)
     }
     return t;
   }

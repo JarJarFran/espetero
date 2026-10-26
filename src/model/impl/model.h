@@ -65,6 +65,9 @@ struct Layer {
   // gates of one layout only; empty otherwise).
   Mat router_sg;
   QW experts_gu, experts_down;
+  // EQV experts (vector-quantized, Qwen4-Exp route B): these instead of experts_gu / experts_down.
+  bool vq = false;
+  VQW vq_gu, vq_down;
   int E = 0;  // this layer's routed experts when fewer than the config's (pruned per layer), else 0
   // Gated DeltaNet: in_proj = [qkv; z; a; b]; full attention: [q|gate; k; v].
   std::vector<Mat> in_proj;

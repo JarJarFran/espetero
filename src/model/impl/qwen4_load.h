@@ -147,10 +147,73 @@ inline ExpertLayer locate_experts(Model& m, const WeightSource& wsrc, const std:
   return E;
 }
 
+// EQV expert stacks (route B, espetero quantize --preset fnxvq): NAME.vq_lo U8 [E, out, nv],
+// NAME.vq_hi U32 [E, out, hw], NAME.vq_scale F16 [E, out, ns] and NAME.vq_cb F16 [2^kbits, 8]
+// (VQW). With `up`, gate and up rows are interleaved by 8 per expert, as every MoE matrix here.
+inline VQW load_vq_stack(Model& m, const SafetensorsSource& src, const std::string& gate, const std::string* up,
+                         int E, int out, int in) {
+  VQW q;
+  const TensorView cb0 = src.tensor(gate + ".vq_cb");
+  int kb = 0;
+  while ((int64_t(1) << kb) < cb0.shape[0]) ++kb;
+  if (cb0.dtype != "F16" || cb0.shape.size() != 2 || cb0.shape[1] != 8 || (int64_t(1) << kb) != cb0.shape[0] || kb < 9 ||
+      kb > 16 || in % 8)
+    fail(gate + ": EQV codebook must be F16 [2^k, 8], 9 <= k <= 16");
+  q.kbits = kb;
+  q.in = in;
+  q.nv = in / 8;
+  q.hw = (q.nv * (kb - 8) + 31) / 32;
+  q.ns = (in + 255) / 256;
+  q.ncb = up ? 2 : 1;
+  q.out = E * out * q.ncb;
+  struct Planes {
+    const uint8_t *lo, *hi, *sc, *cb;
+  };
+  auto planes = [&](const std::string& n) {
+    auto tv = [&](const std::string& t, const char* dt, int64_t last) {
+      const TensorView v = src.tensor(n + t);
+      if (v.dtype != dt || v.cols() != last || v.numel() != int64_t(E) * out * last)
+        fail(n + t + ": EQV plane " + v.dtype + " does not match " + dt + " [" + std::to_string(E) + ", " +
+             std::to_string(out) + ", " + std::to_string(last) + "]");
+      return v.data;
+    };
+    const TensorView c = src.tensor(n + ".vq_cb");
+    if (c.dtype != "F16" || c.numel() != (int64_t(8) << kb)) fail(n + ": EQV codebooks of one stack must match");
+    return Planes{tv(".vq_lo", "U8", q.nv), tv(".vq_hi", "U32", q.hw), tv(".vq_scale", "F16", q.ns), c.data};
+  };
+  const Planes g = planes(gate);
+  const size_t blo = size_t(q.nv), bhi = size_t(q.hw) * 4, bsc = size_t(q.ns) * 2, bcb = size_t(16) << kb;
+  q.lo = m.arena->alloc(size_t(q.out) * blo);
+  q.hi = m.arena->alloc(size_t(q.out) * bhi);
+  q.sc = m.arena->alloc(size_t(q.out) * bsc);
+  q.cb = m.arena->alloc(size_t(q.ncb) * bcb);
+  std::memcpy(ptr(q.cb), g.cb, bcb);
+  if (!up) {
+    parallel_copy(ptr(q.lo), g.lo, size_t(q.out) * blo);
+    parallel_copy(ptr(q.hi), g.hi, size_t(q.out) * bhi);
+    parallel_copy(ptr(q.sc), g.sc, size_t(q.out) * bsc);
+    return q;
+  }
+  if (out % 8) fail(gate + ": EQV gate/up rows must be a multiple of 8");
+  const Planes u = planes(*up);
+  std::memcpy((uint8_t*)ptr(q.cb) + bcb, u.cb, bcb);
+  parallel_for(size_t(E), [&](size_t e) {
+    for (int b = 0; b < out / 8; ++b)
+      for (int h = 0; h < 2; ++h) {
+        const Planes& s = h ? u : g;
+        const size_t src_row = e * size_t(out) + size_t(b) * 8, dst_row = e * size_t(2 * out) + size_t(b) * 16 + size_t(h) * 8;
+        std::memcpy((uint8_t*)ptr(q.lo) + dst_row * blo, s.lo + src_row * blo, 8 * blo);
+        std::memcpy((uint8_t*)ptr(q.hi) + dst_row * bhi, s.hi + src_row * bhi, 8 * bhi);
+        std::memcpy((uint8_t*)ptr(q.sc) + dst_row * bsc, s.sc + src_row * bsc, 8 * bsc);
+      }
+  });
+  return q;
+}
+
 // A layer whose routed experts are EQ (espetero quantize): loaded resident,
 // as mixed-width experts are (an EQ format has no streamed form).
 inline bool q4_eq_experts(const SafetensorsSource& src, const std::string& p) {
-  return src.has(p + "mlp.switch_mlp.gate_proj.super");
+  return src.has(p + "mlp.switch_mlp.gate_proj.super") || src.has(p + "mlp.switch_mlp.gate_proj.vq_lo");
 }
 
 // rq 8: dense matrices requantized to 8 bits (the bf16 MTP drafter);
@@ -166,7 +229,9 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
   L.index_in_kind = index_in_kind;
   // Resident experts may be fewer than the config's (a checkpoint pruned per layer: its stacks say how many).
   const auto* stp = dynamic_cast<const SafetensorsSource*>(&src);
-  const int El = resident && stp ? int(stp->locate(p + "mlp.switch_mlp.gate_proj.weight").shape[0]) : c.E;
+  const bool vq = resident && stp && stp->has(p + "mlp.switch_mlp.gate_proj.vq_lo");
+  const int El = vq ? int(stp->tensor(p + "mlp.switch_mlp.gate_proj.vq_lo").shape[0])
+                    : resident && stp ? int(stp->locate(p + "mlp.switch_mlp.gate_proj.weight").shape[0]) : c.E;
   if (El < 1 || El > c.E) fail(p + ": " + std::to_string(El) + " experts (the config says at most " + std::to_string(c.E) + ")");
   if (El != c.E) L.E = El;
   L.hca = load_hc(m, src, p + "attn_hyper_connection.", true, rq);
@@ -249,6 +314,13 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
     // source: 1.7 GB each; quantized ones as they are), gate and up
     // interleaved by 8 rows per expert.
     const std::string s = p + "mlp.switch_mlp.";
+    if (vq) {
+      const std::string up = s + "up_proj";
+      L.vq_gu = load_vq_stack(m, *stp, s + "gate_proj", &up, El, c.Ie, c.D);
+      L.vq_down = load_vq_stack(m, *stp, s + "down_proj", nullptr, El, c.D, c.Ie);
+      L.vq = true;
+      return L;
+    }
     Arena keep(m.dev);
     auto stack = [&](const std::string& name, int out, int in) {
       if (const auto* g = dynamic_cast<const GGUFSource*>(&src)) {  // the file's widths, converted exactly

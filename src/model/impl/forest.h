@@ -280,6 +280,13 @@ struct MoeGemmParams {
   int32_t split = 0;  // split pass, moe_gemv8 only: 1 the ready experts' tiles, 2 those of experts being read (m.xld)
   int32_t fma_rows = 0;  // moe_fma_mix: tiles of at most this many rows on the FMA kernel, the others on the MMA one
 };
+// moe_vq_gemv (kernels/16_moe_vq.metal): EQV experts. Its pipelines are specialized like the
+// quantized kernels' (group 8, scale mode 9: values the VQ kernels do not read) so that the
+// gated epilogue's optional activation constant resolves as everywhere else (SiLU).
+constexpr int kVqFc = 8 | (9 << 16);
+struct MoeVqParams {
+  int32_t Ne, K, lda, ldy, gather, direct, kbits, nv, hw, ns, cbsel;
+};
 struct MoeCombineParams {
   int32_t D, k, norm;
   float eps;
@@ -433,6 +440,7 @@ inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<
 // e.g. a Q8_0 shared expert beside Q6_K experts: a kernel takes one layout's
 // function constants; or another width on both projections).
 inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
+  if (L.vq) return 0;  // EQV experts: the shared expert runs as its own GEMVs
   if (L.experts_gu.bits == 16) return 0;  // fp16 experts (moe_gemv8r16): no tile kernels
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
   // (EQ4 / EQ3 codebook experts, mode 7 / 8, stream a shared expert of
@@ -481,6 +489,11 @@ inline std::string moe_down_comb_name(const QW& w, const QW& w2, int comb_ks) {
 // experts with Q8_0 down projections in some layers and a Q8_0 shared expert
 // asked for a moe_gemv8_..._s8 kernel that no pass uses, and the load failed.)
 inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<std::string, int>>& out) {
+  if (L.vq) {
+    for (int mm : {1, 2, 4, 8})
+      for (const char* t : {"_swiglu", "_store"}) out.push_back({"moe_vq_gemv" + std::to_string(mm) + t, kVqFc});
+    return;
+  }
   const QW& gu = L.experts_gu;
   const QW& dn = L.experts_down;
   const bool tiles = m.fuse_shared && moe_shared_tile_kind(m.cfg, L) > 0;  // either kind on the FMA path
@@ -520,6 +533,7 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
 // shared expert as tile k on the FMA path, a direct single-row grid, its
 // slot and width limits); m.moe_down_comb then decides.
 inline bool moe_down_comb_fits(const Model& m, const Layer& L, int rows, bool nout) {
+  if (L.vq) return false;
   const Config& c = m.cfg;
   const int tile_kind = moe_shared_tile_kind(c, L);
   const bool shared_tiles = m.fuse_shared && rows <= std::max(8, m.fuse_shared_rows) && rows <= 16 &&
@@ -586,7 +600,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // (E <= 256 not with an expert cache either: its hook remaps the routed ids
   // in moe_sort, which a fused single-row route skips; Qwen4-Exp files pruned
   // to E <= 256 with streamed experts reach this.)
-  const bool fused_route = m.fuse_route && rows <= 8 && (!L.shared_gate.dense || gate_f16) &&
+  const bool fused_route = m.fuse_route && !L.vq && rows <= 8 && (!L.shared_gate.dense || gate_f16) &&
                            ((c.E <= 256 && !m.moe_after_route) || route_e512) &&
                            (router_f16 || (!L.router.dense && L.router.q.bits == L.shared_gate.q.bits &&
                                            L.router.q.fc() == L.shared_gate.q.fc()));
@@ -868,10 +882,37 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // the tiles with at most 2 rows (nearly all of a 16-row step's: ~0.5 rows
   // per routed expert) run on the 2-row FMA kernel, the rest on the MMA one,
   // two dispatches over the same tile table (each skips the other's tiles).
-  const bool fma_mix = m.moe_fma_mix && m.moe_fma && rows > m.moe_fma_rows && rows <= m.moe_fma_mix_rows && !pooled &&
+  const bool fma_mix = m.moe_fma_mix && !L.vq && m.moe_fma && rows > m.moe_fma_rows && rows <= m.moe_fma_mix_rows && !pooled &&
                        bm_nopool == 8;
   auto grouped = [&](const QW& w, const QW* w2, id<MTLBuffer> A, int lda, int gather, id<MTLBuffer> Y, int ldy, int Ne,
                      int epi, int part, int split = 0, int mix = 0) {  // part: 0 gate/up, 1 down (the staged records' halves); split: the split pass; mix: 1 the FMA half, 2 the MMA half
+    if (L.vq && !pooled) {  // EQV experts: moe_vq_gemv, MM = the tiles' rows rounded up to 1 / 2 / 4 / 8
+      const VQW& v = epi == 2 ? L.vq_gu : L.vq_down;
+      const int mm = rows <= 1 ? 1 : rows <= 2 ? 2 : rows <= 4 ? 4 : 8;
+      const std::string name = "moe_vq_gemv" + std::to_string(mm) + (epi == 2 ? "_swiglu" : "_store");
+      E.pipe(name, kVqFc);
+      gemm_tag(E, name, Ne, v.in, rows);
+      const bool direct = rows == 1 && m.moe_direct;
+      const MoeVqParams vp{Ne, v.in, lda, ldy, gather, direct ? 1 : 0, v.kbits, v.nv, v.hw, v.ns, v.ncb == 2 ? 1 : 0};
+      E.set(0, A);
+      E.set(1, v.lo);
+      E.set(2, v.hi);
+      E.set(3, v.sc);
+      E.set(4, Y);
+      E.bytes(5, vp);
+      E.set(6, z.tiles);
+      E.set(7, z.ntiles);
+      E.set(8, z.rowmap);
+      E.set(9, v.cb);
+      E.rd(A);
+      E.rd(z.tiles);
+      E.rd(z.rowmap);
+      if (!direct) E.rd(z.ntiles);
+      E.wr(Y);
+      if (direct) E.groups(MTLSizeMake(size_t(c.k), size_t(Ne / 32), 1), MTLSizeMake(256, 1, 1));
+      else E.groups_indirect(z.ntiles, epi == 2 ? 0 : 12, MTLSizeMake(256, 1, 1));
+      return;
+    }
     // 1-2 rows: the FMA kernel (no MMA padding); 3-8 rows: the MMA kernel.
     const bool fma_path = mix == 1 || (mix == 0 && m.moe_fma && rows <= m.moe_fma_rows);  // 1-2 rows by default; up to 4
     const int mm_rows = mix == 1 ? 2 : rows;  // rows per tile the FMA kernel is instantiated for

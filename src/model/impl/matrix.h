@@ -78,6 +78,22 @@ struct QW {
   int fc() const { return group | (scale_mode << 16) | (act << 24); }
 };
 
+// EQV: a vector-quantized routed expert stack (kernels/16_moe_vq.metal). Rows
+// of `in` inputs are in / 8 vectors of 8 weights; vector v of row r is
+// sc[r][v / 32] * cb[code] with a kbits-bit code split into a byte plane lo
+// [rows][nv] and a bit stream hi [rows][hw] (the upper kbits - 8 bits of every
+// vector, vector v at bit (kbits - 8) v); sc: fp16 per 256 inputs (the last one
+// partial). cb: ncb fp16 codebooks [2^kbits][8]; with ncb 2 (the fused gate/up
+// stack, gate and up rows interleaved by 8) row r reads codebook (r / 8) & 1.
+struct VQW {
+  int out = 0, in = 0;  // all experts' rows; inputs per row
+  int kbits = 0, nv = 0, hw = 0, ns = 0, ncb = 1;
+  Buf lo, hi, sc, cb;
+  size_t bytes() const {
+    return size_t(out) * (size_t(nv) + size_t(hw) * 4 + size_t(ns) * 2) + size_t(ncb) * (size_t(1) << kbits) * 16;
+  }
+};
+
 // GGUF blocks that keep their native scales: Q6_K and Q8_0 (fewer bytes
 // and at least as fast). Q4_K/Q5_K native scales save 0.375 bits per weight
 // but measured 15-35% slower GEMMs than the affine expansion (the kernels are
