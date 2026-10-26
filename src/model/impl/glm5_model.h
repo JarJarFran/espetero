@@ -204,9 +204,10 @@ class DevModel {
       if (eager <= 0 || i < eager) alloc_seq(seqs_[size_t(i)]);
     ensure_scratch(T_);
     make_cache(cache_gb, cache_slots);
-    std::fprintf(stderr, "glm5: GPU allocations %.1f GB of a %.1f GB working set (sequences %.2f GB each, %d allocated)\n",
+    std::fprintf(stderr, "glm5: GPU allocations %.1f GB of a %.1f GB working set (sequences %.2f GB each, %d allocated; expert pool %s)\n",
                  double([rt_.dev currentAllocatedSize]) / 1e9, double([rt_.dev recommendedMaxWorkingSetSize]) / 1e9,
-                 double(seq_bytes_) / 1e9, int(std::count_if(seqs_.begin(), seqs_.end(), [](const Seq& q) { return !q.kda.empty(); })));
+                 double(seq_bytes_) / 1e9, int(std::count_if(seqs_.begin(), seqs_.end(), [](const Seq& q) { return !q.kda.empty(); })),
+                 pool_locked_ ? "locked" : "NOT locked");
     if (xc_.resident)
       std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: all %d resident (%.1f GB) read from %s\n",
                    L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
@@ -866,9 +867,33 @@ class DevModel {
     }
     x.n = std::min(slots, x.total_experts);
     x.per_buf = int(std::max<uint64_t>(1, (uint64_t(2) << 30) / x.slot_bytes));
-    for (int s = 0; s < x.n; s += x.per_buf) x.bufs.push_back(rt_.buffer(size_t(std::min(x.per_buf, x.n - s)) * x.slot_bytes));
+    for (int s = 0; s < x.n; s += x.per_buf) x.bufs.push_back(pool_buffer(size_t(std::min(x.per_buf, x.n - s)) * x.slot_bytes));
     x.key.assign(size_t(x.n), -1);
     x.stamp.assign(size_t(x.n), 0);
+  }
+  // Expert-pool memory locked with mlock, as DSv4's: unlocked, macOS compressed and paged out the experts a
+  // pass did not touch (UD-Q2_K_XL resident: 0.1-0.3 tok/s with 22 GB swapped).
+  bool pool_locked_ = true;
+  id<MTLBuffer> pool_buffer(size_t n) {
+    const size_t len = align_up(std::max<size_t>(n, 16), size_t(::getpagesize()));
+    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) fail("glm5: cannot map the expert pool");
+    if (pool_locked_) {  // in 256 MB pieces on every core
+      const size_t piece = size_t(256) << 20;
+      std::atomic<bool> ok{true};
+      parallel_for((len + piece - 1) / piece, [&](size_t i) {
+        if (::mlock(static_cast<uint8_t*>(p) + i * piece, std::min(piece, len - i * piece)) != 0) ok = false;
+      });
+      if (!ok) {
+        pool_locked_ = false;
+        ::munlock(p, len);
+        std::fprintf(stderr, "glm5: could not lock the expert pool in memory (vm.user_wire_limit?): macOS may compress it\n");
+      }
+    }
+    id<MTLBuffer> b = [rt_.dev newBufferWithBytesNoCopy:p length:len options:kShared deallocator:nil];
+    if (!b) fail("glm5: cannot wrap the expert pool for the GPU");
+    Residency::get().add(b);
+    return b;
   }
   void make_resident() {
     ExpertCache& x = xc_;
@@ -889,7 +914,7 @@ class DevModel {
         used += b, sizes.back() = used;
       }
     }
-    for (uint64_t b : sizes) x.bufs.push_back(rt_.buffer(size_t(b)));
+    for (uint64_t b : sizes) x.bufs.push_back(pool_buffer(size_t(b)));
     x.total_bytes = 0;
     for (uint64_t b : sizes) x.total_bytes += b;
     if (const char* e = std::getenv("ESPETERO_GLM5_PRELOAD"); e && std::atoi(e) == 1) {
