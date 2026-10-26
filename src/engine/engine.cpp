@@ -2920,11 +2920,14 @@ void Engine::step() {
     const bool adapt = opt_.adaptive_drafts && decoding.size() == 1 && jobs.empty() && prefilling.empty();
     // Several decoding sequences: a draft adds rows to a pass every one of them
     // waits for, so it is taken only when the pass's expected tokens per ms
-    // improve by 5 % at the pass's size: (T + e) / (C(R + k) + D) against T / C(R),
+    // improve by 15 % at the pass's size: (T + e) / (C(R + k) + D) against T / C(R),
     // C the measured cost by rows (pass_cost), e the drafts expected to be
-    // accepted, D the draft pass (the first drafter pays it, the others a third).
+    // accepted, D the draft pass (the first drafter pays it, the others half).
     // Sizes not measured yet fall back to drafting for up to two sequences (the
-    // pass then measures them). The sequence that chooses first rotates.
+    // pass then measures them). The sequence that chooses first rotates. (At 5 %
+    // all 8 users of a Qwen3.8-27B drafted at an estimated 1.05-1.1 and made
+    // 2.6 % fewer tokens per second than plain decoding, M4 Max, 2026-10-26.)
+    constexpr double kBatchMargin = 1.15;
     const bool multi = decoding.size() >= 2;
     int rows_pass = 0;
     double tok_pass = 0;
@@ -2970,7 +2973,7 @@ void Engine::step() {
           const double e = s->n_look >= 1 ? std::min(double(lk), s->acc_look) : 0.5 * double(lk);
           if (multi) {
             const double c1 = pass_cost(rows_pass + lk);
-            ok = c0 <= 0 ? decoding.size() <= 2 : (tok_pass + e) / c1 >= 1.05 * tok_pass / c0;
+            ok = c0 <= 0 ? decoding.size() <= 2 : (tok_pass + e) / c1 >= kBatchMargin * tok_pass / c0;
           }
           if (ok) {
             if (multi) take(lk, e);
@@ -2993,11 +2996,11 @@ void Engine::step() {
             int bk = 0;
             for (int kk = 1; kk <= kmax; ++kk) {
               const double e = mtp_expect(*s, kk) - 1.0;
-              const double dk = (dcost_.n_draftk[kk] ? dcost_.draftk[kk] : dcost_.draft) * (first_drafter ? 1.0 : 0.3);
+              const double dk = (dcost_.n_draftk[kk] ? dcost_.draftk[kk] : dcost_.draft) * (first_drafter ? 1.0 : 0.5);
               const double v = (tok_pass + e) / (pass_cost(rows_pass + kk) + dk);
               if (v > best) best = v, bk = kk;
             }
-            k = best >= 1.05 * tok_pass / c0 ? bk : 0;
+            k = best >= kBatchMargin * tok_pass / c0 ? bk : 0;
           }
           if (k > 0) take(k, mtp_expect(*s, k) - 1.0);
         }
