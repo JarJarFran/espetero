@@ -570,6 +570,7 @@ layer; Mac Studio M4 Max):
 | UD-IQ3_XXS slice (blocks 0–3, GGUF through the native block kernels) vs `tools/glm5_ref.py` on the same GGUF weights | 1.0e-4 | 1.5e-4 (prefill + 18 decode steps; routes identical, selections differ in 2 rows) |
 | UD-IQ3_XXS's own distance from the FP8 weights (the two references) | 2–3 % in layers 0–2, 20 % after the IQ2_S / IQ3_S MoE (routes differ in 9 / 21 rows) | |
 | MTP layer (45) after layers 0–3, FP8 / UD-IQ3_XXS, Espetero vs reference: worst per-row relative L2 of the MTP logits | 2.5e-4 / 2.2e-4 (argmax equal 20 / 20, routes identical) | |
+| UD-Q2_K_XL (full file, layers 0–3 + MTP; q Q5_K beside k / v Q6_K, IQ2_XS / IQ3_XXS experts, resident cache) vs reference on the same weights | 1.5e-4 streams, MTP logits 2.0e-4 (argmax 20 / 20, routes and selections identical) | |
 
 Layers 0–2 agree to 3e-6 (fp32 noise); layer 3's attention to 3.6e-4 (half
 latents); mlx-vlm's layer-3 MLP differs by 2–3e-4 because the check holds its

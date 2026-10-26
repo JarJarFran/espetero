@@ -74,7 +74,8 @@ enum Fmt : int { kBF16 = 2, kF32 = 3, kF8B = 4, kGG = 5 };  // ds4_gemv formats;
 struct Mat {
   int fmt = kBF16, N = 0, K = 0;
   Buf w, s;
-  int gg = 0;  // kGG: the ggml type
+  int gg = 0;              // kGG: the ggml type
+  std::vector<Mat> parts;  // rows stacked from matrices of different types (UD-Q2_K_XL's q: Q5_K, k / v: Q6_K)
 };
 inline const char* gguf_suffix(int t) {
   switch (t) {
@@ -716,14 +717,24 @@ class DevModel {
     gguf_suffix(m.fmt == kGG ? m.gg : GGML_Q8_0);  // fails early for a type without a kernel
     return m;
   }
-  // Matrices of one type and width stacked by rows (q | k | v, f_a | g_a | beta, wk | compress_gate).
+  // Matrices of one width stacked by rows (q | k | v, f_a | g_a | beta, wk | compress_gate): one matrix when
+  // their types agree, else parts that gemv runs one after another.
   Mat gcat(const std::vector<std::string>& ns) {
     const GGUFFile::Tensor& t0 = gtensor(ns[0]);
     size_t bytes = 0;
+    bool mixed = false;
     for (const auto& n : ns) {
       const GGUFFile::Tensor& t = gtensor(n);
-      if (t.type != t0.type || t.dims[0] != t0.dims[0]) fail("glm5: GGUF " + n + " cannot be stacked with " + ns[0]);
+      if (t.dims[0] != t0.dims[0]) fail("glm5: GGUF " + n + " cannot be stacked with " + ns[0]);
+      mixed |= t.type != t0.type;
       bytes += t.nbytes;
+    }
+    if (mixed) {
+      Mat m;
+      for (const auto& n : ns) m.parts.push_back(gmat(n));
+      m.fmt = m.parts[0].fmt, m.K = m.parts[0].K;
+      for (const Mat& q : m.parts) m.N += q.N;
+      return m;
     }
     Mat m = gmat(ns[0]);
     Buf b = rt_.arena->alloc(bytes);
@@ -1020,6 +1031,15 @@ class DevModel {
             bool accum = false, id<MTLBuffer> xrow = nil, size_t xro = 0, id<MTLBuffer> yrow = nil, size_t yro = 0,
             id<MTLBuffer> ysc = nil, size_t yso = 0, int grp = 0, int gstr = 0) {
     if (M <= 0) return;
+    if (!m.parts.empty()) {  // stacked rows of different types: each part writes its own columns of Y
+      if (xrow || yrow || ysc || grp) fail("glm5: stacked mixed-type matrix used with indexed rows");
+      int n0 = 0;
+      for (const Mat& q : m.parts) {
+        gemv(E, q, X, xoff, xs, Y, yoff + size_t(n0) * 4, ys, M, accum);
+        n0 += q.N;
+      }
+      return;
+    }
     if (m.fmt == kGG) E.pipe((std::string("gguf_gemv_") + gguf_suffix(m.gg)).c_str());
     else E.pipe(m.fmt == kF8B ? "ds4_gemv_f8b" : m.fmt == kBF16 ? "ds4_gemv_bf16" : "ds4_gemv_f32");
     // indexed rows when any of xrow / yrow / ysc is given (the others default to the identity and 1.0)
