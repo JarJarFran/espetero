@@ -219,7 +219,7 @@ void usage_all() {
                "  --no-gpu-draw         draw sampled tokens on the CPU (no chains for sampled requests)\n"
                "  --prefill-chunk N     most prefill rows per pass while others decode (default 2048)\n"
                "  --prefill-slice-ms N  a prompt chunk beside decoding sequences is sized to about N ms of pass from the\n"
-               "                        measured prefill rate, up to --prefill-chunk (default 500; 0: always the chunk)\n"
+               "                        measured prefill rate, up to --prefill-chunk (default 1000; 0: always the chunk)\n"
                "  --no-image-checkpoint no chat checkpoint after the last image (default: questions about one image share it)\n"
                "  --no-instr-checkpoint no chat checkpoint after the user's instructions before the first image (default:\n"
                "                        photos under the same instructions share them)\n"
@@ -574,7 +574,7 @@ EngineOptions engine_options(const Args& a) {
   o.prompt_checkpoint = !a.has("no-prompt-checkpoint");
   o.prefill_wait_ms = a.i("prefill-wait-ms", 2500);
   o.prefill_batch_rows = a.i("prefill-batch-rows", 512);
-  o.prefill_slice_ms = a.i("prefill-slice-ms", 500);
+  o.prefill_slice_ms = a.i("prefill-slice-ms", 1000);
   o.image_max_pixels = a.i("image-pixels", 131072);
   o.allow_image_detail_max = a.has("allow-image-detail-max");
   o.image_urls = a.has("image-urls");

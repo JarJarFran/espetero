@@ -2920,14 +2920,17 @@ void Engine::step() {
     const bool adapt = opt_.adaptive_drafts && decoding.size() == 1 && jobs.empty() && prefilling.empty();
     // Several decoding sequences: a draft adds rows to a pass every one of them
     // waits for, so it is taken only when the pass's expected tokens per ms
-    // improve by 15 % at the pass's size: (T + e) / (C(R + k) + D) against T / C(R),
+    // improve by 5 % at the pass's size: (T + e) / (C(R + k) + D) against T / C(R),
     // C the measured cost by rows (pass_cost), e the drafts expected to be
     // accepted, D the draft pass (the first drafter pays it, the others half).
     // Sizes not measured yet fall back to drafting for up to two sequences (the
-    // pass then measures them). The sequence that chooses first rotates. (At 5 %
-    // all 8 users of a Qwen3.8-27B drafted at an estimated 1.05-1.1 and made
-    // 2.6 % fewer tokens per second than plain decoding, M4 Max, 2026-10-26.)
-    constexpr double kBatchMargin = 1.15;
+    // pass then measures them). The sequence that chooses first rotates. (M4 Max,
+    // 2026-10-26: at 2 users the 27B with its MTP head 64 -> 86-93 tokens/s in
+    // all against both drafting unchecked; on Flash-Next both drafting is right,
+    // +12-20 % over one, and a 15 % margin blocked the second drafter: the margin
+    // stays at 5 % and spec_max_seqs at 4, where the estimates rest on measured
+    // sizes; at 8 users the 27B lost 2.6 % with it.)
+    constexpr double kBatchMargin = 1.05;
     const bool multi = decoding.size() >= 2;
     int rows_pass = 0;
     double tok_pass = 0;

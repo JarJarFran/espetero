@@ -84,7 +84,7 @@ struct EngineOptions {
   bool decode_first = true;        // prompts wait (bounded) for decoding sequences; big prompts one per pass
   int prefill_wait_ms = 2500;      // ... longest wait of a prompt chunk while sequences decode
   int prefill_batch_rows = 512;    // ... prompt rows per pass beyond which no further prompt joins
-  int prefill_slice_ms = 500;      // ... a prompt chunk beside decoding sequences is sized to about this long a pass
+  int prefill_slice_ms = 1000;     // ... a prompt chunk beside decoding sequences is sized to about this long a pass
                                    //      from the measured prefill rate, up to prefill_chunk (0: always prefill_chunk)
   int draft_tokens = -1;           // MTP drafts per decode pass (0: plain decoding; -1: the model's default,
                                    // else 5; Qwen4-Exp 3)
