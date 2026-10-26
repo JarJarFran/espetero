@@ -106,13 +106,14 @@ kernel void rmsnorm(
 // (in split order from 0, as splitk_reduce_add does), then Y = rmsnorm(X) * W
 // as `rmsnorm` computes it (the same thread -> element mapping and sums), so
 // one dispatch stands for splitk_reduce_add + rmsnorm. One threadgroup per row.
-// Fase 3: the fused RMSNorm's finalizer as its own dispatch (options
-// gemv_fin 2 / moe_fin 2). One threadgroup per row sums the producer's P
-// block partials in the producer's own order (mode 0: serially in block
-// order, moe_down_comb's; mode 1: lane-strided over 32 lanes then simd_sum,
-// rgemv EPI_ADDP's), then writes xn = half(h * inv * w): the same values the
-// in-dispatch finalizer writes, after a dispatch boundary instead of
-// device-scope fences and an arrival counter.
+// Fase 3: the fused RMSNorm's finalizer as its own dispatch (option
+// moe_fin 2). One threadgroup per row sums the producer's P block partials
+// in the producer's own order (mode 0: serially in block order,
+// moe_down_comb's; mode 1: lane-strided over 32 lanes then simd_sum, the
+// rgemv EPI_ADDP order, unused since the dense variant was removed), then
+// writes xn = half(h * inv * w): the same values the in-dispatch finalizer
+// writes, after a dispatch boundary instead of device-scope fences and an
+// arrival counter.
 struct NormFinParams {
   int P;        // partials per row
   int part_ld;  // floats between rows of `parts`

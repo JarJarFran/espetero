@@ -599,10 +599,6 @@ struct Model : Runtime {
   // ESPETERO_MOE_FMA_MIX, "moe_fma_mix". Kept as a diagnostic.
   bool moe_fma_mix = false;
   int moe_fma_mix_rows = 16;
-  // hc_sep (Fase 3, Qwen4-Exp): the hyper-connection up / mix GEMV (K = 320: 5 K steps) on a
-  // threadgroup of 32 * hc_sep threads with per-step partials (rgemv SEP; the same sums as the
-  // 256-thread kernel, whose simdgroups 5-7 are idle there). 0: as before; 1, 2 or 4. ESPETERO_HC_SEP, "hc_sep".
-  int hc_sep = 0;
   int moe_ks = 4;            // FMA expert GEMV: simdgroups per threadgroup (K slices): 2, 4 or 8 (4 for gate/up)
   bool moe_direct = true;    // single-row passes: direct grids for the expert GEMVs (no indirect arguments)
   int moe_nbpt = 1;          // FMA expert GEMV: 32-column blocks per threadgroup (direct grids only)

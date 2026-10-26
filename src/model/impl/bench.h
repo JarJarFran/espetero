@@ -190,7 +190,6 @@ inline std::string gemv_micro_bench(Model& m) {
       {"m4_nomma", 4, "rgemv8r%_d1_store"}, {"m4_noload", 4, "rgemv8r%_d2_store"}, {"m4_nodq", 4, "rgemv8r%_d3_store"},
       {"m3_fma", 3, "rgemv%_3_store"}, {"m4_fma", 4, "rgemv%_4_store"},
       {"m3_fmajit", 3, "rgemv%_3j_store"}, {"m4_fmajit", 4, "rgemv%_4j_store"},
-      {"m1_sep1", 1, "rgemv%_1sep1_store"}, {"m1_sep2", 1, "rgemv%_1sep2_store"}, {"m1_sep4", 1, "rgemv%_1sep4_store"},
   };
   const bool serial0 = m.serial, ball0 = m.barrier_all;
   const std::string diag0 = m.tune.diag_kernel;
@@ -217,7 +216,6 @@ inline std::string gemv_micro_bench(Model& m) {
   auto available = [&](const Kind& k, const Variant& v) {
     if (!*v.kernel) return true;
     std::string name = v.kernel;
-    if (name.find("sep") != std::string::npos && k.mats[0]->in() / 64 > 8) return false;  // short-K kernels only
     name.replace(name.find('%'), 1, std::to_string(k.mats[0]->q.bits));
     try {
       (void)m.kernel(name, k.mats[0]->q.fc());
@@ -539,14 +537,11 @@ inline std::string moe_micro_bench(Model& m) {
     const double mb = double(w0.out()) * double(w0.in()) * (double(w0.q.bits) / 8.0 + 4.0 / double(w0.q.group)) / 1e6;
     id<MTLBuffer> Xo = m.buffer(size_t(w0.in()) * 2);
     std::memset([Xo contents], 0, size_t(w0.in()) * 2);
-    const int gfin0 = m.tune.gemv_fin;
-    for (int mode : {-1, 0, 2}) {
-      const std::string nm = mode < 0 ? "out_add" : mode == 0 ? "out_addp" : "out_adds_fin";
+    for (int mode : {-1, 0}) {
+      const std::string nm = mode < 0 ? "out_add" : "out_addp";
       cases.push_back({nm, [&, Xo, mode](Enc& E, int i) {
                          const Mat& w = lins[size_t(i) % lins.size()]->out;
-                         m.tune.gemv_fin = mode < 0 ? 0 : mode;
                          gemm(E, m.tune, w, Xo, 0, w.in(), Hres, 0, w.out(), 1, 1, 0, nullptr, mode < 0 ? nullptr : &nlink);
-                         m.tune.gemv_fin = gfin0;
                        }, mb});
     }
   }

@@ -63,10 +63,10 @@ struct Tuner {
   bool gemv = true;        // decode-sized rows use rgemv ("gemv": 0 disables)
   bool gemv8 = true;       // 3..8 rows use the MMA GEMV ("gemv8": 0 disables)
   int gemv_max_m = 2;      // rows served by the FMA GEMV (1..kGemvInstM; ESPETERO_GEMV_MAXM)
-  // Fase 3: the fused norm's finalizer of the 1-2-row residual GEMVs (EPI_ADDP) 0 in the
-  // dispatch (last arriver) as before, 2 as a norm_fin dispatch after an EPI_ADDS GEMV (the
-  // same sums in the same order). ESPETERO_GEMV_FIN, "gemv_fin".
-  int gemv_fin = 0;
+  // Fase 3 measured and removed: the dense residual GEMV's fused-norm finalizer as its own
+  // dispatch (gemv_fin 2: EPI_ADDS + norm_fin) was neutral to slower on the M4 Max (14.8 -> 15.9 us
+  // per out projection in chain); its branches left the default rgemv template (Fase 2's lesson:
+  // templating the default kernel changes its code; the M1 Max 27B 1-row step read +1 %).
   // GEMMs above the tuned range (prefill chunks of 2048-4096 rows against
   // tune_max_m = 1024) take the top bucket's tile without its K split, so the
   // summation order stays config 2's ("tune_clamp": 0 = config 2 as before).
@@ -258,10 +258,8 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
       E.wr(nout->ctr.b, nout->ctr.off, nout->ctr.off + 4);
     }
   };
-  static const char* epis4[6] = {"_store", "_add", "_swiglu", "_addp", "", "_adds"};
-  // EPI_ADDS (5): the residual GEMV without the in-dispatch finalizer; norm_fin follows (gemv_fin 2, rgemv only).
-  const bool fin_split = nout && T.gemv_fin == 2 && M <= T.gemv_max_m && T.gemv;
-  const int e = nout ? (fin_split ? 5 : 3) : epi;
+  static const char* epis4[4] = {"_store", "_add", "_swiglu", "_addp"};
+  const int e = nout ? 3 : epi;
   if ((nin || nout) && !gemv_path(T, M)) fail("fused norm needs a GEMV-sized pass");
   // An RMSNorm'd input is the residual stream itself: never also the output.
   if (nin && nin->kind == 1 && (e == 1 || e == 3)) fail("fused norm input with a residual epilogue");
@@ -277,9 +275,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.bytes(5, p);
     E.rd(A, aoff, aoff + a_bytes);
     E.wr(Y, yoff, yoff + y_bytes);
-    const size_t sp = name.find("sep");  // the SEP variants run 32 * KS threads
-    const int sep_ks = sp != std::string::npos ? name[sp + 3] - '0' : 0;
-    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(size_t(sep_ks > 0 ? 32 * sep_ks : 256), 1, 1));
+    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
     return;
   }
   if (M <= T.gemv_max_m && (T.gemv || n_cols > 0)) {
@@ -318,7 +314,6 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
     E.rd(A, aoff, aoff + a_bytes);
     E.wr(Y, yoff, yoff + y_bytes);
     E.groups(MTLSizeMake(size_t(nblocks), size_t(splits), 1), MTLSizeMake(k16 ? 512 : 256, 1, 1));
-    if (fin_split) norm_fin_encode(E, *nout, Y, yoff, M, 1);
     return;
   }
   // 3..8 rows (draft verification): the GEMV-shaped MMA kernel.
@@ -539,10 +534,9 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
     for (int e = 0; e < 3; ++e)
       for (int cfg : {1, 2, 4}) out.push_back({rgemm_name(w.bits, gemm_variant_cfg(cfg, gemm_var), e), w.fc()});
   if (w.bits == 6) out.push_back({"widen6_8", 0});
-  for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g", "_adds", "_adds_g"}) {
+  for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g"}) {
     for (int mm = 1; mm <= kGemvInstM; ++mm)
       out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + v, w.fc()});
-    if (v[1] == 'a' && v[2] == 'd' && v[3] == 'd' && v[4] == 's') continue;  // _adds: rgemv only
     if (fma34)
       for (int mm = 3; mm <= 4; ++mm) out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + "j" + v, w.fc()});
     out.push_back({"rgemv8r" + std::to_string(w.bits) + v, w.fc()});

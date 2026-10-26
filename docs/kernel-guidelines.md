@@ -418,10 +418,14 @@ Rules that keep the tiers honest:
   8) 7.7–10.7 µs (230–250 GB/s; 376 for 8-bit); the isolated `--profile`
   numbers (13 / 12 µs) are mostly command-buffer overhead. A short-K kernel
   with per-step partials on 1–4 simdgroups (`hc_sep`, the same sums as the
-  256-thread kernel's step-ordered simdgroup partials) measures the same in
+  256-thread kernel's step-ordered simdgroup partials) measured the same in
   chain (5.8–8.2 µs) and on the whole step (GPU 15.87–15.92 → 15.81–16.05 ms),
-  bit-identical: off. The 96 blocks' GEMVs cost ~1.6 ms of the 15.9 ms step;
-  at 500 GB/s they would cost 0.9.
+  bit-identical: removed again, together with the dense `gemv_fin` variant,
+  because both lived as template parameters of the default `rgemv` kernel
+  and the M1 Max 27B 1-row step read +1.1 / +1.2 % against main with them in
+  (the M4 Max read equal): the default kernels keep main's text. The 96
+  blocks' GEMVs cost ~1.6 ms of the 15.9 ms step; at 500 GB/s they would
+  cost 0.9.
 - **Flash-Next's 0.88 ms of encode per step is a warm-up, not a steady cost**:
   `bench_native --q4` reports 0.82–0.90 ms over its first 128–200 steps and
   0.28 ms (1.7 % of the step) as the median over 1500; a CPU sample of the
