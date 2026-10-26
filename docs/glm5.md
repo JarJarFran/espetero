@@ -380,9 +380,9 @@ headers read, nothing downloaded):
 | File | Size (experts) | Routed experts: gate/up, down | Dense matrices | Espetero's GGUF converter |
 |:--|--:|:--|:--|:--|
 | UD-Q4_K_XL | 199.7 GB (189.9) | Q4_K (one layer Q5_K), Q5_K (3 layers Q6_K) | Q8_0 everywhere (KDA q/k/v/o, DSA, `attn_k_b`/`attn_v_b`, indexer, hc `fn`, head, embeddings); routers, norms, convs F32 | **every type supported** (Q4_K, Q5_K, Q6_K, Q8_0, F32) |
-| UD-Q3_K_XL | 147.5 GB (137.8) | IQ3_XXS, IQ4_XS | Q8_0; head Q6_K | IQ3_XXS missing |
-| UD-IQ3_XXS | 120.4 GB (112.5) | IQ2_S, IQ3_S | Q6_K; `k_b`/`v_b`, indexer Q8_0 | IQ2_S, IQ3_S missing |
-| UD-Q2_K_XL | 108.7 GB (101.7) | IQ2_XS, IQ3_XXS | Q5_K / Q6_K; head Q4_K | IQ2_XS, IQ3_XXS missing |
+| UD-Q3_K_XL | 147.5 GB (137.8) | IQ3_XXS, IQ4_XS | Q8_0; head Q6_K | supported |
+| UD-IQ3_XXS | 120.4 GB (112.5) | IQ2_S, IQ3_S | Q6_K; `k_b`/`v_b`, indexer Q8_0 | supported |
+| UD-Q2_K_XL | 108.7 GB (101.7) | IQ2_XS, IQ3_XXS (layer 11 IQ3_XXS / IQ4_XS, 12 and 44 down IQ4_XS, 45 Q3_K / Q4_K) | Q5_K / Q6_K; head Q4_K | supported; experts per layer 8.1–10.9 MB, so a resident cache sizes its slots per layer (101.7 GB, not 134.7 GB of equal slots) |
 
 The tensor names map one-to-one onto the HF ones ([LC]: `blk.N.hc_attn_fn`,
 `ssm_conv1d_q/k/v` [4, 1, 8192], `ssm_f_a/f_b/g_a/g_b/beta/a/dt`,
@@ -569,13 +569,14 @@ layer; Mac Studio M4 Max):
 
 | UD-IQ3_XXS slice (blocks 0–3, GGUF through the native block kernels) vs `tools/glm5_ref.py` on the same GGUF weights | 1.0e-4 | 1.5e-4 (prefill + 18 decode steps; routes identical, selections differ in 2 rows) |
 | UD-IQ3_XXS's own distance from the FP8 weights (the two references) | 2–3 % in layers 0–2, 20 % after the IQ2_S / IQ3_S MoE (routes differ in 9 / 21 rows) | |
+| MTP layer (45) after layers 0–3, FP8 / UD-IQ3_XXS, Espetero vs reference: worst per-row relative L2 of the MTP logits | 2.5e-4 / 2.2e-4 (argmax equal 20 / 20, routes identical) | |
 
 Layers 0–2 agree to 3e-6 (fp32 noise); layer 3's attention to 3.6e-4 (half
 latents); mlx-vlm's layer-3 MLP differs by 2–3e-4 because the check holds its
 expert stacks in float16. GPU time at tier 0: 55 ms for 21 tokens, 5.6 s for
 2,138 (KDA token by token, GEMVs per row), 4.3–6.0 ms per decoded token for
 these four layers. The native GGUF-block GEMVs (`tests/gguf_gemv_test.mm`)
-match gguf-py on random and real blocks of all nine types to ~1e-8.
+match gguf-py on random and real blocks of all eleven types to ~1e-8.
 
 Determinism as DSv4: bit-reproducible passes except the pipelined MoE of long
 passes (its row sums depend on which experts were cached); exact comparisons
@@ -634,15 +635,18 @@ against mlx-vlm's own layers to 3e-4; slices of layers 0–3 on the Studio HDD, 
   k-pool indexer (dense and top-512 regimes), the sigmoid router, routed and shared experts; prefill and decode
   (bit-identical); 1.8e-4 worst per-row on a 21-token chat, 9.2e-3 (one near-tie route) on 2,138 tokens;
 * the same on unsloth's UD-IQ3_XXS GGUF (native IQ2_S / IQ3_S / Q6_K / Q8_0 kernels): 1.0e-4 / 1.5e-4 against
-  the reference on the same weights; all nine GGUF block types of UD-IQ3_XXS and UD-Q4_K_XL to ~1e-8;
-* the expert cache: a 40-slot pool (fewer than one layer's experts) bit-identical to a full one;
+  the reference on the same weights; all eleven GGUF block types of UD-IQ3_XXS, UD-Q2_K_XL and UD-Q4_K_XL to
+  ~1e-8 (IQ2_XS / IQ3_XXS also on 64 real rows of UD-Q2_K_XL's layer-3 experts);
+* the MTP layer (layer 45 after layers 0–3, FP8 and UD-IQ3_XXS): logits 2.5e-4 / 2.2e-4, argmax 20 / 20;
+* the expert cache: a 40-slot pool (fewer than one layer's experts) bit-identical to a full one, and to the
+  resident mode (every expert in its own slot sized per layer, chosen when all fit; `ESPETERO_GLM5_PRELOAD=1`
+  reads them at load) with and without preloading;
 * the tokenizer (HF tokenizer.json and the GGUF's own vocabulary: all 25,026 reference cases), the chat
   template (564 cases byte-identical to transformers), the GLM tool-call parser (unit tests);
 * `espetero serve` on the slice (4 layers + head, `ESPETERO_GLM5_HEAD_ANY=1`): chat, sampled chat, streaming,
   completions well formed.
 
-**Written, not yet verified:** the MTP layer (model and reference; the slices lack layer 45's tensors),
-checkpoint files (`slot_save` / `slot_load`), trees with leaves.
+**Written, not yet verified:** checkpoint files (`slot_save` / `slot_load`), trees with leaves.
 
 **Needs the full model** (a GGUF on the Studio SSD, Fran's call): logits and greedy text against llama.cpp on
 the same file, perplexity, the forced tool call (GLM's template always opens `<think>`; forcing waits for the

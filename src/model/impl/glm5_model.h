@@ -126,7 +126,9 @@ struct LayerW {
 // The routed experts stay in the checkpoint files (docs/glm5.md 8): a pool of equal slots in shared Metal
 // buffers, each holding one expert's three matrices as stored (codes, then fp8 scales for the FP8
 // checkpoint); after a layer's routing the missing experts are read with parallel preads (F_NOCACHE) into the
-// least recently used slots. A layer that needs more experts than the pool holds runs them in groups.
+// least recently used slots. A layer that needs more experts than the pool holds runs them in groups. When
+// every expert fits (UD-Q2_K_XL on a 128 GB Mac) the cache is resident instead: one slot per expert, sized
+// per layer (the layers' types differ), filled on first use or at load (ESPETERO_GLM5_PRELOAD=1), never evicted.
 struct XMat {
   int fmt = 0, gg = 0, N = 0, K = 0;
   uint64_t woff = 0, soff = 0;  // in the slot
@@ -144,14 +146,19 @@ struct ExpertCache {
   std::vector<XLayer> layers;
   uint64_t slot_bytes = 0, total_bytes = 0;
   int n = 0, per_buf = 0, total_experts = 0, E = 0;
+  bool resident = false;           // slot = xl * E + e; sbuf / soff place it
+  std::vector<int> sbuf;
+  std::vector<uint64_t> soff;
   std::vector<id<MTLBuffer>> bufs;
   std::vector<int> key;            // slot -> xl * E + e, -1 free
   std::vector<uint64_t> stamp;     // slot -> last use
   std::unordered_map<int, int> where;
   uint64_t clock = 0, hits = 0, misses = 0;
   double read_ms = 0, read_gb = 0;
-  uint8_t* host(int s) const { return static_cast<uint8_t*>([bufs[size_t(s / per_buf)] contents]) + size_t(s % per_buf) * slot_bytes; }
-  Buf at(int s, uint64_t off) const { return Buf{bufs[size_t(s / per_buf)], size_t(s % per_buf) * slot_bytes + off}; }
+  int buf_of(int s) const { return resident ? sbuf[size_t(s)] : s / per_buf; }
+  uint64_t off_of(int s) const { return resident ? soff[size_t(s)] : uint64_t(s % per_buf) * slot_bytes; }
+  uint8_t* host(int s) const { return static_cast<uint8_t*>([bufs[size_t(buf_of(s))] contents]) + off_of(s); }
+  Buf at(int s, uint64_t off) const { return Buf{bufs[size_t(buf_of(s))], size_t(off_of(s) + off)}; }
 };
 
 class DevModel {
@@ -194,10 +201,14 @@ class DevModel {
     for (Seq& q : seqs_) alloc_seq(q);
     ensure_scratch(T_);
     make_cache(cache_gb, cache_slots);
-    std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: %d slots of %.1f MB (%.1f GB) for %d "
-                         "experts (%.1f GB) read from %s\n",
-                 L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.slot_bytes) / 1e6, double(xc_.n) * double(xc_.slot_bytes) / 1e9,
-                 xc_.total_experts, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
+    if (xc_.resident)
+      std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: all %d resident (%.1f GB) read from %s\n",
+                   L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
+    else
+      std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: %d slots of %.1f MB (%.1f GB) for %d "
+                           "experts (%.1f GB) read from %s\n",
+                   L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.slot_bytes) / 1e6, double(xc_.n) * double(xc_.slot_bytes) / 1e9,
+                   xc_.total_experts, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
   }
 
   int layers() const { return L_; }
@@ -225,8 +236,8 @@ class DevModel {
   Runtime& rt() { return rt_; }
   std::string cache_json() const {
     char b[256];
-    std::snprintf(b, sizeof b, "{\"slots\":%d,\"slot_mb\":%.2f,\"hits\":%llu,\"misses\":%llu,\"read_gb\":%.3f,\"read_ms\":%.1f}",
-                  xc_.n, double(xc_.slot_bytes) / 1e6, (unsigned long long)xc_.hits, (unsigned long long)xc_.misses,
+    std::snprintf(b, sizeof b, "{\"resident\":%s,\"slots\":%d,\"slot_mb\":%.2f,\"hits\":%llu,\"misses\":%llu,\"read_gb\":%.3f,\"read_ms\":%.1f}",
+                  xc_.resident ? "true" : "false", xc_.n, double(xc_.slot_bytes) / 1e6, (unsigned long long)xc_.hits, (unsigned long long)xc_.misses,
                   xc_.read_gb, xc_.read_ms);
     return b;
   }
@@ -817,10 +828,15 @@ class DevModel {
     }
     if (x.layers.empty()) return;
     if (slots <= 0) {
-      if (gb <= 0) {  // what the GPU working set leaves after the weights, sequences and scratch, keeping 6 GB
-        const double ws = double([rt_.dev recommendedMaxWorkingSetSize]), mine = double([rt_.dev currentAllocatedSize]);
-        gb = (ws - mine - 6e9) / 1e9;
+      const double ws = double([rt_.dev recommendedMaxWorkingSetSize]), mine = double([rt_.dev currentAllocatedSize]);
+      // every expert, packed per layer, in what the working set leaves keeping 1.5 GB: resident
+      uint64_t packed = 0;
+      for (const XLayer& xl : x.layers) packed += (xl.bytes + 255) / 256 * 256 * uint64_t(c_.E);
+      if ((gb <= 0 && double(packed) <= ws - mine - 1.5e9) || (gb > 0 && double(packed) <= gb * 1e9)) {
+        make_resident();
+        return;
       }
+      if (gb <= 0) gb = (ws - mine - 6e9) / 1e9;  // otherwise an LRU pool, keeping 6 GB
       slots = int(std::max(1.0, gb * 1e9 / double(x.slot_bytes)));
     }
     x.n = std::min(slots, x.total_experts);
@@ -829,6 +845,36 @@ class DevModel {
     x.key.assign(size_t(x.n), -1);
     x.stamp.assign(size_t(x.n), 0);
   }
+  void make_resident() {
+    ExpertCache& x = xc_;
+    x.resident = true;
+    x.n = x.total_experts;
+    x.key.assign(size_t(x.n), -1);
+    x.stamp.assign(size_t(x.n), 0);
+    x.sbuf.resize(size_t(x.n)), x.soff.resize(size_t(x.n));
+    const uint64_t cap = uint64_t(2) << 30;
+    uint64_t used = cap;  // in the last buffer
+    std::vector<uint64_t> sizes;
+    for (int l = 0; l < int(x.layers.size()); ++l) {
+      const uint64_t b = (x.layers[size_t(l)].bytes + 255) / 256 * 256;
+      for (int e = 0; e < x.E; ++e) {
+        if (used + b > cap) sizes.push_back(0), used = 0;
+        const int s = l * x.E + e;
+        x.sbuf[size_t(s)] = int(sizes.size()) - 1, x.soff[size_t(s)] = used;
+        used += b, sizes.back() = used;
+      }
+    }
+    for (uint64_t b : sizes) x.bufs.push_back(rt_.buffer(size_t(b)));
+    x.total_bytes = 0;
+    for (uint64_t b : sizes) x.total_bytes += b;
+    if (const char* e = std::getenv("ESPETERO_GLM5_PRELOAD"); e && std::atoi(e) == 1) {
+      const auto t0 = Clock::now();
+      std::vector<int> all(size_t(x.E));
+      std::iota(all.begin(), all.end(), 0);
+      for (int l = 0; l < int(x.layers.size()); ++l) ensure(l, all);
+      std::fprintf(stderr, "glm5: %d experts (%.1f GB) preloaded in %.1f s\n", x.n, x.read_gb, ms_since(t0) / 1e3);
+    }
+  }
   // Slots for experts `es` of cache layer `xl` (at most xc_.n of them), reading the missing ones; the slots of
   // this call are not evicted by it. The GPU must not be reading the evicted slots (callers flush first).
   std::vector<int> ensure(int xl, const std::vector<int>& es) {
@@ -836,7 +882,15 @@ class DevModel {
     const uint64_t now = ++x.clock;
     std::vector<int> slot(es.size(), -1);
     std::vector<size_t> miss;
-    for (size_t i = 0; i < es.size(); ++i) {
+    if (x.resident) {
+      for (size_t i = 0; i < es.size(); ++i) {
+        const int s = xl * x.E + es[i];
+        slot[i] = s;
+        if (x.key[size_t(s)] < 0) x.key[size_t(s)] = s, miss.push_back(i), ++x.misses;
+        else ++x.hits;
+      }
+    }
+    for (size_t i = 0; i < es.size() && !x.resident; ++i) {
       auto it = x.where.find(xl * x.E + es[i]);
       if (it != x.where.end()) {
         slot[i] = it->second;
@@ -847,6 +901,12 @@ class DevModel {
       }
     }
     if (miss.empty()) return slot;
+    if (!x.resident) evict(xl, es, miss, slot, now);
+    read_experts(xl, es, miss, slot);
+    return slot;
+  }
+  void evict(int xl, const std::vector<int>& es, const std::vector<size_t>& miss, std::vector<int>& slot, uint64_t now) {
+    ExpertCache& x = xc_;
     // victims: free slots first, then the oldest stamps below now
     std::vector<int> order(size_t(x.n));
     std::iota(order.begin(), order.end(), 0);
@@ -867,6 +927,9 @@ class DevModel {
       slot[i] = s;
       ++x.misses;
     }
+  }
+  void read_experts(int xl, const std::vector<int>& es, const std::vector<size_t>& miss, const std::vector<int>& slot) {
+    ExpertCache& x = xc_;
     const auto t0 = Clock::now();
     std::atomic<bool> ok{true};
     std::atomic<uint64_t> bytes{0};
@@ -883,7 +946,6 @@ class DevModel {
     if (!ok) fail("glm5: expert read failed");
     x.read_ms += ms_since(t0);
     x.read_gb += double(bytes.load()) / 1e9;
-    return slot;
   }
   Mat xmat(int xl, int slot, int m) const {
     const XMat& a = xc_.layers[size_t(xl)].m[m];
