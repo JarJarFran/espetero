@@ -132,8 +132,13 @@ index, Engram constants, expert cache), `src/model/impl/dsv4_model.h` (the
   prompt, not once per chunk.
 * **Sequences** are slots of their own (no paged KV): 40 window rings of 128
   latents, the four compressed caches and index-key caches for the context,
-  the compressor's pending rows; ≈ 3.3 KB per token of context. Slots save to
+  the compressor's pending rows; ≈ 3.3 KB per token of context (~110 MB a slot
+  at 32 K). The server gets up to 16 slots (the concurrent requests, `--users`;
+  at least 6; before Fase 3 W7: 6), out of the expert cache. Slots save to
   and load from disk (`slot_save` / `slot_load`, the engine's prompt checkpoints).
+  While other sequences decode, a prompt still runs as one pass (the engine's
+  `ModelInfo::chunk_prefill` is off for this model): chunks of `--prefill-chunk`
+  rows would read a layer's experts once per chunk.
 * **Causal encoder-decoder** (CED, the V4.1 report §2.2 and §3.2.2): layers 0–19
   are the encoder; layer 20, the last KV source, compresses the encoder's output
   into the KV and index keys every decoder layer (20–39) reads. A decoder layer's
