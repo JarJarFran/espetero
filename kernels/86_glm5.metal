@@ -500,3 +500,129 @@ GGUF_EMBED("gguf_embed_q8_0", 8)
 GGUF_EMBED("gguf_embed_q4_k", 12)
 GGUF_EMBED("gguf_embed_q5_k", 13)
 GGUF_EMBED("gguf_embed_q6_k", 14)
+
+// Rows of n floats from src (row stride ss) to dst (row stride ds), and dst += src (the MTP layer's plain residuals).
+kernel void glm5_copy_rows(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                           constant int3& p [[buffer(2)]],  // (n, ss, ds)
+                           uint2 g [[thread_position_in_grid]]) {
+  if (int(g.x) >= p.x) return;
+  dst[ulong(g.y) * ulong(p.z) + g.x] = src[ulong(g.y) * ulong(p.y) + g.x];
+}
+kernel void glm5_add_rows(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+                          constant int3& p [[buffer(2)]],  // (n, ss, ds)
+                          uint2 g [[thread_position_in_grid]]) {
+  if (int(g.x) >= p.x) return;
+  dst[ulong(g.y) * ulong(p.z) + g.x] += src[ulong(g.y) * ulong(p.y) + g.x];
+}
+
+// KDA, chunked (tier 1 of glm5_kda_recur): 8 tokens per step with 8 x 8 MMAs, the per-channel decay folded into
+// the keys and queries. Within a chunk, with A_t[c] = prod_{i <= t} exp(g_i[c]) (|log A| <= 40: fp32 is safe):
+//   k~ = A_t k_t,  k^ = k_t / A_t,  q~ = A_t q_t
+//   L = strictly-lower(beta_t k~_t . k^_i)        D = (I + L)^-1 diag(beta) (V - K~ S)      (the deltas)
+//   O = Q~ S + lower-incl(q~_t . k^_i) D           S' = diag(A_C) (S + K^T D)
+// (I + L)^-1 = (I - L)(I + L^2)(I + L^4) (L nilpotent). One simdgroup per 8-row slab of a head's state
+// (16 fragments of S, k x v, in registers); the 4 simdgroups of a threadgroup share the staged chunk.
+// Grid (32, 128 / 8, H) threads, threadgroup (32, 4, 1).
+kernel void glm5_kda_chunk(device const float* QKV [[buffer(0)]], device const float* G [[buffer(1)]],
+                           device const float* Beta [[buffer(2)]], device float* S [[buffer(3)]],
+                           device float* O [[buffer(4)]], constant Glm5RecurP& p [[buffer(5)]],
+                           uint3 tpig [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+  constexpr int Dk = 128, LDS = Dk + 4;
+  threadgroup float Kt[8 * LDS];  // k~
+  threadgroup float Kh[8 * LDS];  // k^
+  threadgroup float Qt[8 * LDS];  // q~
+  threadgroup float Ac[Dk];       // A_C
+  threadgroup float Bs[8];
+  const int slab = int(tpig.y), h = int(tpig.z);
+  const int C = p.H * 128;
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+  device float* st_p = S + (ulong(h) * 128 + ulong(slab) * 8) * Dk;  // the slab's 8 v rows of [v][k]
+  simdgroup_float8x8 ST[16];
+  for (int kk = 0; kk < 16; ++kk) simdgroup_load(ST[kk], st_p + kk * 8, Dk, ulong2(0, 0), true);
+  simdgroup_float8x8 I8;
+  I8.thread_elements()[0] = fm == fn ? 1.0f : 0.0f;
+  I8.thread_elements()[1] = fm == fn + 1 ? 1.0f : 0.0f;
+  for (int t0 = 0; t0 < p.rows; t0 += 8) {
+    const int nt = min(8, p.rows - t0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < Dk) {  // one channel per thread: the cumulative decay down the chunk
+      const int c = int(tid);
+      float acc = 0.0f;
+      for (int t = 0; t < 8; ++t) {
+        float kv = 0.0f, qv = 0.0f, a = 1.0f;
+        if (t < nt) {
+          device const float* row = QKV + ulong(t0 + t) * ulong(p.C3);
+          acc += G[ulong(t0 + t) * ulong(C) + ulong(h * 128 + c)];
+          a = exp(acc);
+          kv = row[C + h * 128 + c];
+          qv = row[h * 128 + c];
+        }
+        Kt[t * LDS + c] = kv * a;
+        Kh[t * LDS + c] = t < nt ? kv / a : 0.0f;
+        Qt[t * LDS + c] = qv * a;
+      }
+      Ac[c] = exp(acc);
+    }
+    if (tid < 8) Bs[tid] = int(tid) < nt ? Beta[ulong(t0 + int(tid)) * ulong(p.H) + ulong(h)] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 KK = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 QK = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 WS = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 QS = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int kk = 0; kk < 16; ++kk) {
+      simdgroup_float8x8 Kf, KhT, Qf;
+      simdgroup_load(Kf, Kt + kk * 8, LDS);
+      simdgroup_load(KhT, Kh + kk * 8, LDS, ulong2(0, 0), true);
+      simdgroup_load(Qf, Qt + kk * 8, LDS);
+      simdgroup_multiply_accumulate(KK, Kf, KhT, KK);
+      simdgroup_multiply_accumulate(QK, Qf, KhT, QK);
+      simdgroup_multiply_accumulate(WS, Kf, ST[kk], WS);
+      simdgroup_multiply_accumulate(QS, Qf, ST[kk], QS);
+    }
+    const float b_r = Bs[fm];
+    const bool r_ok = fm < nt;
+    simdgroup_float8x8 L, T, P, tmp;
+    L.thread_elements()[0] = fn < fm ? b_r * KK.thread_elements()[0] : 0.0f;
+    L.thread_elements()[1] = fn + 1 < fm ? b_r * KK.thread_elements()[1] : 0.0f;
+    T.thread_elements()[0] = I8.thread_elements()[0] - L.thread_elements()[0];
+    T.thread_elements()[1] = I8.thread_elements()[1] - L.thread_elements()[1];
+    P = L;
+    for (int step = 0; step < 2; ++step) {
+      simdgroup_multiply(tmp, P, P);
+      P = tmp;
+      simdgroup_multiply_accumulate(tmp, T, P, T);
+      T = tmp;
+    }
+    simdgroup_float8x8 X, Dm;
+    {
+      const float2 vv = r_ok ? float2(QKV[ulong(t0 + fm) * ulong(p.C3) + ulong(2 * C + h * 128 + slab * 8 + fn)],
+                                      QKV[ulong(t0 + fm) * ulong(p.C3) + ulong(2 * C + h * 128 + slab * 8 + fn + 1)])
+                             : float2(0.0f);
+      X.thread_elements()[0] = b_r * (vv.x - WS.thread_elements()[0]);
+      X.thread_elements()[1] = b_r * (vv.y - WS.thread_elements()[1]);
+    }
+    simdgroup_multiply(Dm, T, X);
+    simdgroup_float8x8 QKm, Om;
+    QKm.thread_elements()[0] = fn <= fm ? QK.thread_elements()[0] : 0.0f;
+    QKm.thread_elements()[1] = fn + 1 <= fm ? QK.thread_elements()[1] : 0.0f;
+    simdgroup_multiply_accumulate(Om, QKm, Dm, QS);
+    if (r_ok) {
+      device float* y = O + ulong(t0 + fm) * ulong(C) + ulong(h * 128 + slab * 8 + fn);
+      y[0] = Om.thread_elements()[0];
+      y[1] = Om.thread_elements()[1];
+    }
+    for (int kk = 0; kk < 16; ++kk) {  // S' = diag(A_C) (S + K^T D): rows of a fragment are k = kk * 8 + fm
+      simdgroup_float8x8 KhT;
+      simdgroup_load(KhT, Kh + kk * 8, LDS, ulong2(0, 0), true);
+      simdgroup_multiply_accumulate(ST[kk], KhT, Dm, ST[kk]);
+      const float a = Ac[kk * 8 + fm];
+      ST[kk].thread_elements()[0] *= a;
+      ST[kk].thread_elements()[1] *= a;
+    }
+  }
+  if (p.write_state)
+    for (int kk = 0; kk < 16; ++kk) simdgroup_store(ST[kk], st_p + kk * 8, Dk, ulong2(0, 0), true);
+}

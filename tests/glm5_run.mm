@@ -46,6 +46,11 @@ int main(int argc, char** argv) {
     const auto t0 = Clock::now();
     if (split <= 0 || split >= int(ids.size())) {
       m.prefill(ids, out);
+      if (env_on("ESPETERO_GLM5_MTP")) {  // the MTP layer on the last layer's normed hidden (tools/glm5_ref.py --mtp)
+        if (!m.has_mtp()) throw std::runtime_error("no MTP layer (or no head: ESPETERO_GLM5_HEAD_ANY=1 on a slice)");
+        m.mtp_dev(ids, out);
+        std::fprintf(stderr, "mtp: %zu rows\n", ids.size() - 1);
+      }
       std::fprintf(stderr, "prefill of %zu tokens over %d layers: %.1f s (GPU %.1f ms)\n", ids.size(), m.layers(),
                    ms_since(t0) / 1e3, m.gpu_ms());
       return 0;

@@ -65,8 +65,8 @@ struct Enc {
   void groups(size_t x, size_t y, size_t z, size_t tx) {
     if (x && y && z) [e dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
   }
-  void threads(size_t x, size_t y, size_t z, size_t tx) {
-    if (x && y && z) [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, 1, 1)];
+  void threads(size_t x, size_t y, size_t z, size_t tx, size_t ty = 1) {
+    if (x && y && z) [e dispatchThreads:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
   }
 };
 
@@ -97,6 +97,7 @@ inline const char* gguf_suffix(int t) {
 struct Seq {
   bool used = false;
   int len = 0;
+  int mtp_len = 0;  // rows in the MTP layer's caches (its positions start at 0: docs/glm5.md 6)
   std::vector<id<MTLBuffer>> kda, conv, lat, pooled, pend;
 };
 
@@ -115,6 +116,9 @@ struct LayerW {
   Mat router;                   // bf16 [E, D]
   Buf bias;                     // e_score_correction_bias
   int xl = -1;  // the routed experts' entry in the expert cache (ExpertCache::layers)
+  // the NextN / MTP layer (a DSA + MoE layer without hyper-connections) also has
+  Mat eh_proj;                      // [D, 2D] over [enorm(embed(next)) | hnorm(h)]
+  Buf enorm, hnorm, shead_norm;
 };
 
 // The routed experts stay in the checkpoint files (docs/glm5.md 8): a pool of equal slots in shared Metal
@@ -161,6 +165,17 @@ class DevModel {
     } else {
       idx_.open(dir, true);
       c_ = idx_.c;
+      // the MTP layer: in a complete checkpoint when indexed; in a slice only when its tensors were fetched
+      const std::string eh = layer_prefix(c_.L) + "eh_proj.weight";
+      if (c_.n_mtp > 0 && idx_.ck.has(eh)) {
+        if (file_exists(dir + "/.filled.json")) {
+          const json::Value f = json::parse(read_file(dir + "/.filled.json"));
+          for (const json::Value& v : f.as_array())
+            if (v.is_string() && v.as_string() == eh) mtp_ = true;
+        } else {
+          mtp_ = true;
+        }
+      }
     }
     L_ = std::min(layers > 0 ? layers : c_.L, gguf_ ? gg_layers_ : idx_.layers);
     if (L_ <= 0) fail("glm5: no complete layer in " + dir);
@@ -221,7 +236,7 @@ class DevModel {
       if (q.conv[l]) std::memset([q.conv[l] contents], 0, [q.conv[l] length]);
       if (q.pend[l]) std::memset([q.pend[l] contents], 0, [q.pend[l] length]);
     }
-    q.len = 0;
+    q.len = 0, q.mtp_len = 0;
   }
   void fork(Seq& d, const Seq& s) {
     if (&d == &s) return;
@@ -232,19 +247,21 @@ class DevModel {
       if (s.kda[l]) cp(d.kda[l], s.kda[l], [s.kda[l] length]);
       if (s.conv[l]) cp(d.conv[l], s.conv[l], [s.conv[l] length]);
       if (s.pend[l]) cp(d.pend[l], s.pend[l], [s.pend[l] length]);
-      if (s.lat[l]) cp(d.lat[l], s.lat[l], size_t(s.len) * size_t(c_.KVR) * 2);
-      if (s.pooled[l]) cp(d.pooled[l], s.pooled[l], size_t(s.len / c_.KPOOL) * size_t(c_.IHD) * 2);
+      const int n = int(l) == L_ ? s.mtp_len : s.len;  // the MTP layer's caches have their own length
+      if (s.lat[l]) cp(d.lat[l], s.lat[l], size_t(n) * size_t(c_.KVR) * 2);
+      if (s.pooled[l]) cp(d.pooled[l], s.pooled[l], size_t(n / c_.KPOOL) * size_t(c_.IHD) * 2);
     }
-    d.len = s.len;
+    d.len = s.len, d.mtp_len = s.mtp_len;
   }
   // The state of a sequence as a list of (buffer, bytes): what a checkpoint file holds, in order.
-  std::vector<std::pair<id<MTLBuffer>, size_t>> state_parts(const Seq& q, int len) const {
+  std::vector<std::pair<id<MTLBuffer>, size_t>> state_parts(const Seq& q, int len, int mtp_len = 0) const {
     std::vector<std::pair<id<MTLBuffer>, size_t>> v;
     for (size_t l = 0; l < q.kda.size(); ++l) {
+      const int n = int(l) == L_ ? mtp_len : len;
       if (q.kda[l]) v.push_back({q.kda[l], [q.kda[l] length]}), v.push_back({q.conv[l], [q.conv[l] length]});
       if (q.lat[l]) {
-        v.push_back({q.lat[l], size_t(len) * size_t(c_.KVR) * 2});
-        v.push_back({q.pooled[l], size_t(len / c_.KPOOL) * size_t(c_.IHD) * 2});
+        v.push_back({q.lat[l], size_t(n) * size_t(c_.KVR) * 2});
+        v.push_back({q.pooled[l], size_t(n / c_.KPOOL) * size_t(c_.IHD) * 2});
         v.push_back({q.pend[l], [q.pend[l] length]});
       }
     }
@@ -262,6 +279,85 @@ class DevModel {
     }
   }
 
+  bool has_mtp() const { return mtp_ && head_m_.w.b; }
+
+  // The MTP layer over T rows of sequence q (docs/glm5.md 6): row i takes the trunk's final-normed hidden HN[i]
+  // (a GPU buffer of T x D floats) and the token after it, next[i]; its caches continue at q.mtp_len. Writes the
+  // rows' logits [T][V] (T <= max_reads) and, when hout is given, their normed outputs (the next draft step's hidden).
+  void mtp_pass(Seq& q, id<MTLBuffer> HN, size_t hoff, const int32_t* next, int T, float* logits, id<MTLBuffer> hout = nil,
+                const std::string& dump_dir = "") {
+    if (!mtp_) fail("glm5: the checkpoint has no MTP layer");
+    if (T <= 0) return;
+    if (T > T_ || T > max_reads_) fail("glm5: MTP pass too large");
+    const int D = c_.D, p0 = q.mtp_len;
+    if (p0 + T > max_ctx_) fail("glm5: MTP context full");
+    const LayerW& w = L[size_t(L_)];
+    for (int i = 0; i < T; ++i) {
+      if (next[i] < 0 || next[i] >= c_.V) fail("glm5: token id out of range");
+      static_cast<int32_t*>([ids_ contents])[i] = next[i];
+      static_cast<int32_t*>([pos_ contents])[i] = p0 + i;
+    }
+    S_ = &q;
+    Enc E(rt_);
+    embed(E, T);  // H_ rows: the next tokens' embeddings, 4 copies each
+    auto rows = [&](const char* k, id<MTLBuffer> src, size_t so, int ss, id<MTLBuffer> dst, size_t dof, int ds) {
+      const int32_t p[3] = {D, ss, ds};
+      E.pipe(k);
+      E.set(0, src, so);
+      E.set(1, dst, dof);
+      E.bytes(2, p);
+      E.threads(size_t(D), size_t(T), 1, 256);
+    };
+    // [enorm(e) | hnorm(h)] in P1_ rows of 2D, then u = eh_proj . it (Y_), the residual r (P6_ is too small: P3_)
+    rows("glm5_copy_rows", H_, 0, 4 * D, P1_, 0, 2 * D);
+    rows("glm5_copy_rows", HN, hoff, D, P1_, size_t(D) * 4, 2 * D);
+    norm(E, P1_, 0, w.enorm, T, 1, D, 2 * D);
+    norm(E, P1_, size_t(D) * 4, w.hnorm, T, 1, D, 2 * D);
+    gemv(E, w.eh_proj, P1_, 0, 2 * D, RESID_, 0, D, T);  // u: the residual r from here on (RESID_: no block uses it)
+    dump(E, dump_dir, "mtp_u", RESID_, size_t(T) * D * 4);
+    rows("glm5_copy_rows", RESID_, 0, D, X_, 0, D);
+    norm(E, X_, 0, w.attn_norm, T, 1, D, D);
+    dsa(E, w, L_, T, p0, dump_dir.empty() ? "" : dump_dir + "/mtp");
+    dump(E, dump_dir, "mtp_a", Y_, size_t(T) * D * 4);
+    rows("glm5_add_rows", Y_, 0, D, RESID_, 0, D);  // r = u + attention
+    rows("glm5_copy_rows", RESID_, 0, D, X_, 0, D);
+    norm(E, X_, 0, w.ffn_norm, T, 1, D, D);
+    moe(E, w, L_, T, dump_dir.empty() ? "" : dump_dir + "/mtp");
+    dump(E, dump_dir, "mtp_f", Y_, size_t(T) * D * 4);
+    rows("glm5_add_rows", Y_, 0, D, RESID_, 0, D);  // r += MoE
+    rows("glm5_copy_rows", RESID_, 0, D, X_, 0, D);
+    norm(E, X_, 0, w.shead_norm, T, 1, D, D);
+    if (hout) rows("glm5_copy_rows", X_, 0, D, hout, 0, D);
+    dump(E, dump_dir, "mtp_h", X_, size_t(T) * D * 4);
+    gemv(E, head_m_, X_, 0, D, LOG_, 0, c_.V, T);
+    E.end();
+    if (logits) std::memcpy(logits, [LOG_ contents], size_t(T) * size_t(c_.V) * 4);
+    if (!dump_dir.empty()) write_file(dump_dir + "/mtp_logits.f32", [LOG_ contents], size_t(T) * size_t(c_.V) * 4);
+    q.mtp_len += T;
+    S_ = nullptr;
+    gpu_ms_ += E.gpu_ms;
+  }
+
+  // Development: the MTP layer on the last pass's final-normed hidden (rows 0..T-2 of `ids`, each with the next
+  // id), as tools/glm5_ref.py --mtp does on a partial stack. Run right after prefill(ids) on sequence 0.
+  void mtp_dev(const std::vector<int32_t>& ids, const std::string& dump_dir) {
+    const int T = int(ids.size()) - 1, D = c_.D;
+    if (T <= 0) return;
+    {
+      Enc E(rt_);
+      E.pipe("glm5_hc_mean");
+      E.set(0, H_);
+      E.set(1, HN_);
+      E.bytes(2, D);
+      E.threads(size_t(D), size_t(T), 1, 256);
+      norm(E, HN_, 0, norm_, T, 1, D, D);
+      E.end();
+    }
+    std::vector<int32_t> next(ids.begin() + 1, ids.end());
+    if (!dump_dir.empty()) ::mkdir((dump_dir + "/mtp").c_str(), 0755);
+    mtp_pass(seqs_[0], HN_, 0, next.data(), T, nullptr, nil, dump_dir);
+  }
+
   void pass(Seq& q, const int32_t* toks, int T, float* logits, int nlog, const std::string& dump_dir) {
     const int D = c_.D, p0 = q.len;
     if (T <= 0) return;
@@ -273,22 +369,7 @@ class DevModel {
     }
     S_ = &q;
     Enc E(rt_);
-    if (embed_gg_) {
-      E.pipe((std::string("gguf_embed_") + gguf_suffix(embed_gg_)).c_str());
-      E.set(0, embed_);
-      E.set(1, ids_);
-      E.set(2, H_);
-      E.bytes(3, D);
-      E.threads(size_t(D / 32), size_t(T), 1, 64);
-    } else {
-      const int32_t p[2] = {D, 4};
-      E.pipe("ds4_embed");
-      E.set(0, ids_);
-      E.set(1, embed_);
-      E.set(2, H_);
-      E.bytes(3, p);
-      E.threads(size_t(D), size_t(T), 1, 256);
-    }
+    embed(E, T);
     for (int l = 0; l < L_; ++l) {
       const LayerW& w = L[size_t(l)];
       hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, T);
@@ -347,12 +428,14 @@ class DevModel {
   int gg_layers_ = 0;
   double gpu_ms_ = 0;
   Seq* S_ = nullptr;  // the sequence of the pass being encoded
+  bool mtp_ = false;  // the MTP layer is loaded: L[L_] (its state at index L_ of every sequence)
   ExpertCache xc_;
   std::vector<int> nc_fds_;  // F_NOCACHE descriptors of the GGUF files (the safetensors ones are ds4::Ckpt's)
   id<MTLBuffer> zeros_ = nil, ninf_ = nil, ident_ = nil, ones_ = nil;
   // pass scratch
   id<MTLBuffer> ids_ = nil, pos_ = nil, H_ = nil, X_ = nil, Y_ = nil, MIX_ = nil, HCP_ = nil, P1_ = nil, P2_ = nil, P3_ = nil,
-                P4_ = nil, P5_ = nil, P6_ = nil, RL_ = nil, RSEL_ = nil, RW_ = nil, XR_ = nil, LOG_ = nil, SC_ = nil;
+                P4_ = nil, P5_ = nil, P6_ = nil, RL_ = nil, RSEL_ = nil, RW_ = nil, XR_ = nil, LOG_ = nil, SC_ = nil, HN_ = nil,
+                RESID_ = nil;
   size_t sc_bytes_ = 0;
 
   // ---------------------------------------------------------------- loading
@@ -418,15 +501,21 @@ class DevModel {
     embed_ = raw(top + "embed_tokens.weight");
     if (idx_.ck.has("lm_head.weight") && (L_ == c_.L || head_partial_)) head_m_ = Mat{kBF16, c_.V, c_.D, raw("lm_head.weight"), {}};
     norm_ = vecf(top + "norm.weight");
-    L.resize(size_t(L_));
-    for (int l = 0; l < L_; ++l) {
-      LayerW& w = L[size_t(l)];
+    L.resize(size_t(L_ + (mtp_ ? 1 : 0)));
+    for (int li = 0; li < int(L.size()); ++li) {
+      const int l = li < L_ ? li : c_.L;  // the MTP layer: layers.<L> of the checkpoint, L[L_] here
+      LayerW& w = L[size_t(li)];
       const std::string p = layer_prefix(l);
       w.dsa = c_.dsa(l), w.moe = c_.moe(l);
       w.attn_norm = vecf(p + "input_layernorm.weight");
       w.ffn_norm = vecf(p + "post_attention_layernorm.weight");
-      w.hca_fn = vecf(p + "hc_attn_fn"), w.hca_base = vecf(p + "hc_attn_base"), w.hca_scale = vecf(p + "hc_attn_scale");
-      w.hcf_fn = vecf(p + "hc_ffn_fn"), w.hcf_base = vecf(p + "hc_ffn_base"), w.hcf_scale = vecf(p + "hc_ffn_scale");
+      if (l < c_.L) {
+        w.hca_fn = vecf(p + "hc_attn_fn"), w.hca_base = vecf(p + "hc_attn_base"), w.hca_scale = vecf(p + "hc_attn_scale");
+        w.hcf_fn = vecf(p + "hc_ffn_fn"), w.hcf_base = vecf(p + "hc_ffn_base"), w.hcf_scale = vecf(p + "hc_ffn_scale");
+      } else {
+        w.eh_proj = bf16(p + "eh_proj.weight");
+        w.enorm = vecf(p + "enorm.weight"), w.hnorm = vecf(p + "hnorm.weight"), w.shead_norm = vecf(p + "shared_head.norm.weight");
+      }
       const std::string a = p + "self_attn.";
       if (!w.dsa) {
         w.qkv = bf16cat({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"});
@@ -552,9 +641,13 @@ class DevModel {
     if (file_exists(dir + "/.slice.json")) {
       const json::Value sl = json::parse(read_file(dir + "/.slice.json"));
       int n = 0;
-      for (const json::Value& b : sl.get("blocks")->as_array())
+      for (const json::Value& b : sl.get("blocks")->as_array()) {
         if (int(b.as_int()) == n) ++n;
+        if (int(b.as_int()) == c.L) mtp_ = true;
+      }
       gg_layers_ = n;
+    } else {
+      mtp_ = c.n_mtp > 0 && gt_.count("blk." + std::to_string(c.L) + ".nextn.eh_proj.weight") > 0;
     }
   }
   int gfd(const GGUFFile* f) {  // an F_NOCACHE descriptor of the file, opened once
@@ -643,14 +736,21 @@ class DevModel {
     }
     norm_ = gvec("output_norm.weight");
     if ((L_ == c_.L || head_partial_) && gt_.count("output.weight") && gtensor("output.weight").nbytes) head_m_ = gmat("output.weight");
-    L.resize(size_t(L_));
-    for (int l = 0; l < L_; ++l) {
-      LayerW& w = L[size_t(l)];
+    L.resize(size_t(L_ + (mtp_ ? 1 : 0)));
+    for (int li = 0; li < int(L.size()); ++li) {
+      const int l = li < L_ ? li : c_.L;  // the MTP layer: layers.<L> of the checkpoint, L[L_] here
+      LayerW& w = L[size_t(li)];
       const std::string b = "blk." + std::to_string(l) + ".";
       w.dsa = c_.dsa(l), w.moe = c_.moe(l);
       w.attn_norm = gvec(b + "attn_norm.weight"), w.ffn_norm = gvec(b + "ffn_norm.weight");
-      w.hca_fn = gvec(b + "hc_attn_fn.weight"), w.hca_base = gvec(b + "hc_attn_base.weight"), w.hca_scale = gvec(b + "hc_attn_scale.weight");
-      w.hcf_fn = gvec(b + "hc_ffn_fn.weight"), w.hcf_base = gvec(b + "hc_ffn_base.weight"), w.hcf_scale = gvec(b + "hc_ffn_scale.weight");
+      if (l < c_.L) {
+        w.hca_fn = gvec(b + "hc_attn_fn.weight"), w.hca_base = gvec(b + "hc_attn_base.weight"), w.hca_scale = gvec(b + "hc_attn_scale.weight");
+        w.hcf_fn = gvec(b + "hc_ffn_fn.weight"), w.hcf_base = gvec(b + "hc_ffn_base.weight"), w.hcf_scale = gvec(b + "hc_ffn_scale.weight");
+      } else {
+        w.eh_proj = gmat(b + "nextn.eh_proj.weight");
+        w.enorm = gvec(b + "nextn.enorm.weight"), w.hnorm = gvec(b + "nextn.hnorm.weight");
+        w.shead_norm = gvec(b + "nextn.shared_head_norm.weight");
+      }
       if (!w.dsa) {
         w.qkv = gcat({b + "attn_q.weight", b + "attn_k.weight", b + "attn_v.weight"});
         w.fgb = gcat({b + "ssm_f_a.weight", b + "ssm_g_a.weight", b + "ssm_beta.weight"});
@@ -808,9 +908,10 @@ class DevModel {
     };
     const int C = c_.kH * c_.kD;
     size_t bytes = 0;
-    q.kda.assign(size_t(L_), nil), q.conv.assign(size_t(L_), nil), q.lat.assign(size_t(L_), nil);
-    q.pooled.assign(size_t(L_), nil), q.pend.assign(size_t(L_), nil);
-    for (int l = 0; l < L_; ++l) {
+    const int NL = int(L.size());  // the trunk's layers, then the MTP layer's state (index L_)
+    q.kda.assign(size_t(NL), nil), q.conv.assign(size_t(NL), nil), q.lat.assign(size_t(NL), nil);
+    q.pooled.assign(size_t(NL), nil), q.pend.assign(size_t(NL), nil);
+    for (int l = 0; l < NL; ++l) {
       if (!L[size_t(l)].dsa) {
         q.kda[size_t(l)] = zero(size_t(c_.kH) * 128 * 128 * 4);
         q.conv[size_t(l)] = zero(size_t(3) * 3 * C * 4);
@@ -823,7 +924,7 @@ class DevModel {
       }
     }
     seq_bytes_ = bytes;
-    q.len = 0;
+    q.len = 0, q.mtp_len = 0;
   }
 
   void ensure_scratch(int T) {
@@ -838,6 +939,7 @@ class DevModel {
     P1_ = F(size_t(T) * big), P2_ = F(size_t(T) * big), P3_ = F(size_t(T) * big);
     P4_ = F(size_t(T) * std::max(size_t(c_.H) * 256, size_t(c_.I_dense))), P5_ = F(size_t(T) * 512), P6_ = F(size_t(T) * 512);
     RL_ = F(size_t(T) * c_.E), RSEL_ = F(size_t(T) * c_.K), RW_ = F(size_t(T) * c_.K), XR_ = F(size_t(T) * c_.K * 3 + 64);
+    HN_ = F(size_t(T) * D), RESID_ = F(size_t(T) * D);
     LOG_ = F(size_t(std::max(1, max_reads_)) * c_.V);
     ident_ = F(size_t(T) * c_.K), ones_ = F(size_t(T) * c_.K);
     for (int i = 0; i < T * c_.K; ++i) {
@@ -907,6 +1009,26 @@ class DevModel {
     E.set(3, X_);
     E.bytes(4, hcp());
     E.groups(size_t(T), 1, 1, 256);
+  }
+  // Token embeddings of ids_ rows into H_ (4 copies per row).
+  void embed(Enc& E, int T) {
+    const int D = c_.D;
+    if (embed_gg_) {
+      E.pipe((std::string("gguf_embed_") + gguf_suffix(embed_gg_)).c_str());
+      E.set(0, embed_);
+      E.set(1, ids_);
+      E.set(2, H_);
+      E.bytes(3, D);
+      E.threads(size_t(D / 32), size_t(T), 1, 64);
+    } else {
+      const int32_t p[2] = {D, 4};
+      E.pipe("ds4_embed");
+      E.set(0, ids_);
+      E.set(1, embed_);
+      E.set(2, H_);
+      E.bytes(3, p);
+      E.threads(size_t(D), size_t(T), 1, 256);
+    }
   }
   void hc_post(Enc& E, int T) {
     E.pipe("ds4_hc_post");
@@ -980,15 +1102,19 @@ class DevModel {
       E.threads(size_t(C), size_t(T), 1, 256);
     }
     {
+      // the delta rule: chunked (8 tokens a step) from 16 rows, token by token below; ESPETERO_GLM5_KDA=recur|chunk forces one
+      static const char* kv = std::getenv("ESPETERO_GLM5_KDA");
+      const bool chunk = kv ? std::string(kv) == "chunk" : T >= 16;
       const int32_t p[4] = {T, H, C3, 1};
-      E.pipe("glm5_kda_recur");
+      E.pipe(chunk ? "glm5_kda_chunk" : "glm5_kda_recur");
       E.set(0, P2_);
       E.set(1, P3_);
       E.set(2, P6_);
       E.set(3, S_->kda[size_t(l)]);
       E.set(4, P1_);  // o (the projections are no longer needed)
       E.bytes(5, p);
-      E.groups(16, size_t(H), 1, 256);
+      if (chunk) E.threads(32, 16, size_t(H), 32, 4);
+      else E.groups(16, size_t(H), 1, 256);
     }
     {
       struct {

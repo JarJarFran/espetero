@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Francisco José García Barbero
 """Espetero's GLM-5.3-Flash dumps (build/glm5_run) against tools/glm5_ref.py's, layer by layer.
 
-    python3 tests/ref/glm5_compare.py REF_DIR OURS_DIR
+    python3 tests/ref/glm5_compare.py REF_DIR OURS_DIR [--mtp]
 
 Per layer: the attention / KDA block's output (a), the MLP's (f) and the streams
 after the layer (h) as relative L2 errors per row (worst and median), the routed
@@ -52,6 +52,22 @@ def main():
             parts.append(f"selections differ in {diff}/{T} rows")
         print(f"layer {l}: " + " | ".join(parts))
     print(f"worst per-row relative L2 of the streams: {worst:.3g}")
+    if "--mtp" in sys.argv and os.path.exists(os.path.join(ref, "mtp_u.f32")):
+        n = T - 1
+        lid = case["layers"]  # the MTP layer's index in Espetero's dumps (after the loaded trunk layers)
+        parts = []
+        for name, w in (("mtp_u", D), ("mtp_a", D), ("mtp_f", D), ("mtp_h", D), ("mtp_logits", None)):
+            a = np.fromfile(os.path.join(ref, name + ".f32"), np.float32)
+            b = np.fromfile(os.path.join(ours, name + ".f32"), np.float32)
+            r = rel_rows(a.reshape(n, -1), b.reshape(n, -1))
+            parts.append(f"{name[4:]} {r.max():.2e}")
+            if name == "mtp_logits":
+                am_a, am_b = a.reshape(n, -1).argmax(1), b.reshape(n, -1).argmax(1)
+                parts.append(f"argmax equal {int((am_a == am_b).sum())}/{n}")
+        ra = np.sort(np.fromfile(os.path.join(ref, "mtp_route.i32"), np.int32).reshape(n, -1), 1)
+        rb = np.sort(np.fromfile(os.path.join(ours, "mtp", f"route{lid}.i32"), np.int32).reshape(n, -1), 1)
+        parts.append(f"routes differ in {int((ra != rb).any(1).sum())}/{n} rows")
+        print("MTP: " + " | ".join(parts))
 
 
 if __name__ == "__main__":

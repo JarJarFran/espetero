@@ -144,6 +144,8 @@ class GgufCkpt:
             "mlp.gate.weight": "ffn_gate_inp.weight", "mlp.gate.e_score_correction_bias": "exp_probs_b.bias",
             "mlp.shared_experts.gate_proj.weight": "ffn_gate_shexp.weight", "mlp.shared_experts.up_proj.weight": "ffn_up_shexp.weight",
             "mlp.shared_experts.down_proj.weight": "ffn_down_shexp.weight",
+            "eh_proj.weight": "nextn.eh_proj.weight", "enorm.weight": "nextn.enorm.weight",
+            "hnorm.weight": "nextn.hnorm.weight", "shared_head.norm.weight": "nextn.shared_head_norm.weight",
         }
         if rest == "self_attn.A_log":
             return b + "ssm_a", ("neglog",)
@@ -446,6 +448,28 @@ class Ref:
             y[rows] += self.mlp(x[rows], p + f"experts.{e}.") * w[rows, slots][:, None]
         return (y + self.mlp(x, p + "shared_experts.")).astype(np.float32), route
 
+    # ---- the NextN / MTP layer (layers.<L>; llama.cpp glm5-next.cpp graph_mtp, mlx-vlm's glm5_next_mtp: docs/glm5.md 6)
+    def mtp(self, h, next_ids, out):
+        """h [T, D]: the trunk's final-normed hidden per row; next_ids [T]: the token after each row.
+        Returns the MTP's logits [T, V] and its normed output (the next draft step's hidden)."""
+        l = self.L
+        p = self.P(l)
+        emb = self.ck.get("model.language_model.embed_tokens.weight")
+        e = emb[np.asarray(next_ids, np.int64)].astype(np.float32)
+        u = np.concatenate([rmsnorm(e, self.v(p + "enorm.weight"), self.eps), rmsnorm(h, self.v(p + "hnorm.weight"), self.eps)], -1)
+        u = Lin(self.ck, p + "eh_proj")(u)
+        a, sel = self.dsa_attn(rmsnorm(u, self.v(p + "input_layernorm.weight"), self.eps), l)
+        r = u + a
+        f, route = self.moe_block(rmsnorm(r, self.v(p + "post_attention_layernorm.weight"), self.eps), l)
+        r = r + f
+        hn = rmsnorm(r, self.v(p + "shared_head.norm.weight"), self.eps)
+        logits = (hn @ self.v("lm_head.weight").T).astype(np.float32)
+        for name, x in (("mtp_u", u), ("mtp_a", a), ("mtp_f", f), ("mtp_h", hn), ("mtp_logits", logits)):
+            x.tofile(os.path.join(out, name + ".f32"))
+        route.tofile(os.path.join(out, "mtp_route.i32"))
+        sel.tofile(os.path.join(out, "mtp_sel.i32"))
+        return logits, hn
+
     # ---- forward
     def forward(self, ids, layers, out):
         ids = np.asarray(ids, np.int64)
@@ -476,6 +500,7 @@ class Ref:
             h.tofile(os.path.join(out, f"h{l}.f32"))
             print(f"layer {l} ({'DSA' if self.dsa[l] else 'KDA'}, {'MoE' if self.moe[l] else 'dense'}): "
                   f"{time.time() - t0:.1f} s, |h| rms {np.sqrt((h * h).mean()):.4g}", file=sys.stderr)
+        self.last_h = h
         if layers == self.L:
             hn = rmsnorm(h.mean(1), self.v("model.language_model.norm.weight"), self.eps)
             logits = (hn @ self.v("lm_head.weight").T).astype(np.float32)
@@ -492,6 +517,9 @@ def main():
     ap.add_argument("--chat", action="store_true", help="wrap --text as one user turn of GLM's chat format")
     ap.add_argument("--layers", type=int, default=0, help="first N layers (default: all)")
     ap.add_argument("--out", default="glm5_ref_out")
+    ap.add_argument("--mtp", action="store_true",
+                    help="also run the MTP layer on the final-normed hidden of the last layer run (rows 0..T-2 paired "
+                         "with the next token): with --layers < all, a check of the layer's math on a proxy hidden")
     a = ap.parse_args()
     r = Ref(a.model)
     if a.tokens:
@@ -505,6 +533,10 @@ def main():
     json.dump({"ids": ids, "layers": a.layers or r.L}, open(os.path.join(a.out, "case.json"), "w"))
     print(f"{len(ids)} tokens", file=sys.stderr)
     r.forward(ids, a.layers or r.L, a.out)
+    if a.mtp:
+        hn = rmsnorm(r.last_h.mean(1), r.v("model.language_model.norm.weight"), r.eps)
+        r.mtp(hn[:-1], ids[1:], a.out)
+        print("mtp: done", file=sys.stderr)
 
 
 if __name__ == "__main__":
