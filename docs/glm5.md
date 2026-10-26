@@ -20,8 +20,9 @@ Contents: 0 sources and checkpoint facts · 1 decoder structure · 2 mHC ·
 3 KDA layers · 4 DSA layers (nope MLA + k-pool indexer) · 5 dense MLP, MoE,
 shared expert · 6 MTP layer · 7 tokenizer, template, tool calls · 8 memory
 plan on 128 GB (and disk) · 9 per-token traffic, state, expected speed ·
-10 mapping onto Espetero (what is reused, varied, new) · 11 parity plan ·
-12 reference discrepancies, decisions, open questions · A tensor inventory.
+10 mapping onto Espetero (what is reused, varied, new) · 11 parity plan and
+results · 12 reference discrepancies, decisions, open questions · 13 status ·
+A tensor inventory.
 
 ## 0. Sources, conventions, checkpoint facts
 
@@ -623,6 +624,32 @@ Decisions taken with the parent session's advice (pending Fran's review):
    measured.
 
 Open for Fran: the disk (which models go; the download), and A or B.
+
+## 13. Status (2026-10-26, branch arch/glm5)
+
+**Verified on the GPU** (against `tools/glm5_ref.py`, the numpy transcription of transformers, itself checked
+against mlx-vlm's own layers to 3e-4; slices of layers 0–3 on the Studio HDD, §11):
+
+* every layer kind on the FP8 weights: KDA (token by token and chunked), mHC, dense MLP, nope MLA with the
+  k-pool indexer (dense and top-512 regimes), the sigmoid router, routed and shared experts; prefill and decode
+  (bit-identical); 1.8e-4 worst per-row on a 21-token chat, 9.2e-3 (one near-tie route) on 2,138 tokens;
+* the same on unsloth's UD-IQ3_XXS GGUF (native IQ2_S / IQ3_S / Q6_K / Q8_0 kernels): 1.0e-4 / 1.5e-4 against
+  the reference on the same weights; all nine GGUF block types of UD-IQ3_XXS and UD-Q4_K_XL to ~1e-8;
+* the expert cache: a 40-slot pool (fewer than one layer's experts) bit-identical to a full one;
+* the tokenizer (HF tokenizer.json and the GGUF's own vocabulary: all 25,026 reference cases), the chat
+  template (564 cases byte-identical to transformers), the GLM tool-call parser (unit tests);
+* `espetero serve` on the slice (4 layers + head, `ESPETERO_GLM5_HEAD_ANY=1`): chat, sampled chat, streaming,
+  completions well formed.
+
+**Written, not yet verified:** the MTP layer (model and reference; the slices lack layer 45's tensors),
+checkpoint files (`slot_save` / `slot_load`), trees with leaves.
+
+**Needs the full model** (a GGUF on the Studio SSD, Fran's call): logits and greedy text against llama.cpp on
+the same file, perplexity, the forced tool call (GLM's template always opens `<think>`; forcing waits for the
+model's `</think>`), MTP acceptance, decode / prefill speed with the expert cache, memory.
+
+**Not started:** vision tower, several sequences per GPU pass, GPU top-k / draw, GEMMs for prefill (tier 0
+runs every row through GEMVs), MTP drafting in the engine.
 
 ## Appendix A. Tensor inventory ([C]; logical shapes `[out, in]`)
 
