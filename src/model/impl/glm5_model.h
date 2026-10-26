@@ -204,6 +204,9 @@ class DevModel {
       if (eager <= 0 || i < eager) alloc_seq(seqs_[size_t(i)]);
     ensure_scratch(T_);
     make_cache(cache_gb, cache_slots);
+    std::fprintf(stderr, "glm5: GPU allocations %.1f GB of a %.1f GB working set (sequences %.2f GB each, %d allocated)\n",
+                 double([rt_.dev currentAllocatedSize]) / 1e9, double([rt_.dev recommendedMaxWorkingSetSize]) / 1e9,
+                 double(seq_bytes_) / 1e9, int(std::count_if(seqs_.begin(), seqs_.end(), [](const Seq& q) { return !q.kda.empty(); })));
     if (xc_.resident)
       std::fprintf(stderr, "glm5: %d layers, %.2f GB of weights in memory (%.1f s); experts: all %d resident (%.1f GB) read from %s\n",
                    L_, wgb, ms_since(t0) / 1e3, xc_.n, double(xc_.total_bytes) / 1e9, gguf_ ? "the GGUF files" : "the safetensors");
