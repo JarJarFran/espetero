@@ -230,8 +230,20 @@ class MetalModel final : public NativeModel {
     double budget = o.memory_gb > 0 ? o.memory_gb * 1e9
                                     : std::max(1e9, std::min(avail * 0.55, std::max(4e9, 2.0 * double(m.weight_bytes))));
     // Qwen4-Exp: 3 GB for slots + KV unless given (~110K tokens of KV at 27 KB per
-    // token beside the slot states); the expert cache took the rest.
-    if (c.q4 && o.memory_gb <= 0) budget = 3e9;
+    // token beside the slot states); the expert cache took the rest. With every
+    // expert resident (no cache to leave memory to): room for the concurrent
+    // requests (--users, 8 to 16), the shared-prefix checkpoint they continue
+    // and a spare, beside the KV of two full contexts. The 3 GB gave 8 slots with
+    // the MTP head's slot state, and 8 users plus the shared prefix need 9: the
+    // ninth request waited for a slot (M4 Max, 2026-10-22).
+    if (c.q4 && o.memory_gb <= 0) {
+      budget = 3e9;
+      if (!m.xres_l.empty()) {
+        const double kv_min = 2.0 * double(m.max_ctx) * double(tok_bytes);
+        const int want = std::clamp(o.users > 0 ? o.users : 8, 8, 16) + 2;
+        budget = std::max(budget, kv_min + double(want) * double(slot_bytes));
+      }
+    }
     // The Metal working set is per process: other processes are not in
     // it. The automatic budget also stays under 60 % of the memory the
     // system has free now (free + inactive + speculative pages), so several

@@ -62,8 +62,10 @@ class Dsv4Model final : public NativeModel {
     load_weights();
     const double wgb = double(rt_.arena->total()) / 1e9;
     alloc_scratch();
-    // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each
-    int nslots = o.slots > 0 ? o.slots : 6;
+    // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each (~110 MB a slot at
+    // 32 K): the concurrent requests (--users) up to 16, at least 6 (6 slots held 6 users; the expert cache gives up
+    // ~1.1 GB for 16)
+    int nslots = o.slots > 0 ? o.slots : std::clamp(o.users > 0 ? o.users : 16, 6, 16);
     nuser_ = nslots;
     seqs_.resize(size_t(nslots) + size_t(kScratch));  // scratch slots after the user ones: trees that save nothing
     for (Seq& s : seqs_) alloc_seq(s);
@@ -124,6 +126,7 @@ class Dsv4Model final : public NativeModel {
     info_.slot_state_bytes = seq_bytes_;
     info_.leaves = true;
     info_.prompt_lookup = false;  // drafts verified as leaves read several tokens' experts from the SSD
+    info_.chunk_prefill = false;  // a pass reads its layers' experts once: a prompt in chunks reads them per chunk
     info_.commit = false;
     info_.hidden_states = false;
     info_.mtp = false;
