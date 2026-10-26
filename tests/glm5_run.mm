@@ -5,7 +5,7 @@
 // of the token ids tools/glm5_ref.py used (its case.json), every layer dumped
 // for tests/ref/glm5_compare.py.
 //
-//   build/glm5_run MODEL_DIR REF_DIR OUT_DIR [layers] [split]
+//   build/glm5_run MODEL_DIR REF_DIR OUT_DIR|- [layers] [split]     (- : no dumps, for timings)
 //
 // split P > 0: a pass over the first P ids, then one decode pass per remaining id (the state carried across
 // passes: KDA and conv states, latent and pooled-key caches, pending pool rows); the passes' dumps are merged
@@ -34,8 +34,8 @@ int main(int argc, char** argv) {
     for (const json::Value& v : cs.get("ids")->as_array()) ids.push_back(int32_t(v.as_int()));
     const int layers = argc > 4 ? std::atoi(argv[4]) : int(cs.get_int("layers", 0));
     const int split = argc > 5 ? std::atoi(argv[5]) : 0;
-    const std::string out = argv[3];
-    ::mkdir(out.c_str(), 0755);
+    const std::string out = std::string(argv[3]) == "-" ? std::string() : std::string(argv[3]);  // "-": no dumps (timing runs)
+    if (!out.empty()) ::mkdir(out.c_str(), 0755);
     const char* cslots = std::getenv("ESPETERO_GLM5_CACHE_SLOTS");  // a small expert cache (eviction tests)
     glm5::DevModel m(argv[1], std::string(espetero_kernels_metal, espetero_kernels_metal_len), layers,
                      std::max(4096, int(ids.size()) + 64), 1, 4096, 0, cslots ? std::atoi(cslots) : 0);
@@ -57,8 +57,8 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> dirs;
     auto pass = [&](const std::vector<int32_t>& v) {
-      const std::string d = out + "/pass" + std::to_string(dirs.size());
-      ::mkdir(d.c_str(), 0755);
+      const std::string d = out.empty() ? std::string() : out + "/pass" + std::to_string(dirs.size());
+      if (!d.empty()) ::mkdir(d.c_str(), 0755);
       m.prefill(v, d);
       dirs.push_back(d);
     };
@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "prefill of %d tokens, then %d decode steps over %d layers: GPU %.1f ms + %.2f ms per step\n", split, nd,
                  m.layers(), pre_ms, (m.gpu_ms() - pre_ms) / nd);
     // merge: every dump file of the passes, concatenated in pass order (rows); sel rows keep their width
+    if (!out.empty())
     for (int l = 0; l < m.layers(); ++l)
       for (const char* kind : {"a", "f", "h", "route", "sel"}) {
         const std::string name = std::string(kind) + std::to_string(l) + (kind[0] == 'r' || kind[0] == 's' ? ".i32" : ".f32");
