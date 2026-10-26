@@ -194,7 +194,7 @@ void usage_all() {
                "  --expert-store DIR|none  expert records for those models: one read per expert instead of nine\n"
                "                        (default: ~/Library/Caches/espetero/xstore.noindex/<model> when built)\n"
                "  --expert-store-build  write the records once where they are missing (~68 GB for Flash-Next)\n"
-               "  --mtp PATH|none       MTP draft head (default: the model's own)\n"
+               "  --mtp PATH|own|none   MTP draft head (default: the model's own, or a drafter directory beside a Flash-Next file)\n"
                "  --mmproj PATH|none    GGUF vision projector\n"
                "  --dense LIST          decoder matrices served as fp16 (gate_up,down,in_proj,out|all)\n\n"
                "scheduling:\n"
@@ -206,7 +206,8 @@ void usage_all() {
                "  --mtp-coarse N        MTP drafts from a 2-bit LM head copy, N column blocks of 32 ids rescored exactly (default 256;\n"
                "                        0: the 4-bit draft head; replaces the 4-bit head unless --mtp-head4 is also given)\n"
                "  --no-mtp-q8           keep a bf16 MTP layer in bf16 (default: 8-bit copies; drafts only, verification unchanged)\n"
-               "  --spec-max-seqs N     speculate only up to N decoding sequences (default 2)\n"
+               "  --spec-max-seqs N     speculate only up to N decoding sequences (default 4; beyond one, a draft must pay for\n"
+               "                        its verify rows at the pass's size)\n"
                "  --no-lookup           disable prompt-lookup drafts\n"
                "  --lookup-min N        a prompt-lookup copy needs N matching tokens (default 8; 3: any 3-gram)\n"
                "  --no-adaptive-drafts  draft on every step (default: only while drafting beats plain decoding)\n"
@@ -216,7 +217,9 @@ void usage_all() {
                "  --no-gpu-topk         sampled requests read full logits on the CPU (default: GPU top-k when 1 <= top_k <= 32)\n"
                "  --legacy-sampling     mt19937 draws and random draft acceptance instead of exact position-keyed sampling\n"
                "  --no-gpu-draw         draw sampled tokens on the CPU (no chains for sampled requests)\n"
-               "  --prefill-chunk N     prefill rows per pass while others decode (default 2048)\n"
+               "  --prefill-chunk N     most prefill rows per pass while others decode (default 2048)\n"
+               "  --prefill-slice-ms N  a prompt chunk beside decoding sequences is sized to about N ms of pass from the\n"
+               "                        measured prefill rate, up to --prefill-chunk (default 1000; 0: always the chunk)\n"
                "  --no-image-checkpoint no chat checkpoint after the last image (default: questions about one image share it)\n"
                "  --no-instr-checkpoint no chat checkpoint after the user's instructions before the first image (default:\n"
                "                        photos under the same instructions share them)\n"
@@ -481,6 +484,7 @@ json::Value effective_json(const EngineOptions& o, const std::string& repo = "")
   e.set("exif-rotate", vision::exif_orientation_enabled());
   e.set("chain", int64_t(o.chain_steps));
   e.set("prefill-chunk", int64_t(o.prefill_chunk));
+  e.set("prefill-slice-ms", int64_t(o.prefill_slice_ms));
   e.set("memo", int64_t(o.memo));
   e.set("share-prefix", o.share_prefix);
   e.set("prefix-dir", o.prefix_dir.empty() ? json::Value("off") : json::Value(o.prefix_dir));
@@ -549,7 +553,7 @@ EngineOptions engine_options(const Args& a) {
   o.sibling_drafts = a.i("siblings", 0);
   o.draft_auto = a.has("draft-auto");
   o.draft_max = a.i("draft-max", 7);
-  o.spec_max_seqs = a.i("spec-max-seqs", 2);
+  o.spec_max_seqs = a.i("spec-max-seqs", 4);
   o.prompt_lookup = !a.has("no-lookup");
   o.lookup_min = a.i("lookup-min", 8);
   o.adaptive_drafts = !a.has("no-adaptive-drafts");
@@ -570,6 +574,7 @@ EngineOptions engine_options(const Args& a) {
   o.prompt_checkpoint = !a.has("no-prompt-checkpoint");
   o.prefill_wait_ms = a.i("prefill-wait-ms", 2500);
   o.prefill_batch_rows = a.i("prefill-batch-rows", 512);
+  o.prefill_slice_ms = a.i("prefill-slice-ms", 1000);
   o.image_max_pixels = a.i("image-pixels", 131072);
   o.allow_image_detail_max = a.has("allow-image-detail-max");
   o.image_urls = a.has("image-urls");

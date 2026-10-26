@@ -223,6 +223,57 @@ Rules that keep the tiers honest:
   bucket's tile without its K split keeps config 2's summation order (logits
   bit-identical) and cut a 27B 4-bit 2048-row prefill 5.9–6.3% (paired A/B,
   ratio 0.941 / 0.937; 165 tok/s against 158 on an idle M1 Max).
+- **A fused kernel that serializes what the separate ones spread over the
+  GPU loses, even where a dispatch boundary costs nothing** (`ds4_hc_fused`,
+  DeepSeek-V4.1, 2026-10-22, M4 Max, 3 alternating pairs against main's
+  binary): hc_post + hc_part + hc_fin + hc_pre as one 256-thread threadgroup
+  per row (bit-identical, −240 dispatches per decoded token) made the GPU
+  time per token 40.1 → 44.2 ms in every pair. The 24 × 20480 mix is 2 MB of
+  reads per row that `ds4_hc_part` gives 20 threadgroups; one threadgroup
+  does them, and its ~500 simd reductions, in series. At 1 row the boundary
+  it saves is free on this GPU (Fase 2), so there was nothing to win back
+  (per-dispatch profile: the fused kernel 80 µs, the four it replaces 8 + 11 +
+  15 + 3 µs). Opt-in (`ESPETERO_DS4_HCFUSE=1`) for machines where a boundary
+  costs 5–23 µs.
+- **The one-row fp8 and fp4 GEMVs are at their load-level optimum; more
+  loads in flight or more rows per simdgroup lose** (DeepSeek-V4.1 decode,
+  2026-10-22, M4 Max, every dispatch timed alone, same binary, switches):
+  loading the next chunk's weights and scales before using this chunk's
+  (`ds4_gemv_f8p`) 16.2 → 16.6 ms of fp8 GEMVs per token; the expert GEMV with
+  4 output rows per simdgroup instead of 2 (`ds4_xgemv_b4`, half the
+  threadgroups) 12.0 → 13.5 ms, with the prefetch 15.9, the 2-row kernel with
+  the prefetch 12.7. The hardware already overlaps the loads a lane issues;
+  what the two kernels lack against 546 GB/s (420 and 375 GB/s) is not loads
+  in flight. The variants were written to keep each row's summation order,
+  yet 543 of 800 residual dumps differed from main with both on: under
+  Metal's fast math the compiler reassociates a restructured loop's sums, so
+  "the same expression" is not the same bits. They are removed (in the
+  branch's history, commit "fp8 GEMV with the next chunk's loads in flight").
+  Enqueuing each command buffer at creation (`ESPETERO_DS4_ENQUEUE=1`) did not
+  shorten its launch (5.4 → 5.9 ms per token).
+- **A GPU wait on a host-signalled shared event costs ~0.4 ms; a command
+  buffer launch ~0.1 ms** (DeepSeek-V4.1 GPU-driven decode, 2026-10-22, M4 Max):
+  a decode pass as one command buffer with `encodeWaitForEvent` before each
+  layer's experts, the host setting the `MTLSharedEvent`'s value once the
+  misses were read, measured wall minus reads +15 / +23 / +26 ms per token
+  against the 41 command buffers (whose launch and wake-up cost 5.6 ms in all);
+  the host signal → next GPU signal gap summed 55.7 ms for ~39 ms of GPU work
+  over 39 waits, the same whether the host spun or blocked. Hiding a host
+  round trip from the GPU is not worth a GPU-side wait on this driver;
+  commit the next command buffer instead.
+- **Idle GPU memory is compressed, whatever its storage mode; lock what a
+  pass must find in place** (2026-10-22, Studio M4 Max 128 GB,
+  Flash-Next's 77 GB of resident experts): with free memory exhausted by the
+  load, macOS unwires the idle GPU's memory (`iogpu.wired_lwm_mb` 0) and
+  compresses it, shared or GPU-private alike (`vm_stat`: 51–55 GB in the
+  compressor), and the first pass pays the decompression before its command
+  buffer starts (10.1 s of wall time for 0.2 s of GPU time; private buffers
+  0.4 s right after the load but 10.9 s after 90 s of idle). The residency
+  set does not prevent it. Pages locked with `mlock` and wrapped with
+  `newBufferWithBytesNoCopy` (the DeepSeek-V4.1 expert pool, now the
+  resident experts) are never compressed: 0.38 s, and 2.1 s after the idle
+  (the weights and pools, not locked, still are; the weights locked as well,
+  `ESPETERO_WEIGHTS_LOCK=1`: 1.24 s).
 - **Two multi-row switches measured slower, off by default:**
   `ESPETERO_FUSE_NORM_MAXM=8` (fused norms up to 8 rows) +2.4% per step at
   4 rows, +4.7% at 8; `ESPETERO_FMA34=1 ESPETERO_GEMV_MAXM=4` (FMA GEMV up

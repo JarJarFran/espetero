@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <sys/mman.h>
 #include <thread>
 
 #include "common.h"
@@ -114,9 +115,15 @@ struct Residency {
 class Arena {
  public:
   // resident: the model's weights join the residency set; scratch and
-  // staging arenas do not.
-  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false)
-      : dev_(dev), chunk_(chunk), resident_(resident) {}
+  // staging arenas do not. mem: Shared (the default; host-readable),
+  // Private (GPU-only buffers) or Locked (shared buffers over mmap'd pages
+  // locked with mlock: macOS compresses the idle GPU's memory, private or
+  // shared, once free memory runs out, and the next pass pays to bring it
+  // back; locked pages it leaves alone). A Private arena is written by
+  // kernels only (no copy()).
+  enum class Mem { Shared, Private, Locked };
+  explicit Arena(id<MTLDevice> dev, size_t chunk = size_t(1) << 30, bool resident = false, Mem mem = Mem::Shared)
+      : dev_(dev), chunk_(chunk), resident_(resident), mem_(mem) {}
   ~Arena() {
     if (resident_)
       for (id<MTLBuffer> b : buffers_) Residency::get().remove(b);
@@ -141,10 +148,42 @@ class Arena {
       }
     }
     const size_t cap = std::max(nbytes, chunk_);
-    id<MTLBuffer> b = [dev_ newBufferWithLength:cap options:kShared];
-    if (!b) fail("Metal allocation of " + std::to_string(cap >> 20) + " MB failed");
+    id<MTLBuffer> b = nil;
+    if (mem_ == Mem::Locked) {
+      const size_t pg = size_t(::getpagesize()), len = (cap + pg - 1) / pg * pg;
+      void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (p == MAP_FAILED) fail("cannot map " + std::to_string(cap >> 20) + " MB for a locked arena");
+      const size_t piece = size_t(256) << 20;  // lock in pieces on every core (faulting tens of GB in on one thread is slow)
+      std::atomic<bool> ok{true};
+      parallel_for((len + piece - 1) / piece, [&](size_t i) {
+        if (::mlock(static_cast<uint8_t*>(p) + i * piece, std::min(piece, len - i * piece)) != 0) ok = false;
+      });
+      if (!ok) {
+        ::munlock(p, len);
+        static bool warned = false;
+        if (!warned) std::fprintf(stderr, "[espetero] could not lock %zu MB in memory (vm.user_wire_limit?): macOS may compress it while the GPU is idle\n", cap >> 20);
+        warned = true;
+      }
+      b = [dev_ newBufferWithBytesNoCopy:p
+                                  length:len
+                                 options:kShared
+                             deallocator:^(void* q, NSUInteger n) {
+                               ::munlock(q, n);
+                               ::munmap(q, n);
+                             }];
+      if (!b) {
+        ::munlock(p, len);
+        ::munmap(p, len);
+        fail("cannot wrap " + std::to_string(cap >> 20) + " MB of locked memory for the GPU");
+      }
+    } else {
+      b = [dev_ newBufferWithLength:cap
+                            options:mem_ == Mem::Private ? (MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked) : kShared];
+      if (!b) fail("Metal allocation of " + std::to_string(cap >> 20) + " MB failed");
+    }
     if (resident_) Residency::get().add(b);
-    alloc_log(dev_, resident_ ? "arena (resident)" : "arena", cap, __builtin_return_address(0));
+    alloc_log(dev_, mem_ == Mem::Locked ? "arena (locked)" : mem_ == Mem::Private ? "arena (private)" : resident_ ? "arena (resident)" : "arena", cap,
+              __builtin_return_address(0));
     buffers_.push_back(b);
     len_.push_back(cap);
     fill_.push_back(nbytes);
@@ -154,6 +193,7 @@ class Arena {
   }
 
   Buf copy(const void* src, size_t n) {
+    if (mem_ == Mem::Private) fail("Arena::copy into a GPU-only arena");
     Buf b = alloc(n);
     parallel_copy(ptr(b), src, n);
     return b;
@@ -170,6 +210,7 @@ class Arena {
   size_t chunk_;
   size_t total_ = 0, held_ = 0;
   bool resident_ = false;
+  Mem mem_ = Mem::Shared;
   std::vector<id<MTLBuffer>> buffers_;
   std::vector<size_t> len_, fill_;
 };
@@ -226,7 +267,9 @@ struct Runtime {
     NSError* error = nil;
     lib = [dev newLibraryWithSource:src options:opts error:&error];
     if (!lib) fail(std::string("kernel compile failed: ") + [[error localizedDescription] UTF8String]);
-    arena = std::make_unique<Arena>(dev, size_t(1) << 30, true);
+    // ESPETERO_WEIGHTS_LOCK=1: the weights in memory locked with mlock, so an idle GPU's weights are not compressed
+    // (measured on Flash-Next: the first pass after 90 s of idle; a default would change every model's footprint).
+    arena = std::make_unique<Arena>(dev, size_t(1) << 30, true, env_on("ESPETERO_WEIGHTS_LOCK") ? Arena::Mem::Locked : Arena::Mem::Shared);
   }
 
   static std::string key_of(const std::string& name, int fc) { return fc ? name + "#" + std::to_string(fc) : name; }

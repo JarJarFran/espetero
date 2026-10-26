@@ -294,24 +294,23 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
   return L;
 }
 
-// The MTP head (docs/qwen4_exp.md 7) from a drafter directory such as
-// Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16 (31 tensors without prefix): its
-// dense matrices and 512 experts requantized to 8 bits at load (~2.7 GB
-// resident; the oQ4e file's own MTP experts are 4-bit, reported to accept
-// 0-4 % of drafts). Shares the trunk's embedding and LM head.
-inline void load_q4_mtp(Model& m, const std::string& dir) {
+// The MTP head (docs/qwen4_exp.md 7): the 31 tensors under `pre` ("" in a
+// drafter directory such as Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16, "mtp." in
+// the model file itself). rq 8 requantizes dense (bf16) matrices to 8 bits;
+// quantized ones load as stored. The 512 experts load resident (the MTP layer
+// runs outside the expert cache). Shares the trunk's embedding and LM head.
+inline void load_q4_mtp_from(Model& m, const WeightSource& src, const std::string& pre, int rq, const std::string& source) {
   const Config& c = m.cfg;
-  SafetensorsSource src(dir);
-  if (!src.has("fc_embedding.weight") || !src.has("layers.0.mlp.gate.weight"))
-    fail(dir + ": not a qwen4_exp MTP drafter (fc_embedding / layers.0.* tensors)");
+  if (!src.has(pre + "fc_embedding.weight") || !src.has(pre + "layers.0.mlp.gate.weight"))
+    fail(source + ": not a qwen4_exp MTP head (" + pre + "fc_embedding / " + pre + "layers.0.* tensors)");
   Mtp& T = m.mtp;
   const int dense0 = m.n_dense, exempt0 = m.n_dense_mtp;
-  T.enorm = vec(m, src, "pre_fc_norm_embedding.weight", size_t(c.D), 1.0f);
-  T.hnorm = vec(m, src, "pre_fc_norm_hidden.weight", size_t(c.W()), 1.0f);
+  T.enorm = vec(m, src, pre + "pre_fc_norm_embedding.weight", size_t(c.D), 1.0f);
+  T.hnorm = vec(m, src, pre + "pre_fc_norm_hidden.weight", size_t(c.W()), 1.0f);
   {
     Arena tmp(m.dev);
-    const HostMat fe = rq8(tmp, q4_mat(m, tmp, src, "fc_embedding.weight", c.D, c.D), 8);
-    const HostMat fh = rq8(tmp, q4_mat(m, tmp, src, "fc_hidden.weight", c.D, c.D), 8);
+    const HostMat fe = rq8(tmp, q4_mat(m, tmp, src, pre + "fc_embedding.weight", c.D, c.D), rq);
+    const HostMat fh = rq8(tmp, q4_mat(m, tmp, src, pre + "fc_hidden.weight", c.D, c.D), rq);
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     T.fc_emb = finish(m, e, tmp, fe);
@@ -319,13 +318,29 @@ inline void load_q4_mtp(Model& m, const std::string& dir) {
     [e endEncoding];
     commit_wait(cb);
   }
-  T.mixer = load_hc(m, src, "hyper_connection_mixer.", false, 8);
-  T.layer = load_q4_layer(m, src, "layers.0.", false, -1, 8, true);
+  T.mixer = load_hc(m, src, pre + "hyper_connection_mixer.", false, rq);
+  T.layer = load_q4_layer(m, src, pre + "layers.0.", false, -1, rq, true);
   m.n_dense_mtp += (m.n_dense - dense0) - (m.n_dense_mtp - exempt0);
   T.post_norm = false;
-  T.source = dir.substr(dir.find_last_of('/') + 1);
+  T.source = source;
   T.present = true;
-  std::fprintf(stderr, "mtp: %s (8-bit, 512 resident experts)\n", T.source.c_str());
+}
+
+// A drafter directory (bf16: its dense matrices and experts become 8-bit copies, ~2.7 GB resident).
+inline void load_q4_mtp(Model& m, const std::string& dir) {
+  SafetensorsSource src(dir);
+  load_q4_mtp_from(m, src, "", 8, dir.substr(dir.find_last_of('/') + 1));
+  const Mtp& T = m.mtp;
+  std::fprintf(stderr, "mtp: %s (%d-bit experts, %d resident)\n", T.source.c_str(), T.layer.experts_gu.bits, m.cfg.E);
+}
+
+// The model file's own `mtp.*` head, as stored (the oQ4e file: 4-bit g64
+// experts and fc, 5-6-bit attention and hyper-connection matrices, 8-bit
+// shared expert, bf16 router; ~1.5 GB resident).
+inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src) {
+  load_q4_mtp_from(m, src, "mtp.", 0, "own");
+  const Mtp& T = m.mtp;
+  std::fprintf(stderr, "mtp: the file's own head (%d-bit experts, %d resident)\n", T.layer.experts_gu.bits, m.cfg.E);
 }
 
 // The n-gram mix before layer c.ple_layer and the location of its table.
@@ -444,7 +459,9 @@ inline void ensure_ngram_preload(const NgramTable& T) {
   }).detach();
 }
 
-inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision) {
+// draft_head: an MTP head will draft; its 2-bit coarse LM head (mtp.coarse_c > 0) and 4-bit head (mtp.head4)
+// are built from the LM head as load_decoder does (a draft step read the whole 8-bit head, 675 MB, before).
+inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head) {
   Config& c = m.cfg;
   c.validate();
   const std::string pre = "language_model.model.";
@@ -453,8 +470,16 @@ inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision) {
     load_embedding(m, tmp, src, pre + "embed_tokens.weight");
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    m.lm_head = finish(m, e, tmp, q4_mat(m, tmp, src, c.tie ? pre + "embed_tokens.weight" : "language_model.lm_head.weight",
-                                           c.V, c.D));
+    const HostMat h = q4_mat(m, tmp, src, c.tie ? pre + "embed_tokens.weight" : "language_model.lm_head.weight", c.V, c.D);
+    if (draft_head && m.mtp.head4) {
+      m.mtp.head = finish(m, e, tmp, requant4(tmp, h));
+      --m.n_q4;  // not a decoder matrix
+    }
+    if (draft_head && m.mtp.coarse_c > 0 && !h.dense) {
+      m.mtp.coarse = finish(m, e, tmp, requant<2>(tmp, h));
+      --m.n_q8;  // not a decoder matrix (finish counts widths without a counter as 8-bit)
+    }
+    m.lm_head = finish(m, e, tmp, h);
     [e endEncoding];
     commit_wait(cb);
   }

@@ -68,6 +68,7 @@ struct ModelInfo {
   bool prompt_lookup = true;  // the engine may verify prompt-lookup drafts as leaves
   bool commit = false;  // verify-commit: TreeSpec::commit_chain + NativeModel::commit
   bool hidden_states = true;  // TreeSpec::out_hidden readouts (not Qwen4-Exp yet)
+  bool chunk_prefill = true;  // prompts may go in chunks while others decode (false: a pass reads its experts once)
   int draft_default = 0;  // MTP drafts per pass when --draft is not given (0: the engine's default, 5)
   std::string family = "qwen3_5";  // "qwen3_5" (also qwen3_5_moe, qwen4_exp), "gemma4" or "lfm2" (also lfm2_vl)
   std::vector<int> end_ids;        // end-of-turn ids the checkpoint's config names beside the tokenizer's (Gemma 4)

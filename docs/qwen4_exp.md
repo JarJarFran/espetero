@@ -470,6 +470,41 @@ next draft step: (argmax/sampled token, H^m pre-mixer) → same computation  ([M
   pre-mixer state at its position ([MB]:148-185).
 * Weights (oQ4e): attention 5–6-bit, HC 5-bit, shared expert 8-bit g128,
   router bf16 (the splitter never quantizes `layers.0.mlp.gate`), fc 4-bit g64.
+* Espetero drafts with the file's own `mtp.*` head when no drafter directory
+  (a sibling whose config says `qwen4_exp_mtp`, e.g.
+  `Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16`) is beside the model, loading it as
+  stored (~1.5 GB resident; `--mtp own` forces it, `--mtp DIR` a drafter, whose
+  bf16 matrices become 8-bit copies, ~2.7 GB). The drafts score the coarse 2-bit
+  copy of the LM head over the draft vocabulary and the LM head over each row's
+  256 shortlisted column blocks (`--mtp-coarse`, the server's default, as the
+  Qwen3.5 models do; `--mtp-coarse 0` the 4-bit copy; both built at load): a
+  draft step 1.9 → 1.0 ms (the 4-bit copy 1.3), the verify passes unchanged
+  (21.9 / 25.0 / 25.6 ms for 1 / 2 / 3 drafts against a 16.7 ms plain step).
+  Measured on the M4 Max (128 GB, resident experts, three greedy 256-token
+  replies through the server, 2026-10-22):
+
+  | drafting | tokens/s on the three prompts | drafts accepted |
+  |:--|:--|:--|
+  | none (`--mtp none --speculation off --no-lookup`) | 58.7 / 59.5 / 58.9 | – |
+  | own 4-bit head, coarse LM head (default) | 71.7 / 97.2 / 84.3 | 44 / 67 / 56 % |
+  | own head, 4-bit LM head copy (`--mtp-coarse 0`) | 70.2 / 96.0 / 80.1 | 45 / 70 / 56 % |
+  | own head, whole 8-bit LM head (before) | 63.9 / 88.9 / 77.0 | 44 / 67 / 56 % |
+  | bf16 drafter directory, coarse LM head | 71.1 / 98.1 / 79.1 | 44 / 69 / 52 % |
+
+  The own head's replies equal the drafter's on the three prompts, and the
+  coarse shortlist gave the same drafts as the whole head (same pass counts).
+  With 8 users decoding at once (256 tokens each) the aggregate is 142.8
+  tokens/s with the own head against 167.2 with no drafting: the per-request
+  back-off (engine.cpp) judges a draft with the load-time single-user costs,
+  so a few requests keep drafting while every pass carries their verify rows;
+  a policy for concurrent decoding is W7's. Drafts are verified, but greedy
+  replies still depend on
+  the decoding mode: a verify pass of 2–4 rows takes other expert kernels
+  than the 1-row step (another summation order, like `route_par`'s), so plain
+  decoding and the two heads diverge at near-ties on some prompts (one of
+  three here, with `ESPETERO_ROUTE_PAR=0`: plain, drafter and own gave three
+  texts). (An earlier note in the loader said the file's head accepted 0–4 %
+  of drafts; it does not.)
 * `mtp.hybrid: true` is read by neither reference.
 
 ## 8. Vision tower and M-RoPE positions
@@ -518,6 +553,25 @@ small vectors in fp32:
 | Embedding row (8-bit) | 0.003 | – | 0.003 | – |
 | n-gram rows (16 × 100 B, from SSD) | 0.002 | – | 0.002 | – |
 | **Total** | **4,617** | | **4,660** | 6,670 |
+
+**Resident experts (128 GB Macs).** When the whole expert store fits, the
+loader repacks every layer's experts once into resident GPU buffers and the
+passes route on the GPU (CHANGELOG 0.1.2). Those 77 GB live in host memory
+locked with `mlock` and wrapped for the GPU without a copy, as DeepSeek-V4.1's
+expert pool does. Measured on the M4 Max (2026-10-22, `bench_native --q4`,
+first 128-token prefill, wall time for 0.2 s of GPU time): the shared buffers
+of 0.1.2 10.1 s right after the load and 8.8 s after 90 s of idle; GPU-private
+buffers 0.4 s right after the load but 10.9 s after the idle; locked pages
+0.38 s and 2.1 s. `vm_stat` shows why: once free memory runs out (the load
+fills it) and the GPU goes idle, macOS unwires its memory (`iogpu.wired_lwm_mb`
+0) and compresses it, private or shared (51–55 GB in the compressor), and the
+next pass decompresses it before its command buffer can start; locked pages are
+left alone, and the 2.1 s that remain after an idle are the rest of the model's
+memory going the same way: with the weights arena locked too
+(`ESPETERO_WEIGHTS_LOCK=1`, an option: it would change every model's footprint)
+1.24 s, the rest being the pools and scratch. `ESPETERO_XRES_MEM=private|shared`
+selects the other kinds; `ESPETERO_BENCH_SLEEP=S` idles `bench_native --q4`
+between the load and its first pass to reproduce the effect.
 
 Around the weights, per step: GDN recurrent state read + write 2 × 113.2 MB;
 KV and indexer reads per §4.4 (50 MB at 2 k context); GDN conv, PLE conv

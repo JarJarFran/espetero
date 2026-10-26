@@ -135,6 +135,12 @@ int main(int argc, char** argv) {
     t.score_root = true;
     int32_t next = 0;
     t.out_argmax = &next;
+    // ESPETERO_BENCH_SLEEP=S: idle S seconds between the load and the first pass (a served model waits for its
+    // first request; what macOS does to idle memory meanwhile shows in that pass's wall time).
+    if (const char* sl = std::getenv("ESPETERO_BENCH_SLEEP"); sl && std::atoi(sl) > 0) {
+      std::fprintf(stderr, "idle for %d s before the first pass\n", std::atoi(sl));
+      std::this_thread::sleep_for(std::chrono::seconds(std::atoi(sl)));
+    }
     PassStats st;
     const auto t0 = Clock::now();
     m->run({t}, &st);

@@ -62,8 +62,10 @@ class Dsv4Model final : public NativeModel {
     load_weights();
     const double wgb = double(rt_.arena->total()) / 1e9;
     alloc_scratch();
-    // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each
-    int nslots = o.slots > 0 ? o.slots : 6;
+    // ---- sequence slots: window rings, compressed KV and index keys for max_ctx tokens each (~110 MB a slot at
+    // 32 K): the concurrent requests (--users) up to 16, at least 6 (6 slots held 6 users; the expert cache gives up
+    // ~1.1 GB for 16)
+    int nslots = o.slots > 0 ? o.slots : std::clamp(o.users > 0 ? o.users : 16, 6, 16);
     nuser_ = nslots;
     seqs_.resize(size_t(nslots) + size_t(kScratch));  // scratch slots after the user ones: trees that save nothing
     for (Seq& s : seqs_) alloc_seq(s);
@@ -124,6 +126,7 @@ class Dsv4Model final : public NativeModel {
     info_.slot_state_bytes = seq_bytes_;
     info_.leaves = true;
     info_.prompt_lookup = false;  // drafts verified as leaves read several tokens' experts from the SSD
+    info_.chunk_prefill = false;  // a pass reads its layers' experts once: a prompt in chunks reads them per chunk
     info_.commit = false;
     info_.hidden_states = false;
     info_.mtp = false;
@@ -616,6 +619,7 @@ class Dsv4Model final : public NativeModel {
     o.set("prefetch_wasted", int64_t(pf_wasted_));
     o.set("prefetch_wait_ms", pf_wait_ms_);
     o.set("flushes", int64_t(flushes_));
+    o.set("drive_gap_ms", drive_gap_ms_);
     o.set("spec_rounds", spec_rounds_);
     o.set("spec_drafts", spec_drafts_);
     o.set("spec_accepted", spec_accepted_);
@@ -633,7 +637,7 @@ class Dsv4Model final : public NativeModel {
   bool set_option(const std::string& name, int value) override {
     if (name == "expert_stats_reset") {
       xc_.hits = xc_.misses = 0;
-      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = wait_ms_ = wake_ms_ = fwd_ms_ = pf_wait_ms_ = 0;
+      xc_.read_ms = xc_.read_gb = eng_read_ms_ = gpu_ms_ = wait_ms_ = wake_ms_ = fwd_ms_ = pf_wait_ms_ = drive_gap_ms_ = 0;
       pf_issued_ = pf_used_ = pf_wasted_ = 0;
       flushes_ = 0;
       spec_rounds_ = spec_drafts_ = spec_accepted_ = 0;
@@ -945,7 +949,7 @@ class Dsv4Model final : public NativeModel {
   void alloc_scratch() {
     const size_t T = size_t(T_), P = size_t(P_), D = size_t(c_.D), A = P * size_t(c_.K), K = size_t(c_.K);
     auto F = [&](size_t n) { return rt_.buffer(n * 4); };
-    ids_ = F(T), pos_ = F(T), gpos_ = F(T);
+    ids_ = F(T), pos_ = F(T), gpos_ = F(T * 8);  // gpos_: a region per KV source (compress_seq writes them at encode time)
     mix0_ = F(T * 24);
     {
       float* m = static_cast<float*>([mix0_ contents]);
@@ -963,6 +967,7 @@ class Dsv4Model final : public NativeModel {
     const size_t nsub = (T + P - 1) / P + 1 + size_t(kMaxSegs);  // CED layers split blocks at segments' unused rows
     tile_cap_ = 3 * int(A / 16 + size_t(c_.E) + 1);  // three tile lists (64, 32, 16 rows)
     nsub_cap_ = int(nsub);
+    ntile_.assign(2 * nsub * 3, 0);
     XGRP_ = rt_.buffer(2 * nsub * size_t(2 * c_.E) * 24);
     XTILE_ = rt_.buffer(2 * nsub * size_t(tile_cap_) * 8);
     YT_ = F(T * D);  // a pipelined layer's MoE output, all rows
@@ -1055,8 +1060,12 @@ class Dsv4Model final : public NativeModel {
     explicit Enc2(Runtime& r) : rt(r) { begin(); }
     // ESPETERO_DS4_CONC=1: concurrent dispatch with a buffer barrier before every dispatch (experiment).
     bool conc = env_on("ESPETERO_DS4_CONC");
+    // ESPETERO_DS4_ENQUEUE=1: reserve the command buffer's place on the queue as soon as it is created (measured:
+    // launch + wake-up per token 5.4 -> 5.9 ms on the M4 Max, no gain).
+    bool enq = env_on("ESPETERO_DS4_ENQUEUE");
     void begin() {
       cb = [rt.queue commandBufferWithUnretainedReferences];
+      if (enq) [cb enqueue];
       e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
     }
     void bar() {
@@ -1127,7 +1136,44 @@ class Dsv4Model final : public NativeModel {
       }
     }
     void end() {
+      if (async) {  // committed by submit_async: wait for it here
+        const double t0 = Enc::host_seconds();
+        wait_cb(async);
+        gpu_ms += ([async GPUEndTime] - [async GPUStartTime]) * 1000.0;  // spans the host's waits in the GPU-driven decode
+        for (id<MTLCommandBuffer> c : chained) {
+          wait_cb(c);
+          gpu_ms += ([c GPUEndTime] - [c GPUStartTime]) * 1000.0;
+        }
+        chained.clear();
+        wait_ms += (Enc::host_seconds() - t0) * 1000.0;
+        ++flushes;
+        async = nil;
+        cb = nil;
+        e = nil;
+        return;
+      }
       submit_wait();
+      e = nil;
+    }
+    // The GPU signals `ev` = v when the commands encoded so far have run / waits for `ev` >= v before the
+    // commands encoded next (shared events: the host reads and sets them too).
+    void signal(id<MTLSharedEvent> sev, uint64_t v) {
+      [e endEncoding];
+      [cb encodeSignalEvent:sev value:v];
+      e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
+    }
+    void wait(id<MTLSharedEvent> sev, uint64_t v) {
+      [e endEncoding];
+      [cb encodeWaitForEvent:sev value:v];
+      e = conc ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [cb computeCommandEncoder];
+    }
+    // Commit without waiting (the pass's whole command buffer in the GPU-driven decode); end() waits.
+    id<MTLCommandBuffer> async = nil;
+    void submit_async() {
+      [e endEncoding];
+      Residency::get().commit();
+      [cb commit];
+      async = cb;
       e = nil;
     }
     // ESPETERO_DS4_PROFILE=1: every dispatch in its own command buffer, timed by kernel.
@@ -1343,6 +1389,77 @@ class Dsv4Model final : public NativeModel {
     E.set(2, mix, size_t(r0) * 24 * 4);
     E.bytes(3, hcp());
     E.threads(size_t(c_.D), size_t(M), 1, 256);
+  }
+  // The three in one dispatch (ds4_hc_fused, bit-identical): hc_post with `pmix` (post), then from the new H the
+  // next block's coefficients `fn / base / scale` into `mout` (mix) and the next sub-layer's input `X` with
+  // `prem` and norm `w` (pre). Opt-in (ESPETERO_DS4_HCFUSE=1; needs D = 5120): measured +4.1 ms of GPU per
+  // decoded token on the M4 Max (3 pairs against main, 40.1 -> 44.2 ms), where a dispatch boundary costs
+  // nothing at 1 row and one threadgroup per row serializes the 480 float4 dots and ~500 simd reductions that
+  // ds4_hc_part spreads over 20 threadgroups.
+  bool hc_fuse() const {
+    static const bool on = std::getenv("ESPETERO_DS4_HCFUSE") && std::atoi(std::getenv("ESPETERO_DS4_HCFUSE")) == 1;
+    return on && c_.D == 5120;
+  }
+  void hc_fused(Enc2& E, int r0, int M, id<MTLBuffer> Ys, size_t yso, id<MTLBuffer> pmix, const Buf* fn, const Buf* base,
+                const Buf* scale, id<MTLBuffer> mout, id<MTLBuffer> prem, const Buf* w, id<MTLBuffer> X, size_t xoff) {
+    struct {
+      int D, iters;
+      float eps, hc_eps;
+      int post, mix, pre;
+    } p{c_.D, c_.hc_iters, c_.eps, c_.hc_eps, pmix ? 1 : 0, fn ? 1 : 0, w ? 1 : 0};
+    if (!p.post && !p.mix && !p.pre) return;
+    const size_t mo = size_t(r0) * 24 * 4;
+    E.pipe("ds4_hc_fused");
+    E.set(0, H_, hrow(r0));
+    E.set(1, Ys ? Ys : Y_, Ys ? yso : 0);
+    E.set(2, pmix ? pmix : mixA_, mo);
+    E.set(3, fn ? *fn : norm_);
+    E.set(4, scale ? *scale : norm_);
+    E.set(5, base ? *base : norm_);
+    E.set(6, mout ? mout : mixA_, mo);
+    E.set(7, prem ? prem : mixA_, mo);
+    E.set(8, w ? *w : norm_);
+    E.set(9, X ? X : X_, xoff);
+    E.bytes(10, p);
+    E.groups(size_t(M), 1, 1, 256);
+  }
+
+  // The end of layer l for rows [r0, r0 + M): hc_post with `fmix` (the FFN's post / comb), and with the fused
+  // kernel also the next layer's input mix (its hca block -> mixA_, indexed by pass row) and, when the next
+  // layer runs over the same rows (same_rows: X_ is indexed from each block's first row), its attention input
+  // X_; not past an Engram layer (it changes H first) or the last layer. mix_done / pre_done tell the next
+  // layer what was done.
+  void hc_end(Enc2& E, int l, int r0, int M, id<MTLBuffer> Ys, size_t yso, id<MTLBuffer> fmix, const std::vector<LayerW>& LW,
+              bool same_rows, bool& mix_done, bool& pre_done) {
+    if (!hc_fuse()) {
+      hc_post(E, fmix, r0, M, Ys, yso);
+      return;
+    }
+    const bool next = l + 1 < int(LW.size()) && LW[size_t(l + 1)].eg < 0;
+    const LayerW* n = next ? &LW[size_t(l + 1)] : nullptr;
+    const bool pre = next && same_rows;
+    hc_fused(E, r0, M, Ys, yso, fmix, n ? &n->hca_fn : nullptr, n ? &n->hca_base : nullptr, n ? &n->hca_scale : nullptr, mixA_,
+             fmix, pre ? &n->attn_norm : nullptr, X_, 0);
+    mix_done = next;
+    pre_done = pre;
+  }
+
+  // ---- GPU-driven decode: the GPU signals route_ev_ after each router and waits for exp_ev_ before each
+  // layer's experts; one rising sequence of values for both.
+  static constexpr int kDriveRows = 8;
+  id<MTLSharedEvent> route_ev_ = nil, exp_ev_ = nil;
+  uint64_t drive_seq_ = 0;
+  double drive_gap_ms_ = 0;  // per pass: host signal -> the GPU's next route signal, summed (profile_json drive_gap_ms)
+  void drive_wait(id<MTLSharedEvent> ev, uint64_t v) {  // spin briefly (a layer is ~1 ms), then block (ESPETERO_DS4_DRIVE_SPIN=1: never)
+    static const bool spin_only = env_on("ESPETERO_DS4_DRIVE_SPIN");
+    const double t0 = Enc::host_seconds();
+    while (ev.signaledValue < v)
+      if (!spin_only && Enc::host_seconds() - t0 > 0.003) {
+        if (![ev waitUntilSignaledValue:v timeoutMS:60000]) fail("deepseek_v41: the GPU did not reach a layer's route in 60 s");
+        return;
+      } else if (Enc::host_seconds() - t0 > 60.0) {
+        fail("deepseek_v41: the GPU did not reach a layer's route in 60 s");
+      }
   }
 
   // ---------------------------------------------------------------- vision
@@ -2034,8 +2151,24 @@ class Dsv4Model final : public NativeModel {
           off += size_t(n) * size_t(D) * 4;
         }
     }
-    if (!no_engram_ && !draft)
-      for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0, img + g.r0);
+    // The Engram rows (SSD reads, ~1 ms per decoded token) are gathered while the GPU runs the layers before the
+    // first Engram layer; the thread is joined before that layer is encoded (ESPETERO_DS4_ENGRAM_BG=0: inline).
+    static const bool eng_bg = !(std::getenv("ESPETERO_DS4_ENGRAM_BG") && std::atoi(std::getenv("ESPETERO_DS4_ENGRAM_BG")) == 0);
+    struct Joiner {  // joined before the Engram layer is encoded, or on any exit from the pass
+      std::thread t;
+      ~Joiner() { join(); }
+      void join() {
+        if (t.joinable()) t.join();
+      }
+    } eng_th;
+    auto eng_join = [&] { eng_th.join(); };
+    if (!no_engram_ && !draft) {
+      auto gather = [&, img] {
+        for (Seg& g : segs) engram_gather(*g.s, g.toks, g.n, g.r0, img + g.r0);
+      };
+      if (eng_bg) eng_th.t = std::thread(gather);
+      else gather();
+    }
     std::vector<Blk> blks;
     for (int r0 = 0; r0 < T; r0 += P_) {
       Blk bk;
@@ -2109,6 +2242,31 @@ class Dsv4Model final : public NativeModel {
     }
     id<MTLBuffer> prev = mix0_;
     int cur = 0;
+    bool mix_done = false, pre_done = false;  // the fused kernel of the previous layer's end wrote this layer's mixA_ / X_
+    // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
+    // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
+    static const bool pred_on = std::getenv("ESPETERO_DS4_PREDICT") && std::atoi(std::getenv("ESPETERO_DS4_PREDICT")) != 0;
+    static const char* dumpx = std::getenv("ESPETERO_DS4_DUMPX");  // MoE inputs and routes, for routing predictors
+    // ---- GPU-driven decode (ESPETERO_DS4_DRIVE=0: off). A pass of a few rows is one command buffer, committed
+    // before any route is known: after each layer's router the GPU signals the host and waits for the host's
+    // signal before that layer's experts; the host resolves the route and reads the misses as the signals
+    // arrive and fills the expert kernels' tables then (their dispatches are encoded for M x K groups). The
+    // layer's command buffer launch and the host's encode leave the critical path (5.5 ms per token of 82 on
+    // the M4 Max). Not under the per-dispatch profile, dumps, prediction, drafts or streaming.
+    // Opt-in (ESPETERO_DS4_DRIVE=1): measured +16-28 ms per decoded token against the per-layer command buffers on
+    // the M4 Max (3 pairs): a GPU wait on a host-signalled event costs far more than a command buffer launch.
+    static const bool drive_on = std::getenv("ESPETERO_DS4_DRIVE") && std::atoi(std::getenv("ESPETERO_DS4_DRIVE")) == 1;
+    const bool drive = drive_on && !draft && T <= kDriveRows && !streaming && !E.prof && dump_dir_.empty() && !dumpx && !pred_on;
+    struct Drive {  // a layer whose route the host resolves while the GPU waits
+      int l, key;
+      std::vector<Blk> fb;
+      uint64_t rsig, xsig;
+    };
+    std::vector<Drive> drives;
+    if (drive && !route_ev_) {
+      route_ev_ = [rt_.dev newSharedEvent];
+      exp_ev_ = [rt_.dev newSharedEvent];
+    }
     for (int l = 0; l < int(LW.size()); ++l) {
       const LayerW& w = LW[size_t(l)];
       const int K = w.topk, key = draft ? c.L + l : l;  // the expert cache's layer
@@ -2127,10 +2285,8 @@ class Dsv4Model final : public NativeModel {
       }
       std::vector<Blk>& fb = dec0 >= 0 && l >= dec0 ? fsub : blks;
       const int Tf = full_rows(l);
+      const bool same_rows = l + 1 < int(LW.size()) && full_rows(l + 1) == Tf;  // the next layer's blocks are these
       const bool more = pf_on_ && !draft && l + 1 < int(LW.size()) && !dense[size_t(std::min(l + 1, int(LW.size()) - 1))];
-      // Decode-time prediction (the next layer's router on this layer's input) found ~1 in 3 of the
-      // misses and its reads did not finish in time: off unless ESPETERO_DS4_PREDICT=1.
-      static const bool pred_on = std::getenv("ESPETERO_DS4_PREDICT") && std::atoi(std::getenv("ESPETERO_DS4_PREDICT")) != 0;
       const bool predict = more && pred_on && T <= kPredRows;
       // the draft head's view of this layer's input: the mean of the hc copies
       if (!draft && dspark_)
@@ -2157,6 +2313,7 @@ class Dsv4Model final : public NativeModel {
         Blk& bk = fb[ci];
         const int r0 = bk.r0, M = bk.M;
         if (w.eg >= 0) {
+          if (!drive) eng_join();  // its rows must be in ERAW_ before this command buffer is committed (drive: before its signal)
           const int ncol = (c.eng_max_n - 1) * c.eng_heads, Ke = w.e_wkv.K;
           struct {
             int rows, ncol, hd;
@@ -2176,19 +2333,45 @@ class Dsv4Model final : public NativeModel {
           E.set(4, IMG_, size_t(r0));
           E.groups(size_t(M), 1, 1, 256);
         }
-        hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, mixA_, r0, M);
-        hc_pre(E, prev, w.attn_norm, X_, 0, r0, M);
+        // The block's input mix and norm: done by the fused kernel at the end of the previous layer (pre_done),
+        // unless an Engram changed H first.
+        if (!hc_fuse()) {
+          hc_mix(E, w.hca_fn, w.hca_base, w.hca_scale, mixA_, r0, M);
+          hc_pre(E, prev, w.attn_norm, X_, 0, r0, M);
+        } else if (!mix_done || w.eg >= 0) {
+          hc_fused(E, r0, M, nil, 0, nil, &w.hca_fn, &w.hca_base, &w.hca_scale, mixA_, prev, &w.attn_norm, X_, 0);
+        } else if (!pre_done) {  // the rows changed (a decoder layer): the input norm again, from the same mix
+          hc_fused(E, r0, M, nil, 0, nil, nullptr, nullptr, nullptr, nil, prev, &w.attn_norm, X_, 0);
+        }
         attention_block(E, w, l, bk, segs, draft);
         if (!dump_dir_.empty()) dump_rows(E, "a" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
-        hc_post(E, mixA_, r0, M);
-        hc_mix(E, w.hcf_fn, w.hcf_base, w.hcf_scale, mixF_[cur], r0, M);
-        hc_pre(E, mixA_, w.ffn_norm, XF_, size_t(r0) * size_t(D) * 4, r0, M);
+        if (!hc_fuse()) {
+          hc_post(E, mixA_, r0, M);
+          hc_mix(E, w.hcf_fn, w.hcf_base, w.hcf_scale, mixF_[cur], r0, M);
+          hc_pre(E, mixA_, w.ffn_norm, XF_, size_t(r0) * size_t(D) * 4, r0, M);
+        } else {
+          hc_fused(E, r0, M, nil, 0, mixA_, &w.hcf_fn, &w.hcf_base, &w.hcf_scale, mixF_[cur], mixA_, &w.ffn_norm, XF_,
+                   size_t(r0) * size_t(D) * 4);
+        }
         moe_route(E, w, r0, M);
         if (predict) moe_route_to(E, LW[size_t(l + 1)], r0, M, PSEL_, PRW_);  // the next layer's router on this input
       }
+      if (drive) {  // the GPU signals the route and waits for the experts; their kernels encoded for M x K groups
+        Drive d{l, key, fb, ++drive_seq_, ++drive_seq_};
+        E.signal(route_ev_, d.rsig);
+        E.wait(exp_ev_, d.xsig);
+        for (size_t ci = 0; ci < fb.size(); ++ci) {
+          const int r0 = fb[ci].r0, M = fb[ci].M;
+          moe_experts_encode(E, w, int(ci), r0, M, M * K, M * K, true, nil, 0, 0);
+          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
+        }
+        drives.push_back(std::move(d));
+        prev = mixF_[cur];
+        cur ^= 1;
+        continue;
+      }
       E.flush();  // routing on the host
       const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
-      static const char* dumpx = std::getenv("ESPETERO_DS4_DUMPX");  // MoE inputs and routes, for routing predictors
       if (dumpx && !draft) {
         const std::string b = std::string(dumpx) + "/l" + std::to_string(l);
         if (FILE* f = std::fopen((b + ".x16").c_str(), "wb")) {  // XF_ rows as fp16
@@ -2245,7 +2428,7 @@ class Dsv4Model final : public NativeModel {
           const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts(E, w, int(ci), r0, M, slot_of);
           if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
-          hc_post(E, mixF_[cur], r0, M);
+          hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
         }
       } else {
         // ---- phase 3, pipelined (long passes): the GPU computes the experts in
@@ -2285,13 +2468,15 @@ class Dsv4Model final : public NativeModel {
             moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, false, YT_, size_t(fb[ci].r0) * yrow, par);
           used[par] = E.submit_chained();
         }
-        for (size_t ci = 0; ci < fb.size(); ++ci) hc_post(E, mixF_[cur], fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow);
+        for (size_t ci = 0; ci < fb.size(); ++ci)
+          hc_end(E, l, fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow, mixF_[cur], LW, same_rows, mix_done, pre_done);
       }
       prev = mixF_[cur];
       cur ^= 1;
       if (!dump_dir_.empty()) dump_rows(E, "h" + std::to_string(l), H_, size_t(T) * 4 * size_t(D));
     }
     prot_lo_ = -1, prot_hi_ = -2;
+    eng_join();  // no Engram layer (a partial model): the rows were still gathered
     // ---- logits of the segments' last rows
     int R = 0;
     for (const Seg& g : segs)
@@ -2300,6 +2485,42 @@ class Dsv4Model final : public NativeModel {
         R += g.nlog;
       }
     if (R && head_.b) gemv(E, 2, Buf(head_), Buf{}, XN_, 0, D, LOG_, 0, c.V, c.V, D, R);
+    if (drive) {
+      // ---- the whole pass is committed; the host follows the GPU layer by layer: route, slots (reads), tables, signal
+      E.submit_async();
+      try {
+        double t_sig = 0;  // when the host signalled the previous layer's experts
+        for (const Drive& d : drives) {
+          const LayerW& w = LW[size_t(d.l)];
+          const int K = w.topk;
+          drive_wait(route_ev_, d.rsig);
+          if (t_sig > 0) drive_gap_ms_ += (Enc::host_seconds() - t_sig) * 1000.0;  // GPU resume + experts + next layer's phase 1
+          const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]);
+          std::vector<int> used(size_t(w.nE), 0);
+          for (const Blk& bk : d.fb)
+            for (int i = bk.r0 * K; i < (bk.r0 + bk.M) * K; ++i) {
+              if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
+              ++used[size_t(sel[i])];
+            }
+          std::vector<int> need, nrows;
+          for (int e = 0; e < w.nE; ++e)
+            if (used[size_t(e)]) need.push_back(e), nrows.push_back(used[size_t(e)]);
+          const std::vector<int> slots = expert_slots(E, d.key, w, need, nullptr, &nrows, nullptr);
+          std::vector<int> slot_of(size_t(w.nE), -1);
+          for (size_t i = 0; i < need.size(); ++i) slot_of[size_t(need[i])] = slots[i];
+          for (size_t ci = 0; ci < d.fb.size(); ++ci) {
+            int ng = 0;
+            moe_experts_plan(w, int(ci), d.fb[ci].r0, d.fb[ci].M, slot_of, nullptr, 0, ng);
+          }
+          if (d.l + 1 < int(LW.size()) && LW[size_t(d.l + 1)].eg >= 0) eng_join();  // its rows before that layer runs
+          exp_ev_.signaledValue = d.xsig;
+          t_sig = Enc::host_seconds();
+        }
+      } catch (...) {
+        exp_ev_.signaledValue = drive_seq_;  // release the GPU (its remaining work reads stale tables) before failing
+        throw;
+      }
+    }
     if (draft) {  // the Markov head picks the drafts one after another, on the GPU
       int r = 0;
       for (size_t i = 0; i < segs.size(); ++i) {
@@ -2443,7 +2664,11 @@ class Dsv4Model final : public NativeModel {
       const int r = w.ratio, si = w.src;
       const int g0 = p0 / r, G = (p0 + M) / r - g0;
       if (G > s.cap[size_t(si)] - g0) fail("deepseek_v41: compressed KV full");
-      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + r0;  // this part's own rows
+      // this part's own rows, in this source's region: the pass may be encoded whole before it runs, and the
+      // sources' positions differ (ratio 2 rounds down)
+      if (si < 0 || si >= 8) fail("deepseek_v41: more KV sources than gpos_ regions");
+      const size_t gbase = size_t(si) * size_t(T_);
+      int32_t* gp = static_cast<int32_t*>([gpos_ contents]) + gbase + r0;
       for (int g = 0; g < G; ++g) gp[g] = (g0 + g) * r;
       if (r == 1) {
         gemvb(E, w.c_wkv, X_, D, LAT_, HD, M, xo, ho);
@@ -2469,10 +2694,10 @@ class Dsv4Model final : public NativeModel {
         norm(E, LAT_, ho, w.c_norm, G, 1, HD, HD);
         gemvb(E, w.i_wk, LAT_, HD, IK_, c.IHD, G, ho, ko);  // index keys from the RoPE-free latent
         norm(E, IK_, ko, w.i_knorm, G, 1, c.IHD, c.IHD);
-        rope(E, IK_, ko, gpos_, po, invf, G, 1, c.IHD, c.IHD, false);
+        rope(E, IK_, ko, gpos_, po + gbase * 4, invf, G, 1, c.IHD, c.IHD, false);
         quant(E, IK_, ko, G, c.IHD, c.IHD, 1);
         store_half(E, IK_, ro, c.IHD, s.idxk[size_t(si)], 0, G, c.IHD, g0, 0);
-        rope(E, LAT_, ho, gpos_, po, invf, G, 1, HD, HD, false);
+        rope(E, LAT_, ho, gpos_, po + gbase * 4, invf, G, 1, HD, HD, false);
         quant(E, LAT_, ho, G, HD, HD, 2);
         store_half(E, LAT_, ro, HD, s.comp[size_t(si)], 0, G, HD, g0, 0);
       }
@@ -2647,6 +2872,11 @@ class Dsv4Model final : public NativeModel {
     E.groups(size_t(M), 1, 1, 32);
   }
 
+  struct XGroup {  // ds4_xgemv's Ds4XGroup
+    uint32_t part, pad;
+    uint64_t off;
+    int32_t a0, n;
+  };
   // Shared and routed experts of rows [r0, r0 + M) into Y_ (sub-chunk ci; the
   // routing on the host; slot_of: each expert's cache slot for this layer).
   // subset: only these experts' rows (a pipelined layer's round); shared: the shared
@@ -2655,15 +2885,19 @@ class Dsv4Model final : public NativeModel {
   void moe_experts(Enc2& E, const LayerW& w, int ci, int r0, int M, const std::vector<int>& slot_of,
                    const std::vector<char>* subset = nullptr, bool shared = true, id<MTLBuffer> Yb = nil, size_t ybo = 0,
                    int par = 0) {
+    int ngroups = 0;
+    const int A = moe_experts_plan(w, ci, r0, M, slot_of, subset, par, ngroups);
+    moe_experts_encode(E, w, ci, r0, M, A, ngroups, shared, Yb, ybo, par);
+  }
+
+  // The host tables of the routed experts of rows [r0, r0 + M) (sub-chunk ci): the assignments grouped by
+  // expert (xrow_, wsc_, amap_) and each expert's slot (XGRP_), at the tables' `par` copy. Returns the
+  // assignments A and, in ngroups, the expert groups (the kernels' dispatch width). Called at encode time,
+  // or, in the GPU-driven decode, once the route is known while the GPU waits before the dispatch.
+  int moe_experts_plan(const LayerW& w, int ci, int r0, int M, const std::vector<int>& slot_of, const std::vector<char>* subset,
+                       int par, int& ngroups) {
     const Cfg& c = c_;
-    const int D = c.D, IE = c.IE, K = w.topk;
-    id<MTLBuffer> Yt = Yb ? Yb : Y_;
-    quant_copy(E, XF_, size_t(r0) * size_t(D) * 4, D, XQ_, 0, D, M, D);
-    if (shared) {
-      gemv8(E, w.sh13, XQ_, D, SG_, 2 * IE, M);  // gate | up in one matrix
-      swiglu_q(E, SG_, 0, SG_, size_t(IE) * 4, 2 * IE, SH_, IE, M, IE, nil, 0);
-      gemv8(E, w.sh2, SH_, IE, Yt, D, M, 0, ybo);
-    }
+    const int K = w.topk;
     // assignments of the sub-chunk grouped by expert (tables at this sub-chunk's offsets)
     const int32_t* sel = static_cast<const int32_t*>([SEL_ contents]) + size_t(r0) * size_t(K);
     const float* rw = static_cast<const float*>([RW_ contents]) + size_t(r0) * size_t(K);
@@ -2678,7 +2912,6 @@ class Dsv4Model final : public NativeModel {
     float* ws = static_cast<float*>([wsc_ contents]) + ao;
     int32_t* am = static_cast<int32_t*>([amap_ contents]) + ao;
     for (int a = 0; a < M * K; ++a) am[a] = -1;
-    if (A == 0) return;
     std::vector<int> need, start;
     for (int a = 0; a < A; ++a) {
       const int src = order[size_t(a)];
@@ -2689,17 +2922,14 @@ class Dsv4Model final : public NativeModel {
       am[src] = a;
     }
     start.push_back(A);
-    struct XGroup {
-      uint32_t part, pad;
-      uint64_t off;
-      int32_t a0, n;
-    };
     const size_t go = (size_t(par) * size_t(nsub_cap_) + size_t(ci)) * size_t(2 * c.E) * sizeof(XGroup);
     XGroup* grp = reinterpret_cast<XGroup*>(static_cast<uint8_t*>([XGRP_ contents]) + go);
     for (size_t i = 0; i < need.size(); ++i) {
       const int sl = slot_of[size_t(need[i])];
       grp[i] = XGroup{uint32_t(xc_.part(sl)), 0, uint64_t(xc_.offset(sl)), start[i], start[i + 1] - start[i]};
     }
+    // Groups beyond the routed experts (a dispatch encoded before the route was known) do nothing.
+    for (size_t i = need.size(); i < size_t(M) * size_t(K) && i < size_t(2 * c.E); ++i) grp[i] = XGroup{0, 0, 0, 0, 0};
     // Many rows: the GEMM over tiles of 64, 32 or 16 rows of a group (tile lists per
     // size); a few (decode): the grouped GEMV.
     int nt[3] = {0, 0, 0};
@@ -2716,6 +2946,33 @@ class Dsv4Model final : public NativeModel {
           q += bm;
         }
       }
+    for (int q = 0; q < 3; ++q) ntile_[(size_t(par) * size_t(nsub_cap_) + size_t(ci)) * 3 + size_t(q)] = nt[q];
+    ngroups = int(need.size());
+    return A;
+  }
+  std::vector<int> ntile_;  // the tile lists' lengths per (par, sub-chunk), from moe_experts_plan
+
+  // Shared and routed experts of rows [r0, r0 + M) into Y_ (sub-chunk ci; the routed experts' kernels run
+  // over `ngroups` expert groups and A assignments from the tables moe_experts_plan fills). shared: the shared
+  // expert too (it writes the target, the routed rows add to it); Yb: the target rows (null: Y_); par: which
+  // copy of the host tables (rounds in flight alternate).
+  void moe_experts_encode(Enc2& E, const LayerW& w, int ci, int r0, int M, int A, int ngroups, bool shared, id<MTLBuffer> Yb,
+                          size_t ybo, int par) {
+    const Cfg& c = c_;
+    const int D = c.D, IE = c.IE, K = w.topk;
+    id<MTLBuffer> Yt = Yb ? Yb : Y_;
+    quant_copy(E, XF_, size_t(r0) * size_t(D) * 4, D, XQ_, 0, D, M, D);
+    if (shared) {
+      gemv8(E, w.sh13, XQ_, D, SG_, 2 * IE, M);  // gate | up in one matrix
+      swiglu_q(E, SG_, 0, SG_, size_t(IE) * 4, 2 * IE, SH_, IE, M, IE, nil, 0);
+      gemv8(E, w.sh2, SH_, IE, Yt, D, M, 0, ybo);
+    }
+    if (A == 0) return;
+    const size_t ao = size_t(r0) * size_t(K) + size_t(par) * size_t(T_) * size_t(c.K);
+    const size_t go = (size_t(par) * size_t(nsub_cap_) + size_t(ci)) * size_t(2 * c.E) * sizeof(XGroup);
+    const size_t to = (size_t(par) * size_t(nsub_cap_) + size_t(ci)) * size_t(tile_cap_) * 8;
+    const int* nt = &ntile_[(size_t(par) * size_t(nsub_cap_) + size_t(ci)) * 3];
+    const bool tiled = M > gemm_min_;
     struct {
       int N, K, xs, ys;
       uint64_t wbytes, sbytes;
@@ -2737,7 +2994,8 @@ class Dsv4Model final : public NativeModel {
         E.groups(size_t(rows / 64), size_t(nt[q]), 1, 128);
       }
       if (!tiled) {
-        // two rows per simdgroup (ds4_xgemv_b): 345 -> 419 GB/s gate/up, 236 -> 328 GB/s down; ESPETERO_DS4_XGEMV1=1: one
+        // two rows per simdgroup (ds4_xgemv_b): 345 -> 419 GB/s gate/up, 236 -> 328 GB/s down; ESPETERO_DS4_XGEMV1=1: one.
+        // Four rows per simdgroup and the next chunk's loads in flight were measured slower (kernel-guidelines).
         static const bool one = env_on("ESPETERO_DS4_XGEMV1");
         auto q = xp;
         q.nrow_tg = one ? 8 : 16;
@@ -2748,7 +3006,7 @@ class Dsv4Model final : public NativeModel {
         E.set(5, Y);
         E.set(6, xrow_, ao * 4);
         E.bytes(7, q);
-        E.groups(size_t((rows + q.nrow_tg - 1) / q.nrow_tg), need.size(), 1, 256);
+        E.groups(size_t((rows + q.nrow_tg - 1) / q.nrow_tg), size_t(ngroups), 1, 256);
       }
     };
     xgemv(XQ_, XG_);

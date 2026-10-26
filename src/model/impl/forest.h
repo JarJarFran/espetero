@@ -1765,11 +1765,25 @@ inline void reset_arrival_counters(Model& m) {
 // repacked into resident GPU buffers in the whole-layer format moe_mlp reads
 // (slot = expert id), so a pass routes on the GPU without handshakes. Chosen
 // at load when they all fit (model.mm); replaces the expert cache.
+// The buffers are host memory locked with mlock (ESPETERO_XRES_MEM=private |
+// shared: GPU-private buffers, or the shared buffers of 0.1.2) and join the
+// residency set as they are filled. Measured on the M4 Max (128 GB, bench
+// right after the load): the first 128-token prefill took 10.1 s of wall
+// time for 0.2 s of GPU time with shared buffers, 8.7 s after a 90 s idle;
+// 0.4 s with private buffers but 10.9 s after the idle: once free memory is
+// gone macOS compresses the idle GPU's memory, private or shared (vm_stat:
+// 55 GB in the compressor), and the next pass pays to bring it back. Locked
+// pages are left alone (the DeepSeek-V4.1 expert pool, 97 GB, does the same).
 inline void ensure_resident_experts(Model& m) {
   const Config& c = m.cfg;
   if (!m.xres_l.empty() || !m.xs.present) return;
   const auto t0 = Clock::now();
-  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true);
+  static const Arena::Mem mem = [] {
+    const char* v = std::getenv("ESPETERO_XRES_MEM");
+    return v && !std::strcmp(v, "shared") ? Arena::Mem::Shared : v && !std::strcmp(v, "private") ? Arena::Mem::Private : Arena::Mem::Locked;
+  }();
+  const bool shared = mem == Arena::Mem::Shared;
+  m.xres = std::make_unique<Arena>(m.dev, size_t(1) << 30, true, mem);
   Arena tmp(m.dev, size_t(1) << 30);
   m.xres_l.resize(size_t(c.L));
   for (int li = 0; li < c.L; ++li) {
@@ -1781,6 +1795,7 @@ inline void ensure_resident_experts(Model& m) {
     repack(m, e, gu, tmp, m.xres.get());
     repack(m, e, dn, tmp, m.xres.get());
     [e endEncoding];
+    if (!shared) Residency::get().commit();  // this layer's new chunks resident now, not at the first pass
     [cb commit];
     [cb waitUntilCompleted];
     if (cb.status != MTLCommandBufferStatusCompleted) fail("resident experts: repack of layer " + std::to_string(li) + " failed");
@@ -5020,11 +5035,62 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
     moe_mlp(m, E, L, s.xn, s.act, m.q4s.y, R, nullptr);  // resident 8-bit experts (no expert-cache hook)
     q4_hc_inject(m, E, meta.m_x.buf, Buf(m.q4s.y), Buf(m.q4s.inj), R);
   };
-  // Head: the MTP mixer of `rows` of m_x -> LM head -> argmax into arg[k * nq].
+  // Head: the MTP mixer of `rows` of m_x -> LM head -> argmax into arg[k * nq]. As run_draft: the 4-bit head
+  // copy when built, or the coarse 2-bit head over the draft vocabulary and the LM head over each row's
+  // shortlisted column blocks (a draft step read the whole 8-bit head, 675 MB, before).
+  const Mat& head = (MT.head.out() > 0 && MT.use_head4) ? MT.head : m.lm_head;
+  const int n_vblocks = (vocab + 31) / 32;
+  const bool coarse = MT.coarse.out() > 0 && !MT.coarse.dense && MT.coarse_c > 0 && nq <= 8 && !m.lm_head.dense &&
+                      n_vblocks <= 8192;
+  const int cC = coarse ? std::min(MT.coarse_c, 256) : 0;
+  if (coarse) {
+    meta.m_bmax.ensure<float>(m, size_t(nq) * size_t(n_vblocks));
+    meta.m_blist.ensure<int32_t>(m, size_t(nq) * size_t(cC));
+  }
   auto head_step = [&](const std::vector<int32_t>& rows, int k) {
     gather_rows(meta.m_x.buf, meta.m_hc.buf, meta.m_rows, rows, W);
     q4_hc_read(m, E, MT.mixer, false, meta.m_hc.buf, nq, meta.m_hn.buf);
-    gemm(E, m.tune, m.lm_head, meta.m_hn.buf.b, meta.m_hn.buf.off, c.D, s.logits, 0, c.V, nq, 0, vocab);
+    if (coarse) {
+      gemv_blocks(E, MT.coarse.q, meta.m_hn.buf.b, meta.m_hn.buf.off, c.D, s.logits, 0, c.V, nq, vocab);
+      E.pipe("block_max_rows");
+      E.set(0, s.logits);
+      E.set(1, meta.m_bmax.buf);
+      E.bytes(2, vocab);
+      E.bytes(3, c.V);
+      E.bytes(4, n_vblocks);
+      E.rd(s.logits);
+      E.wr(meta.m_bmax.buf, meta.m_bmax.bytes);
+      E.threads(MTLSizeMake(size_t(n_vblocks), size_t(nq), 1), MTLSizeMake(64, 1, 1));
+      E.pipe("topc_blocks");
+      E.set(0, meta.m_bmax.buf);
+      E.set(1, meta.m_blist.buf);
+      E.bytes(2, n_vblocks);
+      E.bytes(3, cC);
+      E.rd(meta.m_bmax.buf, meta.m_bmax.bytes);
+      E.wr(meta.m_blist.buf, meta.m_blist.bytes);
+      E.groups(MTLSizeMake(size_t(nq), 1, 1), MTLSizeMake(1024, 1, 1));
+      gemv_blocks(E, m.lm_head.q, meta.m_hn.buf.b, meta.m_hn.buf.off, c.D, s.logits, 0, c.V, nq, 0, &meta.m_blist.buf,
+                  nq * cC);
+      E.pipe("argmax2_list");
+      E.set(0, s.logits);
+      E.set(1, meta.m_arg.buf, sizeof(int32_t) * size_t(k) * size_t(nq));
+      E.bytes(2, vocab);
+      E.bytes(3, c.V);
+      if (want2) {
+        E.set(4, meta.m_arg2.buf, sizeof(int32_t) * size_t(k) * size_t(nq));
+        E.wr(meta.m_arg2.buf, meta.m_arg2.bytes);
+      }
+      E.set(5, meta.m_blist.buf);
+      E.bytes(6, cC);
+      E.bytes(7, want2 ? 1 : 0);
+      E.rd(s.logits);
+      E.rd(meta.m_blist.buf, meta.m_blist.bytes);
+      E.wr(meta.m_arg.buf, meta.m_arg.bytes);
+      E.groups(MTLSizeMake(size_t(nq), 1, 1), MTLSizeMake(1024, 1, 1));
+      draw_draft_step(m, meta, E, reqs, k, vocab);
+      return;
+    }
+    gemm(E, m.tune, head, meta.m_hn.buf.b, meta.m_hn.buf.off, c.D, s.logits, 0, c.V, nq, 0, vocab);
     E.pipe(want2 ? "argmax2_rows" : "argmax_rows");
     E.set(0, s.logits);
     E.set(1, meta.m_arg.buf, sizeof(int32_t) * size_t(k) * size_t(nq));

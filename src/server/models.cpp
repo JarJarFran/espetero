@@ -875,8 +875,13 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         continue;
       }
       if (starts_with(t.name, "language_model.mtp.") || starts_with(t.name, "mtp.")) {
-        // Flash-Next drafts with a drafter directory; the file's own mtp.* head is not loaded.
-        if (f.geo.q4) continue;
+        // Flash-Next drafts with a drafter directory beside the file when there is one, else with the
+        // file's own mtp.* head (--mtp own forces it), resident as stored: its bytes wait in f.mtp
+        // for footprint_local to decide (not counted in the weights here).
+        if (f.geo.q4) {
+          f.mtp += bytes;
+          continue;
+        }
         f.mtp += bytes;
       } else if (f.geo.q4 && (contains(t.name, ".switch_mlp.") || contains(t.name, ".ngram_embedding."))) {
         f.streamed += t.bytes;  // read from the SSD (expert cache, n-gram rows)
@@ -925,9 +930,11 @@ Footprint footprint_local(const std::string& path0, const std::string& mmproj, c
     });
     // Flash-Next: the drafter directory beside the model (load.h: a sibling
     // named *MTP* / *mtp* whose config says qwen4_exp_mtp), bf16 loaded as 8-bit.
+    const int64_t q4_own_mtp = f.geo.q4 ? f.mtp : 0;  // the file's own mtp.* head (footprint_mlx)
+    if (f.geo.q4) f.mtp = 0;
     if (f.geo.q4 && mtp != "none") {
-      std::string dir = mtp;
-      if (dir.empty()) {
+      std::string dir = mtp == "own" ? "" : mtp;
+      if (dir.empty() && mtp != "own") {
         const std::string parent = path.substr(0, path.find_last_of('/'));
         for (const std::string& n : entries(parent))
           if ((contains(n, "MTP") || contains(n, "mtp")) &&
@@ -946,6 +953,11 @@ Footprint footprint_local(const std::string& path0, const std::string& mmproj, c
         f.weights += bytes;
         f.has_mtp = bytes > 0;
         f.what += ", MTP drafter " + dir.substr(dir.find_last_of('/') + 1);
+      } else if (q4_own_mtp > 0) {
+        f.mtp += q4_own_mtp;
+        f.weights += q4_own_mtp;
+        f.has_mtp = true;
+        f.what += ", own MTP head";
       }
     } else if (!mtp.empty() && mtp != "none") {
       // --mtp PATH: an MTP head from a GGUF file or an MLX directory.

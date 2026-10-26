@@ -595,8 +595,9 @@ inline std::string find_mmproj(const std::string& gguf_path) {
 namespace espetero::native {
 
 // Qwen4-Exp checkpoints (qwen4_load.h).
-inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision);
+inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head = false);
 inline void load_q4_mtp(Model& m, const std::string& dir);
+inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src);
 inline void load_q4_gguf(Model& m, const GGUFSource& src);
 
 // A Qwen4-Exp MTP drafter directory (config model_type qwen4_exp_mtp, e.g.
@@ -748,13 +749,17 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   m.format = "mlx";
   m.cfg = config_from_mlx(src.config());
   if (m.cfg.q4) {
-    load_q4(m, src, want_vision);
-    // MTP: a drafter directory (--mtp PATH, or by default a directory
-    // beside the model whose config says qwen4_exp_mtp, e.g.
-    // Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16); the file's own mtp.* head
-    // (4-bit experts, reported to accept 0-4 % of drafts) is not loaded.
-    const std::string dir = mtp.empty() ? find_q4_drafter(path) : mtp;
-    if (!dir.empty() && dir != "none") load_q4_mtp(m, dir);
+    // MTP: --mtp PATH, a drafter directory such as
+    // Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16; --mtp own, the file's own
+    // mtp.* head (the oQ4e file carries one, 4-bit); by default a drafter
+    // directory beside the model whose config says qwen4_exp_mtp, else the
+    // file's own head when it has one.
+    const std::string dir = mtp == "own" ? "" : mtp.empty() ? find_q4_drafter(path) : mtp;
+    const bool own = mtp == "own" || (mtp.empty() && dir.empty() && src.has("mtp.fc_embedding.weight"));
+    const bool drafting = own || (!dir.empty() && dir != "none");
+    load_q4(m, src, want_vision, drafting && (m.mtp.head4 || m.mtp.coarse_c > 0));
+    if (own) load_q4_mtp_own(m, src);
+    else if (drafting) load_q4_mtp(m, dir);
     return;
   }
   const bool own = mtp.empty() && src.has("language_model.mtp.fc.weight");

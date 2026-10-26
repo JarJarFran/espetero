@@ -588,6 +588,9 @@ void Engine::calibrate_drafts() {
   D.draft = draft[std::min(opt_.draft_tokens, kmax)], D.n_draft = 2;
   if (I.commit && commit < 1e30) D.commit = commit, D.n_commit = 2;
   D.calibrated = true;
+  // The pass-cost table by rows: the plain step (1 row) and the verify passes (their root rows + k leaves).
+  learn_pass_cost(1, plain);
+  for (int k = 1; k <= kmax; ++k) learn_pass_cost((I.commit ? 1 : std::max(1, std::min(3, 8 - k))) + k, verify[k]);
   std::string line;
   for (int k = 1; k <= kmax; ++k) {
     char b[48];
@@ -2323,6 +2326,47 @@ int Engine::choose_depth(const Seq& s, int budget) const {
   return bk;
 }
 
+static inline void ewma(double& v, int& n, double x);
+
+double Engine::pass_cost(int rows) const {
+  const DraftCost& D = dcost_;
+  const int r = std::clamp(rows, 1, DraftCost::kRowBins);
+  if (D.rows_n[r] > 0) return D.rows_ms[r];
+  int lo = 0, hi = 0;
+  for (int i = r - 1; i >= 1 && !lo; --i)
+    if (D.rows_n[i] > 0) lo = i;
+  for (int i = r + 1; i <= DraftCost::kRowBins && !hi; ++i)
+    if (D.rows_n[i] > 0) hi = i;
+  if (lo && hi) return D.rows_ms[lo] + (D.rows_ms[hi] - D.rows_ms[lo]) * double(r - lo) / double(hi - lo);
+  if (!lo) return hi ? D.rows_ms[hi] * double(r) / double(hi) : 0.0;
+  // Beyond the measured rows: the slope of the two highest measured bins, else half the mean cost per row
+  // (optimistic on purpose: a pass at the new size is then tried once and measured).
+  int lo2 = 0;
+  for (int i = lo - 1; i >= 1 && !lo2; --i)
+    if (D.rows_n[i] > 0) lo2 = i;
+  const double slope = lo2 ? std::max(0.0, (D.rows_ms[lo] - D.rows_ms[lo2]) / double(lo - lo2)) : 0.5 * D.rows_ms[lo] / double(lo);
+  return D.rows_ms[lo] + slope * double(r - lo);
+}
+
+void Engine::learn_pass_cost(int rows, double ms) {
+  if (rows < 1 || ms <= 0) return;
+  const int r = std::min(rows, DraftCost::kRowBins);
+  ewma(dcost_.rows_ms[r], dcost_.rows_n[r], ms);
+}
+
+// Prompt rows per pass beside decoding sequences: about prefill_slice_ms of
+// GPU time at the measured prefill rate (every decoding sequence waits for the
+// chunk), between 64 rows and prefill_chunk; 512 until a rate is measured. A
+// model whose passes read their experts once (DeepSeek-V4.1) takes the whole
+// prompt: chunks would read them per chunk.
+int Engine::prefill_chunk_rows() const {
+  const ModelInfo& I = model_->info();
+  if (!I.chunk_prefill) return std::max(I.max_rows, opt_.prefill_chunk);
+  if (opt_.prefill_slice_ms <= 0) return opt_.prefill_chunk;
+  if (dcost_.prefill_rate <= 0) return std::min(opt_.prefill_chunk, 512);
+  return std::clamp(int(dcost_.prefill_rate * double(opt_.prefill_slice_ms)), std::min(64, opt_.prefill_chunk), opt_.prefill_chunk);
+}
+
 // Consecutive losses after which the MTP head stops for the request.
 constexpr int kMtpGiveUp = 4;
 // Passes a decision job waits for the rows decoding sequences leave
@@ -2874,7 +2918,31 @@ void Engine::step() {
     std::vector<Seq*> who;
     std::vector<std::vector<int32_t>> outs, outs2;
     const bool adapt = opt_.adaptive_drafts && decoding.size() == 1 && jobs.empty() && prefilling.empty();
-    for (Seq* s : decoding) {
+    // Several decoding sequences: a draft adds rows to a pass every one of them
+    // waits for, so it is taken only when the pass's expected tokens per ms
+    // improve by 5 % at the pass's size: (T + e) / (C(R + k) + D) against T / C(R),
+    // C the measured cost by rows (pass_cost), e the drafts expected to be
+    // accepted, D the draft pass (the first drafter pays it, the others half).
+    // Sizes not measured yet fall back to drafting for up to two sequences (the
+    // pass then measures them). The sequence that chooses first rotates. (M4 Max,
+    // 2026-10-26: at 2 users the 27B with its MTP head 64 -> 86-93 tokens/s in
+    // all against both drafting unchecked; on Flash-Next both drafting is right,
+    // +12-20 % over one, and a 15 % margin blocked the second drafter: the margin
+    // stays at 5 % and spec_max_seqs at 4, where the estimates rest on measured
+    // sizes; at 8 users the 27B lost 2.6 % with it.)
+    constexpr double kBatchMargin = 1.05;
+    const bool multi = decoding.size() >= 2;
+    int rows_pass = 0;
+    double tok_pass = 0;
+    for (Seq* q : decoding) rows_pass += int(q->pending.size()), tok_pass += 1.0;
+    bool first_drafter = true;
+    auto take = [&](int k, double e) {
+      rows_pass += k, tok_pass += e;
+      first_drafter = false;
+    };
+    const size_t rot = multi ? size_t(passes_ % uint64_t(decoding.size())) : 0;
+    for (size_t di = 0; di < decoding.size(); ++di) {
+      Seq* s = decoding[(di + rot) % decoding.size()];
       s->drafts.clear();
       s->drafts2.clear();
       s->sib = 0;
@@ -2885,6 +2953,7 @@ void Engine::step() {
         const int n = int(s->req.forced.size()), g0 = s->generated;
         const int k = std::max(0, std::min(8 - int(s->pending.size()), n - g0));
         for (int j = 0; j < k; ++j) s->drafts.push_back(s->req.forced[size_t(g0 + j)]);
+        rows_pass += k;
         continue;
       }
       if (!speculate || !s->req.speculate) continue;
@@ -2898,17 +2967,46 @@ void Engine::step() {
       const int room = std::min(s->req.max_tokens - s->generated - 1, ctx_room - 1);
       const int budget = std::min(room, 8 - int(s->pending.size()));
       if (budget <= 0) continue;
+      const double c0 = multi ? pass_cost(rows_pass) : 0.0;  // this pass's cost without the draft (0: not measured)
       if (opt_.prompt_lookup && !(adapt && s->skip_look > 0)) {
         std::vector<int32_t> look = s->ngram.lookup(budget, opt_.lookup_min);
         if (!look.empty()) {
-          s->drafts = std::move(look);
-          s->from_lookup = true;
-          ++s->lookups;
-          continue;
+          bool ok = true;
+          const int lk = int(look.size());
+          const double e = s->n_look >= 1 ? std::min(double(lk), s->acc_look) : 0.5 * double(lk);
+          if (multi) {
+            const double c1 = pass_cost(rows_pass + lk);
+            ok = c0 <= 0 ? decoding.size() <= 2 : (tok_pass + e) / c1 >= kBatchMargin * tok_pass / c0;
+          }
+          if (ok) {
+            if (multi) take(lk, e);
+            s->drafts = std::move(look);
+            s->from_lookup = true;
+            ++s->lookups;
+            continue;
+          }
         }
       }
       if (s->mtp && model_->slot_mtp(s->work) && !(adapt && (s->skip_mtp > 0 || s->mtp_lost_run >= kMtpGiveUp))) {
-        const int k = (opt_.draft_auto && adapt) ? choose_depth(*s, budget) : std::min(opt_.draft_tokens, budget);
+        int k = (opt_.draft_auto && adapt) ? choose_depth(*s, budget) : std::min(opt_.draft_tokens, budget);
+        if (multi) {
+          if (c0 <= 0) {
+            if (decoding.size() > 2) k = 0;
+          } else {
+            // the depth with the most expected tokens per ms at this pass's size, if it beats no drafts
+            const int kmax = std::min({budget, opt_.draft_auto ? opt_.draft_max : opt_.draft_tokens, 7});
+            double best = 0;
+            int bk = 0;
+            for (int kk = 1; kk <= kmax; ++kk) {
+              const double e = mtp_expect(*s, kk) - 1.0;
+              const double dk = (dcost_.n_draftk[kk] ? dcost_.draftk[kk] : dcost_.draft) * (first_drafter ? 1.0 : 0.5);
+              const double v = (tok_pass + e) / (pass_cost(rows_pass + kk) + dk);
+              if (v > best) best = v, bk = kk;
+            }
+            k = best >= kBatchMargin * tok_pass / c0 ? bk : 0;
+          }
+          if (k > 0) take(k, mtp_expect(*s, k) - 1.0);
+        }
         if (k <= 0) continue;
         who.push_back(s);
         outs.emplace_back(size_t(k));
@@ -3392,6 +3490,9 @@ void Engine::step() {
   };
   for (Seq* s : prefilling) {
     if (opt_.decode_first) {
+      // (A wait between a prompt's chunks proportional to the previous chunk's pass, instead of this fixed one,
+      // measured no difference with 500 ms slices on the 27B: the slices shift GPU time from the prompt to the
+      // decoders, they do not lose it.)
       if (!decoding.empty() && ms_since(s->t_wait) < double(opt_.prefill_wait_ms)) continue;
       if (prefill_rows >= opt_.prefill_batch_rows) break;
     }
@@ -3423,7 +3524,7 @@ void Engine::step() {
     }
     const int total = int(s->req.prompt.size());
     int budget = max_rows - rows;
-    if (!decoding.empty() || !jobs.empty()) budget = std::min(budget, opt_.prefill_chunk);
+    if (!decoding.empty() || !jobs.empty()) budget = std::min(budget, prefill_chunk_rows());
     if (budget <= 0 || readouts + 1 > max_readouts) break;
     int end = std::min(total, s->done + budget);
     // Chunks never split an image run: a chunk that would cut one ends before
@@ -3811,6 +3912,9 @@ void Engine::step() {
   }
   rows_ += uint64_t(st.rows);
   gpu_ms_ = gpu_ms_ + st.gpu_ms;
+  // The pass's cost by rows (decode passes) and the prefill rate (passes with a prompt chunk).
+  if (prefill_rows == 0 && jobs.empty() && st.rows > 0) learn_pass_cost(st.rows, st.wall_ms);
+  else if (prefill_rows >= 64 && st.wall_ms > 0) ewma(dcost_.prefill_rate, dcost_.n_prefill_rate, double(prefill_rows) / st.wall_ms);
   for (const std::string& k : reserved_keys) {
     auto it = cache_.find(k);
     if (it != cache_.end()) pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), it->second.slot), pinned_.end());
