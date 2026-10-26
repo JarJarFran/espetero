@@ -84,13 +84,16 @@ struct EngineOptions {
   bool decode_first = true;        // prompts wait (bounded) for decoding sequences; big prompts one per pass
   int prefill_wait_ms = 2500;      // ... longest wait of a prompt chunk while sequences decode
   int prefill_batch_rows = 512;    // ... prompt rows per pass beyond which no further prompt joins
+  int prefill_slice_ms = 500;      // ... a prompt chunk beside decoding sequences is sized to about this long a pass
+                                   //      from the measured prefill rate, up to prefill_chunk (0: always prefill_chunk)
   int draft_tokens = -1;           // MTP drafts per decode pass (0: plain decoding; -1: the model's default,
                                    // else 5; Qwen4-Exp 3)
   int sibling_drafts = 0;          // the MTP head's runner-ups as extra leaves (1: depth 1, 2: depths 1-2; greedy/exact only)
   bool draft_auto = false;         // MTP draft depth per pass from the request's per-depth acceptance and
                                    //      the measured verify/draft costs (single decoding sequence; up to draft_max)
   int draft_max = 7;
-  int spec_max_seqs = 2;           // speculate only while at most this many sequences decode
+  int spec_max_seqs = 8;           // speculate only while at most this many sequences decode (beyond one, a draft
+                                   //      must pay for its verify rows at the pass's size: pass_cost)
   bool prompt_lookup = true;       // n-gram drafts from the context
   int lookup_min = 8;              // ... only copies backed by this many matching tokens
   bool adaptive_drafts = true;     // draft only while it beats plain decoding (single decoding sequence)
@@ -461,6 +464,11 @@ class Engine {
   void loop();
   void warmup();
   void calibrate_drafts();  // draft and verify costs at load
+  // The cost of a decode pass by its rows (an EWMA per row count, seeded by the calibration), interpolated
+  // or extrapolated where unmeasured; 0 when nothing is known yet.
+  double pass_cost(int rows) const;
+  void learn_pass_cost(int rows, double ms);
+  int prefill_chunk_rows() const;  // prompt rows per pass beside decoding sequences
   void step();
   int choose_depth(const Seq& s, int budget) const;
   // A token's raw log-probability and top alternatives at a readout of the last pass.
@@ -631,6 +639,14 @@ class Engine {
     // buffer), an EWMA seeded at load; part of the cost of drafting.
     double commit = 0;
     int n_commit = 0;
+    // Decode passes' wall time by their rows (1..kRowBins; decode-only passes):
+    // what a draft's verify rows cost at the pass's size (pass_cost).
+    static constexpr int kRowBins = 64;
+    double rows_ms[kRowBins + 1] = {};
+    int rows_n[kRowBins + 1] = {};
+    // Prefill rate (rows per ms) of passes carrying prompt chunks, for the adaptive chunk.
+    double prefill_rate = 0;
+    int n_prefill_rate = 0;
   } dcost_;
 };
 
