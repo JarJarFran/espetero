@@ -426,6 +426,16 @@ Rules that keep the tiers honest:
   (the M4 Max read equal): the default kernels keep main's text. The 96
   blocks' GEMVs cost ~1.6 ms of the 15.9 ms step; at 500 GB/s they would
   cost 0.9.
+- **`ESPETERO_PF=1` (the next K step's weights in flight in every GEMV K
+  loop) loses on the M4 Max too** (2026-10-26, three alternating pairs,
+  bit-identical dumps): Flash-Next 1-row step GPU 15.63 / 15.50 / 15.69 →
+  16.02 / 16.12 / 15.89 ms (+2–4 %); the 27B 33.26 / 33.20 / 33.12 → 33.24 /
+  33.05 / 33.20 at 1 row and 79.88 / 79.81 / 79.67 → 79.74 / 79.71 / 79.83 at
+  16 rows (equal). In chain the large GEMVs are unchanged (27B gate_up
+  202.8 → 203.6 µs, Flash-Next in_proj 33.3 → 33.5) and the short-K ones
+  lose (hyper-connection up 6.1–7.6 → 7.2–9.3 µs, the 8-bit down 2560×640
+  6.2 → 10.0): the extra registers cost occupancy where the loop is short.
+  Stays off on both families.
 - **Flash-Next's 0.88 ms of encode per step is a warm-up, not a steady cost**:
   `bench_native --q4` reports 0.82–0.90 ms over its first 128–200 steps and
   0.28 ms (1.7 % of the step) as the median over 1500; a CPU sample of the
