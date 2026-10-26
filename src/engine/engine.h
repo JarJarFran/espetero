@@ -92,8 +92,8 @@ struct EngineOptions {
   bool draft_auto = false;         // MTP draft depth per pass from the request's per-depth acceptance and
                                    //      the measured verify/draft costs (single decoding sequence; up to draft_max)
   int draft_max = 7;
-  int spec_max_seqs = 8;           // speculate only while at most this many sequences decode (beyond one, a draft
-                                   //      must pay for its verify rows at the pass's size: pass_cost)
+  int spec_max_seqs = 4;           // speculate only while at most this many sequences decode (beyond one, a draft
+                                   //      must pay for its verify rows at the pass's size: pass_cost; measured: never at 8)
   bool prompt_lookup = true;       // n-gram drafts from the context
   int lookup_min = 8;              // ... only copies backed by this many matching tokens
   bool adaptive_drafts = true;     // draft only while it beats plain decoding (single decoding sequence)

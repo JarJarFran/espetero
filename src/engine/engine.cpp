@@ -261,6 +261,7 @@ struct Engine::Seq {
   NgramIndex ngram;
   Clock::time_point t_start, t_first, t_decode;
   Clock::time_point t_wait;  // decode-first: since when the prompt's next chunk has been waiting
+  double chunk_ms = 0;       // the pass that ran this prompt's last chunk (decode-first: the next one waits half of it)
   int passes = 0, drafted = 0, accepted = 0, lookups = 0;
   int retries = 0;  // first prompt chunks run again after a GPU abort
   double gpu_ms = 0;
@@ -3487,7 +3488,13 @@ void Engine::step() {
   };
   for (Seq* s : prefilling) {
     if (opt_.decode_first) {
-      if (!decoding.empty() && ms_since(s->t_wait) < double(opt_.prefill_wait_ms)) continue;
+      // The first chunk waits up to prefill_wait_ms for the decoders to finish; the next ones half of what the
+      // previous chunk's pass took (at least 200 ms), so a prompt keeps about two thirds of the GPU through its
+      // slices and the decoders are never stalled longer than one (with the fixed wait, 24 slices of a 7 K
+      // prompt spent 2.5 s each waiting: its first token came 35 % later than with 2048-row chunks).
+      const double wait = s->passes == 0 ? double(opt_.prefill_wait_ms)
+                                         : std::min(double(opt_.prefill_wait_ms), std::max(200.0, 0.5 * s->chunk_ms));
+      if (!decoding.empty() && ms_since(s->t_wait) < wait) continue;
       if (prefill_rows >= opt_.prefill_batch_rows) break;
     }
     if (s->done == s->cached && s->passes == 0) {
@@ -4213,6 +4220,7 @@ void Engine::step() {
       }
       s->done = s->chunk_end;
       s->t_wait = Clock::now();
+      s->chunk_ms = st.wall_ms;
       if (!s->final_chunk) continue;
       s->phase = Seq::Decode;
       s->t_first = Clock::now();

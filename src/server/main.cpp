@@ -206,7 +206,7 @@ void usage_all() {
                "  --mtp-coarse N        MTP drafts from a 2-bit LM head copy, N column blocks of 32 ids rescored exactly (default 256;\n"
                "                        0: the 4-bit draft head; replaces the 4-bit head unless --mtp-head4 is also given)\n"
                "  --no-mtp-q8           keep a bf16 MTP layer in bf16 (default: 8-bit copies; drafts only, verification unchanged)\n"
-               "  --spec-max-seqs N     speculate only up to N decoding sequences (default 8; beyond one, a draft must pay for\n"
+               "  --spec-max-seqs N     speculate only up to N decoding sequences (default 4; beyond one, a draft must pay for\n"
                "                        its verify rows at the pass's size)\n"
                "  --no-lookup           disable prompt-lookup drafts\n"
                "  --lookup-min N        a prompt-lookup copy needs N matching tokens (default 8; 3: any 3-gram)\n"
@@ -553,7 +553,7 @@ EngineOptions engine_options(const Args& a) {
   o.sibling_drafts = a.i("siblings", 0);
   o.draft_auto = a.has("draft-auto");
   o.draft_max = a.i("draft-max", 7);
-  o.spec_max_seqs = a.i("spec-max-seqs", 8);
+  o.spec_max_seqs = a.i("spec-max-seqs", 4);
   o.prompt_lookup = !a.has("no-lookup");
   o.lookup_min = a.i("lookup-min", 8);
   o.adaptive_drafts = !a.has("no-adaptive-drafts");
