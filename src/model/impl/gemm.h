@@ -63,6 +63,10 @@ struct Tuner {
   bool gemv = true;        // decode-sized rows use rgemv ("gemv": 0 disables)
   bool gemv8 = true;       // 3..8 rows use the MMA GEMV ("gemv8": 0 disables)
   int gemv_max_m = 2;      // rows served by the FMA GEMV (1..kGemvInstM; ESPETERO_GEMV_MAXM)
+  // Fase 3 measured and removed: the dense residual GEMV's fused-norm finalizer as its own
+  // dispatch (gemv_fin 2: EPI_ADDS + norm_fin) was neutral to slower on the M4 Max (14.8 -> 15.9 us
+  // per out projection in chain); its branches left the default rgemv template (Fase 2's lesson:
+  // templating the default kernel changes its code; the M1 Max 27B 1-row step read +1 %).
   // GEMMs above the tuned range (prefill chunks of 2048-4096 rows against
   // tune_max_m = 1024) take the top bucket's tile without its K split, so the
   // summation order stays config 2's ("tune_clamp": 0 = config 2 as before).
@@ -186,6 +190,30 @@ struct SplitOut {
 
 // True when a GEMM of M rows runs as a GEMV kernel (fusion is possible).
 inline bool gemv_path(const Tuner& T, int M) { return (M <= T.gemv_max_m && T.gemv) || (M <= 8 && T.gemv && T.gemv8); }
+
+struct NormFinParamsHost {
+  int32_t P, part_ld, D;
+  float eps;
+  int32_t mode;
+};
+
+// Fase 3: the fused RMSNorm's finalizer as its own dispatch (one threadgroup
+// per row): sums the producer's P block partials in its order (mode 0: serial,
+// moe_down_comb's; 1: lane-strided + simd_sum, rgemv EPI_ADDP's) and writes the
+// normalized fp16 rows. h: the residual rows (stride D floats), M rows.
+inline void norm_fin_encode(Enc& E, const NormLink& nl, id<MTLBuffer> h, size_t hoff, int M, int mode) {
+  const NormFinParamsHost np{nl.P, nl.ld, nl.D, nl.eps, mode};
+  E.pipe("norm_fin");
+  E.set(0, h, hoff);
+  E.set(1, nl.parts);
+  E.set(2, nl.w);
+  E.set(3, nl.xn);
+  E.bytes(4, np);
+  E.rd(h, hoff, hoff + size_t(M) * size_t(nl.D) * 4);
+  E.rd(nl.parts.b, nl.parts.off, nl.parts.off + size_t(M) * size_t(nl.ld) * 4);
+  E.wr(nl.xn.b, nl.xn.off, nl.xn.off + size_t(M) * size_t(nl.D) * 2);
+  E.groups(MTLSizeMake(size_t(M), 1, 1), MTLSizeMake(256, 1, 1));
+}
 
 // epi: 0 store fp32, 1 accumulate fp32, 2 SwiGLU -> fp16. n_cols > 0 (GEMV
 // only): compute just the first ~n_cols outputs (a vocabulary prefix).

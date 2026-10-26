@@ -1049,6 +1049,11 @@ struct MoeGemmParams {
   // are ready, 2 only those of experts still being read (flag != 0 in the
   // per-expert flags at buffer 15); 0: every tile.
   int split;
+  // Fase 3 (option moe_fma_mix, passes of 3-16 rows): tiles of at most this
+  // many rows run on the FMA kernel (moe_gemv, MM 2) and the MMA kernels skip
+  // them; 0: every tile on the pass's own kernel. Those rows' sums are the
+  // FMA kernel's (as on 1-2-row passes), not the MMA tile's.
+  int fma_rows;
 };
 
 // Grouped expert GEMM: one tile (expert, <= BM sorted rows) x 32 of the
@@ -1088,6 +1093,7 @@ kernel void moe_gemv8(
   const int4 ti = tiles[tgid.x];
   const int e = ti.x, r0 = ti.y, rows = ti.z;
   if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  if (p.fma_rows > 0 && rows <= p.fma_rows) return;  // the FMA kernel's tiles (moe_fma_mix)
   const int nloc = int(tgid.y) * 32;
   if (nloc >= p.Ne) return;
   const bool sh = e == p.shared_e;  // uniform per threadgroup
@@ -1221,6 +1227,7 @@ kernel void moe_gemm_bm(
   const int4 ti = tiles[tgid.x];
   const int e = ti.x, r0 = ti.y, rows = ti.z;
   if (p.split && (loading[e] != 0) != (p.split == 2)) return;
+  if (p.fma_rows > 0 && rows <= p.fma_rows) return;  // the FMA kernel's tiles (moe_fma_mix)
   const int nloc = int(tgid.y) * 32;
   if (nloc >= p.Ne) return;
   constexpr int FM = BM / 8;           // row fragments of the tile
@@ -1403,7 +1410,11 @@ INSTANTIATE_MOE_BM("moe_gemm32r8", 8, 32)
 // fm k rows; the caller reduces across lanes and simdgroups. Templated on
 // the bit width so a threadgroup of the shared expert (tile k) can stream an
 // 8-bit matrix beside 4/5/6-bit routed experts (oQ4e-style files).
-template <int BITSX, int MM, int KS>
+// PF (Fase 3): the next K step's weight words requested before this step's
+// FMAs (two steps' loads in flight per simdgroup); the per-lane sums are the
+// same in the same order. 0 by default (ESPETERO_PF: the compile-time switch
+// for every kernel); the `_pf` instantiations set 1 (option moe_pf).
+template <int BITSX, int MM, int KS, int PF = ESPETERO_PF>
 static inline void moe_kloop(device const uint* Wr, device const half4* SB, device const uint* Wh, int nb, int KGall,
                              int g_begin, int g_end, int Np2, int n0, int rows, device const half* arow0,
                              device const half* arow1, ushort lane, short fm, short fn, thread float* acc) {
@@ -1414,11 +1425,11 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   device const half* arow[2] = {arow0, arow1};
   uint words[4 * WPL], hw[4] = {0u, 0u, 0u, 0u};
-  if (ESPETERO_PF && g_begin < g_end) load_kstep<BITSX, WPL>(wp, hp, g_begin, words, hw);
+  if (PF && g_begin < g_end) load_kstep<BITSX, WPL>(wp, hp, g_begin, words, hw);
   for (int g = g_begin; g < g_end; ++g) {
     uint wnext[4 * WPL], hnext[4] = {0u, 0u, 0u, 0u};
-    if (!ESPETERO_PF) load_kstep<BITSX, WPL>(wp, hp, g, words, hw);
-    if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITSX, WPL>(wp, hp, g + 1, wnext, hnext);
+    if (!PF) load_kstep<BITSX, WPL>(wp, hp, g, words, hw);
+    if (PF && g + 1 < g_end) load_kstep<BITSX, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
     kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
     float xv[MM][8];
@@ -1448,14 +1459,14 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
         }
       }
     }
-    if (ESPETERO_PF) {
+    if (PF) {
       UNROLL for (int i = 0; i < 4 * WPL; ++i) words[i] = wnext[i];
       UNROLL for (int i = 0; i < 4; ++i) hw[i] = hnext[i];
     }
   }
 }
 
-template <int BITS, int MM, int EPI, int KS, int DIAG, int BITS2>
+template <int BITS, int MM, int EPI, int KS, int DIAG, int BITS2, int PF = 0>
 kernel void moe_gemv(
     device const half* A [[buffer(0)]],
     device const uint* Wr [[buffer(1)]],
@@ -1528,6 +1539,7 @@ kernel void moe_gemv(
     const int4 ti = tiles[tix];
     if (!p.direct && tix >= ntiles[0]) return;
     e = ti.x, r0 = ti.y, rows = ti.z;
+    if (p.fma_rows > 0 && rows > p.fma_rows) return;  // the MMA kernel's tiles (moe_fma_mix)
   }
   const bool sh = e == p.shared_e;  // uniform per threadgroup
   const int KGall = p.K / 64;
@@ -1555,9 +1567,9 @@ kernel void moe_gemv(
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
   if (sh)
-    moe_kloop<BITS2, MM, KS>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
+    moe_kloop<BITS2, MM, KS, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
   else
-    moe_kloop<BITS, MM, KS>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
+    moe_kloop<BITS, MM, KS, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
   // Sum the 8 lanes that hold different k rows (fm: lane bits 1, 2 and 4).
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) {
@@ -1648,6 +1660,46 @@ INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv6_", 6)
+// Fase 3 (option moe_pf): the single-row kernels with two K steps' loads in
+// flight per simdgroup (moe_kloop PF 1): `_pf` after the K-slice suffix.
+#define INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, KS, DIAG, TAG)                                \
+  template [[host_name(PRE "1_store" TAG "_pf")]] kernel void moe_gemv<BITS, 1, 0, KS, DIAG, BITS2, 1>( \
+      device const half*, device const uint*, device const half4*, device const uint*,        \
+      device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
+      device int*, device const uint*, device const half4*, device const uint*,               \
+      device const float*, device int*, device float*, device float*, device int*,           \
+      uint3, uint, uint);                                                                     \
+  template [[host_name(PRE "1_swiglu" TAG "_pf")]] kernel void moe_gemv<BITS, 1, 2, KS, DIAG, BITS2, 1>( \
+      device const half*, device const uint*, device const half4*, device const uint*,        \
+      device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
+      device int*, device const uint*, device const half4*, device const uint*,               \
+      device const float*, device int*, device float*, device float*, device int*,           \
+      uint3, uint, uint);
+#define INSTANTIATE_MOE_GEMV_ROUTE_PF1(PRE, BITS, BITS2, KS, TAG)                                 \
+  template [[host_name(PRE "1_swiglu" TAG "_pf")]] kernel void moe_gemv<BITS, 1, 2, KS, 2, BITS2, 1>( \
+      device const half*, device const uint*, device const half4*, device const uint*,        \
+      device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
+      device int*, device const uint*, device const half4*, device const uint*,               \
+      device const float*, device int*, device float*, device float*, device int*,           \
+      uint3, uint, uint);                                                                     \
+  template [[host_name(PRE "1_swiglu" TAG "_e512_pf")]] kernel void moe_gemv<BITS, 1, 2, KS, 3, BITS2, 1>( \
+      device const half*, device const uint*, device const half4*, device const uint*,        \
+      device void*, constant MoeGemmParams&, device int4*, device const uint*,                \
+      device int*, device const uint*, device const half4*, device const uint*,               \
+      device const float*, device int*, device float*, device float*, device int*,           \
+      uint3, uint, uint);
+#define INSTANTIATE_MOE_GEMV_PF(PRE, BITS, BITS2, S8)                                             \
+  INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, 8, 0, S8) INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, 4, 0, "_k4" S8) \
+  INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, 2, 0, "_k2" S8)                                      \
+  INSTANTIATE_MOE_GEMV_ROUTE_PF1(PRE, BITS, BITS2, 8, "_route" S8) INSTANTIATE_MOE_GEMV_ROUTE_PF1(PRE, BITS, BITS2, 4, "_route_k4" S8) \
+  INSTANTIATE_MOE_GEMV_ROUTE_PF1(PRE, BITS, BITS2, 2, "_route_k2" S8)
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 4, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 5, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv6_", 6, 6, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv8_", 8, 8, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv6_", 6, 8, "_s8")
 
 struct MoeCombineParams {
   int D;
@@ -1762,7 +1814,14 @@ struct MoeDownCombParams {
   float eps;
 };
 
-template <int BITS, int BITS2, int KSX>
+// Fase 3 variants (bit-identical sums): PF 1 runs moe_kloop with two K
+// steps' loads in flight; FIN 1 keeps the in-dispatch finalizer but requests
+// every block partial at once (staged in threadgroup memory, summed in block
+// order) and writes xn four columns per thread; FIN 2 writes the residual
+// and the block partials with plain stores and leaves the norm to a
+// `norm_fin` dispatch (mode 0: the same serial block-order sum). Options
+// moe_pf / moe_fin; the names carry `_pf`, `_f1`, `_f2`.
+template <int BITS, int BITS2, int KSX, int PF = 0, int FIN = 0>
 kernel void moe_down_comb(
     device const half* A [[buffer(0)]],        // act rows [k + 1][Ie], slot order
     device const uint* Wr [[buffer(1)]],
@@ -1823,9 +1882,9 @@ kernel void moe_down_comb(
   float acc[8];
   UNROLL for (int c = 0; c < 8; ++c) acc[c] = 0.0f;
   if (sh)
-    moe_kloop<BITS2, 1, KSX>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
+    moe_kloop<BITS2, 1, KSX, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
   else
-    moe_kloop<BITS, 1, KSX>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
+    moe_kloop<BITS, 1, KSX, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
   UNROLL for (int c = 0; c < 8; ++c) {
     float v = acc[c];
     v += simd_shuffle_xor(v, ushort(2));
@@ -1857,11 +1916,15 @@ kernel void moe_down_comb(
     const float g = 1.0f / (1.0f + exp(-sgl));
     device float* hp = h + nloc + c;
     const float v = *hp + (routed + g * ysh);
-    if (p.norm && ntgs > 1) atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v), memory_order_relaxed);
+    if (p.norm && ntgs > 1 && FIN != 2) atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v), memory_order_relaxed);
     else *hp = v;
     ss = simd_sum(v * v);
   }
   if (!p.norm) return;
+  if (FIN == 2) {  // the block's partial for norm_fin (mode 0), no finalizer here
+    if (tid == 0) parts[tgid] = ss;
+    return;
+  }
   float total = ss;
   if (ntgs > 1) {
     if (tid == 0) atomic_store_explicit((device atomic_uint*)(parts + tgid), as_type<uint>(ss), memory_order_relaxed);
@@ -1871,25 +1934,57 @@ kernel void moe_down_comb(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!last_tg) return;
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
-    total = 0.0f;
-    for (uint b = 0; b < ntgs; ++b)
-      total += as_type<float>(atomic_load_explicit((device atomic_uint*)(parts + b), memory_order_relaxed));
+    if (FIN == 1) {
+      // Every partial requested at once (one per thread; the host keeps
+      // ntgs <= 64), then summed in block order by every thread.
+      threadgroup float stage[64];
+      if (tid < ntgs) stage[tid] = as_type<float>(atomic_load_explicit((device atomic_uint*)(parts + tid), memory_order_relaxed));
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      total = 0.0f;
+      for (uint b = 0; b < ntgs; ++b) total += stage[b];
+    } else {
+      total = 0.0f;
+      for (uint b = 0; b < ntgs; ++b)
+        total += as_type<float>(atomic_load_explicit((device atomic_uint*)(parts + b), memory_order_relaxed));
+    }
     if (tid == 0) atomic_store_explicit(ctr, 0, memory_order_relaxed);
   }
   const float inv = rsqrt(total / float(p.D) + p.eps);
+  if (FIN == 1 && ntgs > 1) {
+    // Four columns per thread per round: the four residual loads and the
+    // weight load in flight together (the same per-column arithmetic).
+    for (int d4 = int(tid); d4 < p.D / 4; d4 += int(ntg)) {
+      device atomic_uint* hr = (device atomic_uint*)(h + d4 * 4);
+      const float4 v = float4(as_type<float>(atomic_load_explicit(hr, memory_order_relaxed)),
+                              as_type<float>(atomic_load_explicit(hr + 1, memory_order_relaxed)),
+                              as_type<float>(atomic_load_explicit(hr + 2, memory_order_relaxed)),
+                              as_type<float>(atomic_load_explicit(hr + 3, memory_order_relaxed)));
+      const float4 w = ((device const float4*)wn)[d4];
+      ((device half4*)xn)[d4] = half4(v * inv * w);
+    }
+    return;
+  }
   for (int d = int(tid); d < p.D; d += int(ntg)) {
     const float v = ntgs > 1 ? as_type<float>(atomic_load_explicit((device atomic_uint*)(h + d), memory_order_relaxed)) : h[d];
     xn[d] = half(v * inv * wn[d]);
   }
 }
 
-#define INSTANTIATE_DOWN_COMB(PRE, BITS, BITS2, KSX)                                               \
-  template [[host_name(PRE)]] kernel void moe_down_comb<BITS, BITS2, KSX>(                        \
+#define INSTANTIATE_DOWN_COMB_V(PRE, BITS, BITS2, KSX, PF, FIN)                                   \
+  template [[host_name(PRE)]] kernel void moe_down_comb<BITS, BITS2, KSX, PF, FIN>(               \
       device const half*, device const uint*, device const half4*, device const uint*,           \
       device float*, constant MoeDownCombParams&, device const int4*, device const float*,       \
       device const float*, device const uint*, device const half4*, device const uint*,          \
       device const float*, device half*, device float*, device atomic_int*, device const int*,   \
       uint, uint, uint, uint, uint, uint);
+// The default kernel (PF 0, FIN 0) and the Fase 3 variants: _pf, _f1, _f2, _pf_f1, _pf_f2.
+#define INSTANTIATE_DOWN_COMB(PRE, BITS, BITS2, KSX)                                               \
+  INSTANTIATE_DOWN_COMB_V(PRE, BITS, BITS2, KSX, 0, 0)                                            \
+  INSTANTIATE_DOWN_COMB_V(PRE "_pf", BITS, BITS2, KSX, 1, 0)                                      \
+  INSTANTIATE_DOWN_COMB_V(PRE "_f1", BITS, BITS2, KSX, 0, 1)                                      \
+  INSTANTIATE_DOWN_COMB_V(PRE "_f2", BITS, BITS2, KSX, 0, 2)                                      \
+  INSTANTIATE_DOWN_COMB_V(PRE "_pf_f1", BITS, BITS2, KSX, 1, 1)                                   \
+  INSTANTIATE_DOWN_COMB_V(PRE "_pf_f2", BITS, BITS2, KSX, 1, 2)
 #define INSTANTIATE_DOWN_COMB_B(BITS)                                                              \
   INSTANTIATE_DOWN_COMB("moe_down_comb" #BITS "_k1", BITS, BITS, 1)                                \
   INSTANTIATE_DOWN_COMB("moe_down_comb" #BITS "_k2", BITS, BITS, 2)

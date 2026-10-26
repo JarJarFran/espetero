@@ -277,6 +277,7 @@ struct MoeGemmParams {
   int32_t Ne, N, K, lda, ldy, gather, shared_e, N2, direct, nbpt, swap, route_nsl, route_E, route_k, route_sync, route_shared;
   int32_t st_first = 0, st_count = 0, st_words = 0, st_half4 = 0;  // staged experts in records (moe_gemv8 only)
   int32_t split = 0;  // split pass, moe_gemv8 only: 1 the ready experts' tiles, 2 those of experts being read (m.xld)
+  int32_t fma_rows = 0;  // moe_fma_mix: tiles of at most this many rows on the FMA kernel, the others on the MMA one
 };
 struct MoeCombineParams {
   int32_t D, k, norm;
@@ -429,6 +430,17 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
     for (int ks : {8, 4, 2}) out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks) + "_e512", gu.fc()});
   if (sdn)
     for (int kk : {1, 2}) out.push_back({moe_down_comb_name(dn, *sdn, kk), dn.fc()});
+  // Fase 3 variants in use (moe_pf, moe_fin): the single-row kernels' `_pf` and the finalizer modes.
+  if (m.moe_pf) {
+    for (int ks : {8, 4, 2}) {
+      out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, false, ks) + "_pf", gu.fc()});
+      out.push_back({moe_gemv_name(dn, sdn, true, 1, 0, false, ks) + "_pf", dn.fc()});
+      out.push_back({moe_gemv_name(gu, sgu, true, 1, 2, true, ks) + (m.cfg.E > 256 ? "_e512" : "") + "_pf", gu.fc()});
+    }
+  }
+  if (sdn && (m.moe_pf || m.moe_fin))
+    for (int kk : {1, 2})
+      out.push_back({moe_down_comb_name(dn, *sdn, kk) + (m.moe_pf ? "_pf" : "") + (m.moe_fin ? "_f" + std::to_string(m.moe_fin) : ""), dn.fc()});
 }
 
 // The MoE MLP of `rows` rows: X (half, post-norm) in, H (fp32 residual)
@@ -448,7 +460,10 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // Same bits on every path; or an 8-bit shared expert beside 4/5/6-bit
   // routed experts on the 1-2-row FMA kernels (oQ4e-style files).
   const int tile_kind = moe_shared_tile_kind(c, L);
-  const bool shared_tiles = m.fuse_shared && rows <= 8 &&
+  // fuse_shared_rows (Fase 3, decision candidate above 8 rows): at 9-16 rows the shared
+  // expert's own rgemm GEMMs run 16 unsplit threadgroups (41 us per layer for 2.4 MB on the
+  // M4 Max); as two 8-row tiles of the grouped MMA kernel its sums take that kernel's order.
+  const bool shared_tiles = m.fuse_shared && rows <= std::max(8, m.fuse_shared_rows) && rows <= 16 &&
                             (tile_kind == 1 || (tile_kind == 2 && m.moe_fma && rows <= m.moe_fma_rows));
   if (!shared_tiles) {
     shared_mlp_in(m, E, L, X, act, rows);
@@ -725,6 +740,20 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   E.wr(z.slotpos);
   E.groups(MTLSizeMake(1, 1, 1), MTLSizeMake(1024, 1, 1));
   }
+  // Profiling: the expert tiles the pass's grouped GEMVs run (the sort's
+  // indirect arguments, complete here: every profiled dispatch is waited for),
+  // summed under the labels "moe_tiles_gu" / "moe_tiles_down" (the profile's
+  // ms field holds the count; a 1-row pass runs k + shared tiles directly).
+  if (E.rt.profile && (m.moe_stages & 1)) {
+    if (rows == 1) {
+      E.rt.prof["moe_tiles_gu"].first += double(c.k + shared_flag);
+      E.rt.prof["moe_tiles_down"].first += double(c.k + shared_flag);
+    } else {
+      const uint32_t* nt = static_cast<const uint32_t*>([z.ntiles contents]);
+      E.rt.prof["moe_tiles_gu"].first += double(nt[0]);
+      E.rt.prof["moe_tiles_down"].first += double(nt[3]);
+    }
+  }
   // ESPETERO_MOE_CHECK=1: check the tile table of long pooled passes; =2: and stop there (stall diagnostic).
   static const int moe_check = [] {
     const char* v = std::getenv("ESPETERO_MOE_CHECK");
@@ -732,17 +761,26 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   }();
   if (moe_check && pooled && rows > 8 && (m.moe_stages & 1))
     moe_check_tiles(m, E, z, PV, int(&L - m.layers.data()), Eeff, rows, shared_flag, moe_check, bm);
+  // moe_fma_mix (Fase 3, candidate for a decision: not output-preserving at
+  // these row counts): on passes of moe_fma_rows + 1 .. moe_fma_mix_rows rows
+  // the tiles with at most 2 rows (nearly all of a 16-row step's: ~0.5 rows
+  // per routed expert) run on the 2-row FMA kernel, the rest on the MMA one,
+  // two dispatches over the same tile table (each skips the other's tiles).
+  const bool fma_mix = m.moe_fma_mix && m.moe_fma && rows > m.moe_fma_rows && rows <= m.moe_fma_mix_rows && !pooled &&
+                       bm_nopool == 8;
   auto grouped = [&](const QW& w, const QW* w2, id<MTLBuffer> A, int lda, int gather, id<MTLBuffer> Y, int ldy, int Ne,
-                     int epi, int part, int split = 0) {  // part: 0 gate/up, 1 down (the staged records' halves); split: the split pass
+                     int epi, int part, int split = 0, int mix = 0) {  // part: 0 gate/up, 1 down (the staged records' halves); split: the split pass; mix: 1 the FMA half, 2 the MMA half
     // 1-2 rows: the FMA kernel (no MMA padding); 3-8 rows: the MMA kernel.
-    const bool fma_path = m.moe_fma && rows <= m.moe_fma_rows;  // 1-2 rows by default; up to 4
+    const bool fma_path = mix == 1 || (mix == 0 && m.moe_fma && rows <= m.moe_fma_rows);  // 1-2 rows by default; up to 4
+    const int mm_rows = mix == 1 ? 2 : rows;  // rows per tile the FMA kernel is instantiated for
     const bool staged = PV && PV->st_count > 0;
     if (staged && fma_path) fail("expert cache: staged experts need the 8-row MoE kernel");
     const int ks_opt = epi == 2 ? m.moe_ks : m.moe_ks_dn;
-    const int ks = fma_path ? (ks_opt == 4 || (ks_opt == 2 && rows <= 2) ? ks_opt : 8) : 8;  // no k2 variants above 2 rows
+    const int ks = fma_path ? (ks_opt == 4 || (ks_opt == 2 && mm_rows <= 2) ? ks_opt : 8) : 8;  // no k2 variants above 2 rows
     const bool route_name = route_in_gemv && epi == 2 && fma_path && rows == 1 && m.moe_direct;
-    const std::string name = moe_gemv_name(w, w2, fma_path, rows, epi, route_name, ks, bm) +
-                             (route_name && route_e512 ? "_e512" : "");  // routes of 257-512 experts (Qwen4-Exp)
+    const std::string name = moe_gemv_name(w, w2, fma_path, mm_rows, epi, route_name, ks, bm) +
+                             (route_name && route_e512 ? "_e512" : "") +  // routes of 257-512 experts (Qwen4-Exp)
+                             (fma_path && rows == 1 && m.moe_pf ? "_pf" : "");  // Fase 3: two K steps in flight
     if (env_on("ESPETERO_MOE_LOG"))
       std::fprintf(stderr, "moe: layer %d %s (w %d/%d bits fc %x, w2 %d bits, shared_tiles %d)\n", int(&L - m.layers.data()),
                    name.c_str(), w.bits, w.src_bits, w.fc(), w2 ? w2->bits : -1, shared_tiles ? 1 : 0);
@@ -762,6 +800,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
       gp.st_half4 = int(PV->st_stride / 8);
     }
     gp.split = split;
+    gp.fma_rows = mix ? 2 : 0;
     E.set(0, A);
     E.set(1, w.wr);
     E.set(2, w.sb);
@@ -841,7 +880,14 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
       m.xdefer.clear();
       E.barrier();
     }
-    if (m.moe_stages & 2) grouped(*xgu, shared_tiles ? &L.gate_up.q : nullptr, X, c.D, 1, z.act, c.Ie, 2 * c.Ie, 2, 0);
+    if (m.moe_stages & 2) {
+      if (fma_mix) {
+        grouped(*xgu, shared_tiles ? &L.gate_up.q : nullptr, X, c.D, 1, z.act, c.Ie, 2 * c.Ie, 2, 0, 0, 1);
+        grouped(*xgu, shared_tiles ? &L.gate_up.q : nullptr, X, c.D, 1, z.act, c.Ie, 2 * c.Ie, 2, 0, 0, 2);
+      } else {
+        grouped(*xgu, shared_tiles ? &L.gate_up.q : nullptr, X, c.D, 1, z.act, c.Ie, 2 * c.Ie, 2, 0);
+      }
+    }
   }
   // Single-row passes: the down projection and the combine in one kernel.
   const int comb_ks = m.moe_comb_ks == 1 ? 1 : 2;
@@ -852,7 +898,9 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   if (down_comb) {
     const QW& w = *xdn;
     const QW& w2 = L.down.q;
-    const std::string name = moe_down_comb_name(w, w2, comb_ks);
+    // Fase 3 variants: `_pf` (two K steps in flight), `_f1` / `_f2` (the finalizer staged / as a norm_fin dispatch).
+    const int fin = nout ? m.moe_fin : 0;
+    const std::string name = moe_down_comb_name(w, w2, comb_ks) + (m.moe_pf ? "_pf" : "") + (fin ? "_f" + std::to_string(fin) : "");
     E.pipe(name, w.fc());
     gemm_tag(E, name, c.D, c.Ie, rows);
     const MoeDownCombParams dp{c.D, w.out, w2.out, c.Ie, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f};
@@ -883,11 +931,25 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     E.wr(z.cparts);
     E.rd(z.cctr);
     E.wr(z.cctr);
-    if (nout) E.wr(nout->xn.b, nout->xn.off, nout->xn.off + size_t(c.D) * 2);
+    if (nout && fin != 2) E.wr(nout->xn.b, nout->xn.off, nout->xn.off + size_t(c.D) * 2);
     E.groups(MTLSizeMake(size_t(c.D / 32), 1, 1), MTLSizeMake(size_t((c.k + 1) * comb_ks * 32), 1, 1));
+    if (fin == 2) {  // the finalizer as its own dispatch: the block partials (z.cparts) summed in block order
+      NormLink nl = *nout;
+      nl.parts = Buf(z.cparts, 0);
+      nl.ld = 64;
+      nl.P = c.D / 32;
+      norm_fin_encode(E, nl, H, h_off, 1, 0);
+    }
     return;
   }
-  if (m.moe_stages & 4) grouped(*xdn, shared_tiles ? &L.down.q : nullptr, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, 1, split ? 2 : 0);
+  if (m.moe_stages & 4) {
+    if (fma_mix && !split) {
+      grouped(*xdn, shared_tiles ? &L.down.q : nullptr, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, 1, 0, 1);
+      grouped(*xdn, shared_tiles ? &L.down.q : nullptr, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, 1, 0, 2);
+    } else {
+      grouped(*xdn, shared_tiles ? &L.down.q : nullptr, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, 1, split ? 2 : 0);
+    }
+  }
   if (!(m.moe_stages & 8)) return;
   // Column slices of 512 (128 threads x float4): several threadgroups per row.
   const int slice = 512;

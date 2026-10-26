@@ -92,8 +92,9 @@ int main(int argc, char** argv) {
   o.kv_gb = std::max(4.0, (long_seqs + 1.0) * max_ctx * 72e3 / 1e9);
   auto m = NativeModel::load(argv[1], o);
   const ModelInfo& I = m->info();
-  std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)\n", argv[1], I.device.c_str(), I.layers,
-              I.vocab, int(I.mtp), I.load_ms, I.tune_ms);
+  std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)  boundary %.2f us (family %d%s)\n", argv[1],
+              I.device.c_str(), I.layers, I.vocab, int(I.mtp), I.load_ms, I.tune_ms, I.boundary_us, I.gpu_family,
+              I.devprof_measured ? ", measured" : ", cached");
   if (load_only) return 0;
   if (q4_steps > 0) {
     // Qwen4-Exp decode with streamed experts: random tokens, so routing
@@ -729,10 +730,16 @@ int main(int argc, char** argv) {
   }
 
   // ---- single-sequence decode (plain)
+  // false: the model has fewer free slots than sequences (the row is skipped: the gap
+  // bench and everything after it used to die on slot_free(-1) at the 64-sequence row).
   auto decode_run = [&](int nseq, int steps, double* gpu_per, double* wall_per, double* enc_per, int* disp, int* barr) {
     std::vector<int> slots;
     for (int i = 0; i < nseq; ++i) {
       const int s = m->slot_alloc();
+      if (s < 0) {
+        for (int x : slots) m->slot_free(x);
+        return false;
+      }
       slots.push_back(s);
       auto r = toks(ctx);
       TreeSpec t;
@@ -773,6 +780,7 @@ int main(int argc, char** argv) {
     *disp = st.dispatches;
     *barr = st.barriers;
     for (int s : slots) m->slot_free(s);
+    return true;
   };
   std::printf("\n## decode (context %d, greedy, plain; one forest pass per step for all sequences)\n", ctx);
   std::printf(" seqs  gpu ms/step  wall ms/step  encode ms  dispatches barriers  tokens/s\n");
@@ -780,7 +788,10 @@ int main(int argc, char** argv) {
     if (b > 70) continue;
     double g, w, e;
     int d, br;
-    decode_run(b, quick ? 16 : 48, &g, &w, &e, &d, &br);
+    if (!decode_run(b, quick ? 16 : 48, &g, &w, &e, &d, &br)) {
+      std::printf("%5d  (skipped: needs %d slots, --slots %d)\n", b, b, I.slots);
+      continue;
+    }
     std::printf("%5d %12.2f %13.2f %10.2f %11d %8d %9.0f\n", b, g, w, e, d, br, b / (w / 1000));
   }
 
@@ -794,7 +805,7 @@ int main(int argc, char** argv) {
       m->set_option("barrier_all", md.ball);
       double g, w, e;
       int d, br;
-      decode_run(1, quick ? 16 : 48, &g, &w, &e, &d, &br);
+      if (!decode_run(1, quick ? 16 : 48, &g, &w, &e, &d, &br)) continue;
       std::printf(" %-32s %12.2f %13.2f %9d\n", md.name, g, w, br);
     }
     m->set_option("serial", 1);

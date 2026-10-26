@@ -582,6 +582,23 @@ struct Model : Runtime {
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
+  // Fase 3 (bit-identical variants of the single-row MoE kernels):
+  // moe_fin: moe_down_comb's fused-norm finalizer 0 the last arriver reading the 64 block
+  // partials serially in every thread (main dde1aa1: 64 dependent atomic loads, ~37 us of a
+  // 52 us kernel on the M4 Max), 1 the last arriver with the partials staged at once and xn
+  // written four columns per thread (M4 Max, 35B-A3B 4-bit, 1-row step 7.60-7.66 -> 6.31-6.33 ms
+  // GPU, 127 -> 152 tok/s, 3 alternating pairs against main's binary; logits bit-identical),
+  // 2 a norm_fin dispatch after the kernel (6.31-6.38 ms). moe_pf: the single-row FMA expert
+  // kernels with two K steps' loads in flight (`_pf`; measured neutral: 7.67 vs 7.65 ms).
+  // ESPETERO_MOE_FIN / ESPETERO_MOE_PF, "moe_fin" / "moe_pf".
+  int moe_fin = 1;
+  int moe_pf = 0;
+  // moe_fma_mix (Fase 3, measured slower: M4 Max 16-row step 24.8-25.0 -> 26.6-26.7 ms, +7 %, and
+  // not output-preserving): on MoE passes of moe_fma_rows + 1 .. moe_fma_mix_rows rows, tiles of
+  // at most 2 rows run on the 2-row FMA expert kernel and the MMA kernel skips them.
+  // ESPETERO_MOE_FMA_MIX, "moe_fma_mix". Kept as a diagnostic.
+  bool moe_fma_mix = false;
+  int moe_fma_mix_rows = 16;
   int moe_ks = 4;            // FMA expert GEMV: simdgroups per threadgroup (K slices): 2, 4 or 8 (4 for gate/up)
   bool moe_direct = true;    // single-row passes: direct grids for the expert GEMVs (no indirect arguments)
   int moe_nbpt = 1;          // FMA expert GEMV: 32-column blocks per threadgroup (direct grids only)
@@ -613,6 +630,15 @@ struct Model : Runtime {
   bool fuse_nrm = false;
   int moe_stages = 15;       // diagnostic (bench_json "moe"): MoE layer stages encoded: 1 route, 2 gate/up, 4 down, 8 combine
   bool fuse_shared = true;   // MoE: the shared expert runs as one more tile of the grouped GEMVs
+  // ... on passes of up to this many rows: 16 (Fase 3, Fran's decision 2026-10-26). At 9-16 rows
+  // the shared expert's own rgemm GEMMs ran 16 unsplit threadgroups (41 + 8 us per layer); as two
+  // 8-row tiles of the grouped MMA kernel its sums take that kernel's order, so 9-16-row passes
+  // are not bit-identical to 0.1.2's: M4 Max 16-row step 24.6-24.9 -> 23.2 ms (-6.2 %), and on
+  // real text (tests/batch_kld.mm, 3,072 teacher-forced tokens of 16-row passes) KLD mean 8.1e-4,
+  // median 6.5e-5, top-1 agreement 99.06 %, the same drift as serving a request alone instead of
+  // in a batch of 16 already has (9.2e-4, 99.15 %). 8: 0.1.2's behaviour. ESPETERO_FUSE_SHARED_ROWS,
+  // "fuse_shared_rows".
+  int fuse_shared_rows = 16;
   bool fuse_gdn = true;      // decode passes: conv + gates + recurrence + gated norm in one dispatch per segment set
   // ... also on passes of up to this many rows when every segment is <= 8
   // tokens (batched decode steps, verify passes); 8 = GEMV-sized passes only,

@@ -7,6 +7,7 @@
 
 #include "api.h"
 #include "impl/bench.h"
+#include "impl/devprof.h"
 #include "impl/forest.h"
 #include "impl/load.h"
 #include "impl/qwen4_load.h"
@@ -270,6 +271,12 @@ class MetalModel final : public NativeModel {
     mark("expert cache, sizing");
     make_pools(m, slots, kv_tokens, o.block_tokens);
     mark("slot and KV pools");
+    // Fase 3: the device profile (dispatch-boundary cost, measured once per
+    // GPU and cached) sets its thresholds first; the environment and
+    // set_option override them below.
+    devprof_ = device_profile(m);
+    apply_device_profile(m, devprof_);
+    mark("device profile");
     if (const char* v = std::getenv("ESPETERO_FUSE_NORM")) m.fuse_norm = *v == '1';
     // Draft vocabulary: a prefix of the LM head for MTP drafts; verification reads all of it.
     if (o.mtp_vocab > 0) m.mtp.vocab = o.mtp_vocab;
@@ -293,6 +300,10 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_MOE_FMA")) m.moe_fma = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_COMB_KS")) m.moe_comb_ks = std::atoi(v);
+    if (const char* v = std::getenv("ESPETERO_MOE_FIN")) m.moe_fin = std::max(0, std::min(2, std::atoi(v)));
+    if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX")) m.moe_fma_mix = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX_ROWS")) m.moe_fma_mix_rows = std::max(3, std::atoi(v));
+    if (const char* v = std::getenv("ESPETERO_MOE_PF")) m.moe_pf = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_ROWS")) m.moe_fma_rows = std::max(1, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_GEMV_MAXM")) m.tune.gemv_max_m = std::max(1, std::min(m.fma34 ? 4 : kGemvInstM, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_GEMV_KS")) m.tune.gemv_ks = std::atoi(v) == 16 ? 16 : 8;
@@ -321,6 +332,7 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITK")) m.tune.gemv_splitk = *v == '1';
     if (const char* v = std::getenv("ESPETERO_GEMV_SPLITS")) m.tune.max_splits = std::max(2, std::min(64, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_SHARED")) m.fuse_shared = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_FUSE_SHARED_ROWS")) m.fuse_shared_rows = std::max(1, std::min(16, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN")) m.fuse_gdn = *v == '1';
     if (const char* v = std::getenv("ESPETERO_FUSE_GDN_ROWS")) m.fuse_gdn_rows = std::max(8, std::atoi(v));
     if (const char* v = std::getenv("ESPETERO_FUSE_KVSAVE")) m.fuse_kvsave = *v == '1';
@@ -447,6 +459,9 @@ class MetalModel final : public NativeModel {
     }
     I.extra = d;
     I.tune_ms = m.tune.ms;
+    I.boundary_us = devprof_.boundary_us;
+    I.gpu_family = devprof_.family;
+    I.devprof_measured = devprof_.measured;
     I.load_ms = ms_since(t0);
   }
 
@@ -851,6 +866,8 @@ class MetalModel final : public NativeModel {
     }
   }
 
+  DeviceProfile devprof_;
+
   bool set_option(const std::string& name, int value) override {
     if (name == "serial") m_.serial = value != 0;
     else if (name == "barrier_all") m_.barrier_all = value != 0;
@@ -878,6 +895,10 @@ class MetalModel final : public NativeModel {
     else if (name == "mtp_coarse") m_.mtp.coarse_c = m_.mtp.coarse.out() > 0 ? std::max(0, std::min(256, value)) : 0;
     else if (name == "mtp_head4") m_.mtp.use_head4 = value != 0;
     else if (name == "moe_comb_ks") m_.moe_comb_ks = value;
+    else if (name == "moe_fin") m_.moe_fin = std::max(0, std::min(2, value));
+    else if (name == "moe_fma_mix") m_.moe_fma_mix = value != 0;
+    else if (name == "moe_fma_mix_rows") m_.moe_fma_mix_rows = std::max(3, value);
+    else if (name == "moe_pf") m_.moe_pf = value != 0;
     else if (name == "moe_fma_rows") m_.moe_fma_rows = std::max(1, std::min(2, value));
     else if (name == "moe_gemv_cfg") {  // A/B composites (ab_native): 0 (8 slices, 1 block), 1 (gate/up 4; down 4 x 2), 2 gate/up 4 only, 3 down 4 x 2 only
       m_.moe_ks = (value == 1 || value == 2) ? 4 : 8;
@@ -889,6 +910,7 @@ class MetalModel final : public NativeModel {
     }
     else if (name == "moe_fma") m_.moe_fma = value != 0;
     else if (name == "fuse_shared") m_.fuse_shared = value != 0;
+    else if (name == "fuse_shared_rows") m_.fuse_shared_rows = std::max(1, std::min(16, value));
     else if (name == "gemv_splitk") m_.tune.gemv_splitk = value != 0;
     else if (name == "fuse_gdn") m_.fuse_gdn = value != 0;
     else if (name == "fuse_gdn_rows") m_.fuse_gdn_rows = std::max(8, value);
@@ -990,6 +1012,7 @@ class MetalModel final : public NativeModel {
       if (L.moe && !m.cfg.gemma && !m.cfg.q3moe) {
         moe_pipelines(m, L, list);  // the passes' own choice per layer (formats may differ by layer)
         for (const char* k : {"moe_topk", "moe_sort", "moe_combine"}) list.push_back({k, 0});
+        list.push_back({"norm_fin", 0});
         if (!L.router.dense) list.push_back({"moe_route" + std::to_string(L.router.q.bits), L.router.q.fc()});
         if (!L.router.dense) list.push_back({"moe_route_par" + std::to_string(L.router.q.bits), L.router.q.fc()});
         if (L.router.dense && !L.shared_gate.dense)

@@ -106,6 +106,59 @@ kernel void rmsnorm(
 // (in split order from 0, as splitk_reduce_add does), then Y = rmsnorm(X) * W
 // as `rmsnorm` computes it (the same thread -> element mapping and sums), so
 // one dispatch stands for splitk_reduce_add + rmsnorm. One threadgroup per row.
+// Fase 3: the fused RMSNorm's finalizer as its own dispatch (option
+// moe_fin 2). One threadgroup per row sums the producer's P block partials
+// in the producer's own order (mode 0: serially in block order,
+// moe_down_comb's; mode 1: lane-strided over 32 lanes then simd_sum, the
+// rgemv EPI_ADDP order, unused since the dense variant was removed), then
+// writes xn = half(h * inv * w): the same values the in-dispatch finalizer
+// writes, after a dispatch boundary instead of device-scope fences and an
+// arrival counter.
+struct NormFinParams {
+  int P;        // partials per row
+  int part_ld;  // floats between rows of `parts`
+  int D;        // normalized width (row stride of h and xn)
+  float eps;
+  int mode;
+};
+
+kernel void norm_fin(
+    device const float* h [[buffer(0)]],
+    device const float* parts [[buffer(1)]],
+    device const float* wn [[buffer(2)]],
+    device half* xn [[buffer(3)]],
+    constant NormFinParams& p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float stage[256];
+  threadgroup float tot;
+  device const float* pr = parts + ulong(row) * ulong(p.part_ld);
+  float inv;
+  if (p.mode == 0) {
+    for (int i = int(tid); i < p.P; i += int(ntg)) stage[i] = pr[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (int b = 0; b < p.P; ++b) total += stage[b];
+    inv = rsqrt(total / float(p.D) + p.eps);
+  } else {
+    if (sg == 0) {
+      float ss = 0.0f;
+      for (int i = int(lane); i < p.P; i += 32) ss += pr[i];
+      ss = simd_sum(ss);
+      if (lane == 0) tot = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    inv = rsqrt(tot / float(p.D) + p.eps);
+  }
+  device const float4* hr = (device const float4*)(h + ulong(row) * ulong(p.D));
+  device const float4* w4 = (device const float4*)wn;
+  device half4* y = (device half4*)(xn + ulong(row) * ulong(p.D));
+  for (int d4 = int(tid); d4 < p.D / 4; d4 += int(ntg)) y[d4] = half4(hr[d4] * inv * w4[d4]);
+}
+
 kernel void rmsnorm_addk(
     device float* X [[buffer(0)]],
     device const float* Wt [[buffer(1)]],

@@ -355,6 +355,168 @@ Rules that keep the tiers honest:
 - **Session-to-session numbers drift ±3–5% with the thermal state**; A/B
   inside one session, alternating, and confirm on whole-model runs.
 
+### Measured facts: Fase 3 (M4 Max, 2026-10-22; exclusive gpuq runs, alternating against main dde1aa1's binary)
+
+- **A last-arriver finalizer must not read its partials serially.**
+  `moe_down_comb`'s finalizing threadgroup summed the 64 block partials of
+  the fused next norm with a loop of dependent atomic loads *in every
+  thread*: 37 of the kernel's 52 µs on the M4 Max (`bench_native --micro
+  moe`: `layer_down` 14.7 µs without the norm, `layer_down_n` 51.6 with it,
+  51.6 → 19.3 with the partials requested at once and staged in threadgroup
+  memory, summed in the same block order, and xn written four columns per
+  thread). Whole model, Qwen3.6-35B-A3B 4-bit, 1-row step: 7.60 / 7.66 /
+  7.65 → 6.31 / 6.33 / 6.31 ms GPU (127 → 152 tok/s; −17 %), logits
+  bit-identical (`moe_fin` 1, the default now). The same finalizer as its own
+  `norm_fin` dispatch (`moe_fin` 2) measures the same (6.31–6.38 ms): on this
+  GPU a dispatch boundary and an in-dispatch arrival counter cost alike at
+  one row. Fase 2's "preloading the epilogue operands made no difference"
+  had preloaded the tile positions and weights, not these loads. `rgemv`'s
+  EPI_ADDP finalizer already reads its partials lane-strided (2 loads per
+  lane): splitting it into a dispatch (`gemv_fin` 2) is neutral to slightly
+  slower (out projection in chain 14.8 → 15.9 µs; without any norm 12.9).
+- **Two K steps' loads in flight per simdgroup (`moe_pf`, the single-row FMA
+  expert kernels) are neutral on the M4 Max** (7.67 vs 7.65 ms; bit-identical),
+  as they were slower on the M1 Max: the loop is not load-latency-bound at
+  this occupancy.
+- **The expert kernels' bandwidth at one row** (in a dependent chain, main's
+  kernels): gate/up `moe_gemv4_1_swiglu_route_k4` 25–28 µs per layer for
+  10.6 MB (380–420 GB/s), the route finalize folded into its prologue
+  +2.5 µs, `moe_down_comb` without the norm 14.7 µs for 5.3 MB (360 GB/s),
+  `moe_route_par8` 4.3 µs; the dense in_proj 12352×2048 32.8 µs (434 GB/s),
+  the out projection 2048×4096 (64 threadgroups) 12.9 µs plain / 14.8 with the
+  fused norm (320–366 GB/s), the LM head 515 GB/s. Isolated (`--profile`)
+  numbers run 1.1–1.3× above these.
+- **Dispatch boundaries on the M4 Max**: none measurable at one row
+  (the 35B-A3B 1-row step 7.23 ms in pass against 7.50 isolated; Flash-Next
+  15.81 vs 16.09 over 871 dispatches) nor at 2048 rows; 3.8 µs each at 16
+  rows (24.98 vs 21.74 ms over 846).
+- **Thresholds re-measured on the M4 Max, all rejected** (`--verify-ab`, main):
+  the JIT FMA GEMV on 3–4-row passes (`ESPETERO_FMA34=1`, `gemv_max_m` 4)
+  verify pass +7.8 % (35B-A3B) / +12.8 % (27B); fused norms on 3–8-row passes
+  (`fuse_norm_max_m` 8) −0.2 % / +4.3 %; `attn_split` 256 / 512 / 1024 at
+  1K and 8K contexts within 0.1 % on both models with identical logits.
+- **FMA tiles for the 1–2-row tiles of 9–16-row passes lose** (`moe_fma_mix`:
+  the 2-row FMA kernel over the tile table for tiles of ≤ 2 rows, the MMA
+  kernel skipping them; nearly every routed expert of a 16-row step holds one
+  row): 16-row step 24.82 / 25.00 / 24.98 → 26.60 / 26.55 / 26.68 ms (+7 %,
+  +80 dispatches); with `route_sg` 21.65–22.23 → 23.31–23.95. The FMA
+  kernel's 14–30 % per-call advantage at one row does not survive an
+  indirect grid of ~110 × 32 threadgroups beside the MMA dispatch. Off, not
+  output-preserving either (Fase 2's candidate 10, closed).
+- **`bench_native`'s 16-sequence step touches a quarter of the experts a
+  16-user server would**: the profile's tile count (`moe_tiles_gu`, read
+  back from the sort's indirect arguments in profile mode) is 25.6 per
+  layer (23.6 routed experts + 2 shared tiles) because the 16 random-token
+  contexts route alike, against 102 expected for independent routing. The
+  expert kernels then stream 1.2 GB (gate/up, 3.44 ms, 357 GB/s) and 0.6 GB
+  (down, 1.78 ms, 341 GB/s) per step; a real 16-row step would be ~30 ms, not
+  25. The 1-row step is representative (k + shared experts per layer).
+- **Flash-Next's hyper-connection GEMVs are latency-bound, not occupancy-bound**
+  (M4 Max, `bench_native --micro gemv`, 16-deep dependent chains): the up /
+  mix projection 10240×320 (5 K steps) runs 6.1–7.6 µs per call (300–350
+  GB/s; 512 GB/s for the 8-bit one) and the low-rank read 324×10240 (split-K
+  8) 7.7–10.7 µs (230–250 GB/s; 376 for 8-bit); the isolated `--profile`
+  numbers (13 / 12 µs) are mostly command-buffer overhead. A short-K kernel
+  with per-step partials on 1–4 simdgroups (`hc_sep`, the same sums as the
+  256-thread kernel's step-ordered simdgroup partials) measured the same in
+  chain (5.8–8.2 µs) and on the whole step (GPU 15.87–15.92 → 15.81–16.05 ms),
+  bit-identical: removed again, together with the dense `gemv_fin` variant,
+  because both lived as template parameters of the default `rgemv` kernel
+  and the M1 Max 27B 1-row step read +1.1 / +1.2 % against main with them in
+  (the M4 Max read equal): the default kernels keep main's text. The 96
+  blocks' GEMVs cost ~1.6 ms of the 15.9 ms step; at 500 GB/s they would
+  cost 0.9.
+- **`ESPETERO_PF=1` (the next K step's weights in flight in every GEMV K
+  loop) loses on the M4 Max too** (2026-10-26, three alternating pairs,
+  bit-identical dumps): Flash-Next 1-row step GPU 15.63 / 15.50 / 15.69 →
+  16.02 / 16.12 / 15.89 ms (+2–4 %); the 27B 33.26 / 33.20 / 33.12 → 33.24 /
+  33.05 / 33.20 at 1 row and 79.88 / 79.81 / 79.67 → 79.74 / 79.71 / 79.83 at
+  16 rows (equal). In chain the large GEMVs are unchanged (27B gate_up
+  202.8 → 203.6 µs, Flash-Next in_proj 33.3 → 33.5) and the short-K ones
+  lose (hyper-connection up 6.1–7.6 → 7.2–9.3 µs, the 8-bit down 2560×640
+  6.2 → 10.0): the extra registers cost occupancy where the loop is short.
+  Stays off on both families.
+- **Flash-Next's 0.88 ms of encode per step is a warm-up, not a steady cost**:
+  `bench_native --q4` reports 0.82–0.90 ms over its first 128–200 steps and
+  0.28 ms (1.7 % of the step) as the median over 1500; a CPU sample of the
+  loop shows the main thread waiting on the GPU with Metal's own
+  `setBuffer` / enqueue calls as the remaining encode work (`ngram_read_row`
+  is the only engine function in the top of the stack). The server hides it
+  anyway with `chain_steps` 8 on greedy decode.
+- **What a dependent boundary costs on the M4 Max by kernel size**
+  (`bench_native --quick --gap`, 35B-A3B 4-bit, per dispatch: alone / in a
+  32-deep dependent chain / 32 independent dispatches concurrently encoded):
+  a tiny gather 2.5 / 1.4 / 0.0 µs; a 32-threadgroup GEMV 7.8 / 4.8 / 1.5;
+  the 64-threadgroup out projection 12.5 / 9.7 / 5.1; a 256-threadgroup
+  GEMV 17.1 / 17.8 / 10.1; the 386-threadgroup in_proj 21.5 / 22.7 / 16.8;
+  the 7760-threadgroup LM head 543 / 551 / 545. So a dependent boundary adds
+  3–4 µs to a GEMV of 16–64 threadgroups (the drain and refill of a nearly
+  empty GPU) and nothing measurable from ~250 threadgroups up.
+- **The device profile measures 2.12 µs per dependent tiny dispatch on the
+  M4 Max and 4.20 µs on the M1 Max** (`gather_rows_f32` over 2048 floats,
+  64-deep chain, serial encoder; family 2 = Apple9, family 1 = Apple7),
+  cached in device-profile-r1-<device>.json; `dear_boundary()` (≥ 3 µs)
+  separates the two. `apply_device_profile()` (src/model/impl/devprof.h)
+  sets the thresholds from it, before the environment and `set_option`:
+
+  | threshold | M1 Max (boundary 4.20 µs) | M4 Max (2.12 µs) | measured |
+  |:--|:--|:--|:--|
+  | `fuse_nrm` (split-K partials summed by the next RMSNorm; bit-identical) | **on** | off | M1: 35B-A3B 16-row step 64.24 → 62.60, 63.15 → 63.10, 69.58 → 67.90 ms (median −2.4 %; 27B and 1-row steps ±0.45 %; session youthful-edison, 2026-10-24). M4: −1.2 / −0.6 / 0 / 0 % vs a 0.7 % spread, 27B +0.7 % (Fase 2) |
+  | `moe_bm_rows` | 2048 | 2048 | 16-row expert tiles pay from 2048 rows up on both (M4 −1.4 % / −8.3 % Q6_K; M1 −3.1 % / −6.8 %); at 1024 rows neutral on the M4 and +3.7 % on the M1 (983.9 → 1020.7 ms, 2026-10-26) |
+  | `gemv_max_m` | 2 | 2 | the FMA GEMV on 3–4-row passes loses on both (M1 +22 % at 4 sequences; M4 verify +7.8 % / +12.8 %) |
+  | `fuse_norm_max_m` | 2 | 2 | fused norms on 3–8-row passes lose on both (M1 +2.4 / +4.7 %; M4 −0.2 / +4.3 %) |
+  | `fuse_norm` (fused norms at 1–2 rows) | on | on | with `moe_fin` 1 in place, separate norm dispatches (`fuse_norm` 0, not output-preserving: max \|Δlogit\| up to 0.18) gain nothing real: 1-row step M4 Max 35B-A3B 6.38 → 6.28 / 6.22 → 6.19 / 6.38 → 6.40 ms, 27B 33.02 → 33.04 and −0.6 %; M1 Max 35B 9.26 → 8.99 / 9.28 → 9.31 / 9.35 → 9.22, 27B 47.83 → 47.76 and −0.3 / +2 % (2026-10-26; the −18 % another copy measured for `fuse_norm` 0 on main was this finalizer) |
+  | `attn_split` / `attn_min_chunk` | 512 / 32 | 512 / 32 | 256 / 512 / 1024 keys per tile alike on both Macs (M4 within 0.1 %; M1 8.97 / 8.97 / 8.96 ms at 1K and 9.91 / 9.98 / 9.90 at 8K context), identical logits; larger minimum chunks are not output-preserving and lose (+0.9 / +2.5 % on the M4) |
+  | the same thresholds on the 27B 4-bit, M1 Max (2026-10-26, a loaded MacBook: the 1-row step at 110 ms vs its 55–60 ms norm) | | | `gemv_max_m` 4 verify +25 %; `fuse_norm_max_m` 8 +4.2 %; `fuse_nrm` 16 rows 222.52 → 222.70 (inert: so_max); fase2 folds 220.38 → 217.95 (−1.1 %); `fuse_norm` 0 110.30 → 111.08 / 114.51 → 117.68 (lossy, slower); **`attn_split` 256 / 512 / 1024: 59.21 / 60.68 / 61.34 ms at 1K and 59.61 / 61.19 / 62.39 at 8K, identical logits** (256 is 2.5–4.5 % faster there; the 35B-A3B reads equal on the M1, the M4 reads equal on both: a family-1 candidate pending the GGUF run) |
+  | the same thresholds on the 27B 4-bit, M4 Max | | | `gemv_max_m` 4 verify 38.58 → 43.49 (+12.7 %); `fuse_norm_max_m` 8 +4.2 %; `fuse_nrm` / fase2 folds inert (79.83 → 79.79, 79.69 → 79.62); `fuse_norm` 0 33.11 → 33.07 (lossy, nothing left); `attn_split` 256 / 512 / 1024: 33.35 / 33.23 / 33.35 and 34.43 / 34.42 / 34.45 (equal) |
+  | the same on the 27B UD-Q6_K GGUF, M4 Max | | | `gemv_max_m` 4 verify 51.82 → 62.17 (+20 %); `fuse_norm_max_m` 8 +3.6 %; `fuse_norm` 0 49.26 → 49.19 / 49.60 → 49.62 (lossy, nothing left); `fuse_nrm` / fase2 folds inert; `attn_split` 256 / 512 / 1024: 49.33 / 49.28 / 49.38 and 50.37 / 50.56 / 50.33 (equal, identical logits) |
+  | the same on the 27B UD-Q6_K GGUF, M1 Max (loaded MacBook) | | | `gemv_max_m` 4 verify +28 %; `fuse_norm_max_m` 8 +2.2 %; `fuse_norm` 0 +2.3 / +2.8 % (lossy, slower); `fuse_nrm` 226.18 → 230.66 (inert path, noise); fase2 folds 225.12 → 221.08 (−1.8 %); `attn_split` 256 / 512 / 1024: 93.53 / 94.56 / 93.87 at 1K, 98.67 / 98.27 / 98.26 at 8K (mixed): together with the 35B's equal reading, 256 is not a family-1 default (the 27B 4-bit's −2.5 / −4.5 % stands alone) |
+  | the same thresholds on Flash-Next oQ4e (M4 Max, resident experts, 2026-10-26) | – | as above | `gemv_max_m` 4 verify pass 25.45 → 27.70 ms (+8.8 %); `fuse_norm_max_m` 8 +1.2 %; `attn_split` 256 / 512 / 1024: 15.97 / 16.00 / 15.99 ms at 1K and 17.20 / 17.18 / 17.26 at 8K, identical logits; `moe_bm` 16 at 2048 rows 2132 → 2122 ms (−0.5 %), at 1024 rows equal (512 experts: ~4 rows each at 2048); `fuse_nrm` / the fase2 folds at 16 rows 84.87 → 85.21 / 84.55 → 84.89 (this family never fuses norms, so they are inert). The M1 Max (64 GB) serves it from the SSD expert cache (76–100 ms per token, GPU 3–4 ms): not a target there |
+  | `fuse_kvsave`, `fuse_rsum`, `fuse_sort` | off | off | M4 neutral / +0.9 % (Fase 2); M1 Max `fase2` 0 vs 2 (kvsave + rsum + nrm) 52.83 → 52.41 and 49.50 → 49.80 ms on the 16-row step (neutral, a disturbed day: the same step varied 44–53 ms within the job; fuse_nrm alone 44.45 → 44.30 there against the −2.4 % median of three clean pairs) |
+- **`moe_fin` 1 also wins on the M1 Max** (2026-10-24, MacBook, 35B-A3B
+  4-bit, three alternating pairs against main dde1aa1's binary): 1-row step
+  9.86 / 9.31 / 9.49 → 9.25 / 9.11 / 9.15 ms GPU (−3 to −6 %, 96–101 →
+  98–102 tok/s); 16 rows 46.1–49.5 vs 46.3–50.7 (equal within the
+  MacBook's thermal spread).
+- **The 9–16-row shared expert and its gate are the step's largest small
+  items**: at 16 rows the 1×2048 shared-gate GEMM (one threadgroup, one live
+  simdgroup streaming 32 K steps) takes 57 µs per layer (2.28 ms, 10.5 % of
+  the 24.98 ms step) and the shared gate_up `rgemm_8x4_swiglu` 1024×2048
+  (16 unsplit threadgroups) 41 µs (1.66 ms, 59 GB/s). `route_sg` (the gate as
+  row 257 of the router GEMM, not output-preserving) measures 24.87 / 25.03 /
+  24.92 → 21.65 / 22.23 / 22.12 ms (−11 %, 630 → 707–725 tok/s) on the M4 Max;
+  its drift on the logits_dump cases: 16,234 of 22,250 values differ, max
+  |Δlogit| 1.17, 5 argmax flips. The shared expert as two 8-row tiles of the
+  grouped MMA kernel at 9–16 rows (`fuse_shared_rows` 16: its own gate_up
+  and down GEMMs and their reduces gone, −120 dispatches): 24.76 / 24.63 /
+  24.94 → 23.22 / 23.23 / 23.25 ms (−6.2 %, 679 tok/s); 3,742 values differ,
+  max |Δ| 0.12, no argmax flip. Both together: 20.45 / 20.09 / 20.42 ms
+  (−18 %, 770–782 tok/s). Both are the arithmetic other shapes already use
+  (the router's split-K order; the grouped kernel's tile order). **Decision
+  (Fran, 2026-10-26): `fuse_shared_rows` 16 is the default** (its drift
+  equals the engine's own batch-vs-alone drift, below); `route_sg` stays
+  opt-in. **Their quality cost on real text**
+  (`tests/batch_kld.mm`: 3,072 teacher-forced tokens of 16-row passes on the
+  KLD harness's wikitext2 + code windows, the full distribution of every
+  readout against the defaults in one process): KLD mean 8.1e-4 / 1.3e-3 /
+  1.5e-3 (shared tiles / route_sg / both), median 6.5e-5 / 2.5e-4 / 2.8e-4,
+  p99 0.012 / 0.016 / 0.017, top-1 agreement 99.06 / 98.86 / 98.80 %, top-1
+  accuracy on the true next token unchanged (56.97 → 57.00 / 57.10 /
+  56.90 %); a lock-step greedy decode of the 16 sequences (64 tokens) stays
+  identical for 10 / 9 / 9 of them and diverges at near-tie tokens in the
+  rest. For scale, the EQ references on the same text give the 4-bit MLX
+  file itself KLD mean 0.069 / median 0.026 against fp32, and a bf16 run
+  against the bf16 reference mean 0.0034 / median 0.0007: the options' drift
+  is below the bf16 arithmetic noise floor. The engine's own batch-shape
+  drift measured the same way (the same tokens through 1-row passes against
+  the 16-row ones: the FMA expert kernels, fused norms and the parallel
+  route against the MMA tiles, split-K GEMMs and the router GEMM) is KLD
+  mean 9.2e-4 / median 7.9e-5, top-1 agreement 99.15 %, greedy replies
+  identical for 10 of 16 sequences (835 of 1024 tokens): the shared-tile
+  option drifts exactly that much, route_sg 1.4× it, both 1.6×. Flash-Next oQ4e is untouched by
+  both (bf16 router: no `router_sg`; 8-bit shared expert: no grouped tile
+  above 2 rows): KLD 0, identical dispatches and replies.
+
 ## 6. Numerics and determinism
 
 1. Operands fp16, accumulation fp32, residual stream fp32; dequantization is

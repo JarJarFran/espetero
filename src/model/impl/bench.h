@@ -160,6 +160,13 @@ inline std::string gemv_micro_bench(Model& m) {
     add("gate", &L.gate);
     add("up", &L.up);
     add("down", &L.down);
+    // Qwen4-Exp hyper-connections (Flash-Next): the low-rank read [324 x 10240] (split-K in production) and
+    // the up projection [10240 x 320] (the hcmix GEMV in production: the same loads plus the mix epilogue).
+    for (const HCBlock* B : {&L.hca, &L.hcm})
+      if (B->present()) {
+        add("hc.down", &B->down);
+        add("hc.up", &B->up);
+      }
   }
   add("lm_head", &m.lm_head);
   int K = 64, N = 64;
@@ -489,21 +496,55 @@ inline std::string moe_micro_bench(Model& m) {
   id<MTLBuffer> Hres = m.buffer(size_t(c.D) * 4);
   id<MTLBuffer> act_sh = m.buffer(size_t(std::max(c.I_shared, 64)) * 2);
   const double mb_layer = mb_gu + mb_dn;
-  struct Knob { const char* name; int stages, sync, fin1, rig, nsl; };
+  // Fase 3: the layer with the next norm fused (`_n`: a NormLink as in the
+  // pass), under the finalizer modes (moe_fin) and the pipelined K loop (moe_pf).
+  NormLink nlink;
+  id<MTLBuffer> nl_parts = m.buffer(size_t(64) * 4), nl_xn = m.buffer(size_t(c.D) * 2), nl_ctr = m.buffer(16);
+  std::memset([nl_ctr contents], 0, 16);
+  nlink.parts = Buf(nl_parts, 0);
+  nlink.ld = 64;
+  nlink.P = (c.D + 31) / 32;
+  nlink.D = c.D;
+  nlink.eps = c.eps;
+  nlink.w = Ls[0]->in_norm;
+  nlink.xn = Buf(nl_xn, 0);
+  nlink.ctr = Buf(nl_ctr, 0);
+  struct Knob { const char* name; int stages, sync, fin1, rig, nsl, norm = 0, mfin = 0, pf = 0; };
   const Knob knobs[] = {{"layer_all_fin0", 15, 2, 0, 0, 0}, {"layer_all_fin1", 15, 2, 1, 0, 0}, {"layer_all_rig", 15, 2, 1, 1, 0},
                         {"layer_route_par", 17, 2, 1, 0, 0}, {"layer_route_fin0", 1, 2, 0, 0, 0}, {"layer_route_fin1", 1, 2, 1, 0, 0},
                         {"layer_route_fin1_noload", 1, 2 | 32, 1, 0, 0},
                         {"layer_route_gu_fin1", 3, 2, 1, 0, 0}, {"layer_route_gu_rig", 3, 2, 1, 1, 0}, {"layer_route_gu_rig_noload", 3, 2 | 32, 1, 1, 0},
-                        {"layer_combine", 8, 2, 1, 0, 0}};
-  const int stages0 = m.moe_stages, sync0 = m.route_sync, nsl0 = m.route_nsl;
+                        {"layer_combine", 8, 2, 1, 0, 0},
+                        {"layer_all_n", 15, 2, 1, 1, 0, 1, 0, 0}, {"layer_all_n_f1", 15, 2, 1, 1, 0, 1, 1, 0}, {"layer_all_n_f2", 15, 2, 1, 1, 0, 1, 2, 0},
+                        {"layer_all_pf", 15, 2, 1, 1, 0, 0, 0, 1}, {"layer_all_n_pf", 15, 2, 1, 1, 0, 1, 0, 1}, {"layer_all_n_pf_f2", 15, 2, 1, 1, 0, 1, 2, 1},
+                        {"layer_route_gu_pf", 3, 2, 1, 1, 0, 0, 0, 1},
+                        {"layer_down", 12, 2, 1, 1, 0, 0, 0, 0}, {"layer_down_n", 12, 2, 1, 1, 0, 1, 0, 0}, {"layer_down_n_f1", 12, 2, 1, 1, 0, 1, 1, 0},
+                        {"layer_down_n_f2", 12, 2, 1, 1, 0, 1, 2, 0}, {"layer_down_pf", 12, 2, 1, 1, 0, 0, 0, 1}, {"layer_down_n_pf_f2", 12, 2, 1, 1, 0, 1, 2, 1}};
+  const int stages0 = m.moe_stages, sync0 = m.route_sync, nsl0 = m.route_nsl, mfin0 = m.moe_fin, pf0 = m.moe_pf;
   const bool fin0 = m.route_fin1, rig0 = m.route_in_gemv;
   for (const Knob& kb : knobs)
     cases.push_back({kb.name, [&, kb](Enc& E, int i) {
                        m.moe_stages = kb.stages, m.route_sync = kb.sync, m.route_fin1 = kb.fin1 != 0, m.route_in_gemv = kb.rig != 0;
-                       m.route_nsl = kb.nsl;
-                       moe_mlp(m, E, layer(i), X, act_sh, Hres, 1, nullptr);
+                       m.route_nsl = kb.nsl, m.moe_fin = kb.mfin, m.moe_pf = kb.pf;
+                       moe_mlp(m, E, layer(i), X, act_sh, Hres, 1, kb.norm ? &nlink : nullptr);
                        m.moe_stages = stages0, m.route_sync = sync0, m.route_fin1 = fin0, m.route_in_gemv = rig0, m.route_nsl = nsl0;
-                     }, kb.stages == 15 ? mb_layer : 0.0});
+                       m.moe_fin = mfin0, m.moe_pf = pf0;
+                     }, kb.stages == 15 ? mb_layer : (kb.stages == 12 ? mb_dn : 0.0)});
+  // The dense out projection (2048 x 4096 on the 35B-A3B: 64 threadgroups) with its fused
+  // norm: the in-dispatch finalizer (addp), the norm_fin dispatch (adds + norm_fin), none (add).
+  if (!lins.empty() && !lins[0]->out.dense) {
+    const Mat& w0 = lins[0]->out;
+    const double mb = double(w0.out()) * double(w0.in()) * (double(w0.q.bits) / 8.0 + 4.0 / double(w0.q.group)) / 1e6;
+    id<MTLBuffer> Xo = m.buffer(size_t(w0.in()) * 2);
+    std::memset([Xo contents], 0, size_t(w0.in()) * 2);
+    for (int mode : {-1, 0}) {
+      const std::string nm = mode < 0 ? "out_add" : "out_addp";
+      cases.push_back({nm, [&, Xo, mode](Enc& E, int i) {
+                         const Mat& w = lins[size_t(i) % lins.size()]->out;
+                         gemm(E, m.tune, w, Xo, 0, w.in(), Hres, 0, w.out(), 1, 1, 0, nullptr, mode < 0 ? nullptr : &nlink);
+                       }, mb});
+    }
+  }
   // Rounds interleave the cases so clock and background load hit all alike; min per case.
   std::vector<double> iso(cases.size(), 1e30), ch(cases.size(), 1e30);
   for (int r = 0; r < 5; ++r)

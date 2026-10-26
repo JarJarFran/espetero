@@ -44,6 +44,10 @@ $(BUILD)/parity_test: tests/parity_test.mm $(BUILD)/model.o $(BUILD)/json.o
 clean:
 	rm -rf $(BUILD)
 
+# Quality cost of a kernel option on batched decode (Fase 3): KLD / top-1 / greedy divergence vs an in-process baseline.
+$(BUILD)/batch_kld: tests/batch_kld.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 $(BUILD)/bench_native: tests/bench_native.mm $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
