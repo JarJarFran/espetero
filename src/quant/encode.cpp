@@ -640,7 +640,7 @@ Fmt parse_fmt(const std::string& spec) {
   f.spec = spec;
   const size_t plus = spec.find('+');
   const std::string base = spec.substr(0, plus);
-  const std::string enc = plus == std::string::npos ? "rtn" : spec.substr(plus + 1);
+  const std::string enc = plus == std::string::npos ? (spec.rfind("eqv:", 0) == 0 ? "gptq" : "rtn") : spec.substr(plus + 1);
   if (enc == "rtn") f.enc = Fmt::RTN;
   else if (enc == "mse") f.enc = Fmt::MSE;
   else if (enc == "imat") f.enc = Fmt::IMAT;
@@ -670,6 +670,14 @@ Fmt parse_fmt(const std::string& spec) {
     if (f.bits < 2 || f.bits > 8) fail("format " + spec + ": 2..8 bits");
     return f;
   }
+  if (p[0] == "eqv") {
+    f.kind = Fmt::VQ;
+    f.bits = num(1);
+    f.group = 256;
+    if (f.bits < 9 || f.bits > 16) fail("format " + spec + ": eqv:K with 9 <= K <= 16");
+    if (f.enc != Fmt::GPTQ && f.enc != Fmt::IMAT) fail("format " + spec + ": eqv encoders are +gptq (LDLQ) or +imat");
+    return f;
+  }
   if (p[0] == "eql") {
     f.bits = num(1);
     if (num(2) != 16) fail("eql: lane sub-blocks are 16 wide");
@@ -684,8 +692,10 @@ Fmt parse_fmt(const std::string& spec) {
     f.kind = Fmt::EQ;
     return f;
   }
-  fail("unknown format " + spec + " (eql:B:16, eql:4:16:cb, eql:3:16:cb, affine:B:G[:SD], bf16)");
+  fail("unknown format " + spec + " (eql:B:16, eql:4:16:cb, eql:3:16:cb, eqv:K, affine:B:G[:SD], bf16)");
 }
+
+std::vector<int64_t> np_choice_sorted_vq(uint32_t seed, int64_t n, int64_t k) { return np_choice(seed, n, k); }
 
 std::vector<uint32_t> pack_codes(const uint8_t* q, int64_t R, int C, int bits) {
   const size_t wpr = size_t(C) * size_t(bits) / 32;

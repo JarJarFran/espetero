@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <regex>
@@ -29,6 +30,7 @@
 #include "../model/impl/hf_source.h"
 #include "calib.h"
 #include "encode.h"
+#include "vq.h"
 #include "st.h"
 
 namespace espetero::quant {
@@ -194,6 +196,11 @@ std::string preset(const std::string& name) {
     // n-gram table stays outside the rules (--ple-bits).
     const std::string rest = name == "fnx3" ? "eql:6:16+gptq" : "eql:5:16+gptq";
     r = {"*switch_mlp*=eql:3:16:cb+imat", "*embed_tokens=affine:8:64:f16", "*lm_head=affine:6:64:f16+gptq", "*=" + rest};
+  } else if (name.rfind("fnxvq", 0) == 0) {
+    // Qwen3.8-Flash-Next at ~30 GB with all 512 experts (route B): routed experts (trunk and MTP) EQV
+    // with 2^K-entry codebooks (fnxvq: K 13, ~1.69 bits per weight; fnxvq12 / fnxvq14 ...), the rest as fnx3m.
+    const std::string k = name.size() > 5 ? name.substr(5) : "13";
+    r = {"*switch_mlp*=eqv:" + k, "*embed_tokens=affine:8:64:f16", "*lm_head=affine:6:64:f16+gptq", "*=eql:5:16+gptq"};
   } else {
     fail("unknown preset " + name);
   }
@@ -277,6 +284,8 @@ int text_layers(const std::string& model_dir) {
 
 bool known_preset(const std::string& p) {
   if (is_dense_preset(p)) return true;
+  if (p.rfind("fnxvq", 0) == 0 && (p.size() == 5 || (std::isdigit(p[5]) && std::stoi(p.substr(5)) >= 9 && std::stoi(p.substr(5)) <= 16)))
+    return true;
   if (p == "eq4dhb" || p == "eq3h" || p == "eq3dh" || p == "eq3dx" || p == "eq3dhb" || p == "fnx3" || p == "fnx3m" ||
       std::find(kPresets.begin(), kPresets.end(), p) != kPresets.end())
     return true;
@@ -330,6 +339,14 @@ std::vector<StTensor> outputs(const Item& it) {
     return s;
   };
   std::vector<StTensor> v;
+  if (it.f.kind == Fmt::VQ) {  // EQV planes (vq.h), routed expert stacks
+    const int64_t nv = C / 8, hw = (nv * (it.f.bits - 8) + 31) / 32;
+    v.push_back({it.path + ".vq_lo", "U8", with(nv)});
+    v.push_back({it.path + ".vq_hi", "U32", with(hw)});
+    v.push_back({it.path + ".vq_scale", "F16", with((C + 255) / 256)});
+    v.push_back({it.path + ".vq_cb", "F16", {int64_t(1) << it.f.bits, 8}});
+    return v;
+  }
   if (it.f.kind == Fmt::EQ || it.f.kind == Fmt::EQC) {
     v.push_back({it.path + ".weight", "U32", with(C * it.f.bits / 32)});
     v.push_back({it.path + ".scales", "I8", with(C / 16)});
@@ -371,6 +388,18 @@ json::Value encode_write(StWriter& w, const Item& it, const float* W, const Stat
   const int64_t R = numel(it.shape) / C;
   const int nexp = it.shape.size() == 3 ? int(it.shape[0]) : 0;
   json::Value q = json::Value::object();
+  if (it.f.kind == Fmt::VQ) {
+    if (!nexp) fail(it.path + ": EQV (eqv:K) is for routed expert stacks only");
+    const VqOut o = encode_vq(W, R, int(C), nexp, it.f.bits, it.f.enc == Fmt::GPTQ, st);
+    w.write(it.path + ".vq_lo", o.lo.data(), o.lo.size());
+    w.write(it.path + ".vq_hi", o.hi.data(), o.hi.size() * 4);
+    w.write(it.path + ".vq_scale", o.sc.data(), o.sc.size() * 2);
+    w.write(it.path + ".vq_cb", o.cb.data(), o.cb.size() * 2);
+    q.set("bits", json::Value(it.f.bits));
+    q.set("group_size", json::Value(8));
+    q.set("mode", json::Value("eqv"));
+    return q;
+  }
   if (it.f.kind == Fmt::EQ || it.f.kind == Fmt::EQC) {
     const EqOut o = encode_eq(W, R, int(C), nexp, it.f, st);
     const std::vector<uint32_t> packed = pack_codes(o.q.data(), R, int(C), it.f.bits);
@@ -732,6 +761,7 @@ const char* kUsage =
     "             (EQ4 experts with codebooks: eq4dhc ...), eq4dhb (default eq4);\n"
     "             EQ3 codebook experts (MoE only): eq3h eq3dh eq3dx eq3dhb;\n"
     "             Qwen3.8-Flash-Next: fnx3 (experts EQ3 codebooks, the rest EQ6), fnx3m (the rest EQ5);\n"
+    "             fnxvq[K] (all 512 experts EQV with 2^K codebooks, K 13 by default; the rest as fnx3m);\n"
     "             dense Qwen3.5 / 3.6 (widths by tensor class and layer position, sized at or\n"
     "             under the GGUF named): eqd4m (Q4_K_M) eqd4l (UD-Q4_K_XL) eqd5 (UD-Q5_K_XL) eqd6 (Q6_K);\n"
     "             Qwen3.8-27B: eqd6-27b (UD-Q6_K; calibrate with prose as well as code)\n"
@@ -930,7 +960,8 @@ int cmd_quantize(int argc, char** argv) {
         }
     if (!f || f->kind == Fmt::BF16) continue;
     // EQ: any width that is a multiple of 64 (a partial last super-block below 256)
-    if (shape.back() % (f->kind == Fmt::EQ || f->kind == Fmt::EQC ? 64 : f->group)) continue;
+    if (shape.back() % (f->kind == Fmt::EQ || f->kind == Fmt::EQC ? 64 : f->kind == Fmt::VQ ? 8 : f->group)) continue;
+    if (f->kind == Fmt::VQ && shape.size() != 3) fail(p + ": EQV (" + f->spec + ") is for routed expert stacks only");
     Item it{p, *f, shape};
     if (it.f.kind == Fmt::EQ && !(it.f.bits == 3 || it.f.bits == 4 || it.f.bits == 5 || it.f.bits == 6 || it.f.bits == 8))
       it.f = parse_fmt("affine:8:64:f16");
@@ -1036,8 +1067,10 @@ int cmd_quantize(int argc, char** argv) {
     std::vector<float> hbuf;  // a packed E[x x^T] unpacked for this matrix only
     st = full_hessian(st, full, hbuf);
     qcfg.set(it.path, encode_write(w, it, W.data(), st));
-    const std::string tag = it.f.kind == Fmt::EQC ? "EQ" + std::to_string(it.f.bits) + "cb" : it.f.kind == Fmt::EQ ? "EQ" + std::to_string(it.f.bits)
-                                                                                   : "mlx" + std::to_string(it.f.bits);
+    const std::string tag = it.f.kind == Fmt::VQ    ? "EQV" + std::to_string(it.f.bits)
+                            : it.f.kind == Fmt::EQC ? "EQ" + std::to_string(it.f.bits) + "cb"
+                            : it.f.kind == Fmt::EQ  ? "EQ" + std::to_string(it.f.bits)
+                                                    : "mlx" + std::to_string(it.f.bits);
     counts[tag] += numel(it.shape);
     std::fprintf(stderr, "\r[quantize] %zu/%zu %s %s  %.0fs\033[K", i + 1, plan.size(), it.path.c_str(), it.f.spec.c_str(),
                  native::ms_since(t0) / 1000.0);

@@ -16,6 +16,9 @@
 //                         weight = half(super * sub) * cb[code]
 //   eql:3:16:cb[:R][+ENC] EQ3 with an 8-entry codebook, the same way (Espetero
 //                         runs EQ3 for routed expert stacks only)
+//   eqv:K[+ENC]           EQV (vq.h): 8-weight vectors, a 2^K-entry codebook per
+//                         stack, an fp16 scale per 256 inputs; routed experts
+//                         only (+gptq, the default: LDLQ; +imat: no feedback)
 //   affine:B:G[:SD][+ENC] MLX affine, scale and bias per G in SD (bf16, f16, f32)
 //   bf16                  kept as it is
 // Encoders: rtn (round to nearest; for affine, MLX's own mx.quantize), mse
@@ -31,7 +34,7 @@
 namespace espetero::quant {
 
 struct Fmt {
-  enum Kind { BF16, Affine, EQ, EQC } kind = BF16;
+  enum Kind { BF16, Affine, EQ, EQC, VQ } kind = BF16;
   enum Enc { RTN, MSE, IMAT, GPTQ } enc = RTN;
   int bits = 0;
   int group = 0;            // affine: G; EQ / EQC: 256 (one super-block)
