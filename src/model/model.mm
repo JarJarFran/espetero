@@ -266,12 +266,16 @@ class MetalModel final : public NativeModel {
       // A large slot state (Gemma 4 31B's sliding-window rings: 0.84 GB a
       // slot) leaves fewer slots than concurrent requests, and the requests
       // past them wait for a free one. Automatic slots then grow to the
-      // requests, as far as the budget allows beside the KV of two full
-      // contexts.
-      if (!kv_tokens && o.users > slots) {
+      // requests, the shared-prefix checkpoint they continue and a spare, as
+      // far as the budget allows beside the KV of two full contexts. Slots for
+      // the requests alone were one short: 16 users in 16 slots, the checkpoint
+      // held one and the 16th request waited 25 s for a slot (Flash-Next, M4
+      // Max, 2026-10-26: 138 tokens/s in all, against 171 for 8 users).
+      const int want = o.users + 2;
+      if (!kv_tokens && o.users > 0 && want > slots) {
         const double kv_min = 2.0 * double(m.max_ctx) * double(tok_bytes);
         const int fit = int(std::max(0.0, budget - kv_min) / double(slot_bytes));
-        slots = std::clamp(std::min(o.users, fit), slots, 256);
+        slots = std::clamp(std::min(want, fit), slots, 256);
       }
     }
     if (!kv_tokens) {
