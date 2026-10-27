@@ -654,17 +654,17 @@ against mlx-vlm's own layers to 3e-4; slices of layers 0–3 on the Studio HDD, 
   6.6 s, GEMV tier); coherent text, forced and auto tool calls parsed (`get_weather {"city": ...}`).
   Without mlock (job #810) the same run went 0.004–0.3 tok/s: unlocked buffers were compressed under
   memory pressure. GLM's template has no thinking switch: `reasoning_effort: none` still reasons.
-  Open: a bare completion of `Hello` (no `[gMASK]<sop>` prefix) answers `[gMASK]` tokens; compare with
-  llama.cpp on the same file.
+  A bare completion of `Hello` (no `[gMASK]<sop>` prefix) answers `[gMASK]` tokens.
 
 **Written, not yet verified:** checkpoint files (`slot_save` / `slot_load`), trees with leaves.
 
-**Needs the full model** (a GGUF on the Studio SSD, Fran's call): logits and greedy text against llama.cpp on
-the same file, perplexity, MTP acceptance, the LRU cache's speed on UD-Q4_K_XL (does not fit
-resident).
+**Dropped (Fran, 2026-10-27):** comparisons with llama.cpp and perplexity runs; the model is judged by its
+own parity against the reference and its own speed.
+
+**Next:** MTP drafting in the engine, GEMMs for prefill, UD-Q4_K_XL through the LRU cache.
 
 **Not started:** vision tower, several sequences per GPU pass, GPU top-k / draw, GEMMs for prefill (tier 0
-runs every row through GEMVs), MTP drafting in the engine.
+runs every row through GEMVs).
 
 ## Appendix A. Tensor inventory ([C]; logical shapes `[out, in]`)
 
