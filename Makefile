@@ -68,9 +68,10 @@ VISION_SRC := $(wildcard src/vision/*.cpp)
 VISION_MM  := $(wildcard src/vision/*.mm)
 ENGINE_SRC := $(wildcard src/engine/*.cpp)
 SERVER_SRC := $(wildcard src/server/*.cpp)
+QUANT_SRC  := $(wildcard src/quant/*.cpp)
 SERVER_MM  := $(wildcard src/server/*.mm)
 
-OBJS := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC) $(HTTP_SRC) $(VISION_SRC) $(ENGINE_SRC) $(SERVER_SRC)) \
+OBJS := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC) $(HTTP_SRC) $(VISION_SRC) $(ENGINE_SRC) $(QUANT_SRC) $(SERVER_SRC)) \
         $(patsubst src/%.mm,$(BUILD)/obj/%.o,$(VISION_MM) $(SERVER_MM))
 
 $(BUILD)/obj/%.o: src/%.cpp

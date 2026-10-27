@@ -215,6 +215,27 @@ struct CommitRequest {
   int n = 0;
 };
 
+// Calibration (espetero quantize): the inputs of the decoder's matrices as
+// the engine computed them (fp16), handed over after each pass. One call per
+// (layer, kind) of the Qwen3.5-family layers:
+//   kAttnIn    [rows][D]   input of in_proj (linear attention) or q/k/v
+//   kMixOut    [rows][W]   input of out_proj / o_proj
+//   kMlpIn     [rows][D]   input of the MLP: gate/up, or router, shared expert,
+//                          shared gate and experts' gate/up
+//   kDownIn    [rows][I]   input of a dense MLP's or the shared expert's down_proj
+//   kExpertIn  [pairs][Ie] input of the experts' down_proj, rows in sorted
+//                          order: pair p = row * k + j routes to expert ids[p]
+//                          and its row is pos[p]
+// Taps are on for passes with more than 8 rows and plain (unfused) kernels,
+// as prefill passes of a dense checkpoint run.
+class ActivationSink {
+ public:
+  enum Kind { kAttnIn = 0, kMixOut = 1, kMlpIn = 2, kDownIn = 3, kExpertIn = 4 };
+  virtual ~ActivationSink() = default;
+  virtual void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids,
+                   const int32_t* pos, int k) = 0;
+};
+
 class NativeModel {
  public:
   static std::unique_ptr<NativeModel> load(const std::string& path, const LoadOptions& options);
@@ -288,6 +309,9 @@ class NativeModel {
   // Development: internal micro-benchmarks by name ("gap": dispatch-gap
   // characterization); returns JSON.
   virtual std::string bench_json(const std::string& what) = 0;
+  // Calibration: deliver the matrix inputs of every later pass to `sink`
+  // (nullptr: off). Qwen3.5-family and dense Gemma 4 models only; throws otherwise.
+  virtual void set_activation_sink(ActivationSink* sink) = 0;
 };
 
 }  // namespace espetero

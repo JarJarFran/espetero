@@ -350,6 +350,56 @@ inline void moe_check_tiles(Model& m, Enc& E, const MoeScratch& z, const ExpertP
 }
 
 // The shared expert's gate/up (fused or split) into `act` (half [rows, I]).
+// ---------------------------------------------------------------- calibration taps
+// (NativeModel::set_activation_sink) The inputs of the decoder's matrices,
+// copied into m.tap_buf as the pass runs; MetalModel::run hands them to the
+// sink after the pass.
+
+// Bytes of tap_buf a pass of `rows` rows needs: every layer's attention
+// input, mixer output, MLP input, down input and (MoE) expert rows with
+// their ids and positions, plus alignment.
+inline size_t tap_bytes(const Config& c, int rows) {
+  const size_t W = std::max<size_t>(size_t(c.Vd()), size_t(c.H) * size_t(std::max(c.HD, c.HDg)));
+  const size_t I = size_t(std::max(c.I, c.I_shared));
+  size_t per = size_t(rows) * (2 * size_t(c.D) + W + I) * 2;
+  if (c.E) per += size_t(rows) * size_t(c.k) * (size_t(c.Ie) * 2 + 8);
+  return (per + 8 * 256) * size_t(c.L);
+}
+
+// Copy `bytes` of `src` from `src_off` into the tap buffer; returns where.
+inline size_t tap_copy(Model& m, Enc& E, id<MTLBuffer> src, size_t src_off, size_t bytes) {
+  const size_t off = m.tap_used;
+  if (bytes % 4 || off + bytes > m.tap_cap) fail("calibration taps: buffer overflow");
+  const uint32_t n = uint32_t(bytes / 4);
+  E.pipe("copy_words");
+  E.set(0, src, src_off);
+  E.set(1, m.tap_buf, off);
+  E.bytes(2, n);
+  E.rd(src, src_off, src_off + bytes);
+  E.wr(m.tap_buf, off, off + bytes);
+  E.threads(MTLSizeMake(n, 1, 1), MTLSizeMake(256, 1, 1));
+  m.tap_used = align_up(off + bytes, 256);
+  return off;
+}
+
+// fp16 rows [rows][width] of `src` as tap (layer, kind).
+inline void tap_rows(Model& m, Enc& E, int layer, int kind, id<MTLBuffer> src, int rows, int width) {
+  if (!m.tap_pass || layer < 0) return;
+  Model::TapRec r;
+  r.layer = layer;
+  r.kind = kind;
+  r.n = rows;
+  r.width = width;
+  r.off = tap_copy(m, E, src, 0, size_t(rows) * size_t(width) * 2);
+  m.tap_recs.push_back(r);
+}
+
+// Index of a decoder layer in m.layers, -1 for another one (the MTP layer).
+inline int layer_index(const Model& m, const Layer& L) {
+  const Layer* p = &L;
+  return p >= m.layers.data() && p < m.layers.data() + m.layers.size() ? int(p - m.layers.data()) : -1;
+}
+
 inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuffer> act, int rows) {
   const Config& c = m.cfg;
   Scratch& s = m.sc;
@@ -499,6 +549,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
                             (tile_kind == 1 || (tile_kind == 2 && m.moe_fma && rows <= m.moe_fma_rows));
   if (!shared_tiles) {
     shared_mlp_in(m, E, L, X, act, rows);
+    tap_rows(m, E, layer_index(m, L), 3, act, rows, L.I);  // ActivationSink::kDownIn
     gemm(E, m.tune, L.down, act, 0, L.I, z.shared, 0, c.D, rows, 0);
   }
   const int shared_flag = shared_tiles ? 1 : 0;
@@ -922,6 +973,19 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
         grouped(*xgu, shared_tiles ? &L.gate_up.q : nullptr, X, c.D, 1, z.act, c.Ie, 2 * c.Ie, 2, 0);
       }
     }
+  }
+  if (m.tap_pass && !pooled && layer_index(m, L) >= 0) {  // the experts' down inputs, their experts and act rows
+    const size_t pairs = size_t(rows) * size_t(c.k);
+    Model::TapRec r;
+    r.layer = layer_index(m, L);
+    r.kind = 4;  // ActivationSink::kExpertIn
+    r.n = rows;
+    r.width = c.Ie;
+    r.k = c.k;
+    r.off = tap_copy(m, E, z.act, 0, pairs * size_t(c.Ie) * 2);
+    r.ids_off = tap_copy(m, E, z.ids, 0, pairs * 4);
+    r.pos_off = tap_copy(m, E, z.slotpos, 0, pairs * 4);
+    m.tap_recs.push_back(r);
   }
   // Single-row passes: the down projection and the combine in one kernel.
   const int comb_ks = m.moe_comb_ks == 1 ? 1 : 2;
@@ -2184,6 +2248,15 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   if (any_hidden && c.q4) fail("hidden-state readouts are not supported for qwen4_exp");
   // MTP needs every root row's final hidden state: no last-layer pruning.
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
+  // Calibration taps: prefill-sized plain passes of the Qwen3.5-family and
+  // dense Gemma 4 layers (no pruned last layer: every row reaches every matrix).
+  m.tap_pass = m.tap_sink && !fuse && !prune && M > 8 && !c.q4 && !(c.gemma && c.E) && !c.q3moe && !c.lfm2;
+  m.tap_recs.clear();
+  m.tap_used = 0;
+  if (m.tap_pass && m.tap_cap < tap_bytes(c, M)) {
+    m.tap_cap = tap_bytes(c, M);
+    m.tap_buf = m.buffer(m.tap_cap);
+  }
   // The DeltaNet kernels of this pass (the rule of every linear layer below);
   // the verify-commit replays a commit chain with the same ones.
   // (extended below to larger passes of short segments when fuse_gdn_rows allows)
@@ -3686,6 +3759,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     }
     id<MTLBuffer> x_in = s.xn;
     const NormLink* out_link = fuse ? &l_post : nullptr;
+    tap_rows(m, E, li, 0, x_in, M, c.D);  // ActivationSink::kAttnIn
     if (L.linear) {
       const int k = L.index_in_kind;
       gemm_runs(E, m.tune, L.in_proj, x_in, 0, c.D, s.proj, 0, ldl, M, 0, nin);
@@ -3820,6 +3894,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         gemm(E, m.tune, L.out, s.y, 0, Vd, s.h, 0, c.D, M, 1, 0, &g, out_link);
       } else if (gdn_fused) {
         // yn was written by the fused kernel
+        tap_rows(m, E, li, 1, s.yn, M, Vd);  // ActivationSink::kMixOut
         if (last_layer) {
           if (N == 0) break;
           gather(s.yn, s.mixc, Vd, false);
@@ -3841,6 +3916,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       E.rd(s.proj);
       E.wr(s.yn);
       E.groups(MTLSizeMake(size_t(c.Hv + 3) / 4, size_t(M), 1), MTLSizeMake(128, 1, 1));
+      tap_rows(m, E, li, 1, s.yn, M, Vd);  // ActivationSink::kMixOut
       if (last_layer) {
         if (N == 0) break;
         gather(s.yn, s.mixc, Vd, false);
@@ -3861,6 +3937,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       attention(A, meta.a_trees, meta.a_tiles, meta.a_comb, meta.desc.buf, k, qs.n_sparse ? &qs : nullptr);
       if (!kvfold) kv_save(meta.kv_saves, kv_saves.size(), k);
       if (qsa_idx) qsa_save(m, E, qs, meta.pos.buf, meta.kv_saves.buf, kv_saves.size(), k, false);
+      tap_rows(m, E, li, 1, s.O, M, qdim);  // ActivationSink::kMixOut
       if (last_layer) {
         if (N == 0) break;
         gather(s.O, s.mixc, qdim, false);
@@ -3953,11 +4030,13 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       break;
     }
     if (!fuse) rmsnorm_h(L.post_norm, s.xn, M);
+    tap_rows(m, E, li, 2, s.xn, M, c.D);  // ActivationSink::kMlpIn
     const NormLink* next_link = fuse && li + 1 < c.L ? &l_next : nullptr;
     if (L.moe) {
       moe_mlp(m, E, L, s.xn, s.act, s.h, M, next_link);
     } else {
       mlp_in(L, s.xn, s.act, M);
+      tap_rows(m, E, li, 3, s.act, M, L.I);  // ActivationSink::kDownIn
       // (the next layer's input norm adds the partials; the last layer's go through settle_h below)
       gemm(E, m.tune, L.down, s.act, 0, L.I, s.h, 0, c.D, M, 1, 0, nullptr, next_link, nrm_fold ? &hpend : nullptr);
     }

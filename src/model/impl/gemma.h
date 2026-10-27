@@ -16,6 +16,9 @@
 //          routed on rmsnorm(h) * router.scale / sqrt(D)) are each normed (_1, _2), added and normed
 //          again (post_feedforward_layernorm) before the residual add and the scalar.
 //
+// Calibration taps (dense checkpoints): the q/k/v input, o_proj input, MLP
+// input and down input of every layer, as in the Qwen3.5 path.
+//
 // Semantics of mlx-lm's models/gemma4_text.py (MIT, THIRD_PARTY_NOTICES.md).
 // Sliding layers keep K/V in per-slot rings (Model::kvs); global layers use
 // the paged pool. The logits are soft-capped by run_forest after the LM head.
@@ -270,6 +273,8 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
   };
   // GeGLU MLP of `rows` rows: X (fp16) -> act (fp16 [rows, I]) -> T (fp32 [rows, D], stored).
   auto mlp = [&](const Layer& L, id<MTLBuffer> X, id<MTLBuffer> act, id<MTLBuffer> T, int rows) {
+    const int li = layer_index(m, L);
+    tap_rows(m, E, li, 2, X, rows, c.D);  // ActivationSink::kMlpIn
     if (L.gate_up.out() > 0) {
       gemm(E, m.tune, L.gate_up, X, 0, c.D, act, 0, L.I, rows, 2);
     } else {
@@ -285,6 +290,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       E.wr(act);
       E.threads(MTLSizeMake(size_t(L.I / 4), size_t(rows), 1), MTLSizeMake(64, 1, 1));
     }
+    tap_rows(m, E, li, 3, act, rows, L.I);  // ActivationSink::kDownIn
     gemm(E, m.tune, L.down, act, 0, L.I, T, 0, c.D, rows, 0);
   };
   // The experts of an MoE layer: router logits -> top-k -> tile table ->
@@ -391,6 +397,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     const int qd = c.H * g.hd, kvd = g.hkv * g.hd, ld = c.g4_ld(sw);
     const bool has_v = sw || !c.k_eq_v;
     const int k = L.index_in_kind;
+    tap_rows(m, E, li, 0, s.xn, M, c.D);  // ActivationSink::kAttnIn
     gemm_runs(E, m.tune, L.in_proj, s.xn, 0, c.D, s.proj, 0, ld, M, 0);
     {
       const G4PrepParamsHost pp{c.H, g.hkv, ld, qd, has_v ? qd + kvd : qd, qd, kvd, c.eps};
@@ -422,6 +429,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       gather(s.h, s.hc, c.D, true);
       rows = N, Ob = s.mixc, Hb = s.hc, Xb = s.xc, Ab = s.actc;
     }
+    tap_rows(m, E, li, 1, Ob, rows, qd);  // ActivationSink::kMixOut
     gemm(E, m.tune, L.out, Ob, 0, qd, s.proj, 0, c.D, rows, 0);
     {
       const G4NormParamsHost np{c.D, c.eps, 1.0f, L.moe ? 3 : 1};

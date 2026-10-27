@@ -28,6 +28,10 @@
 #include <unordered_map>
 
 #include "config.h"
+
+namespace espetero {
+class ActivationSink;
+}
 #include "gemm.h"
 
 namespace espetero::native {
@@ -584,6 +588,18 @@ struct Model : Runtime {
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
   bool moe_down_comb_tune = false;  // ... or chosen at load per device and model (tune_moe_down): ESPETERO_MOE_DOWN_TUNE=1
+  // Calibration taps (NativeModel::set_activation_sink): the decoder
+  // matrices' inputs copied into tap_buf during a pass (tap_rows, forest.h),
+  // handed to the sink once the pass is done.
+  struct TapRec {
+    int layer = 0, kind = 0, n = 0, width = 0, k = 0;
+    size_t off = 0, ids_off = 0, pos_off = 0;
+  };
+  espetero::ActivationSink* tap_sink = nullptr;
+  bool tap_pass = false;  // this pass copies
+  id<MTLBuffer> tap_buf = nil;
+  size_t tap_cap = 0, tap_used = 0;
+  std::vector<TapRec> tap_recs;
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
   // Fase 3 (bit-identical variants of the single-row MoE kernels):
   // moe_fin: moe_down_comb's fused-norm finalizer 0 the last arriver reading the 64 block

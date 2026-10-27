@@ -851,8 +851,14 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     if (is_gemma4_type(cfg.get_string("model_type", "")) ||
         (tc && tc->is_object() && is_gemma4_type(tc->get_string("model_type", "")))) {
       if (!mtp.empty() && mtp != "none") fail("--mtp: Gemma 4 has no drafting head (prompt lookup drafts only)");
-      m.format = "mlx";
       m.cfg = config_from_gemma(cfg);
+      if (HFSource::is_hf_dir(src)) {  // BF16 as transformers writes it (espetero quantize's calibration)
+        HFSource hf(path);
+        m.format = "hf";
+        load_gemma(m, hf);
+        return;
+      }
+      m.format = "mlx";
       load_gemma(m, src);
       if (want_vision && src.has("vision_tower.patch_embedder.input_proj.weight")) {
         const VisionConfig vc = vision_from_gemma(cfg, m.cfg.D);

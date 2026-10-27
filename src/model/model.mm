@@ -743,6 +743,15 @@ class MetalModel final : public NativeModel {
     @autoreleasepool {
       const FailMarks counters(m_);
       run_forest(m_, meta_, trees, stats);
+      if (m_.tap_pass) {  // calibration taps: the pass is done, its copies are in tap_buf
+        const uint8_t* base = static_cast<const uint8_t*>([m_.tap_buf contents]);
+        for (const auto& r : m_.tap_recs)
+          m_.tap_sink->tap(r.layer, r.kind, reinterpret_cast<const uint16_t*>(base + r.off), r.n, r.width,
+                           r.k ? reinterpret_cast<const int32_t*>(base + r.ids_off) : nullptr,
+                           r.k ? reinterpret_cast<const int32_t*>(base + r.pos_off) : nullptr, r.k);
+        m_.tap_recs.clear();
+        m_.tap_pass = false;
+      }
       // Readout table for logits(): tree -> first readout.
       readout_base_.assign(trees.size(), 0);
       int n = 0;
@@ -1003,6 +1012,11 @@ class MetalModel final : public NativeModel {
     }
   }
 
+  void set_activation_sink(ActivationSink* sink) override {
+    if (sink && (m_.cfg.q4 || (m_.cfg.gemma && m_.cfg.E) || m_.cfg.q3moe || m_.cfg.lfm2))
+      fail("calibration taps: Qwen3.5-family and dense Gemma 4 models only");
+    m_.tap_sink = sink;
+  }
   void set_profile(bool on) override {
     m_.profile = on;
     m_.prof.clear();

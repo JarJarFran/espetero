@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Francisco José García Barbero
 
-// A Hugging Face Qwen3.5 / Qwen3.6 checkpoint (BF16 safetensors, the names
+// A Hugging Face Qwen3.5 / Qwen3.6 or Gemma 4 checkpoint (BF16 safetensors, the names
 // transformers writes) seen through the MLX names the loaders and the
 // quantizer use, with the conversions mlx-lm's sanitize makes:
 //   model.language_model.X -> language_model.model.X, lm_head.weight ->
@@ -13,7 +13,10 @@
 //   checkpoint has an MTP head or unsanitized conv weights;
 //   fused experts (mlp.experts.gate_up_proj [E, 2 I, D], down_proj [E, D, I])
 //   or per-expert tensors (mlp.experts.N.gate_proj.weight ...) as stacked
-//   switch_mlp.{gate,up,down}_proj.weight [E, out, in].
+//   switch_mlp.{gate,up,down}_proj.weight [E, out, in];
+//   Gemma 4 (gemma4_text.sanitize): no norm shift, the audio and vision
+//   towers left out, fused experts (layers.N.experts.gate_up_proj /
+//   down_proj) as experts.switch_glu.{gate,up,down}_proj.weight.
 // Tensors that need new bytes (shifted norms, split or stacked experts) are
 // materialized on first use; large ones are kept only while they are among
 // the last few asked for (a loader converts each matrix before it asks for
@@ -41,8 +44,20 @@ class HFSource : public WeightSource {
     tied_ = cfg.get_bool("tie_word_embeddings", t.get_bool("tie_word_embeddings", false));
     static const std::regex fused(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$)");
     static const std::regex single(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$)");
+    static const std::regex g4fused(R"(^model\.language_model\.layers\.(\d+)\.experts\.(gate_up_proj|down_proj)$)");
     for (const std::string& n : raw_.names()) {
       std::smatch mm;
+      if (std::regex_match(n, mm, g4fused)) {  // Gemma 4: experts beside the dense MLP
+        const std::string p = "language_model.model.layers." + mm[1].str() + ".experts.switch_glu.";
+        if (mm[2] == "gate_up_proj") {
+          map_[p + "gate_proj.weight"] = {n, Kind::GateHalf};
+          map_[p + "up_proj.weight"] = {n, Kind::UpHalf};
+        } else {
+          map_[p + "down_proj.weight"] = {n, Kind::Plain};
+        }
+        continue;
+      }
+      if (n.find("self_attn.rotary_emb") != std::string::npos) continue;  // gemma4_text.sanitize drops these
       if (std::regex_match(n, mm, fused)) {
         const std::string p = "language_model.model.layers." + mm[1].str() + ".mlp.switch_mlp.";
         if (mm[2] == "gate_up_proj") {
