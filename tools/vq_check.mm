@@ -143,13 +143,13 @@ int main(int argc, char** argv) {
           std::printf("vq_dequant           k%2d %s: max abs err %.3g\n", kbits, down ? "down" : "gu  ", mx);
           if (mx > 1e-2) ++fails;
         }
-        for (int MM : {1, 2, 4, 8}) {
+        for (int MM : {1, 2, 4, 8, 9}) {  // 9: moe_vq_gemm8 (8-row tiles on the matrix units)
           // tiles: expert e, rows r0..r0+rows (gathered A rows via rowmap)
           const int ntok = 13;
           std::vector<int32_t> tiles, rowmap;
           int slot = 0;
           for (int e = 0; e < E; ++e) {
-            const int rows = 1 + (e * 3) % MM;
+            const int rows = 1 + (e * 3) % std::min(MM, 8);
             tiles.insert(tiles.end(), {e, slot, rows, 0});
             for (int m = 0; m < rows; ++m) rowmap.push_back((slot + m * 5 + e) % ntok);
             slot += rows;
@@ -167,7 +167,8 @@ int main(int argc, char** argv) {
             id<MTLBuffer> Y = buf(size_t(slot) * ldy * 4);
             std::memset(Y.contents, 0, size_t(slot) * ldy * 4);
             MoeVqParams p{Ne, K, K, ldy, 1, 0, kbits, nv, hw, ns, ncb == 2 ? 1 : 0};
-            const std::string name = "moe_vq_gemv" + std::to_string(MM) + (epi == 2 ? "_swiglu" : "_store");
+            const std::string name = (MM == 9 ? std::string("moe_vq_gemm8") : "moe_vq_gemv" + std::to_string(MM)) +
+                                     (epi == 2 ? "_swiglu" : "_store");
             id<MTLCommandBuffer> c = [q commandBuffer];
             id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
             [e setComputePipelineState:pipe(name)];
@@ -214,7 +215,7 @@ int main(int argc, char** argv) {
             }
             const double rel = mx / std::max(ref_mx, 1e-9);
             std::printf("%-20s k%2d %s: max rel err %.3g\n", name.c_str(), kbits, down ? "down" : "gu  ", rel);
-            if (rel > 5e-3) ++fails;
+            if (rel > (MM == 9 ? 2e-2 : 5e-3)) ++fails;  // (gemm8: fp16 dequantized weights and fp16 x products)
           }
         }
       }

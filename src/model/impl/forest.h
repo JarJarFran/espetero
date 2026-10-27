@@ -490,8 +490,10 @@ inline std::string moe_down_comb_name(const QW& w, const QW& w2, int comb_ks) {
 // asked for a moe_gemv8_..._s8 kernel that no pass uses, and the load failed.)
 inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<std::string, int>>& out) {
   if (L.vq) {
-    for (int mm : {1, 2, 4, 8})
-      for (const char* t : {"_swiglu", "_store"}) out.push_back({"moe_vq_gemv" + std::to_string(mm) + t, kVqFc});
+    for (const char* t : {"_swiglu", "_store"}) {
+      for (int mm : {1, 2, 4, 8}) out.push_back({"moe_vq_gemv" + std::to_string(mm) + t, kVqFc});
+      out.push_back({std::string("moe_vq_gemm8") + t, kVqFc});
+    }
     return;
   }
   const QW& gu = L.experts_gu;
@@ -888,8 +890,11 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
                      int epi, int part, int split = 0, int mix = 0) {  // part: 0 gate/up, 1 down (the staged records' halves); split: the split pass; mix: 1 the FMA half, 2 the MMA half
     if (L.vq && !pooled) {  // EQV experts: moe_vq_gemv, MM = the tiles' rows rounded up to 1 / 2 / 4 / 8
       const VQW& v = epi == 2 ? L.vq_gu : L.vq_down;
+      // 1-2 rows: the FMA kernel; more: the 8-row MMA kernel (ESPETERO_VQ_FMA=1: FMA up to 8 rows)
+      static const bool vq_fma = env_on("ESPETERO_VQ_FMA");
       const int mm = rows <= 1 ? 1 : rows <= 2 ? 2 : rows <= 4 ? 4 : 8;
-      const std::string name = "moe_vq_gemv" + std::to_string(mm) + (epi == 2 ? "_swiglu" : "_store");
+      const std::string name = (mm <= 2 || vq_fma ? "moe_vq_gemv" + std::to_string(mm) : std::string("moe_vq_gemm8")) +
+                               (epi == 2 ? "_swiglu" : "_store");
       E.pipe(name, kVqFc);
       gemm_tag(E, name, Ne, v.in, rows);
       const bool direct = rows == 1 && m.moe_direct;
