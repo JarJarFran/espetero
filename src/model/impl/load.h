@@ -36,7 +36,7 @@ inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std
   } else {
     h.q = qw_from_view(tmp, t, out, in);
     m.source_types[t.kind == TensorView::GGUFQuant ? ggml_type_info(t.gguf_type)->name
-                   : t.kind == TensorView::EQQuant ? "eq" + std::to_string(t.bits)
+                   : t.kind == TensorView::EQQuant ? "eq" + std::to_string(t.bits) + (t.codebook ? "cb" : "")
                                                    : "mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
   }
   return h;
@@ -44,6 +44,25 @@ inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std
 
 // Dequantize a host QW to fp16 (identical to the GPU's half-precision fma).
 inline Buf dequant_f16(Arena& ar, const QW& q_in) {
+  if (eqc_mode(q_in.scale_mode)) {  // EQ4 codebooks: half(half(super * sub) * cb[code]), as the GPU's GEMMs
+    const QW& q = q_in;
+    Buf out = ar.alloc(size_t(q.out) * q.in * 2);
+    __fp16* dst = (__fp16*)ptr(out);
+    const uint32_t* codes = (const uint32_t*)ptr(q.w);
+    const int8_t* ss = (const int8_t*)ptr(q.s);
+    const int in = q.in, spr = in / 16, bpr = in / 256;
+    const size_t zrow = q.z_row_bytes() / 2;
+    parallel_for(size_t(q.out), [&](size_t r) {
+      const uint16_t* z = (const uint16_t*)ptr(q.z) + r * zrow;
+      for (int c = 0; c < in; ++c) {
+        const uint32_t code = (codes[(r * size_t(in) + c) / 8] >> (4 * (c % 8))) & 0xF;
+        const int step = c / 64, t = (c % 8) / 2;
+        const float sc = f16_to_f32(f32_to_f16_bits(f16_to_f32(z[c / 256]) * float(ss[r * spr + step * 4 + t])));
+        dst[r * size_t(in) + c] = __fp16(sc * f16_to_f32(z[bpr + code]));
+      }
+    });
+    return out;
+  }
   const QW q0 = to_affine(ar, q_in);
   const QW q = to_half_scales(ar, q0.src_bits == 4 || q0.src_bits == 8 ? q0 : widen8(ar, q0));
   Buf out = ar.alloc(size_t(q.out) * q.in * 2);
@@ -393,7 +412,7 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   const QW& rq = router.q;
   const QW& gq = sgate.q;
   if (!router.dense && !sgate.dense && rq.bits == gq.bits && rq.src_bits == gq.src_bits && rq.group == gq.group &&
-      rq.half_scales == gq.half_scales && rq.scale_mode == gq.scale_mode) {
+      rq.half_scales == gq.half_scales && rq.scale_mode == gq.scale_mode && !eqc_mode(rq.scale_mode)) {  // (EQ codebooks: 8-row groups)
     L.router_sg.q = concat_rows(tmp, {rq, gq});
     repack(m, e, L.router_sg.q, tmp);
     L.router_sg.q.w = L.router_sg.q.s = L.router_sg.q.z = Buf{};

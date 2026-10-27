@@ -31,6 +31,12 @@ struct QW {
   //    2^(bits - 1)) * half(super * sub), an int8 sub-scale per lane sub-block
   //    (16 K rows: the rows k of a 64-wide K step with (k % 8) / 2 == t, in
   //    s [out][in / 16] at 4 * step + t) and an fp16 super-scale per 256 (z).
+  // 7: EQ4 with codebooks: mode 6's scales, weight = half(super * sub) *
+  //    cb[code] with a 16-entry fp16 codebook per row; z holds each row's
+  //    super-scales followed by its codebook (16 halves), so row moves (fusion,
+  //    interleaving) carry it. On the GPU each 32-column block keeps one
+  //    codebook per 8 columns after its scales (rows of an 8-row group must
+  //    share one).
   int scale_mode = 0;
   // Gated epilogue of a gate/up matrix: 0 SiLU (SwiGLU), 1 tanh-GELU
   // (GeGLU, Gemma 4). A function constant of the kernels (fc() bit 24).
@@ -42,7 +48,8 @@ struct QW {
   size_t s_row_bytes() const {
     switch (scale_mode) {
       case 1:
-      case 6: return size_t(in / 16);
+      case 6:
+      case 7: return size_t(in / 16);
       case 2: return size_t(in / 32) * 2;
       case 3: return size_t(in / 32) * 2;
       default: return size_t(in / group) * 2;
@@ -52,6 +59,7 @@ struct QW {
     switch (scale_mode) {
       case 1:
       case 6: return size_t(in / 256) * 2;
+      case 7: return size_t(in / 256) * 2 + 32;
       case 2: return 0;
       case 3: return size_t(in / 256) * 4;
       default: return size_t(in / group) * 2;
@@ -80,10 +88,12 @@ int native_scale_mode(int gguf_type) {
 
 // Symmetric two-level scales (int8 per 16 x fp16 per 256): Q6_K and EQ,
 // codes offset by 2^(bits - 1).
-inline bool sym16_mode(int mode) { return mode == 1 || mode == 6; }
+inline bool sym16_mode(int mode) { return mode == 1 || mode == 6 || mode == 7; }
 // EQ: sub-blocks shaped by the GPU's fragment lanes (no affine form wider
 // than 2 columns; fused only with EQ matrices of the same code width).
-inline bool eq_mode(int mode) { return mode == 6; }
+inline bool eq_mode(int mode) { return mode == 6 || mode == 7; }
+// EQ with codebooks (EQ4: 16 entries).
+inline bool eqc_mode(int mode) { return mode == 7; }
 inline int eq_scale_mode(int bits) {
   if ((bits < 4 || bits > 6) && bits != 8) fail("EQ: unsupported code width " + std::to_string(bits));
   return 6;
@@ -152,7 +162,21 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
     q.scale_mode = eq_scale_mode(t.bits);
     q.w = ar.copy(t.data, q.row_bytes() * size_t(out));
     q.s = ar.copy(t.scales, q.s_row_bytes() * size_t(out));
-    q.z = ar.copy(t.biases, q.z_row_bytes() * size_t(out));
+    if (!t.codebook) {
+      q.z = ar.copy(t.biases, q.z_row_bytes() * size_t(out));
+      return q;
+    }
+    // EQ4 codebooks [ncb][16] fp16, codebook r / (out / ncb) for row r: per
+    // row after its super-scales.
+    if (t.bits != 4) fail(t.name + ": codebooks need 4-bit EQ codes");
+    if (t.ncb <= 0 || out % t.ncb || (out / t.ncb) % 8) fail(t.name + ": codebook rows must be whole 8-row groups");
+    q.scale_mode = 7;
+    const size_t sup = size_t(in / 256) * 2, zrow = q.z_row_bytes(), per = size_t(out / t.ncb);
+    q.z = ar.alloc(zrow * size_t(out));
+    parallel_for(size_t(out), [&](size_t r) {
+      std::memcpy((uint8_t*)ptr(q.z) + r * zrow, t.biases + r * sup, sup);
+      std::memcpy((uint8_t*)ptr(q.z) + r * zrow + sup, t.codebook + (r / per) * 32, 32);
+    });
     return q;
   }
   if (t.kind != TensorView::GGUFQuant) fail(t.name + ": not a quantized tensor");
@@ -198,6 +222,7 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
 // the column pairs 2 t, 2 t + 1 of every 8 in a 64-wide K step), for the host
 // paths that dequantize (requant, dequant_f16); no GPU kernel takes group 2.
 QW eq_to_affine(Arena& ar, const QW& q) {
+  if (q.scale_mode == 7) fail("EQ4 codebook matrices have no affine form (dequant_f16 reads them directly)");
   QW o = q;
   o.scale_mode = 0;
   o.group = 2;
@@ -369,7 +394,7 @@ std::vector<QW> unify(Arena& ar, std::vector<QW> parts) {
   }
   if (same_native && same_bits) return parts;  // one native GGUF / EQ layout
   for (const QW& p : parts)
-    if (eq_mode(p.scale_mode)) fail("EQ matrices fuse only with EQ matrices of the same code width");
+    if (eq_mode(p.scale_mode)) fail("EQ matrices fuse only with EQ matrices of the same code width (and codebook use)");
   for (QW& p : parts) p = to_affine(ar, p);
   for (const QW& p : parts) group = std::min(group, p.group);
   for (QW& p : parts) {
@@ -416,7 +441,8 @@ std::vector<QW> fuse_rows(Arena& ar, const std::vector<QW>& parts) {
   for (const auto& p : parts) {
     // (EQ parts stay out of other layouts' runs: they have no shared form)
     if (!cur.empty() && (cur.back().bits != p.bits || eq_mode(cur.back().scale_mode) != eq_mode(p.scale_mode) ||
-                         (eq_mode(p.scale_mode) && cur.back().src_bits != p.src_bits)))
+                         (eq_mode(p.scale_mode) && (cur.back().src_bits != p.src_bits ||
+                                                    cur.back().scale_mode != p.scale_mode))))
       flush();
     cur.push_back(p);
   }
@@ -473,7 +499,8 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   const int KG = q.in / 64;
   if (q.in % 64) fail("quantized matrices need an input width that is a multiple of 64");
   if ((q.scale_mode == 1 && q.bits != 6) ||
-      (q.scale_mode == 6 && (((q.bits < 4 || q.bits > 6) && q.bits != 8) || q.bits != q.src_bits)))
+      (q.scale_mode == 6 && (((q.bits < 4 || q.bits > 6) && q.bits != 8) || q.bits != q.src_bits)) ||
+      (q.scale_mode == 7 && (q.bits != 4 || q.src_bits != 4)))
     fail("repack: Q6_K / EQ scales with an unexpected code width");
   if ((q.scale_mode == 2 && q.bits != 8) || (q.scale_mode == 3 && q.bits != 4 && q.bits != 5))
     fail("repack: native GGUF scales with an unexpected code width");
@@ -484,6 +511,7 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   switch (q.scale_mode) {
     case 1:
     case 6: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4; break;
+    case 7: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4 + size_t(Np / 8) * 32; break;
     case 2: q.sb_n = pairs * (q.in / 32) * 4; break;
     case 3: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 8; break;
     default: q.sb_n = pairs * size_t(q.in / q.group) * 8;
@@ -550,6 +578,36 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     [e setBytes:&q.out length:4 atIndex:2];
     [e setBytes:&q.in length:4 atIndex:3];
     [e dispatchThreads:MTLSizeMake(size_t(Np / 32) * KG * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+  if (q.scale_mode == 7) {
+    // Super-scales apart from the rows' codebooks, and the codebooks of each
+    // 8-row group (its first row's; the group must share one) after the
+    // scales, zero for padding rows.
+    const size_t sup = size_t(q.in / 256) * 2, zrow = q.z_row_bytes();
+    Buf zs = tmp.alloc(sup * size_t(q.out)), cbs = tmp.alloc(size_t(Np / 8) * 32);
+    std::memset(ptr(cbs), 0, size_t(Np / 8) * 32);
+    const uint8_t* z = (const uint8_t*)ptr(q.z);
+    for (int r = 0; r < q.out; ++r) {
+      std::memcpy((uint8_t*)ptr(zs) + size_t(r) * sup, z + size_t(r) * zrow, sup);
+      if (r % 8 == 0) std::memcpy((uint8_t*)ptr(cbs) + size_t(r / 8) * 32, z + size_t(r) * zrow + sup, 32);
+      else if (std::memcmp(z + size_t(r) * zrow + sup, z + size_t(r - r % 8) * zrow + sup, 32))
+        fail("EQ4 codebooks differ within an 8-row group");
+    }
+    [e setComputePipelineState:rt.kernel("repack_eq_scales")];
+    [e setBuffer:q.s.b offset:q.s.off atIndex:0];
+    [e setBuffer:zs.b offset:zs.off atIndex:1];
+    [e setBuffer:q.sb.b offset:q.sb.off atIndex:2];
+    [e setBytes:&q.out length:4 atIndex:3];
+    [e setBytes:&q.in length:4 atIndex:4];
+    [e dispatchThreads:MTLSizeMake(Np / 2, KG, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    const uint32_t nw = uint32_t(Np / 8) * 8;  // 32-bit words of codebooks
+    const size_t at = pairs * KG * 8 + pairs * (q.in / 256) * 4;
+    [e setComputePipelineState:rt.kernel("copy_words")];
+    [e setBuffer:cbs.b offset:cbs.off atIndex:0];
+    [e setBuffer:q.sb.b offset:q.sb.off + at atIndex:1];
+    [e setBytes:&nw length:4 atIndex:2];
+    [e dispatchThreads:MTLSizeMake(nw, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    return;
   }
   if (sym16_mode(q.scale_mode) || q.scale_mode == 3) {
     [e setComputePipelineState:rt.kernel(q.scale_mode == 3 ? "repack_kq_scales"

@@ -379,7 +379,14 @@ inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<
 // function constants; or another width on both projections).
 inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
-  if (L.gate_up.q.fc() != L.experts_gu.fc() || L.down.q.fc() != L.experts_down.fc()) return 0;
+  // (EQ4 codebook experts, mode 7, stream a shared expert of another EQ
+  // width with mode 6's uniform codes: the kernels read codebooks for 4-bit
+  // codes only.)
+  auto same = [](const QW& s, const QW& x) {
+    return s.fc() == x.fc() ||
+           (eqc_mode(x.scale_mode) && s.scale_mode == 6 && s.bits != x.bits && (s.fc() & ~(0xFF << 16)) == (x.fc() & ~(0xFF << 16)));
+  };
+  if (!same(L.gate_up.q, L.experts_gu) || !same(L.down.q, L.experts_down)) return 0;
   if (L.gate_up.q.bits == L.experts_gu.bits && L.down.q.bits == L.experts_down.bits) return 1;
   // Per matrix: GGUF experts mix widths (Q4_K gate/up beside a Q5_1 or Q8_0 down).
   // EQ (one layout for every width) also has a wider EQ5 / EQ6 shared expert

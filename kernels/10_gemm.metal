@@ -10,15 +10,27 @@ constant int kGroup [[function_constant(0)]];
 // (4 and 5 are reserved.)
 // 6: EQ (Espetero's own checkpoints, 4/5/6/8-bit codes): symmetric two-level
 // scales like Q6_K's, with sub-blocks shaped by the fragment lanes (kEQS).
+// 7: EQ4 with codebooks: EQ's scales, the 4-bit code an index into a 16-entry
+// fp16 codebook (eqc_on).
 constant int kScaleMode [[function_constant(1)]];
 // Symmetric two-level scales (signed int8 sub-scale x fp16 super-scale per
 // 256): Q6_K and EQ. Their codes are offset by 2^(BITS - 1) (sym_bias).
-constant bool kQ6K = kScaleMode == 1 || kScaleMode == 6;
+constant bool kQ6K = kScaleMode == 1 || kScaleMode == 6 || kScaleMode == 7;
 // EQ's sub-blocks follow the fragment lanes instead of contiguous K: within a
 // 64-wide K step, sub-block t holds the K rows k with (k % 8) / 2 == t (16
 // rows: two fm lanes x 8 jj slices), so a lane's 8 rows of a step share one
 // sub-scale per column (vs 4 for Q6_K's contiguous 16-wide sub-blocks).
-constant bool kEQS = kScaleMode == 6;
+constant bool kEQS = kScaleMode == 6 || kScaleMode == 7;
+// EQ4 codebooks: weight = half(super * sub) * cb[code], with the codebook of
+// the weight's 8-column group. A 32-column block's 4 codebooks (16 halves
+// each, group j = columns 8 j .. 8 j + 7, which are a lane's column pair j)
+// follow the scale buffer's scales (eqc_load); each simdgroup copies its
+// block's into threadgroup memory, so a code costs one threadgroup load.
+// Only codes of the codebook width read them (eqc_on), so a shared expert of
+// another width streamed beside codebook experts (moe kernels' BITS2) keeps
+// EQ's uniform codes.
+template <int BITS>
+static inline bool eqc_on() { return kScaleMode == 7 && BITS == 4; }
 // Exponent-biased code (1024 + code) minus the symmetric offset of the code
 // width: 2^(BITS - 1) (EQ4/5/6/8, Q6_K). For Q6_K, BITS 8 is its 6-bit codes
 // widened to bytes for the prefill GEMMs (widen6_8; EQ6 is never widened).
@@ -33,6 +45,32 @@ constant int kActV = is_function_constant_defined(kAct) ? kAct : 0;
 static inline float glu_gate(float x) {
   if (kActV == 1) return 0.5f * x * (1.0f + precise::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
   return silu(x);
+}
+
+// Copy the codebooks of 32-column block nb (scale buffer SB of a KGall-step,
+// Np2-pair matrix) into this simdgroup's 64 halves of threadgroup memory.
+static inline void eqc_load(device const half4* SB, int KGall, int Np2, int nb, threadgroup half* t, ushort lane) {
+  device const half2* C = (device const half2*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 32;
+  const half2 v = C[lane];
+  simdgroup_barrier(mem_flags::mem_threadgroup);  // this simdgroup's lookups of a previous block are done
+  ((threadgroup half2*)t)[lane] = v;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// The 1-2-row GEMV's codebook EQ4 lookups (eqc_pairs): per codebook j, the
+// 256 code pairs (c0, c1) of a lane's column pair as half2(cb[c0], cb[c1]) at
+// j * 256 + c0 + 16 * c1, so a pair costs one 4-byte threadgroup load instead
+// of two 2-byte ones (the lookups alone made that GEMV 8-13 % slower than
+// uniform EQ4 on an M1 Max; 3-8 % with the table). The whole threadgroup builds the
+// block's 4 KB table once (its simdgroups share column block nb); the caller
+// waits on a threadgroup barrier.
+static inline void eqc_pairs_load(device const half4* SB, int KGall, int Np2, int nb, threadgroup half2* t,
+                                  int tid, int nthreads) {
+  device const half* C = (device const half*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 64;
+  for (int i = tid; i < 4 * 256; i += nthreads) {
+    const int j = i >> 8, e = i & 255;
+    t[i] = half2(C[j * 16 + (e & 15)], C[j * 16 + (e >> 4)]);
+  }
 }
 
 // EQ scales of K step g for a lane (pair0: its first column pair, fm: its K
@@ -123,17 +161,28 @@ static inline void kstep_scales(device const half4* SB, ulong g, int KGall, int 
   }
 }
 
-// A dequantized pair of weights from its codes (as exponent-biased halves,
-// value 1024 + code) and scales.
+// A codebook EQ code pair's values: codebook j (the lane's column pair j)
+// of the simdgroup's copy t (eqc_load) at the two codes.
 template <int BITS>
-static inline half2 dequant_pair(half2 biased, half2 s, half2 b) {
+static inline half2 eqc_value(half2 biased, threadgroup const half* t, int j) {
+  const uint u = as_type<uint>(biased);
+  return half2(t[j * 16 + (u & 15u)], t[j * 16 + ((u >> 16) & 15u)]);
+}
+
+// A dequantized pair of weights from its codes (as exponent-biased halves,
+// value 1024 + code) and scales (codebook EQ: from the codebook copy t of
+// column pair j).
+template <int BITS>
+static inline half2 dequant_pair(half2 biased, half2 s, half2 b, threadgroup const half* t = nullptr, int j = 0) {
+  if (eqc_on<BITS>()) return eqc_value<BITS>(biased, t, j) * s;
   return kQ6K ? (biased - half2(sym_bias<BITS>())) * s : fma(biased - half2(1024.0h), s, b);
 }
 
 // A code pair's value before its scale (exact halves): the symmetric modes'
-// code - 2^(BITS - 1) (EQ's GEMV path, eq_kstep).
+// code - 2^(BITS - 1), or codebook EQ's entries (EQ's GEMV path, eq_kstep).
 template <int BITS>
-static inline half2 code_value(half2 biased) {
+static inline half2 code_value(half2 biased, threadgroup const half* t = nullptr, int j = 0) {
+  if (eqc_on<BITS>()) return eqc_value<BITS>(biased, t, j);
   return biased - half2(kQ6K ? sym_bias<BITS>() : 1024.0h);
 }
 
@@ -165,12 +214,56 @@ static inline half2 kstep_code(thread const uint* words, thread const uint* hw, 
 // the weights). xv: [MM][8] activations of the lane's K rows; acc: [MM][8].
 template <int BITS, int MM>
 static inline void eq_kstep(thread const uint* words, thread const uint* hw, thread const float2* s4,
-                            thread const float* xv, thread float* acc) {
+                            thread const float* xv, thread float* acc, threadgroup const half* cbt = nullptr) {
   UNROLL for (int j = 0; j < 4; ++j) {
     float2 t[MM];
     UNROLL for (int m = 0; m < MM; ++m) t[m] = float2(0.0f);
     UNROLL for (int jj = 0; jj < 8; ++jj) {
-      const float2 cv = float2(code_value<BITS>(kstep_code<BITS>(words, hw, jj, j)));
+      const float2 cv = float2(code_value<BITS>(kstep_code<BITS>(words, hw, jj, j), cbt, j));
+      UNROLL for (int m = 0; m < MM; ++m) t[m] = fma(float2(xv[m * 8 + jj]), cv, t[m]);
+    }
+    UNROLL for (int m = 0; m < MM; ++m) {
+      acc[m * 8 + 2 * j] = fma(s4[j].x, t[m].x, acc[m * 8 + 2 * j]);
+      acc[m * 8 + 2 * j + 1] = fma(s4[j].y, t[m].y, acc[m * 8 + 2 * j + 1]);
+    }
+  }
+}
+
+// Whether BITS-bit codes read the pair table of eqc_pairs_load (codebook EQ4).
+template <int BITS>
+static inline bool eqc_pairs_on() { return kScaleMode == 7 && BITS == 4; }
+
+// The pair-table index c0 + 16 c1 of a lane's column pair j, K row jj (the
+// codes of kstep_code<4>): see eq_kstep_cbp; with the K step unrolled the
+// masked words are shared by the rows.
+static inline uint eqc_pair_index(thread const uint* words, int jj, int j) {
+  const uint w = words[j * 2 + jj / 4];
+  const uint n = (jj % 2) ? (w >> 4) & 0x0F0F0F0Fu : w & 0x0F0F0F0Fu;
+  return ((n | (n >> 12)) >> (8 * ((jj % 4) / 2))) & 0xFFu;
+}
+
+// eq_kstep for codebook EQ4 with the pair table of eqc_pairs_load: the same
+// values and FMAs in the same order as eq_kstep, so the results are
+// bit-identical.
+template <int MM>
+static inline void eq_kstep_cbp(thread const uint* words, thread const float2* s4, thread const float* xv,
+                                thread float* acc, threadgroup const half2* tp) {
+  UNROLL for (int j = 0; j < 4; ++j) {
+    float2 t[MM];
+    UNROLL for (int m = 0; m < MM; ++m) t[m] = float2(0.0f);
+    // Pair indices c0 + 16 c1 of the 8 K rows, a byte each: nibble k of a
+    // word's low half is column x's code of row 4 i + k, of its high half
+    // column y's; masking even / odd nibbles and folding the high half down
+    // by 12 bits leaves rows k, k + 2 in bytes 0, 1.
+    uint pi[4];
+    UNROLL for (int i = 0; i < 2; ++i) {
+      const uint a = words[j * 2 + i] & 0x0F0F0F0Fu, b = (words[j * 2 + i] >> 4) & 0x0F0F0F0Fu;
+      pi[2 * i] = a | (a >> 12);
+      pi[2 * i + 1] = b | (b >> 12);
+    }
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      const uint q = pi[(jj / 4) * 2 + (jj % 2)] >> (8 * ((jj % 4) / 2));
+      const float2 cv = float2(tp[j * 256 + (q & 0xFFu)]);
       UNROLL for (int m = 0; m < MM; ++m) t[m] = fma(float2(xv[m * 8 + jj]), cv, t[m]);
     }
     UNROLL for (int m = 0; m < MM; ++m) {
@@ -604,6 +697,8 @@ kernel void rgemm(
   constexpr int LDA = BK + 8;
   constexpr int AC = (BM * 8 + NT - 1) / NT;
   threadgroup half As[BM * LDA];
+  threadgroup half eqct_all[WN][64];  // codebook EQ: each simdgroup's block codebooks (eqc_load)
+  threadgroup half* eqct = eqct_all[sgid];
 
   // Row blocks vary fastest in the grid, so the threadgroups that share one
   // column block (its weights) run back to back and read them from cache.
@@ -645,6 +740,7 @@ kernel void rgemm(
   constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(n_ok ? n0 / 32 : 0) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(n_ok ? n0 / 32 : 0) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  if (eqc_on<BITS>()) eqc_load(SB, KGall, Np2, n_ok ? n0 / 32 : 0, eqct, ushort(lane));
 
   for (int g = g_begin; g < g_end; ++g) {
     UNROLL for (int c = 0; c < AC; ++c)
@@ -698,7 +794,7 @@ kernel void rgemm(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j);
         b[j].thread_elements()[0] = wv.x;
         b[j].thread_elements()[1] = wv.y;
       }
@@ -768,6 +864,8 @@ kernel void rgemm_v(
   constexpr int U8 = BK / 8;  // uint4 (8 halves) per staged A row
   constexpr int AC = (BM * U8 + NT - 1) / NT;
   threadgroup half As[BM * LDA];
+  threadgroup half eqct_all[WN][64];  // codebook EQ: each simdgroup's block codebooks (eqc_load)
+  threadgroup half* eqct = eqct_all[sgid];
 
   // Row blocks vary fastest in the grid, so the threadgroups that share one
   // column block (its weights) run back to back and read them from cache.
@@ -812,6 +910,7 @@ kernel void rgemm_v(
   constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(n_ok ? n0 / 32 : 0) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(n_ok ? n0 / 32 : 0) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  if (eqc_on<BITS>()) eqc_load(SB, KGall, Np2, n_ok ? n0 / 32 : 0, eqct, ushort(lane));
 
   for (int g = g_begin; g < g_end; g += KPB) {
     UNROLL for (int c = 0; c < AC; ++c)
@@ -877,7 +976,7 @@ kernel void rgemm_v(
             q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
           }
           const int gi = (jj * 8) / kGroup;
-          const half2 wv = dequant_pair<BITS>(q, s2[kk][gi * 4 + j], b2[kk][gi * 4 + j]);
+          const half2 wv = dequant_pair<BITS>(q, s2[kk][gi * 4 + j], b2[kk][gi * 4 + j], eqct, j);
           b[j].thread_elements()[0] = wv.x;
           b[j].thread_elements()[1] = wv.y;
         }
@@ -951,6 +1050,8 @@ kernel void rgemm_s(
   constexpr int AC = (BM * 8 + NT - 1) / NT;
   threadgroup half As[BM * LDA];
   threadgroup half2 Bx[WN][2][8][2][32];  // [pair][half][jj][local j][lane]
+  threadgroup half eqct_all[2 * WN][64];  // codebook EQ: each simdgroup's block codebooks (eqc_load)
+  threadgroup half* eqct = eqct_all[sgid];
 
   const int cb = int(sgid) >> 1, hf = int(sgid) & 1;
   const int m0 = tgid.x * BM;
@@ -993,6 +1094,7 @@ kernel void rgemm_s(
   constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(n_ok ? n0 / 32 : 0) * KGall * (32 * WPL) + lane * WPL + hf * WPH;
   device const uint* hp = Wh + (ulong(n_ok ? n0 / 32 : 0) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  if (eqc_on<BITS>()) eqc_load(SB, KGall, Np2, n_ok ? n0 / 32 : 0, eqct, ushort(lane));
 
   for (int g = g_begin; g < g_end; ++g) {
     UNROLL for (int c = 0; c < AC; ++c)
@@ -1034,7 +1136,7 @@ kernel void rgemm_s(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        mine[jj][jl] = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        mine[jj][jl] = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j);
         Bx[cb][hf][jj][jl][lane] = mine[jj][jl];
       }
     }
@@ -1241,6 +1343,18 @@ kernel void rgemv(
   float inv[MM];
   threadgroup float nred[KS][MM];
   if (NRM == 1) row_inv<MM, KS>(pin, np, p.M, ushort(sgid), ushort(lane), nred, inv);
+  // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4 on
+  // the FMA path) the threadgroup's pair table (eqc_pairs_load).
+  threadgroup half eqct_all[KS][64];
+  threadgroup half* eqct = eqct_all[sgid];
+  const bool cbp = eqc_pairs_on<BITS>() && !JIT;
+  threadgroup half2 eqcp[4 * 256];
+  if (cbp) {
+    eqc_pairs_load(SB, KGall, Np2, nb, eqcp, int(sgid) * 32 + int(lane), KS * 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (eqc_on<BITS>()) {
+    eqc_load(SB, KGall, Np2, nb, eqct, ushort(lane));
+  }
   // NRM 3 (Qwen4-Exp hyper-connection read, q4_hc_gates folded in): the input
   // is the down projection's fp32 rows (lda = their width), read as
   // half(silu(dn / S)) with S = np.D; np.P is the gates' mode (0 injection
@@ -1298,8 +1412,10 @@ kernel void rgemv(
       UNROLL for (int m = 0; m < MM; ++m)
         UNROLL for (int jj = 0; jj < 8; ++jj) xv[JIT ? 0 : m][jj] = act(m, g * 64 + jj * 8 + fm);
     }
-    if (kEQS && !JIT) {
-      eq_kstep<BITS, MM>(words, hw, s4, &xv[0][0], &acc[0][0]);
+    if (cbp) {
+      eq_kstep_cbp<MM>(words, s4, &xv[0][0], &acc[0][0], eqcp);
+    } else if (kEQS && !JIT) {
+      eq_kstep<BITS, MM>(words, hw, s4, &xv[0][0], &acc[0][0], eqct);
     } else {
       UNROLL for (int jj = 0; jj < 8; ++jj) {
         float xj[JIT ? MM : 1];
@@ -1324,7 +1440,7 @@ kernel void rgemv(
             q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
           }
           const int gi = (jj * 8) / kGroup;
-          const float2 wv = float2(dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]));
+          const float2 wv = float2(dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j));
           UNROLL for (int m = 0; m < MM; ++m) {
             const float x = JIT ? xj[JIT ? m : 0] : xv[JIT ? 0 : m][jj];
             acc[m][2 * j] = fma(x, wv.x, acc[m][2 * j]);
@@ -1552,6 +1668,18 @@ kernel void rgemv8(
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   const bool row_ok = fm < p.M;
+  // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4)
+  // the threadgroup's pair table (see rgemv).
+  threadgroup half eqct_all[KS][64];
+  threadgroup half* eqct = eqct_all[sgid];
+  const bool cbp = eqc_pairs_on<BITS>() && DG != 3;
+  threadgroup half2 eqcp[4 * 256];
+  if (cbp) {
+    eqc_pairs_load(SB, KGall, Np2, nb, eqcp, int(sgid) * 32 + int(lane), KS * 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (eqc_on<BITS>()) {
+    eqc_load(SB, KGall, Np2, nb, eqct, ushort(lane));
+  }
   device const half* arow = (device const half*)Av + ulong(row_ok ? fm : 0) * p.lda;
   device const float* frow = (device const float*)Av + ulong(row_ok ? fm : 0) * p.lda;
   float inv_row = 1.0f;
@@ -1645,7 +1773,9 @@ kernel void rgemv8(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = DG == 3 ? q : dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = DG == 3 ? q
+                         : cbp  ? eqcp[j * 256 + eqc_pair_index(words, jj, j)] * s2[gi * 4 + j]
+                                : dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j);
         simdgroup_matrix<half, 8, 8> b;
         b.thread_elements()[0] = wv.x;
         b.thread_elements()[1] = wv.y;
@@ -1948,6 +2078,12 @@ kernel void dequant_hr(
         q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
       }
       const int gi = (jj * 8) / kGroup;
+      if (eqc_on<BITS>()) {
+        device const half* C = (device const half*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 64 + j * 16;
+        const uint u = as_type<uint>(q);
+        out[j] = as_type<uint>(half2(C[u & 15u], C[(u >> 16) & 15u]) * s2[gi * 4 + j]);
+        continue;
+      }
       out[j] = as_type<uint>(dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]));
     }
     Hr[slot * 8 + jj] = uint4(out[0], out[1], out[2], out[3]);
@@ -2171,3 +2307,9 @@ kernel void hgemm(
 INSTANTIATE_HGEMM("32x4", 32, 4, 8)
 INSTANTIATE_HGEMM("16x4", 16, 4, 2)
 INSTANTIATE_HGEMM("8x8", 8, 8, 8)
+
+// dst[i] = src[i] (EQ4 codebooks into the tail of a scale buffer).
+kernel void copy_words(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]], constant uint& n [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+  if (i < n) dst[i] = src[i];
+}

@@ -24,6 +24,8 @@ struct TensorView {
   int bits = 0, group = 0;       // MLXQuant / EQQuant: code width and group size along cols
   const uint8_t* scales = nullptr;  // MLXQuant: [rows, cols / group]; EQQuant: int8 [rows, cols / 16]
   const uint8_t* biases = nullptr;  // EQQuant: fp16 scale per 256 [rows, cols / 256]
+  const uint8_t* codebook = nullptr;  // EQQuant with codebooks (EQ4): fp16 [ncb, 16], codebook r / (rows / ncb) of row r
+  int64_t ncb = 0;
   int gguf_type = -1;            // GGUFQuant: ggml type id
 
   int64_t rows() const { return shape.empty() ? 0 : (shape.size() == 1 ? 1 : shape[0]); }
@@ -134,6 +136,12 @@ class SafetensorsSource : public WeightSource {
         t.scales = files_[size_t(s->second.file)]->at(s->second.offset);
         t.biases = files_[size_t(sup->second.file)]->at(sup->second.offset);
         t.dtype = "F16";
+        if (auto cb = entries_.find(base + ".codebook"); cb != entries_.end()) {
+          if (cb->second.dtype != "F16" || cb->second.shape.size() != 2 || cb->second.shape[1] != 16 || bits != 4)
+            fail(base + ": EQ codebooks must be F16 [n, 16] beside 4-bit codes");
+          t.codebook = files_[size_t(cb->second.file)]->at(cb->second.offset);
+          t.ncb = cb->second.shape[0];
+        }
         return t;
       }
       auto z = entries_.find(base + ".biases");
