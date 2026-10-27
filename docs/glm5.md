@@ -627,7 +627,7 @@ Decisions taken with the parent session's advice (pending Fran's review):
 
 Open for Fran: the disk (which models go; the download), and A or B.
 
-## 13. Status (2026-10-26, branch arch/glm5)
+## 13. Status (2026-10-27, branch arch/glm5)
 
 **Verified on the GPU** (against `tools/glm5_ref.py`, the numpy transcription of transformers, itself checked
 against mlx-vlm's own layers to 3e-4; slices of layers 0–3 on the Studio HDD, §11):
@@ -646,12 +646,22 @@ against mlx-vlm's own layers to 3e-4; slices of layers 0–3 on the Studio HDD, 
   template (564 cases byte-identical to transformers), the GLM tool-call parser (unit tests);
 * `espetero serve` on the slice (4 layers + head, `ESPETERO_GLM5_HEAD_ANY=1`): chat, sampled chat, streaming,
   completions well formed.
+* `espetero serve` on the **full UD-Q2_K_XL** (Studio M4 Max, 64K and 128K context, 2 slots,
+  `ESPETERO_GLM5_PRELOAD=1`, all 12,384 experts resident in mlock'd memory, wire limit raised to 120 GB):
+  load 789 s (725 s of it reading 101.7 GB of experts from the HDD), 112.0 GB of GPU allocations of a
+  128.8 GB working set, peak 105.5 GB (128K: load 814 s, 113.7 GB allocated, sequences 1.86 GB, peak
+  107.9 GB, same speeds and text); decode 13–16 tok/s greedy, prefill ≈ 25 tok/s (163 tokens in
+  6.6 s, GEMV tier); coherent text, forced and auto tool calls parsed (`get_weather {"city": ...}`).
+  Without mlock (job #810) the same run went 0.004–0.3 tok/s: unlocked buffers were compressed under
+  memory pressure. GLM's template has no thinking switch: `reasoning_effort: none` still reasons.
+  Open: a bare completion of `Hello` (no `[gMASK]<sop>` prefix) answers `[gMASK]` tokens; compare with
+  llama.cpp on the same file.
 
 **Written, not yet verified:** checkpoint files (`slot_save` / `slot_load`), trees with leaves.
 
 **Needs the full model** (a GGUF on the Studio SSD, Fran's call): logits and greedy text against llama.cpp on
-the same file, perplexity, the forced tool call (GLM's template always opens `<think>`; forcing waits for the
-model's `</think>`), MTP acceptance, decode / prefill speed with the expert cache, memory.
+the same file, perplexity, MTP acceptance, the LRU cache's speed on UD-Q4_K_XL (does not fit
+resident).
 
 **Not started:** vision tower, several sequences per GPU pass, GPU top-k / draw, GEMMs for prefill (tier 0
 runs every row through GEMVs), MTP drafting in the engine.
