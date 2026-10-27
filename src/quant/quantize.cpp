@@ -201,6 +201,11 @@ std::string preset(const std::string& name) {
     // with 2^K-entry codebooks (fnxvq: K 13, ~1.69 bits per weight; fnxvq12 / fnxvq14 ...), the rest as fnx3m.
     const std::string k = name.size() > 5 ? name.substr(5) : "13";
     r = {"*switch_mlp*=eqv:" + k, "*embed_tokens=affine:8:64:f16", "*lm_head=affine:6:64:f16+gptq", "*=eql:5:16+gptq"};
+  } else if (name == "fnxmix") {
+    // Qwen3.8-Flash-Next at ~52 GB (64 GB Macs) with all 512 experts in two formats per layer
+    // (--expert-split, the most routed first by --keep-experts): EQ3 codebooks, the rest EQV 13; as fnx3m otherwise.
+    r = {"*switch_mlp_b*=eqv:13", "*switch_mlp*=eql:3:16:cb+imat", "*embed_tokens=affine:8:64:f16",
+         "*lm_head=affine:6:64:f16+gptq", "*=eql:5:16+gptq"};
   } else {
     fail("unknown preset " + name);
   }
@@ -286,7 +291,7 @@ bool known_preset(const std::string& p) {
   if (is_dense_preset(p)) return true;
   if (p.rfind("fnxvq", 0) == 0 && (p.size() == 5 || (std::isdigit(p[5]) && std::stoi(p.substr(5)) >= 9 && std::stoi(p.substr(5)) <= 16)))
     return true;
-  if (p == "eq4dhb" || p == "eq3h" || p == "eq3dh" || p == "eq3dx" || p == "eq3dhb" || p == "fnx3" || p == "fnx3m" ||
+  if (p == "eq4dhb" || p == "eq3h" || p == "eq3dh" || p == "eq3dx" || p == "eq3dhb" || p == "fnx3" || p == "fnx3m" || p == "fnxmix" ||
       std::find(kPresets.begin(), kPresets.end(), p) != kPresets.end())
     return true;
   const std::string b = p.substr(0, p.size() - 1);
@@ -319,6 +324,11 @@ struct Item {
   std::string path;            // module (MLX path, no .weight)
   Fmt f;
   std::vector<int64_t> shape;  // the weight's MLX shape
+  // An expert stack split in two (--expert-split): the source module and the range [e0, e1) of its
+  // experts (in the --keep-experts order) this item holds; e1 0: the whole module `path`.
+  std::string src;
+  int e0 = 0, e1 = 0;
+  const std::string& source() const { return src.empty() ? path : src; }
 };
 
 int64_t numel(const std::vector<int64_t>& s) {
@@ -609,6 +619,37 @@ Keep read_keep(const std::string& path, int E, int L, bool mtp) {
   return k;
 }
 
+// --expert-split H | FILE: a layer's routed experts in two formats, the first H (in the --keep-experts
+// order, e.g. most routed first) in mlp.switch_mlp.* by the rules for that path, the others in
+// mlp.switch_mlp_b.* by the rules for theirs (e.g. '*switch_mlp_b*=eqv:13;*switch_mlp*=eql:3:16:cb+imat').
+// H: every layer; FILE: JSON {"<layer>": H, ..., "mtp": H}, a layer not listed keeps one stack. H and the
+// rest multiples of 8.
+struct Split {
+  int all = 0;
+  std::map<std::string, int> per;
+  // H of the expert stack `name` (0: one stack).
+  int of(const std::string& name) const {
+    static const std::regex re(R"(^(language_model\.model\.|mtp\.)layers\.(\d+)\.mlp\.switch_mlp\.(gate|up|down)_proj\.weight$)");
+    std::smatch m;
+    if ((!all && per.empty()) || !std::regex_match(name, m, re)) return 0;
+    if (all) return all;
+    auto it = per.find(m[1] == "mtp." ? "mtp" : m[2].str());
+    return it == per.end() ? 0 : it->second;
+  }
+};
+
+Split read_split(const std::string& v) {
+  Split s;
+  if (!v.empty() && std::all_of(v.begin(), v.end(), [](char c) { return std::isdigit((unsigned char)c); })) {
+    s.all = std::stoi(v);
+    return s;
+  }
+  const json::Value j = json::parse(native::read_file(v));
+  const json::Object& o = j.as_object();
+  for (size_t i = 0; i < o.size(); ++i) s.per[o.keys[i]] = int(o.vals[i].as_int());
+  return s;
+}
+
 // Rows of `keep`'s experts from W [E][rows_per][C] (or a router [E][C]).
 std::vector<float> slice_experts(const std::vector<float>& W, int E, const std::vector<int>& keep) {
   const size_t per = W.size() / size_t(E);
@@ -752,7 +793,7 @@ const char* kUsage =
     "         [--calib FILE | --calib none] [--calib-data file:PATH[+...]] [--calib-tokens N] [--ctx N]\n"
     "         [--calib-out FILE] [--calib-only] [--calib-experts f16|q8] [--calib-layers A:B]\n"
     "         [--hessian-max N] [--hessian-pack N] [--no-mtp] [--shard-gb G] [--tiles]\n"
-    "         [--calib-model DIR] [--keep-experts FILE] [--ple-bits 4|8]\n"
+    "         [--calib-model DIR] [--keep-experts FILE] [--expert-split H|FILE] [--ple-bits 4|8]\n"
     "       espetero quantize --preset NAME --print-rules [--model HF_DIR | --layers N]\n"
     "\n"
     "A Hugging Face BF16 checkpoint (Qwen3.5 / Qwen3.6, dense Gemma 4, Qwen4-Exp) to an EQ checkpoint;\n"
@@ -762,6 +803,7 @@ const char* kUsage =
     "             EQ3 codebook experts (MoE only): eq3h eq3dh eq3dx eq3dhb;\n"
     "             Qwen3.8-Flash-Next: fnx3 (experts EQ3 codebooks, the rest EQ6), fnx3m (the rest EQ5);\n"
     "             fnxvq[K] (all 512 experts EQV with 2^K codebooks, K 13 by default; the rest as fnx3m);\n"
+    "             fnxmix (with --expert-split: the first experts EQ3 codebooks, the rest EQV 13; the rest as fnx3m);\n"
     "             dense Qwen3.5 / 3.6 (widths by tensor class and layer position, sized at or\n"
     "             under the GGUF named): eqd4m (Q4_K_M) eqd4l (UD-Q4_K_XL) eqd5 (UD-Q5_K_XL) eqd6 (Q6_K);\n"
     "             Qwen3.8-27B: eqd6-27b (UD-Q6_K; calibrate with prose as well as code)\n"
@@ -789,6 +831,9 @@ const char* kUsage =
     "             \"mtp\": [ids] (optional)}, counts multiples of 8, possibly different per layer (list order = new\n"
     "             expert id); expert stacks, routers and statistics are sliced, num_experts set to the\n"
     "             largest count\n"
+    "  --expert-split H|FILE  each layer's routed experts in two formats: the first H (in the --keep-experts\n"
+    "             order) in mlp.switch_mlp.*, the rest in mlp.switch_mlp_b.*, each by the rules for its path\n"
+    "             (the second EQV, e.g. preset fnxmix); FILE: JSON {\"<layer>\": H, ...}, unlisted layers whole\n"
     "  --ple-bits Qwen4-Exp n-gram table (read from disk at run time, outside the rules): MLX affine\n"
     "             4-bit (default, the oQ4e layout, 100 B per row) or 8-bit, group 32, bf16 scales\n";
 
@@ -906,6 +951,8 @@ int cmd_quantize(int argc, char** argv) {
     if (!moe) fail("--keep-experts: not a mixture-of-experts model");
     keep = read_keep(a.get("keep-experts"), nexp, int(tc.get_int("num_hidden_layers", 0)), q4 && !no_mtp);
   }
+  const Split xsplit = a.has("expert-split") ? read_split(a.get("expert-split")) : Split{};
+  if (a.has("expert-split") && !moe) fail("--expert-split: not a mixture-of-experts model");
   const int ple_bits = std::stoi(a.get("ple-bits", "4"));
   if (ple_bits != 4 && ple_bits != 8) fail("--ple-bits: 4 or 8");
   // Qwen4-Exp's n-gram table (shards of [rows, 160]): MLX affine, outside the rules.
@@ -941,31 +988,49 @@ int cmd_quantize(int argc, char** argv) {
     if (is_ple(name)) continue;
     if (!ends_with(name, ".weight") || shape.size() < 2 || name.find("conv1d") != std::string::npos) continue;
     const std::string p = name.substr(0, name.size() - 7);
-    const Fmt* f = nullptr;
-    Fmt pred;
-    for (const Rule& r : rules)
-      if (r.glob != "*" && fnmatch(p.c_str(), r.glob.c_str())) {
-        f = &r.f;
-        break;
-      }
-    if (!f && moe && (ends_with(p, "mlp.gate") || ends_with(p, "shared_expert_gate"))) {
-      pred = parse_fmt("affine:8:64");
-      f = &pred;
-    }
-    if (!f)
+    // The format of module `q`: an explicit rule first, then the predicate, then the first match.
+    auto fmt_of = [&](const std::string& q) -> const Fmt* {
+      const Fmt* f = nullptr;
+      static Fmt pred = parse_fmt("affine:8:64");
       for (const Rule& r : rules)
-        if (fnmatch(p.c_str(), r.glob.c_str())) {
+        if (r.glob != "*" && fnmatch(q.c_str(), r.glob.c_str())) return &r.f;
+      if (moe && (ends_with(q, "mlp.gate") || ends_with(q, "shared_expert_gate"))) return &pred;
+      for (const Rule& r : rules)
+        if (fnmatch(q.c_str(), r.glob.c_str())) {
           f = &r.f;
           break;
         }
-    if (!f || f->kind == Fmt::BF16) continue;
+      return f;
+    };
     // EQ: any width that is a multiple of 64 (a partial last super-block below 256)
-    if (shape.back() % (f->kind == Fmt::EQ || f->kind == Fmt::EQC ? 64 : f->kind == Fmt::VQ ? 8 : f->group)) continue;
-    if (f->kind == Fmt::VQ && shape.size() != 3) fail(p + ": EQV (" + f->spec + ") is for routed expert stacks only");
-    Item it{p, *f, shape};
-    if (it.f.kind == Fmt::EQ && !(it.f.bits == 3 || it.f.bits == 4 || it.f.bits == 5 || it.f.bits == 6 || it.f.bits == 8))
-      it.f = parse_fmt("affine:8:64:f16");
-    plan.push_back(std::move(it));
+    auto encodable = [&](const Fmt* f) {
+      return f && f->kind != Fmt::BF16 &&
+             shape.back() % (f->kind == Fmt::EQ || f->kind == Fmt::EQC ? 64 : f->kind == Fmt::VQ ? 8 : f->group) == 0;
+    };
+    auto add = [&](Item it) {
+      if (it.f.kind == Fmt::VQ && it.shape.size() != 3) fail(it.path + ": EQV (" + it.f.spec + ") is for routed expert stacks only");
+      if (it.f.kind == Fmt::EQ && !(it.f.bits == 3 || it.f.bits == 4 || it.f.bits == 5 || it.f.bits == 6 || it.f.bits == 8))
+        it.f = parse_fmt("affine:8:64:f16");
+      plan.push_back(std::move(it));
+    };
+    if (const int H = xsplit.of(name)) {  // two stacks: experts [0, H) here, [H, E) in switch_mlp_b
+      const int Ex = int(shape[0]);
+      if (H % 8 || (Ex - H) % 8 || H <= 0 || H >= Ex)
+        fail(name + ": --expert-split " + std::to_string(H) + " of " + std::to_string(Ex) + " experts (multiples of 8, both stacks non-empty)");
+      const std::string pb = replace_all(p, ".switch_mlp.", ".switch_mlp_b.");
+      const Fmt *fa = fmt_of(p), *fb = fmt_of(pb);
+      if (!encodable(fa) || !encodable(fb)) fail(name + ": --expert-split needs both stacks quantized (" + p + ", " + pb + ")");
+      std::vector<int64_t> sa = shape, sb = shape;
+      sa[0] = H;
+      sb[0] = Ex - H;
+      add(Item{p, *fa, sa, p, 0, H});
+      add(Item{pb, *fb, sb, p, H, Ex});
+      replaced.insert(name);
+      continue;
+    }
+    const Fmt* f = fmt_of(p);
+    if (!encodable(f)) continue;
+    add(Item{p, *f, shape});
     replaced.insert(name);
   }
 
@@ -1047,11 +1112,16 @@ int cmd_quantize(int argc, char** argv) {
   int gptq_fallbacks = 0;
   for (size_t i = 0; i < plan.size(); ++i) {
     const Item& it = plan[i];
-    std::vector<float> W = src.f32(it.path + ".weight");
+    std::vector<float> W = src.f32(it.source() + ".weight");
     src.release();
-    const std::vector<int>* kl = keep.of(it.path + ".weight");
+    const std::vector<int>* kl = keep.of(it.source() + ".weight");
+    std::vector<int> range;  // a split stack's experts, in the kept order
+    if (it.e1) {
+      for (int e = it.e0; e < it.e1; ++e) range.push_back(kl ? (*kl)[size_t(e)] : e);
+      kl = &range;
+    }
     if (kl) W = slice_experts(W, nexp, *kl);
-    const Stats* st = stats ? stats->get(it.path) : nullptr;
+    const Stats* st = stats ? stats->get(it.source()) : nullptr;
     Stats sliced;
     std::vector<float> sd, sx;
     st = slice_stats(st, nexp, kl, sliced, sd, sx);

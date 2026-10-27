@@ -219,6 +219,74 @@ int main(int argc, char** argv) {
           }
         }
       }
+    // moe_sort with a split (two expert stacks): the second stack's tiles must be the one-stack
+    // table's tiles of experts >= split, ids rebased, and the indirect counts the two shares.
+    {
+      struct SortParams {
+        int32_t E, k, M, gu_blocks, down_blocks, shared, remap, bm, split;
+      };
+      const int E = 512, k = 10, H = 408;
+      for (int M : {1, 7, 300}) {
+        const int n = M * k;
+        std::vector<int32_t> ids(n);
+        std::uniform_int_distribution<int> ue(0, E - 1);
+        for (int r = 0; r < M; ++r)
+          for (int j = 0; j < k; ++j) {
+            int e;
+            do e = ue(rng) % (r % 3 ? E : 64) + (r % 3 ? 0 : H - 32);  // some rows around the split
+            while (std::find(ids.begin() + r * k, ids.begin() + r * k + j, e) != ids.begin() + r * k + j);
+            ids[size_t(r) * k + j] = e;
+          }
+        const size_t ntmax = size_t(n) / 8 + E + 2;
+        auto run = [&](int split, std::vector<int32_t>& ta, std::vector<uint32_t>& ia, std::vector<int32_t>& tb,
+                       std::vector<uint32_t>& ib, std::vector<int32_t>& rm) {
+          id<MTLBuffer> bi = buf(ids.size() * 4), off = buf(E * 4), t = buf(ntmax * 16), ind = buf(32), r = buf(size_t(n) * 4),
+                        sp = buf(size_t(n) * 4), t2 = buf(ntmax * 16), ind2 = buf(32);
+          std::memcpy(bi.contents, ids.data(), ids.size() * 4);
+          std::memset(t.contents, 0xff, ntmax * 16);
+          std::memset(t2.contents, 0xff, ntmax * 16);
+          SortParams p{E, k, M, 40, 80, 0, 0, 8, split};
+          id<MTLCommandBuffer> c = [q commandBuffer];
+          id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
+          [e setComputePipelineState:pipe("moe_sort")];
+          [e setBuffer:bi offset:0 atIndex:0];
+          [e setBuffer:off offset:0 atIndex:1];
+          [e setBuffer:t offset:0 atIndex:2];
+          [e setBuffer:ind offset:0 atIndex:3];
+          [e setBuffer:r offset:0 atIndex:4];
+          [e setBuffer:sp offset:0 atIndex:5];
+          [e setBytes:&p length:sizeof(p) atIndex:6];
+          [e setBuffer:bi offset:0 atIndex:7];
+          [e setBuffer:t2 offset:0 atIndex:8];
+          [e setBuffer:ind2 offset:0 atIndex:9];
+          [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+          [e endEncoding];
+          [c commit];
+          [c waitUntilCompleted];
+          ia.assign((uint32_t*)ind.contents, (uint32_t*)ind.contents + 6);
+          ib.assign((uint32_t*)ind2.contents, (uint32_t*)ind2.contents + 6);
+          ta.assign((int32_t*)t.contents, (int32_t*)t.contents + 4 * ia[0]);
+          tb.assign((int32_t*)t2.contents, (int32_t*)t2.contents + 4 * (split ? ib[0] : 0));
+          rm.assign((int32_t*)r.contents, (int32_t*)r.contents + n);
+        };
+        std::vector<int32_t> t1, t1b, r1, ta, tb, r2;
+        std::vector<uint32_t> i1, i1b, ia, ib;
+        run(0, t1, i1, t1b, i1b, r1);
+        run(H, ta, ia, tb, ib, r2);
+        // reference: the one-stack table split at the first tile of an expert >= H
+        size_t cut = 0;
+        while (cut < i1[0] && t1[4 * cut] < H) ++cut;
+        bool ok = ia[0] == cut && ia[3] == cut && ib[0] == i1[0] - cut && ib[3] == ib[0] && ib[1] == 40 && ib[4] == 80 &&
+                  r1 == r2 && std::equal(ta.begin(), ta.end(), t1.begin());
+        for (size_t i = 0; ok && i < ib[0]; ++i) {
+          const int32_t* a = &t1[4 * (cut + i)];
+          const int32_t* b = &tb[4 * i];
+          ok = b[0] == a[0] - H && b[1] == a[1] && b[2] == a[2];
+        }
+        std::printf("moe_sort split %d of %d, %3d rows: %zu + %u tiles %s\n", H, E, M, cut, ib[0], ok ? "ok" : "MISMATCH");
+        if (!ok) ++fails;
+      }
+    }
     std::printf(fails ? "FAILED (%d)\n" : "ok\n", fails);
     return fails ? 1 : 0;
   }

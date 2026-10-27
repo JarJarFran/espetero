@@ -228,10 +228,15 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
   L.linear = linear;
   L.index_in_kind = index_in_kind;
   // Resident experts may be fewer than the config's (a checkpoint pruned per layer: its stacks say how many).
+  // Two expert formats (espetero quantize --expert-split): the first H experts in mlp.switch_mlp.*, the
+  // rest EQV in mlp.switch_mlp_b.*; the layer has H + those.
   const auto* stp = dynamic_cast<const SafetensorsSource*>(&src);
   const bool vq = resident && stp && stp->has(p + "mlp.switch_mlp.gate_proj.vq_lo");
-  const int El = vq ? int(stp->tensor(p + "mlp.switch_mlp.gate_proj.vq_lo").shape[0])
+  const bool two = resident && stp && stp->has(p + "mlp.switch_mlp_b.gate_proj.vq_lo");
+  const int Eh = vq ? int(stp->tensor(p + "mlp.switch_mlp.gate_proj.vq_lo").shape[0])
                     : resident && stp ? int(stp->locate(p + "mlp.switch_mlp.gate_proj.weight").shape[0]) : c.E;
+  const int Eb = two ? int(stp->tensor(p + "mlp.switch_mlp_b.gate_proj.vq_lo").shape[0]) : 0;
+  const int El = Eh + Eb;
   if (El < 1 || El > c.E) fail(p + ": " + std::to_string(El) + " experts (the config says at most " + std::to_string(c.E) + ")");
   if (El != c.E) L.E = El;
   L.hca = load_hc(m, src, p + "attn_hyper_connection.", true, rq);
@@ -314,10 +319,16 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
     // source: 1.7 GB each; quantized ones as they are), gate and up
     // interleaved by 8 rows per expert.
     const std::string s = p + "mlp.switch_mlp.";
+    if (two) {
+      const std::string sb = p + "mlp.switch_mlp_b.", up = sb + "up_proj";
+      L.xb_gu = load_vq_stack(m, *stp, sb + "gate_proj", &up, Eb, c.Ie, c.D);
+      L.xb_down = load_vq_stack(m, *stp, sb + "down_proj", nullptr, Eb, c.D, c.Ie);
+      L.xsplit = Eh;
+    }
     if (vq) {
       const std::string up = s + "up_proj";
-      L.vq_gu = load_vq_stack(m, *stp, s + "gate_proj", &up, El, c.Ie, c.D);
-      L.vq_down = load_vq_stack(m, *stp, s + "down_proj", nullptr, El, c.D, c.Ie);
+      L.vq_gu = load_vq_stack(m, *stp, s + "gate_proj", &up, Eh, c.Ie, c.D);
+      L.vq_down = load_vq_stack(m, *stp, s + "down_proj", nullptr, Eh, c.D, c.Ie);
       L.vq = true;
       return L;
     }
@@ -327,7 +338,7 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
         std::vector<uint8_t> raw;
         const TensorView t = g->tensor_uncached(s + name, raw);
         HostMat h;
-        h.out = El * out;
+        h.out = Eh * out;
         h.in = in;
         h.q = qw_from_view(keep, t, h.out, in);
         if (h.q.scale_mode) h.q = to_affine(keep, h.q);
@@ -336,7 +347,7 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
       }
       if (const auto* st = dynamic_cast<const SafetensorsSource*>(&src);
           st && st->has(s + name.substr(0, name.size() - 6) + "super")) {  // EQ (espetero quantize): as stored
-        HostMat h = host_mat(m, keep, src, s + name, El * out, in);
+        HostMat h = host_mat(m, keep, src, s + name, Eh * out, in);
         if (h.dense) fail(s + name + ": expected an EQ stack");
         return h;
       }
@@ -355,13 +366,13 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
           *ptrs[k] = raw[k].data();
         }
         HostMat h;
-        h.out = El * out;
+        h.out = Eh * out;
         h.in = in;
         h.q = qw_from_view(keep, t, h.out, in);
         m.source_types["mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
         return h;
       }
-      HostMat h = q4_mat(m, keep, src, s + name, El * out, in);  // the bf16 MTP drafter: requantized below
+      HostMat h = q4_mat(m, keep, src, s + name, Eh * out, in);  // the bf16 MTP drafter: requantized below
       return rq8(keep, h, 8);
     };
     const HostMat eg = stack("gate_proj.weight", c.Ie, c.D), eu = stack("up_proj.weight", c.Ie, c.D);
@@ -658,6 +669,15 @@ inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bo
     m.xs.fds.push_back(fd);
   }
   m.xs.present = !mixed;
+  {
+    int n2 = 0;
+    const Layer* first = nullptr;
+    for (const Layer& L : m.layers)
+      if (L.xsplit) n2 += 1, first = first ? first : &L;
+    if (first)
+      std::fprintf(stderr, "experts: %d layers in two formats (e.g. %d + %d EQV experts)\n", n2, first->xsplit,
+                   (first->E ? first->E : c.E) - first->xsplit);
+  }
   m.inv_freq = m.arena->alloc(sizeof(float) * size_t(c.rot / 2));
   float* f = (float*)ptr(m.inv_freq);
   for (int i = 0; i < c.rot / 2; ++i) f[i] = float(1.0 / std::pow(c.theta, double(2 * i) / double(c.rot)));

@@ -68,6 +68,11 @@ struct Layer {
   // EQV experts (vector-quantized, Qwen4-Exp route B): these instead of experts_gu / experts_down.
   bool vq = false;
   VQW vq_gu, vq_down;
+  // Two expert formats in one layer (espetero quantize --expert-split): experts [0, xsplit) are the
+  // stacks above (experts_gu / experts_down, or vq_gu / vq_down), [xsplit, E) these EQV stacks
+  // (mlp.switch_mlp_b.*). moe_sort gives each stack its own tile table. 0: one stack.
+  int xsplit = 0;
+  VQW xb_gu, xb_down;
   int E = 0;  // this layer's routed experts when fewer than the config's (pruned per layer), else 0
   // Gated DeltaNet: in_proj = [qkv; z; a; b]; full attention: [q|gate; k; v].
   std::vector<Mat> in_proj;
@@ -423,6 +428,7 @@ struct StatePool {
 struct MoeScratch {
   int rows = 0;
   id<MTLBuffer> logits, ids, w, counts, fill, offsets, tiles, ntiles, rowmap, slotpos;
+  id<MTLBuffer> tiles_b, ntiles_b;  // the second expert stack's tile table and indirect arguments (Layer::xsplit)
   id<MTLBuffer> act, ys, shared, sgate;
   id<MTLBuffer> cparts, cctr;  // combine: per-row partial sums of squares and arrival counters
   id<MTLBuffer> rparts, rctr;  // parallel route: per-row slice partial logits and arrival counters

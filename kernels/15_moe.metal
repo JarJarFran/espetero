@@ -30,6 +30,9 @@ struct MoeSortParams {
   int shared;       // 1: append tiles of expert E (the shared expert) over every row
   int remap;        // 1: ids are expert ids and map[id] is the pool slot the GEMVs read (Qwen4-Exp expert cache)
   int bm;           // rows per tile: 8 (0 too), 16 or 32 (the moe_gemm16 / moe_gemm32 kernels)
+  int split;        // > 0: experts [split, E) are a second stack (another format): their tiles go to tiles_b
+                    // (ids rebased to 0) with their own indirect arguments, the first stack's stay in tiles
+                    // (8-row tiles only)
 };
 
 // The sort proper, run by one threadgroup (moe_sort, or the last-arriving
@@ -41,7 +44,8 @@ static inline void moe_sort_body(device const int* ids, device int* offsets, dev
                                  device int* rowmap, device int* slotpos, constant MoeSortParams& p, device const int* map,
                                  uint tid, uint ntg, uint sg, uint lane, threadgroup atomic_int* tcnt,
                                  threadgroup atomic_int* tfill, threadgroup int* toff, threadgroup int* ttile,
-                                 threadgroup int* scan_c, threadgroup int* scan_t) {
+                                 threadgroup int* scan_c, threadgroup int* scan_t, device int4* tiles_b,
+                                 device uint* indirect_b) {
   auto id_at = [&](int i) -> int {
     return ATOMIC_IDS ? atomic_load_explicit((device atomic_int*)ids + i, memory_order_relaxed) : ids[i];
   };
@@ -100,19 +104,33 @@ static inline void moe_sort_body(device const int* ids, device int* offsets, dev
     // The shared expert: tiles over the M token rows, placed after the pairs.
     const int t = ttile[p.E];
     const int ts = p.shared ? (p.M + bm - 1) / bm : 0;
-    indirect[0] = uint(t + ts);
+    const int ta = p.split > 0 ? ttile[p.split] : t + ts;  // (no shared tiles with a split)
+    indirect[0] = uint(ta);
     indirect[1] = uint(p.gu_blocks);
     indirect[2] = 1u;
-    indirect[3] = uint(t + ts);
+    indirect[3] = uint(ta);
     indirect[4] = uint(p.down_blocks);
     indirect[5] = 1u;
+    if (p.split > 0) {
+      indirect_b[0] = uint(t - ta);
+      indirect_b[1] = uint(p.gu_blocks);
+      indirect_b[2] = 1u;
+      indirect_b[3] = uint(t - ta);
+      indirect_b[4] = uint(p.down_blocks);
+      indirect_b[5] = 1u;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int e = tid; e < p.E; e += ntg) {
     offsets[e] = toff[e];
     const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
-    for (int j = 0; j * bm < c; ++j)
-      tiles[ttile[e] + j] = int4(e, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    if (p.split > 0 && e >= p.split) {
+      for (int j = 0; j * bm < c; ++j)
+        tiles_b[ttile[e] - ttile[p.split] + j] = int4(e - p.split, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    } else {
+      for (int j = 0; j * bm < c; ++j)
+        tiles[ttile[e] + j] = int4(e, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    }
   }
   if (p.shared) {
     const int t0 = ttile[p.E];
@@ -136,6 +154,8 @@ kernel void moe_sort(
     device int* slotpos [[buffer(5)]],
     constant MoeSortParams& p [[buffer(6)]],
     device const int* map [[buffer(7)]],
+    device int4* tiles_b [[buffer(8)]],     // (p.split > 0 only)
+    device uint* indirect_b [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint ntg [[threads_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -146,7 +166,7 @@ kernel void moe_sort(
   threadgroup int ttile[1025];
   threadgroup int scan_c[32], scan_t[32];
   moe_sort_body<0>(ids, offsets, tiles, indirect, rowmap, slotpos, p, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
-                   scan_c, scan_t);
+                   scan_c, scan_t, tiles_b, indirect_b);
 }
 
 struct MoeRouteParams {
@@ -277,7 +297,7 @@ kernel void moe_topk(
   atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
   if (tid == 0) atomic_store_explicit(ctr, 0, memory_order_relaxed);
   moe_sort_body<1>(ids, offsets, tiles, indirect, rowmap, slotpos, sp, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
-                   scan_c, scan_t);
+                   scan_c, scan_t, tiles, indirect);  // (the folded sort: no split)
 }
 
 // A 32-column block of a quantized GEMV over the K steps [g_begin, g_end) for
