@@ -41,6 +41,8 @@ Same model files, same client ([tools/bench_compare.py](tools/bench_compare.py))
 
 Greedy decoding with thinking off. *Decode*: 8 short prompts, 512 new tokens each, one at a time; after the dot, with the engine's own drafts (checked by the full model, so the replies do not change). *First token*: the same prompts. *Prompt of 8K tokens*: prefill speed on a 7.9K-token document. *Decode at 32K context*: 256 new tokens after a 31.5K-token document. *8 users*: 8 different requests at once, 256 new tokens each, in total. *Photo*: a 1024×768 picture and a 128-token description. Every server had 16 parallel slots and a 40K context and its defaults otherwise; Espetero ran without drafts except *with MTP*. Files: [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit), [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit), [unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF). The flags, every measure (load time, prefill at 1K and 32K, 16 users, memory, answers checked), more files (8-bit MLX, Gemma 4 31B) and every request: [docs/benchmarks](docs/benchmarks/README.md). Measured on 2026-10-10 and 11 with macOS 26.5.
 
+**Re-measured with 0.1.2** on 2026-10-26 and 27 ([docs/benchmarks/2026-10-27-m1-max.md](docs/benchmarks/2026-10-27-m1-max.md)): Qwen3.8-27B MLX 4-bit 14.2 · **22.3** tok/s with MTP (mlx-lm 12.8), 8 users 58.6 (mlx-lm 17.8); the UD-Q6_K GGUF 8.9 · **16.7** with MTP (llama.cpp 6.7 · 11.0), 8 users 47.5 (llama.cpp 24.5). **Qwen3.8-Flash-Next** (125B-A6B, 106 GB) runs on this 64 GB Mac with its experts read from the SSD and the ones in use cached in memory (31 GB): 12.9 · **17.8** tok/s with MTP, a first token in 1.6 s, an 8K prompt at 265 tok/s, a photo in 20 s. The SSD bounds it to one or a few users: 8 users together get ~19 tok/s.
+
 † Another app used the GPU during this run (5 to 33 % of the run's time on the GPU), which can slow the engine down.
 ¹ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF.
 ² TensorFold's native engine has no backend for the Qwen3.6 mixture-of-experts or Gemma 4 checkpoints yet, and it serves images only with `--vision`, which these runs did not pass.
@@ -48,27 +50,27 @@ Greedy decoding with thinking off. *Decode*: 8 short prompts, 512 new tokens eac
 
 ## Speed on a Mac Studio M4 Max (128 GB)
 
-The same client and protocol on a Mac Studio with an M4 Max (128 GB, macOS 27.0.1), measured on 2026-10-20 and 21 with Espetero main 70f3bb4, medians. Release 0.1.2 is that code plus bit-identical 16-row expert tiles for prefills of 2048 rows and more, which make the 8K-token prompts of the MoE files 1-8 % faster than shown:
+The same client and protocol on a Mac Studio with an M4 Max (128 GB, macOS 27.0.1), measured on 2026-10-26 and 27 with Espetero 0.1.2, medians, every run alone on the GPU:
 
 | Model · file | Engine | Decode, tok/s | First token, s | Prompt of 8K tokens, tok/s | Decode at 32K context, tok/s | 8 users at once, tok/s | Photo, s |
 |:--|:--|--:|--:|--:|--:|--:|--:|
-| **Qwen3.8-27B** · MLX 4-bit | Espetero 0.1.2 | 29.9 · **59.2** with MTP¹ | 0.20 | 293 | 26.2 | 157.6 | 7.3 |
-|  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 27.9 | 0.40 | 256 | 23.1 | 77.9 | 7.8 |
-| **Qwen3.6-35B-A3B** · MLX 4-bit | Espetero 0.1.2 | 130.0 | 0.05 | 2122 | 109.3 | 423.5 | 1.7 |
-|  | MLX (mlx-lm 0.32 · mlx-vlm 0.7.6) | 110.8 | 0.10 | 1848 | 80.9 | 318.3 | 1.8 |
-| **Qwen3.8-Flash-Next** (125B-A6B) · MLX oQ4e, experts resident | Espetero 0.1.2 | 58.7 · **72.9** with MTP | 0.16 | 758 | 54.0 | 127.4 | 3.5 |
+| **Qwen3.8-Flash-Next** (125B-A6B) · MLX oQ4e, experts resident | Espetero 0.1.2 | 58.6 · **78.7** with MTP | **0.12** | **770** | **54.3** · 66.1 with MTP | **170.7** | 3.4 |
+|  | oMLX 0.7.2¹ | **81.1** with MTP | 0.25 | 547 | – | 110.0 | **3.0** |
 |  | MLX (mlx-lm 0.32)² | – | – | – | – | – | – |
-| **DeepSeek-V4.1-Flash** (552B-A16B) · FP8/FP4, experts on the SSD | Espetero 0.1.2³ | 9.7 | 5.39 | 253 | 10.2 | 6.1 | 43.6 |
-| **Qwen3.8-27B** · GGUF UD-Q6_K | Espetero 0.1.2 | 20.2 · **46.9** with MTP | 0.22 | 279 | 18.3 | 123.9 | 9.6 |
-|  | llama.cpp b11429 | 19.3 · **33.6** with MTP | 0.39 | 231 | 17.0 | 73.9 | 10.4 |
-| **Qwen3.6-35B-A3B** · GGUF UD-Q6_K | Espetero 0.1.2 | 90.5 | 0.05 | 1873 | 79.8 | 307.1 | 2.2 |
-|  | llama.cpp b11429 | 88.8 | 0.11 | 1509 | 73.8 | 213.6 | 2.4 |
+| **Qwen3.8-27B** · MLX 4-bit | Espetero 0.1.2 | 30.1 · **59.4** with MTP³ | **0.18** | **294** | **26.3** · 38.7 with MTP | **161.0** | **7.3** |
+|  | MLX (mlx-lm 0.32) | 27.5 | 0.41 | 256 | – | 77.7 | – |
+|  | oMLX 0.7.2 | 30.1 | 0.42 | 259 | – | 74.0 | 7.7 |
+|  | BaseRT 0.3.0 (its own 4-bit build) | 28.7 | 0.39 | 267 | – | 92.4 | 8.3 |
+| **Qwen3.8-27B** · GGUF UD-Q6_K | Espetero 0.1.2 | 20.2 · **47.0** with MTP | **0.20** | **280** | **18.4** · 32.6 with MTP | **125.8** | **9.6** |
+|  | llama.cpp b11429 | 19.5 · 33.3 with MTP | 0.39 | 231 | 17.2 | 74.0 | 10.4 |
+| **DeepSeek-V4.1-Flash** (552B-A16B) · FP8/FP4, experts on the SSD | Espetero 0.1.2⁴ | 9.7 | 5.39 | 253 | 10.2 | 6.1 | 43.6 |
 
-Same protocol as above (greedy, thinking off, 16 parallel slots, 40K context, no drafts except *with MTP*). Files: [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), [mlx-community/Qwen3.6-35B-A3B-4bit](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit), [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), [Jundot/Qwen3.8-Flash-Next-oQ4e-mtp](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ4e-mtp) (every expert resident in memory), [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (the routed experts and Engram tables read from the SSD). Every measure, the flags and every request: [docs/benchmarks/m4-max.md](docs/benchmarks/m4-max.md).
+Same protocol as above (greedy, thinking off, 16 parallel slots, 40K context, no drafts except *with MTP*); the other engines ran decode, prefill, 8 and 16 users and the photo, so their empty cells were not run. With 16 users Flash-Next serves 152 tok/s (154 with MTP) and the 27B 175. Files: [Jundot/Qwen3.8-Flash-Next-oQ4e-mtp](https://huggingface.co/Jundot/Qwen3.8-Flash-Next-oQ4e-mtp) (every expert resident in memory), [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) (the routed experts and Engram tables read from the SSD). Every measure, the flags and every request: [docs/benchmarks/2026-10-27-m4-max.md](docs/benchmarks/2026-10-27-m4-max.md); the Qwen3.6-35B-A3B rows of 0.1.2's code: [docs/benchmarks/m4-max.md](docs/benchmarks/m4-max.md).
 
-¹ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF. Flash-Next: the bf16 drafter directory `Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16` (`--mtp DIR`); the oQ4e file's own 4-bit MTP tensors are not used.
+¹ oMLX turns on the oQ4e file's MTP head from its model preset; its column is oMLX as it ships. Greedy replies were identical across repeats.
 ² mlx-lm 0.32 loads the Flash-Next file but its generation thread dies on the first request (HTTP 404).
-³ DeepSeek-V4.1 runs with 6 sequence slots (its state is a slot of its own), so *8 users* queue: 6 at a time. Its first token includes the experts a new prompt reads from the SSD.
+³ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF. Flash-Next drafts with the oQ4e file's own 4-bit MTP head.
+⁴ DeepSeek-V4.1 (measured with 0.1.2's code on 2026-10-21) runs with 6 sequence slots (its state is a slot of its own), so *8 users* queue: 6 at a time. Its first token includes the experts a new prompt reads from the SSD.
 
 ## Quick start
 
