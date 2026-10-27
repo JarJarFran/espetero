@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstring>
 
 #include "tensors.h"
 
@@ -313,6 +314,24 @@ class GGUFSource : public WeightSource {
       v.nbytes = owned.size() * 4;
       return v;
     }
+    if (name == "mtp.fc_embedding.weight" || name == "mtp.fc_hidden.weight") {
+      // Qwen4-Exp MTP GGUF (unsloth's MTP/mtp-*.gguf): one eh_proj over the
+      // concatenated [embedding, hidden] inputs; the head takes its halves.
+      TensorView v = gguf_view(f_, *t, name);
+      const GGMLTypeInfo* ti = ggml_type_info(t->type);
+      const int64_t rows = v.rows(), half = v.cols() / 2;
+      if (v.shape.size() != 2 || v.cols() % 2 || half % ti->block) fail(g + ": cannot split into the MTP fc halves");
+      const size_t row_bytes = v.nbytes / size_t(rows), half_bytes = row_bytes / 2;
+      const size_t at = name == "mtp.fc_embedding.weight" ? 0 : half_bytes;
+      auto& owned = owned_bytes_[name];
+      owned.resize(size_t(rows) * half_bytes);
+      for (int64_t r = 0; r < rows; ++r)
+        std::memcpy(owned.data() + size_t(r) * half_bytes, v.data + size_t(r) * row_bytes + at, half_bytes);
+      v.shape = {rows, half};
+      v.data = owned.data();
+      v.nbytes = owned.size();
+      return v;
+    }
     return gguf_view(f_, *t, name);
   }
 
@@ -424,6 +443,31 @@ class GGUFSource : public WeightSource {
     if (name == "language_model.model.embed_tokens.weight") return out = "token_embd.weight", true;
     if (name == "language_model.lm_head.weight") return out = "output.weight", true;
     if (name == "language_model.model.norm.weight") return out = "output_norm.weight", true;
+    static const std::string Q4MTP = "mtp.";
+    if (name.compare(0, Q4MTP.size(), Q4MTP) == 0) {
+      // Qwen4-Exp MTP head (the names of the oQ4e file's own mtp.* head),
+      // from a GGUF whose nextn block is `mtp_block_`. fc_embedding and
+      // fc_hidden are the halves of eh_proj (tensor()).
+      if (mtp_block_ < 0) return false;
+      const std::string blk = "blk." + std::to_string(mtp_block_);
+      static const std::vector<std::pair<std::string, std::string>> heads = {
+          {"fc_embedding.weight", ".nextn.eh_proj.weight"},
+          {"fc_hidden.weight", ".nextn.eh_proj.weight"},
+          {"pre_fc_norm_embedding.weight", ".nextn.enorm.weight"},
+          {"pre_fc_norm_hidden.weight", ".nextn.hnorm.weight"},
+          {"hyper_connection_mixer.hc_norm.weight", ".nextn.hc_head_norm.weight"},
+          {"hyper_connection_mixer.input_mix_weight_down.weight", ".nextn.hc_head_down.weight"},
+          {"hyper_connection_mixer.input_mix_weight_up.weight", ".nextn.hc_head_up.weight"},
+      };
+      const std::string rest = name.substr(Q4MTP.size());
+      for (const auto& [hf, gg] : heads)
+        if (rest == hf) return out = blk + gg, true;
+      static const std::string layer0 = "layers.0";
+      if (rest.compare(0, layer0.size(), layer0) != 0) return false;
+      for (const auto& [mlx, gg] : suffix)
+        if (rest.substr(layer0.size()) == mlx) return out = blk + gg, true;
+      return false;
+    }
     if (name.compare(0, MTP.size(), MTP) == 0) {
       // MTP head (HF mtp.*): fc/norms are nextn.*, its layer is block `mtp_block_`.
       if (mtp_block_ < 0) return false;
@@ -457,6 +501,7 @@ class GGUFSource : public WeightSource {
   int mtp_block_ = -1;
   bool gemma_ = false;
   mutable std::unordered_map<std::string, std::vector<float>> owned_;
+  mutable std::unordered_map<std::string, std::vector<uint8_t>> owned_bytes_;
 };
 
 // ---------------------------------------------------------------- mmproj

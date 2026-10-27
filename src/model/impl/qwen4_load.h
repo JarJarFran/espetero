@@ -303,10 +303,19 @@ inline void load_q4_mtp_from(Model& m, const WeightSource& src, const std::strin
   const Config& c = m.cfg;
   if (!src.has(pre + "fc_embedding.weight") || !src.has(pre + "layers.0.mlp.gate.weight"))
     fail(source + ": not a qwen4_exp MTP head (" + pre + "fc_embedding / " + pre + "layers.0.* tensors)");
+  // The head's norms and Q8_0 blocks follow its own file's format, not the
+  // trunk's (q4_norm_add, q4_gguf): an MLX drafter beside a GGUF model took
+  // the trunk's norms without their +1 and drafted nothing useful.
+  struct Format {
+    Model& m;
+    std::string trunk;
+    ~Format() { m.format = trunk; }
+  } restore{m, m.format};
+  m.format = dynamic_cast<const GGUFSource*>(&src) ? "gguf" : "mlx";
   Mtp& T = m.mtp;
   const int dense0 = m.n_dense, exempt0 = m.n_dense_mtp;
-  T.enorm = vec(m, src, pre + "pre_fc_norm_embedding.weight", size_t(c.D), 1.0f);
-  T.hnorm = vec(m, src, pre + "pre_fc_norm_hidden.weight", size_t(c.W()), 1.0f);
+  T.enorm = vec(m, src, pre + "pre_fc_norm_embedding.weight", size_t(c.D), q4_norm_add(m));
+  T.hnorm = vec(m, src, pre + "pre_fc_norm_hidden.weight", size_t(c.W()), q4_norm_add(m));
   {
     Arena tmp(m.dev);
     const HostMat fe = rq8(tmp, q4_mat(m, tmp, src, pre + "fc_embedding.weight", c.D, c.D), rq);
@@ -330,6 +339,18 @@ inline void load_q4_mtp_from(Model& m, const WeightSource& src, const std::strin
 inline void load_q4_mtp(Model& m, const std::string& dir) {
   SafetensorsSource src(dir);
   load_q4_mtp_from(m, src, "", 8, dir.substr(dir.find_last_of('/') + 1));
+  const Mtp& T = m.mtp;
+  std::fprintf(stderr, "mtp: %s (%d-bit experts, %d resident)\n", T.source.c_str(), T.layer.experts_gu.bits, m.cfg.E);
+}
+
+// unsloth's MTP GGUF (MTP/mtp-*.gguf, a qwen4exp file whose nextn block is
+// the head; Q8_0, ~2.9 GB resident), as stored.
+inline void load_q4_mtp_gguf(Model& m, const std::string& file) {
+  GGUFSource src(file);
+  const Config mc = config_from_gguf(src.file());
+  if (!mc.q4 || mc.D != m.cfg.D || mc.V != m.cfg.V || mc.E != m.cfg.E)
+    fail(file + ": MTP head does not match the model's dimensions");
+  load_q4_mtp_from(m, src, "mtp.", 0, file.substr(file.find_last_of('/') + 1));
   const Mtp& T = m.mtp;
   std::fprintf(stderr, "mtp: %s (%d-bit experts, %d resident)\n", T.source.c_str(), T.layer.experts_gu.bits, m.cfg.E);
 }

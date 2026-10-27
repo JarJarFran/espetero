@@ -310,6 +310,14 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     std::string p = path;
     while (!p.empty() && p.back() == '/') p.pop_back();
     name_ = p.substr(p.find_last_of('/') + 1);
+    // A Hugging Face cache snapshot (.../models--org--name/snapshots/<commit>)
+    // is named by its repo id, not by the commit.
+    const size_t snap = p.rfind("/snapshots/");
+    const size_t repo = snap == std::string::npos ? std::string::npos : p.rfind("/models--", snap);
+    if (repo != std::string::npos && p.find('/', snap + 11) == std::string::npos) {
+      std::string id = p.substr(repo + 9, snap - repo - 9);
+      if (const size_t d = id.find("--"); d != std::string::npos) name_ = id.replace(d, 2, "/");
+    }
   }
   // Other model families fail here with one message, before their tokenizer
   // or geometry would fail with a less clear one.

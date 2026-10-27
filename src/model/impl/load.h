@@ -598,6 +598,7 @@ namespace espetero::native {
 inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head = false);
 inline void load_q4_mtp(Model& m, const std::string& dir);
 inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src);
+inline void load_q4_mtp_gguf(Model& m, const std::string& file);
 inline void load_q4_gguf(Model& m, const GGUFSource& src);
 
 // A Qwen4-Exp MTP drafter directory (config model_type qwen4_exp_mtp, e.g.
@@ -682,9 +683,14 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
           if (vc.present) load_vision(m, vsrc, vc);
         }
       }
-      // llama.cpp's qwen4exp files carry no MTP head here: an MLX drafter (--mtp DIR, or found nearby).
-      const std::string dir = mtp.empty() ? find_q4_drafter(path) : mtp;
-      if (!dir.empty() && dir != "none") load_q4_mtp(m, dir);
+      // llama.cpp's qwen4exp files carry no MTP head here: an MLX drafter
+      // directory or unsloth's MTP GGUF (--mtp PATH, or found nearby: a
+      // drafter directory first, then MTP/mtp-*.gguf).
+      std::string head = mtp.empty() ? find_q4_drafter(path) : mtp;
+      if (mtp.empty() && head.empty()) head = find_mtp(path);
+      if (head.empty() || head == "none") return;
+      if (ends_with(head, ".gguf")) load_q4_mtp_gguf(m, head);
+      else load_q4_mtp(m, head);
       return;
     }
     std::string mtp_file;
