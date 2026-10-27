@@ -187,19 +187,20 @@ class MetalModel final : public NativeModel {
         // - System: what it could give before this model loaded (sys_avail0)
         //   less 2 GB for macOS, so other applications keep their memory.
         // - RAM: wired + compressed memory (held0 before loading, plus this
-        //   server) at least 12 GB under the RAM. The file cache counted in
+        //   server) at least 18 GB under the RAM. The file cache counted in
         //   sys_avail0 is not all reclaimable at once, and a raised GPU limit
         //   (iogpu.wired_limit_mb) lifts the working-set bound: on a 64 GB M1
         //   Max at 58 GB, Flash-Next's 39 GB cache left wired + compressed at
         //   59 of 64 GB and the first photo request took the Mac to memory
-        //   pressure (2026-10-27).
+        //   pressure (2026-10-27). 12 GB under the RAM at load still grew by
+        //   ~6 GB at 8K-32K-token prompts (KV, pass scratch, prefetch).
         const double kv = (o.memory_gb > 0 ? o.memory_gb * 1e9 : 3e9) + 9.0 * double(slot_state_bytes(c, m.mtp.present));
         const double mine = double([m.dev currentAllocatedSize]), rest = mine + kv + 2.5e9;
         const double ws = double([m.dev recommendedMaxWorkingSetSize]);
         uint64_t ram = 0;
         size_t ram_len = sizeof ram;
         sysctlbyname("hw.memsize", &ram, &ram_len, nullptr, 0);
-        const double by_ram = ram && held0 > 0 ? (double(ram) - 12e9 - held0 - rest) / 1e9 : 1e9;
+        const double by_ram = ram && held0 > 0 ? (double(ram) - 18e9 - held0 - rest) / 1e9 : 1e9;
         gb = std::min({record_store_gb(m), (ws - rest - 3e9) / 1e9, (sys_avail0 - rest - 2e9) / 1e9, by_ram});
         std::fprintf(stderr, "expert cache: automatic size from the GPU working set %.1f GB, %.1f GB available and %.1f GB "
                              "wired + compressed before loading, less %.1f GB allocated (weights %.1f GB in %.1f GB of "
