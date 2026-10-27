@@ -581,6 +581,7 @@ struct Model : Runtime {
   bool moe_fma = true;       // MoE: 1-2-row expert tiles use the FMA GEMV instead of the 8-row MMA one
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
+  bool moe_down_comb_tune = false;  // ... or chosen at load per device and model (tune_moe_down): ESPETERO_MOE_DOWN_TUNE=1
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
   // Fase 3 (bit-identical variants of the single-row MoE kernels):
   // moe_fin: moe_down_comb's fused-norm finalizer 0 the last arriver reading the 64 block

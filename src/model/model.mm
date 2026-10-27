@@ -328,7 +328,8 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_ROUTE_NOTILES")) m.route_notiles = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ROUTE_SEQEXP")) m.route_seqexp = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_FMA")) m.moe_fma = *v == '1';
-    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_TUNE")) m.moe_down_comb_tune = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1', m.moe_down_comb_tune = false;
     if (const char* v = std::getenv("ESPETERO_MOE_COMB_KS")) m.moe_comb_ks = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_FIN")) m.moe_fin = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX")) m.moe_fma_mix = *v == '1';
@@ -406,6 +407,8 @@ class MetalModel final : public NativeModel {
     mark("GEMM tiles (autotune)");
     prewarm();
     mark("pipelines (prewarm)");
+    tune_moe_down(m);
+    mark("MoE down path (tune)");
 
     // ---- info
     ModelInfo& I = info_;
@@ -920,7 +923,8 @@ class MetalModel final : public NativeModel {
     else if (name == "gemm_var") m_.tune.gemm_var = m_.gemm_var_kernels ? std::max(0, std::min(3, value)) : 0;  // kernels compiled with ESPETERO_GEMM_VAR
     else if (name == "so_max") m_.tune.so_max_floats = value;
     else if (name == "gemv_ks") m_.tune.gemv_ks = value == 16 ? 16 : 8;
-    else if (name == "moe_down_comb") m_.moe_down_comb = value != 0;
+    else if (name == "moe_down_comb") m_.moe_down_comb = value != 0, m_.moe_down_comb_tune = false;
+    else if (name == "moe_down_tune") m_.moe_down_comb_tune = value != 0;  // takes effect at the next load only
     else if (name == "expert_cache_gb") m_.expert_cache_gb = m_.xpool.empty() ? double(value) : m_.expert_cache_gb;
     else if (name == "mtp_coarse") m_.mtp.coarse_c = m_.mtp.coarse.out() > 0 ? std::max(0, std::min(256, value)) : 0;
     else if (name == "mtp_head4") m_.mtp.use_head4 = value != 0;

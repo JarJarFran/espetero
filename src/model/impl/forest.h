@@ -450,6 +450,20 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
       out.push_back({moe_down_comb_name(dn, *sdn, kk) + (m.moe_pf ? "_pf" : "") + (m.moe_fin ? "_f" + std::to_string(m.moe_fin) : ""), dn.fc()});
 }
 
+// Whether a pass of `rows` rows on MoE layer L can run moe_down_comb (the
+// shared expert as tile k on the FMA path, a direct single-row grid, its
+// slot and width limits); m.moe_down_comb then decides.
+inline bool moe_down_comb_fits(const Model& m, const Layer& L, int rows, bool nout) {
+  const Config& c = m.cfg;
+  const int tile_kind = moe_shared_tile_kind(c, L);
+  const bool shared_tiles = m.fuse_shared && rows <= std::max(8, m.fuse_shared_rows) && rows <= 16 &&
+                            (tile_kind == 1 || (tile_kind == 2 && m.moe_fma && rows <= m.moe_fma_rows));
+  const int comb_ks = m.moe_comb_ks == 1 ? 1 : 2;
+  // (The 64-block limit is the fused next norm's; without it, e.g. Qwen4-Exp's D = 2560 fits.)
+  return rows == 1 && m.moe_direct && m.moe_fma && shared_tiles && c.k <= 16 && c.D % 32 == 0 &&
+         (c.D / 32 <= 64 || !nout) && c.Ie % 64 == 0 && (m.moe_stages & 12) == 12 && (c.k + 1) * comb_ks * 32 <= 1024;
+}
+
 // The MoE MLP of `rows` rows: X (half, post-norm) in, H (fp32 residual)
 // accumulated; with `nout`, the combine also writes the next norm's fp16 rows.
 // act: scratch of [rows, I_shared] halves for the shared expert.
@@ -899,10 +913,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   }
   // Single-row passes: the down projection and the combine in one kernel.
   const int comb_ks = m.moe_comb_ks == 1 ? 1 : 2;
-  // (The 64-block limit is the fused next norm's; without it, e.g. Qwen4-Exp's D = 2560 fits.)
-  const bool down_comb = m.moe_down_comb && rows == 1 && m.moe_direct && m.moe_fma && shared_tiles && c.k <= 16 &&
-                         c.D % 32 == 0 && (c.D / 32 <= 64 || !nout) && c.Ie % 64 == 0 && (m.moe_stages & 12) == 12 &&
-                         (c.k + 1) * comb_ks * 32 <= 1024;
+  const bool down_comb = m.moe_down_comb && moe_down_comb_fits(m, L, rows, nout != nullptr);
   if (down_comb) {
     const QW& w = *xdn;
     const QW& w2 = L.down.q;
@@ -989,6 +1000,100 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   E.wr(z.cctr);
   if (nout) E.wr(nout->xn.b, nout->xn.off, nout->xn.off + size_t(rows) * size_t(c.D) * 2);
   E.groups(MTLSizeMake(size_t(rows), size_t(nsl), 1), MTLSizeMake(128, 1, 1));
+}
+
+// The single-row down path of the MoE layers, per device and model: the
+// fused moe_down_comb (one threadgroup per 32 output columns, a simdgroup
+// per slot over all of K) or the grouped down GEMV (slots x column blocks, K
+// in 4 slices) + moe_combine. At the 35B's shape (D 2048, Ie 512, k 8) the
+// fused kernel has 64 threadgroups: before Fase 3's finalizer it was ~10%
+// faster than the pair on the M1 Max (32 cores) and about twice as slow on
+// the M4 Max (40 cores; decode 12-14% slower). Timed at load through moe_mlp
+// at one row (route, gate/up and down of every MoE layer, the next norm fused
+// as in decode), rounds interleaved, min of each; the GEMV pair needs a 3%
+// lead. Cached per device and model shape beside the GEMM tiles
+// (ESPETERO_TUNE_FRESH=1 re-times). Opt-in (ESPETERO_MOE_DOWN_TUNE=1, option
+// moe_down_tune before a load): the two paths sum in different orders, so the
+// choice changes a model's logits, and the measurements above predate Fase
+// 3's finalizer; ESPETERO_MOE_DOWN_COMB=0/1 forces a path.
+inline void tune_moe_down(Model& m) {
+  if (!m.moe_down_comb_tune || !m.moe_down_comb || !m.xpool.empty() || m.xs.present) return;  // (streamed experts: not resident)
+  const Config& c = m.cfg;
+  const bool norm = !c.q4;  // Qwen4-Exp passes run their MoE layers without the norm link
+  std::vector<const Layer*> Ls;
+  std::string key = "D" + std::to_string(c.D) + "_Ie" + std::to_string(c.Ie) + "_k" + std::to_string(c.k) + "_E" +
+                    std::to_string(c.E) + (norm ? "" : "_nonorm");
+  std::vector<std::string> mats;
+  for (const Layer& L : m.layers) {
+    if (!L.moe || !moe_down_comb_fits(m, L, 1, norm)) continue;
+    Ls.push_back(&L);
+    const std::string w = tune_key(&L.experts_down) + "+" + tune_key(&L.down.q);
+    if (std::find(mats.begin(), mats.end(), w) == mats.end()) mats.push_back(w), key += "_" + w;
+  }
+  if (Ls.empty()) return;
+  std::string dev = [[m.dev name] UTF8String];
+  for (auto& ch : dev)
+    if (!isalnum(static_cast<unsigned char>(ch))) ch = '_';
+  const std::string path = cache_dir() + "/moe-down-r1-" + dev + ".json";
+  json::Value cache = json::Value::object();
+  if (file_exists(path) && !std::getenv("ESPETERO_TUNE_FRESH")) {
+    try {
+      cache = json::parse(read_file(path));
+      if (!cache.is_object()) cache = json::Value::object();
+    } catch (...) {
+      cache = json::Value::object();
+    }
+  }
+  if (const json::Value* v = cache.get(key); v && v->is_object() && v->get("comb")) {
+    m.moe_down_comb = v->get("comb")->as_int() != 0;
+    return;
+  }
+  id<MTLBuffer> X = m.buffer(size_t(c.D) * 2), H = m.buffer(size_t(c.D) * 4);
+  id<MTLBuffer> act = m.buffer(size_t(std::max(c.I_shared, 64)) * 2);
+  id<MTLBuffer> wn = m.buffer(size_t(c.D) * 4), xn = m.buffer(size_t(c.D) * 2);
+  {
+    auto* x = (uint16_t*)[X contents];
+    for (int i = 0; i < c.D; ++i) x[i] = uint16_t(0x3c00 + (i % 7) * 37);  // ~1.0..1.25: routing spreads over experts
+    std::memset([H contents], 0, size_t(c.D) * 4);
+    auto* w = (float*)[wn contents];
+    for (int i = 0; i < c.D; ++i) w[i] = 1.0f;
+  }
+  NormLink nl;
+  nl.D = c.D;
+  nl.eps = c.eps;
+  nl.w = wn;
+  nl.xn = xn;
+  auto run = [&](bool comb) {
+    m.moe_down_comb = comb;
+    id<MTLCommandBuffer> cb = [m.queue commandBufferWithUnretainedReferences];
+    Enc E(m, cb);
+    for (const Layer* L : Ls) moe_mlp(m, E, *L, X, act, H, 1, norm ? &nl : nullptr);
+    cb = E.finish();
+    commit_wait(cb);
+    return gpu_ms(cb);
+  };
+  for (int r = 0; r < 3; ++r) run(true), run(false);  // clocks up
+  double t_comb = 1e30, t_pair = 1e30;
+  for (int r = 0; r < 7; ++r) {
+    t_comb = std::min(t_comb, run(true));
+    t_pair = std::min(t_pair, run(false));
+  }
+  m.moe_down_comb = !(t_pair < 0.97 * t_comb);
+  json::Value rec = json::Value::object();
+  rec.set("comb", m.moe_down_comb ? 1 : 0);
+  rec.set("comb_us", std::round(t_comb * 1e3 / double(Ls.size()) * 10.0) / 10.0);
+  rec.set("pair_us", std::round(t_pair * 1e3 / double(Ls.size()) * 10.0) / 10.0);
+  cache.set(key, std::move(rec));
+  const std::string tmp = path + ".tmp";
+  if (FILE* f = paths::make_private_file(tmp) ? std::fopen(tmp.c_str(), "wb") : nullptr) {
+    const std::string s = json::dump(cache);
+    std::fwrite(s.data(), 1, s.size(), f);
+    std::fclose(f);
+    std::rename(tmp.c_str(), path.c_str());
+  }
+  if (const char* lt = std::getenv("ESPETERO_LOAD_TRACE"); lt && *lt == '1')
+    std::fprintf(stderr, "[load] MoE down path: moe_down_comb %.1f us, GEMV + combine %.1f us per layer -> %s\n",
+                 t_comb * 1e3 / double(Ls.size()), t_pair * 1e3 / double(Ls.size()), m.moe_down_comb ? "moe_down_comb" : "GEMV + combine");
 }
 
 // Per-pass memory for metadata and small GPU scratch: a bump allocator over
