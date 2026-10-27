@@ -209,7 +209,8 @@ std::string preset(const std::string& name) {
 // the most sensitive part per byte, then the embedding, the attention k/v/o, and the MLPs of the first and
 // last quarters; the middle MLPs least. Each preset is sized at or under a llama.cpp / unsloth GGUF of
 // its quality class: eqd4m ~ Q4_K_M, eqd4l ~ UD-Q4_K_XL, eqd5 ~ UD-Q5_K_XL, eqd6 ~ Q6_K.
-const std::vector<std::string> kDensePresets = {"eqd4m", "eqd4l", "eqd5", "eqd6"};
+// eqd6-27b: Qwen3.8-27B, set with KL probes on held-out text (prose and code), sized under UD-Q6_K.
+const std::vector<std::string> kDensePresets = {"eqd4m", "eqd4l", "eqd5", "eqd6", "eqd6-27b"};
 
 bool is_dense_preset(const std::string& p) {
   return std::find(kDensePresets.begin(), kDensePresets.end(), p) != kDensePresets.end();
@@ -230,6 +231,18 @@ std::string dense_preset(const std::string& name, int L) {
   };
   const std::string c4 = "eql:4:16:cb+gptq", e5 = "eql:5:16+gptq", e6 = "eql:6:16+gptq", e8 = "eql:8:16+gptq";
   const std::string a5 = "affine:5:64:f16+gptq", a6 = "affine:6:64:f16+gptq";
+  if (name == "eqd6-27b") {
+    // every matrix EQ6; the MLPs of the first 5/16 of the layers (L0-19 of 64) EQ5; v_proj, lm_head and
+    // in_proj_a/b EQ8; down_proj (17408 inputs, wider than --hessian-max) +imat; the vision tower bf16.
+    // KLD 0.00127 at 6.417 bpw vs UD-Q6_K 0.00137 at 6.431 with a prose-heavy calibration text (wikitext-103,
+    // C4, PG19 train + calibration_v5, chat and Python; 452k tokens); with calibration_v5 alone 0.00149.
+    const int b = L * 5 / 16;
+    r = {"*visual*=bf16", "*linear_attn.in_proj_[ab]=" + e8, "*self_attn.v_proj=" + e8, "*lm_head=" + e8};
+    band(0, b, "mlp.down_proj", "eql:5:16+imat");
+    band(0, b, "mlp.[gu]*", e5);
+    r.insert(r.end(), {"*mlp.down_proj=eql:6:16+imat", "*embed_tokens=" + a5, "*=" + e6});
+    return join(r, ";");
+  }
   // linear attention of the first quarter: qkv/z EQ6 and out_proj EQ8 (eqd4*), all EQ8 (eqd5/eqd6);
   // in_proj_a/b EQ8 everywhere (tiny)
   const bool hi = name == "eqd5" || name == "eqd6";
@@ -720,7 +733,8 @@ const char* kUsage =
     "             EQ3 codebook experts (MoE only): eq3h eq3dh eq3dx eq3dhb;\n"
     "             Qwen3.8-Flash-Next: fnx3 (experts EQ3 codebooks, the rest EQ6), fnx3m (the rest EQ5);\n"
     "             dense Qwen3.5 / 3.6 (widths by tensor class and layer position, sized at or\n"
-    "             under the GGUF named): eqd4m (Q4_K_M) eqd4l (UD-Q4_K_XL) eqd5 (UD-Q5_K_XL) eqd6 (Q6_K)\n"
+    "             under the GGUF named): eqd4m (Q4_K_M) eqd4l (UD-Q4_K_XL) eqd5 (UD-Q5_K_XL) eqd6 (Q6_K);\n"
+    "             Qwen3.8-27B: eqd6-27b (UD-Q6_K; calibrate with prose as well as code)\n"
     "  --fmt      rules GLOB=FMT;... instead (eql:B:16[+enc], eql:4:16:cb[+enc], eql:3:16:cb[+enc],\n"
     "             affine:B:G[:SD][+enc], bf16; enc rtn | mse | imat | gptq)\n"
     "  --calib    statistics from an earlier run (or tools/dev/calib_npz.py); without it they are\n"

@@ -57,6 +57,15 @@ under the GGUF named. Set on KL probes over calibration text (Qwen3.5-9B).
 in_proj_a/b are EQ8 in every dense preset. `--print-rules` takes the layer
 count from `--model` or `--layers N` (default 32).
 
+These widths do not carry over to Qwen3.8-27B: its own probes, on held-out
+text (Wikipedia, C4, Python), gave `eqd6-27b`: every matrix EQ6, the MLPs of
+the first 5/16 of the layers (L0-19) EQ5, v_proj, LM head and in_proj_a/b
+EQ8, the embedding MLX 5-bit, the vision tower BF16. It needs a calibration
+text with prose as well as code: with one of wikitext-103, C4 and PG19 train
+plus calibration_v5, chat and Python (452k tokens), KLD 0.00127 at 6.417 bpw
+against UD-Q6_K's 0.00137 at 6.431 (fp32 BF16 reference, wikitext-2 test and
+C++/Metal code); with calibration_v5 alone 0.00149.
+
 A 4-bit preset with a trailing `c` (`eq4dhc`, `eq4xc`, ...) gives its EQ4
 experts codebooks. `espetero quantize --preset NAME --print-rules` prints a
 preset's rules. Rules: `GLOB=FMT;...` matched against module paths in order,

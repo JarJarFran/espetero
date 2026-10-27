@@ -259,9 +259,10 @@ std::vector<float> hinv_upper(const float* H, int C, std::vector<uint8_t>& dead)
   if (info != 0) {
     // Hessians with a few massive-activation inputs (Gemma 4: diagonal from
     // 1e-7 to 5e3) can lose definiteness in float32: the same steps in
-    // double precision, with 10x and 100x the damping if needed.
+    // double precision, with 10x to 10000x the damping if needed (Qwen3.8-27B's
+    // layer-0 linear_attn.out_proj, captured on prose, is indefinite: 1000x).
     std::vector<double> D(A.size());
-    for (double mult : {1.0, 10.0, 100.0}) {
+    for (double mult : {1.0, 10.0, 100.0, 1000.0, 10000.0}) {
       for (int i = 0; i < C; ++i)
         for (int j = 0; j < C; ++j) D[size_t(i) * C + j] = double(H[size_t(i) * C + j]);
       for (int i = 0; i < C; ++i) D[size_t(i) * C + i] += (dead[size_t(i)] ? 1.0 : 0.0) + mult * damp * (sum / C);
