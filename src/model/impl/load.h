@@ -11,6 +11,7 @@
 
 #include <dirent.h>
 
+#include "hf_source.h"
 #include "tensors.h"
 #include "model.h"
 #include "tiles.h"
@@ -430,7 +431,47 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   HostMat eg = host_mat(m, tmp, src, p + "mlp.switch_mlp.gate_proj.weight", c.E * c.Ie, c.D);
   HostMat eu = host_mat(m, tmp, src, p + "mlp.switch_mlp.up_proj.weight", c.E * c.Ie, c.D);
   HostMat ed = host_mat(m, tmp, src, p + "mlp.switch_mlp.down_proj.weight", c.E * c.D, c.Ie);
-  if (eg.dense || eu.dense || ed.dense) fail("dense expert weights are not supported");
+  // Dense (bf16) experts, as a Hugging Face checkpoint holds them (the
+  // calibration forward of espetero quantize): the grouped expert kernels
+  // read quantized layouts only, so they run as 8-bit group-64 copies
+  // (per-group min/max, ~0.2 % of each group's range).
+  // ESPETERO_EXPERTS_F16=1 keeps them exact instead (fp16, the bf16 values up to
+  // fp16's range): repack_f16's fragment order, read by moe_gemv8r16 (the 8-row
+  // MMA path only: no FMA tiles, no fused down + combine, no shared-expert tile).
+  static const bool experts_f16 = [] {
+    const char* v = std::getenv("ESPETERO_EXPERTS_F16");
+    return v && *v == '1';
+  }();
+  if (experts_f16 && eg.dense && eu.dense && ed.dense) {
+    const HostMat egu = interleave_gate_up(tmp, eg, eu);
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    L.router = finish(m, e, tmp, router, false, p + "router");
+    L.shared_gate = finish(m, e, tmp, sgate, false, p + "shared_gate");
+    m.n_dense_mtp += (L.router.dense ? 1 : 0) + (L.shared_gate.dense ? 1 : 0);
+    auto f16_experts = [&](const HostMat& h) {
+      const HW d = repack_dense(m, e, h.f16, h.out, h.in);
+      QW q;
+      q.out = h.out;
+      q.in = h.in;
+      q.bits = q.src_bits = 16;
+      q.wr = q.sb = d.wr;
+      q.wr_n = d.wr_n;
+      return q;
+    };
+    L.experts_gu = f16_experts(egu);
+    L.experts_down = f16_experts(ed);
+    [e endEncoding];
+    commit_wait(cb);
+    m.moe_fma = false;
+    m.moe_down_comb = false;
+    m.route_in_gemv = false;
+    L.moe = true;
+    return;
+  }
+  if (eg.dense) eg = requant<8>(tmp, eg);
+  if (eu.dense) eu = requant<8>(tmp, eu);
+  if (ed.dense) ed = requant<8>(tmp, ed);
   // Interleaving by 8 rows keeps every expert's 2 * Ie rows together (Ie % 64 == 0).
   const HostMat egu = interleave_gate_up(tmp, eg, eu);
   id<MTLCommandBuffer> cb = [m.queue commandBuffer];
@@ -842,6 +883,18 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       load_lfm2(m, src, cfg, want_vision);
       return;
     }
+  }
+  if (HFSource::is_hf_dir(src)) {
+    // A Hugging Face checkpoint as transformers writes it (BF16): text only,
+    // without its MTP head (espetero quantize's calibration forward; dense
+    // matrices served as fp16, experts as 8-bit copies or, with
+    // ESPETERO_EXPERTS_F16=1, fp16).
+    HFSource hf(path);
+    m.format = "hf";
+    m.cfg = config_from_mlx(hf.config());
+    if (m.cfg.q4) fail(path + ": Hugging Face checkpoints of this family are not supported (convert it first)");
+    load_decoder(m, hf, false);
+    return;
   }
   if (!src.has("language_model.model.embed_tokens.weight"))
     fail("expected an MLX-converted Qwen3.5 checkpoint (language_model.model.* tensors)");

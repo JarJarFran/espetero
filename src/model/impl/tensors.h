@@ -199,6 +199,13 @@ class SafetensorsSource : public WeightSource {
     auto ov = overrides_.find(base);
     return ov != overrides_.end() ? ov->second : std::make_pair(default_bits_, default_group_);
   }
+  // Every tensor name in the checkpoint (unsorted).
+  std::vector<std::string> names() const {
+    std::vector<std::string> v;
+    v.reserve(entries_.size());
+    for (const auto& [k, _] : entries_) v.push_back(k);
+    return v;
+  }
 
  private:
   struct Entry {

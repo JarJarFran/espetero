@@ -378,6 +378,7 @@ inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<
 // e.g. a Q8_0 shared expert beside Q6_K experts: a kernel takes one layout's
 // function constants; or another width on both projections).
 inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
+  if (L.experts_gu.bits == 16) return 0;  // fp16 experts (moe_gemv8r16): no tile kernels
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
   // (EQ4 / EQ3 codebook experts, mode 7 / 8, stream a shared expert of
   // another EQ width with mode 6's uniform codes: the kernels read codebooks
@@ -432,6 +433,7 @@ inline void moe_pipelines(const Model& m, const Layer& L, std::vector<std::pair<
   const QW* sdn = tiles ? &L.down.q : nullptr;
   out.push_back({moe_gemv_name(gu, sgu, false, 8, 2, false, 8), gu.fc()});
   out.push_back({moe_gemv_name(dn, sdn, false, 8, 0, false, 8), dn.fc()});
+  if (gu.bits == 16) return;  // fp16 experts: the 8-row kernel only
   if (m.moe_bm > 8) {  // the wide tiles of passes of more than 8 rows
     out.push_back({moe_gemv_name(gu, nullptr, false, 8, 2, false, 8, m.moe_bm), gu.fc()});
     out.push_back({moe_gemv_name(dn, nullptr, false, 8, 0, false, 8, m.moe_bm), dn.fc()});
@@ -529,7 +531,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // The wide tiles pay only once an expert holds tens of rows (moe_bm_rows); below that, and on
   // the 16-row step, the half-empty fragments and the halved tile count cost more than the
   // weight re-reads they save (M4 Max: 512 rows +3.1 %, 16-row step +24 %; 2048 rows -1.4 %).
-  const int bm_nopool = (rows > 8 && rows >= m.moe_bm_rows && (m.moe_bm == 16 || m.moe_bm == 32)) ? m.moe_bm : 8;
+  const int bm_nopool = (rows > 8 && rows >= m.moe_bm_rows && (m.moe_bm == 16 || m.moe_bm == 32) &&
+                         L.experts_gu.bits != 16) ? m.moe_bm : 8;  // (fp16 experts: the 8-row kernel only)
   MoeRouteParParams route_p{};
   if ((m.moe_stages & 1) && par_route) {
     // Router GEMV over nblocks x nsl threadgroups (one k-step per simdgroup),
