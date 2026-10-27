@@ -37,6 +37,10 @@ using native::parallel_for;
 namespace {
 
 constexpr int kSuper = 256;
+// Super-blocks of a row of C inputs (C % 64 == 0): 256 inputs each, the last
+// one partial when C % 256 != 0 (640 = 256 + 256 + 128); width of block sb.
+inline int n_supers(int C) { return (C + kSuper - 1) / kSuper; }
+inline int super_width(int C, int sb) { return std::min(kSuper, C - sb * kSuper); }
 
 inline float rint_even(float x) { return __builtin_rintf(x); }  // mx.round (default rounding mode: ties to even)
 inline float round_away(float x) { return std::round(x); }       // Metal round(): MLX's quantize kernel
@@ -94,15 +98,15 @@ float sym_search(const float* x, const float* w, int bits, bool rtn) {
   return best_s;
 }
 
-// Two-level form of 16 sub-block scales (quant_lab._fit_eq, eqs): fp16
-// super-scale amax / 127, int8 sub-scales, and the products half(sc * d)
-// the codes are chosen for.
-void two_level(const float* s, uint16_t& d_out, int8_t* sc_out, float* s2) {
+// Two-level form of nt (16; fewer in a partial last super-block) sub-block
+// scales (quant_lab._fit_eq, eqs): fp16 super-scale amax / 127, int8
+// sub-scales, and the products half(sc * d) the codes are chosen for.
+void two_level(const float* s, uint16_t& d_out, int8_t* sc_out, float* s2, int nt = 16) {
   float amax = 0;
-  for (int t = 0; t < 16; ++t) amax = std::max(amax, std::fabs(s[t]));
+  for (int t = 0; t < nt; ++t) amax = std::max(amax, std::fabs(s[t]));
   const float d = f16_round(amax / 127.0f);
   const float dv = d > 0 ? d : 1.0f;
-  for (int t = 0; t < 16; ++t) {
+  for (int t = 0; t < nt; ++t) {
     const float sc = std::clamp(rint_even(s[t] / dv), -127.0f, 127.0f);
     sc_out[t] = int8_t(sc);
     s2[t] = f16_round(sc * d);
@@ -116,13 +120,15 @@ inline float eq_code(float x, float s, int bits) {
   return std::clamp(rint_even(x / ss), float(-nmax), float(nmax - 1));
 }
 
-// One super-block (256 permuted inputs of one row) without error feedback.
-void eq_superblock(const float* x, const float* w, const Fmt& f, uint16_t& d, int8_t* sc, float* codes) {
+// One super-block (n = 256 permuted inputs of one row, fewer in a partial
+// last block) without error feedback.
+void eq_superblock(const float* x, const float* w, const Fmt& f, uint16_t& d, int8_t* sc, float* codes, int n = kSuper) {
   float s[16], s2[16];
   const bool rtn = f.enc == Fmt::RTN;
-  for (int t = 0; t < 16; ++t) s[t] = sym_search(x + 16 * t, w ? w + 16 * t : nullptr, f.bits, rtn);
-  two_level(s, d, sc, s2);
-  for (int k = 0; k < kSuper; ++k) codes[k] = eq_code(x[k], s2[k / 16], f.bits);
+  const int nt = n / 16;
+  for (int t = 0; t < nt; ++t) s[t] = sym_search(x + 16 * t, w ? w + 16 * t : nullptr, f.bits, rtn);
+  two_level(s, d, sc, s2, nt);
+  for (int k = 0; k < n; ++k) codes[k] = eq_code(x[k], s2[k / 16], f.bits);
 }
 
 // ---------------------------------------------------------------- affine
@@ -291,23 +297,24 @@ template <class Fit, class Code>
 void gptq(float* Wr, int64_t R, int C, const float* U, int g, Fit&& fit, Code&& code) {
   std::vector<float> Eg(static_cast<size_t>(R) * size_t(g));
   for (int i = 0; i < C; i += g) {
-    const int j = i + g;
+    const int gw = std::min(g, C - i);  // (EQ: a partial last super-block)
+    const int j = i + gw;
     for_row_blocks(R, 16, [&](int64_t r0, int64_t r1) {
       for (int64_t r = r0; r < r1; ++r) {
         float* w = Wr + size_t(r) * C + i;
         fit(r, i, w);
         float* e = Eg.data() + size_t(r) * g;
-        for (int k = 0; k < g; ++k) {
+        for (int k = 0; k < gw; ++k) {
           const float q = code(r, i, k, w[k]);
           const float* u = U + size_t(i + k) * C + i;
           const float ek = (w[k] - q) / u[k];
-          for (int c = k; c < g; ++c) w[c] -= ek * u[c];
+          for (int c = k; c < gw; ++c) w[c] -= ek * u[c];
           e[k] = ek;
         }
       }
     });
     if (j < C)
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, int(R), C - j, g, -1.0f, Eg.data(), g,
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, int(R), C - j, gw, -1.0f, Eg.data(), g,
                   U + size_t(i) * C + j, C, 1.0f, Wr + j, C);
   }
 }
@@ -483,7 +490,7 @@ std::vector<int64_t> np_choice(uint32_t seed, int64_t n, int64_t k) {
 void eqc_fit(const float* Xp, int64_t R, int C, const std::function<const float*(int64_t)>& imp_row,
              const std::function<int(int64_t)>& grp, int ng, int iters, std::vector<float>& cb, uint8_t* q_out,
              uint16_t* d_out, int8_t* sc_out, int L) {
-  const int nsb = C / kSuper;
+  const int nsb = n_supers(C);
   const size_t Lz = size_t(L), Mz = size_t(L - 1);
   for (int it = 0; it <= iters; ++it) {
     const bool last = it == iters;
@@ -510,25 +517,26 @@ void eqc_fit(const float* Xp, int64_t R, int C, const std::function<const float*
         for (int sb = 0; sb < nsb; ++sb) {
           const float* xs = x + sb * kSuper;
           const float* ws = w + sb * kSuper;
+          const int sw = super_width(C, sb), nt = sw / 16;
           float s[16];
           static const bool scalar = std::getenv("EQ_SCALAR") != nullptr;
           if (scalar)
-            for (int t = 0; t < 16; ++t) s[t] = cb_scale(xs + 16 * t, ws + 16 * t, c, m, L);
+            for (int t = 0; t < nt; ++t) s[t] = cb_scale(xs + 16 * t, ws + 16 * t, c, m, L);
           else
-            for (int t = 0; t < 16; t += 4) cb_scale4(xs + 16 * t, ws + 16 * t, c, m, L, s + t);
+            for (int t = 0; t < nt; t += 4) cb_scale4(xs + 16 * t, ws + 16 * t, c, m, L, s + t);
           float amax = 0;
-          for (int t = 0; t < 16; ++t) amax = std::max(amax, std::fabs(s[t]));
+          for (int t = 0; t < nt; ++t) amax = std::max(amax, std::fabs(s[t]));
           const float d = f16_round(amax / 127.0f);
           const float dv = d > 0 ? d : 1.0f;
           float s2[16];
-          for (int t = 0; t < 16; ++t) {
+          for (int t = 0; t < nt; ++t) {
             const float sc = std::clamp(rint_even(s[t] / dv), -127.0f, 127.0f);
             s2[t] = f16_round(sc * d);
             if (s2[t] == 0) s2[t] = 1e-8f;
             if (last) sc_out[size_t(r) * (C / 16) + sb * 16 + t] = int8_t(sc);
           }
           if (last) d_out[size_t(r) * nsb + sb] = f16_bits(d);
-          for (int k = 0; k < kSuper; ++k) {
+          for (int k = 0; k < sw; ++k) {
             const float st = s2[k / 16];
             const int q = cb_nearest(xs[k] / st, m, L);
             if (dbg) {
@@ -700,12 +708,13 @@ std::vector<uint32_t> pack_codes(const uint8_t* q, int64_t R, int C, int bits) {
 // ---------------------------------------------------------------- EQ / EQC
 
 EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const Stats* st) {
-  if (C % kSuper) fail("EQ: input width " + std::to_string(C) + " is not a multiple of 256");
+  if (C % 64) fail("EQ: input width " + std::to_string(C) + " is not a multiple of 64");
   const std::vector<int> perm = lane_perm(C);
+  const int nsup = n_supers(C);
   EqOut out;
   out.q.resize(size_t(R) * C);
   out.sc.resize(size_t(R) * (C / 16));
-  out.d.resize(size_t(R) * (C / kSuper));
+  out.d.resize(size_t(R) * size_t(nsup));
   const int64_t O = nexp ? R / nexp : R;
   std::vector<float> dtmp;
 
@@ -761,7 +770,7 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
         for (int64_t u = 0; u < unit; ++u) src[size_t(a * unit + u)] = sel[size_t(a)] * unit + u;
       for (size_t i = 0; i < src.size(); ++i) std::memcpy(&Xs[i * C], &Xp[size_t(src[i]) * C], sizeof(float) * C);
       std::vector<uint8_t> qs(Xs.size());
-      std::vector<uint16_t> ds(src.size() * (C / kSuper));
+      std::vector<uint16_t> ds(src.size() * size_t(nsup));
       std::vector<int8_t> ss(src.size() * (C / 16));
       eqc_fit(Xs.data(), int64_t(src.size()), C, [&](int64_t r) { return imp_row(src[size_t(r)]); },
               [](int64_t) { return 0; }, 1, 8, cb, qs.data(), ds.data(), ss.data(), L);
@@ -792,20 +801,21 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
       gptq(
           Wr.data(), R, C, U.data(), kSuper,
           [&](int64_t r, int i, const float* w) {
+            const int nt = super_width(C, i / kSuper) / 16;
             float s[16];
-            for (int t = 0; t < 16; t += 4) cb_scale4(w + 16 * t, wimp + i + 16 * t, cb.data(), mids.data(), L, s + t);
+            for (int t = 0; t < nt; t += 4) cb_scale4(w + 16 * t, wimp + i + 16 * t, cb.data(), mids.data(), L, s + t);
             float amax = 0;
-            for (int t = 0; t < 16; ++t) amax = std::max(amax, std::fabs(s[t]));
+            for (int t = 0; t < nt; ++t) amax = std::max(amax, std::fabs(s[t]));
             const float d = f16_round(amax / 127.0f);
             const float dv = d > 0 ? d : 1.0f;
-            for (int t = 0; t < 16; ++t) {
+            for (int t = 0; t < nt; ++t) {
               const float sc = std::clamp(rint_even(s[t] / dv), -127.0f, 127.0f);
               float v = f16_round(sc * d);
               if (v == 0) v = 1e-8f;
               s2[size_t(r) * 16 + t] = v;
               out.sc[size_t(r) * (C / 16) + i / 16 + t] = int8_t(sc);
             }
-            out.d[size_t(r) * (C / kSuper) + i / kSuper] = f16_bits(d);
+            out.d[size_t(r) * size_t(nsup) + i / kSuper] = f16_bits(d);
           },
           [&](int64_t r, int i, int k, float w) {
             const float sk = s2[size_t(r) * 16 + k / 16];
@@ -853,10 +863,11 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
     gptq(
         Wr.data(), R, C, U.data(), kSuper,
         [&](int64_t r, int i, const float* w) {
+          const int nt = super_width(C, i / kSuper) / 16;
           float s[16];
-          for (int t = 0; t < 16; ++t) s[t] = sym_search(w + 16 * t, imp.data() + i + 16 * t, f.bits, false);
-          two_level(s, out.d[size_t(r) * (C / kSuper) + i / kSuper], &out.sc[size_t(r) * (C / 16) + i / 16],
-                    &s2[size_t(r) * 16]);
+          for (int t = 0; t < nt; ++t) s[t] = sym_search(w + 16 * t, imp.data() + i + 16 * t, f.bits, false);
+          two_level(s, out.d[size_t(r) * size_t(nsup) + i / kSuper], &out.sc[size_t(r) * (C / 16) + i / 16],
+                    &s2[size_t(r) * 16], nt);
         },
         [&](int64_t r, int i, int k, float w) {
           const float s = s2[size_t(r) * 16 + k / 16];
@@ -902,10 +913,11 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
     for (int64_t r = r0; r < r1; ++r) {
       for (int i = 0; i < C; ++i) xp[size_t(i)] = W[size_t(r) * C + perm[size_t(i)]];
       const float* w = nimp == 0 ? nullptr : imp.data() + (nimp == 1 ? 0 : size_t(r / O) * C);
-      for (int sb = 0; sb < C / kSuper; ++sb) {
-        eq_superblock(xp.data() + sb * kSuper, w ? w + sb * kSuper : nullptr, fe, out.d[size_t(r) * (C / kSuper) + sb],
-                      &out.sc[size_t(r) * (C / 16) + sb * 16], codes.data());
-        for (int k = 0; k < kSuper; ++k)
+      for (int sb = 0; sb < nsup; ++sb) {
+        const int sw = super_width(C, sb);
+        eq_superblock(xp.data() + sb * kSuper, w ? w + sb * kSuper : nullptr, fe, out.d[size_t(r) * size_t(nsup) + sb],
+                      &out.sc[size_t(r) * (C / 16) + sb * 16], codes.data(), sw);
+        for (int k = 0; k < sw; ++k)
           out.q[size_t(r) * C + perm[size_t(sb * kSuper + k)]] = uint8_t(int(codes[size_t(k)]) + nmax);
       }
     }

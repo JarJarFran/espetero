@@ -67,7 +67,8 @@ struct ModelInfo {
   bool leaves = true;  // multi-branch passes (draft leaves, decision trees)
   bool prompt_lookup = true;  // the engine may verify prompt-lookup drafts as leaves
   bool commit = false;  // verify-commit: TreeSpec::commit_chain + NativeModel::commit
-  bool hidden_states = true;  // TreeSpec::out_hidden readouts (not Qwen4-Exp yet)
+  bool hidden_states = true;  // the engine's hidden-state readouts (embeddings, heads; not Qwen4-Exp yet)
+  bool hidden_rows = true;     // TreeSpec::out_hidden of every row (Qwen4-Exp too: the final mixer's output)
   bool chunk_prefill = true;  // prompts may go in chunks while others decode (false: a pass reads its experts once)
   int draft_default = 0;  // MTP drafts per pass when --draft is not given (0: the engine's default, 5)
   std::string family = "qwen3_5";  // "qwen3_5" (also qwen3_5_moe, qwen4_exp), "gemma4" or "lfm2" (also lfm2_vl)
@@ -230,7 +231,11 @@ struct CommitRequest {
 // as prefill passes of a dense checkpoint run.
 class ActivationSink {
  public:
-  enum Kind { kAttnIn = 0, kMixOut = 1, kMlpIn = 2, kDownIn = 3, kExpertIn = 4 };
+  enum Kind { kAttnIn = 0, kMixOut = 1, kMlpIn = 2, kDownIn = 3, kExpertIn = 4,
+              // Qwen4-Exp: the hyper-connection blocks' normed streams and low-rank
+              // activations (attention block 5 / 6, MLP block 7 / 8; layer = the layer
+              // count for the final mixer, kinds 5 / 6) and the n-gram rows (9)
+              kHcAttnN = 5, kHcAttnLow = 6, kHcMlpN = 7, kHcMlpLow = 8, kPleIn = 9 };
   virtual ~ActivationSink() = default;
   virtual void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids,
                    const int32_t* pos, int k) = 0;

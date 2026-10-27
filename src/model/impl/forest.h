@@ -358,13 +358,17 @@ inline void moe_check_tiles(Model& m, Enc& E, const MoeScratch& z, const ExpertP
 
 // Bytes of tap_buf a pass of `rows` rows needs: every layer's attention
 // input, mixer output, MLP input, down input and (MoE) expert rows with
-// their ids and positions, plus alignment.
+// their ids and positions, plus alignment. Qwen4-Exp also taps both
+// hyper-connection blocks of a layer (normed streams, low-rank activations),
+// the final mixer's and the n-gram mix input.
 inline size_t tap_bytes(const Config& c, int rows) {
   const size_t W = std::max<size_t>(size_t(c.Vd()), size_t(c.H) * size_t(std::max(c.HD, c.HDg)));
   const size_t I = size_t(std::max(c.I, c.I_shared));
   size_t per = size_t(rows) * (2 * size_t(c.D) + W + I) * 2;
   if (c.E) per += size_t(rows) * size_t(c.k) * (size_t(c.Ie) * 2 + 8);
-  return (per + 8 * 256) * size_t(c.L);
+  if (!c.q4) return (per + 8 * 256) * size_t(c.L);
+  const size_t hc = size_t(rows) * (size_t(c.W()) + size_t(c.hc_rank)) * 2;
+  return (per + 2 * hc + 12 * 256) * size_t(c.L) + hc + size_t(rows) * 2 * size_t(c.D) * 2 + 8 * 256;
 }
 
 // Copy `bytes` of `src` from `src_off` into the tap buffer; returns where.
@@ -531,7 +535,15 @@ inline bool moe_down_comb_fits(const Model& m, const Layer& L, int rows, bool no
 // act: scratch of [rows, I_shared] halves for the shared expert.
 inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuffer> act, id<MTLBuffer> H, int rows,
                     const NormLink* nout, size_t h_off = 0) {  // h_off: byte offset of the residual rows in H
-  const Config& c = m.cfg;
+  // A layer pruned to fewer experts than the config's (the scratch is sized for the config's)
+  const Config* cfg_p = &m.cfg;
+  Config c_layer;
+  if (L.E) {
+    c_layer = m.cfg;
+    c_layer.E = L.E;
+    cfg_p = &c_layer;
+  }
+  const Config& c = *cfg_p;
   ensure_moe_scratch(m, rows);
   MoeScratch& z = m.mz;
   const int gu_blocks = (2 * c.Ie + 31) / 32, down_blocks = (c.D + 31) / 32;
@@ -571,7 +583,11 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // expert cache (its sort remaps the routed ids to pool slots).
   const bool route_e512 = c.E > 256 && c.E <= 512 && m.route_par && (m.route_sync & 15) == 2 && m.route_fin1 &&
                           m.xpool.empty() && c.D % 64 == 0;
-  const bool fused_route = m.fuse_route && rows <= 8 && (!L.shared_gate.dense || gate_f16) && (c.E <= 256 || route_e512) &&
+  // (E <= 256 not with an expert cache either: its hook remaps the routed ids
+  // in moe_sort, which a fused single-row route skips; Qwen4-Exp files pruned
+  // to E <= 256 with streamed experts reach this.)
+  const bool fused_route = m.fuse_route && rows <= 8 && (!L.shared_gate.dense || gate_f16) &&
+                           ((c.E <= 256 && !m.moe_after_route) || route_e512) &&
                            (router_f16 || (!L.router.dense && L.router.q.bits == L.shared_gate.q.bits &&
                                            L.router.q.fc() == L.shared_gate.q.fc()));
   const bool par_route = fused_route && (m.route_par || router_f16) && c.D % 64 == 0;
@@ -2246,12 +2262,15 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   bool any_hidden = false;
   for (const TreeSpec& b : specs)
     any_hidden = any_hidden || b.out_hidden != nullptr || b.out_last_hidden != nullptr || b.out_rows_hidden != nullptr;
-  if (any_hidden && c.q4) fail("hidden-state readouts are not supported for qwen4_exp");
+  if (c.q4)  // (Qwen4-Exp: out_hidden only, the final mixer's output)
+    for (const TreeSpec& b : specs)
+      if (b.out_last_hidden || b.out_rows_hidden) fail("last-row hidden-state readouts are not supported for qwen4_exp");
   // MTP needs every root row's final hidden state: no last-layer pruning.
   const bool prune = m.prune_last && !any_mtp && !fuse && !c.q4 && !any_hidden;
   // Calibration taps: prefill-sized plain passes of the Qwen3.5-family and
   // dense Gemma 4 layers (no pruned last layer: every row reaches every matrix).
-  m.tap_pass = m.tap_sink && !fuse && !prune && M > 8 && !c.q4 && !(c.gemma && c.E) && !c.q3moe && !c.lfm2;
+  m.tap_pass = m.tap_sink && !fuse && !prune && M > 8 && !(c.gemma && c.E) && !c.q3moe && !c.lfm2 &&
+               !(c.q4 && !m.xpool.empty());  // (Qwen4-Exp: no expert cache, whose slots replace the expert ids)
   m.tap_recs.clear();
   m.tap_used = 0;
   if (m.tap_pass && m.tap_cap < tap_bytes(c, M)) {
@@ -2915,6 +2934,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     Model::Q4Scratch& q = m.q4s;
     const Ple& P = m.ple;
     const int W = c.W();
+    tap_rows(m, E, c.ple_layer, 9, q.e16, M, c.D);  // (calibration) the n-gram rows: key / value projections' input
     gemm(E, m.tune, P.key, q.e16, 0, c.D, q.kraw, 0, W, M, 0);
     gemm(E, m.tune, P.value, q.e16, 0, c.D, q.vp, 0, c.D, M, 0);
     E.pipe("q4_ple_gate");
@@ -3761,6 +3781,8 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     if (c.q4) {
       if (li == c.ple_layer) q4_ple();
       q4_read(L.hca, true, m.q4s.H, M, s.xn);
+      tap_rows(m, E, li, 5, m.q4s.N16, M, c.W());      // (calibration) attention HC: normed streams,
+      tap_rows(m, E, li, 6, m.q4s.a16, M, c.hc_rank);  // low-rank activations
     } else if (!fuse || li == 0) {
       rmsnorm_h(L.in_norm, s.xn, M);
     }
@@ -3959,6 +3981,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     if (c.q4) {
       q4_inject(M, &L.hcm);
       q4_read(L.hcm, true, m.q4s.H, M, s.xn);
+      tap_rows(m, E, li, 7, m.q4s.N16, M, c.W());      // (calibration) MLP HC: normed streams,
+      tap_rows(m, E, li, 8, m.q4s.a16, M, c.hc_rank);  // low-rank activations,
+      tap_rows(m, E, li, 2, s.xn, M, c.D);             // the MoE input (ActivationSink::kMlpIn)
       if (!m.xres_l.empty()) {
         Layer& Lr = m.layers[size_t(li)];
         Lr.experts_gu = m.xres_l[size_t(li)].first;
@@ -4061,12 +4086,23 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   s.tk_k = topk_k;
   bool any_rows = false;  // out_hidden: every row's final-normed state, copied out per tree below
   for (const TreeSpec& b : specs) any_rows = any_rows || b.out_hidden != nullptr;
-  if (any_rows) {
+  if (any_rows && !c.q4) {
     if (s.hid_rows < M) {
       s.hid = m.buffer(sizeof(uint16_t) * size_t(M) * size_t(c.D));
       s.hid_rows = M;
     }
     rmsnorm(s.h, m.final_norm, s.hid, M, nil);
+  }
+  if (c.q4 && (any_rows || m.tap_pass)) {
+    // Every row's LM head input, the final mixer's output (this family has no
+    // final norm): hidden-state readouts, and the mixer's calibration taps.
+    if (s.hid_rows < M) {
+      s.hid = m.buffer(sizeof(uint16_t) * size_t(M) * size_t(c.D));
+      s.hid_rows = M;
+    }
+    q4_read(m.mixer, false, m.q4s.H, M, s.hid);
+    tap_rows(m, E, c.L, 5, m.q4s.N16, M, c.W());
+    tap_rows(m, E, c.L, 6, m.q4s.a16, M, c.hc_rank);
   }
   if (N > 0) {
     if (c.q4) {  // the final mixer on the rows that are read out

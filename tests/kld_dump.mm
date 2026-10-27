@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
   o.max_rows = std::max(o.max_rows, ctx);
   auto model = NativeModel::load(argv[1], o);
   const ModelInfo& I = model->info();
-  if (!I.hidden_states) {
+  if (!I.hidden_rows) {
     std::fprintf(stderr, "%s: this model has no hidden-state readouts\n", argv[1]);
     return 1;
   }

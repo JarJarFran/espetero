@@ -8,7 +8,9 @@
 // Formats (specs as in eq_convert.py's rules):
 //   eql:B:16[+ENC]        EQ, B in 3, 4, 5, 6, 8: signed codes, an int8 sub-scale
 //                         per lane sub-block of 16 inputs, an fp16 super-scale
-//                         per 256; weight = half(super * sub) * code
+//                         per 256 (the last super-block of a row partial when
+//                         the width is not a multiple of 256: 640 = 256 + 256 + 128);
+//                         weight = half(super * sub) * code
 //   eql:4:16:cb[:R][+ENC] EQ4 with a 16-entry fp16 codebook per matrix (or per
 //                         R rows; per expert for stacked experts):
 //                         weight = half(super * sub) * cb[code]
@@ -52,11 +54,11 @@ struct Stats {
   int C = 0;
 };
 
-// EQ / EQC encoding of R rows of C inputs (C % 256 == 0).
+// EQ / EQC encoding of R rows of C inputs (C % 64 == 0).
 struct EqOut {
   std::vector<uint8_t> q;    // [R][C] stored codes, original column order: code + 2^(B-1), or codebook index
   std::vector<int8_t> sc;    // [R][C / 16] sub-scales, lane sub-block order (4 * step + t)
-  std::vector<uint16_t> d;   // [R][C / 256] fp16 super-scales
+  std::vector<uint16_t> d;   // [R][ceil(C / 256)] fp16 super-scales
   std::vector<uint16_t> cb;  // EQC: [ncb][2^bits] fp16 codebooks (EQ4 16, EQ3 8)
 };
 // MLX affine encoding.

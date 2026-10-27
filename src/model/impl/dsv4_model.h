@@ -129,6 +129,7 @@ class Dsv4Model final : public NativeModel {
     info_.chunk_prefill = false;  // a pass reads its layers' experts once: a prompt in chunks reads them per chunk
     info_.commit = false;
     info_.hidden_states = false;
+    info_.hidden_rows = false;
     info_.mtp = false;
     info_.vision = vision_;
     if (vision_) {

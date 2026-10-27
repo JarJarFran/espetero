@@ -16,7 +16,11 @@
 //   switch_mlp.{gate,up,down}_proj.weight [E, out, in];
 //   Gemma 4 (gemma4_text.sanitize): no norm shift, the audio and vision
 //   towers left out, fused experts (layers.N.experts.gate_up_proj /
-//   down_proj) as experts.switch_glu.{gate,up,down}_proj.weight.
+//   down_proj) as experts.switch_glu.{gate,up,down}_proj.weight;
+//   Qwen4-Exp (qwen4_exp, Qwen3.8-Flash-Next; the oQ4e-mtp MLX names):
+//   no norm shift (the family's norm weights stay zero-centred, the loader
+//   adds 1), and the MTP head kept as mtp.* with its fused experts split
+//   into mtp.layers.0.mlp.switch_mlp.*.
 // Tensors that need new bytes (shifted norms, split or stacked experts) are
 // materialized on first use; large ones are kept only while they are among
 // the last few asked for (a loader converts each matrix before it asks for
@@ -43,6 +47,8 @@ class HFSource : public WeightSource {
     const json::Value& t = tc && tc->is_object() ? *tc : cfg;
     tied_ = cfg.get_bool("tie_word_embeddings", t.get_bool("tie_word_embeddings", false));
     spark_ = cfg.get_string("model_type", "") == "spark2_5";
+    qwen4_ = cfg.get_string("model_type", "").rfind("qwen4_exp", 0) == 0 || t.get_string("model_type", "").rfind("qwen4_exp", 0) == 0;
+    static const std::regex mtp_fused(R"(^mtp\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$)");
     static const std::regex fused(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$)");
     static const std::regex single(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$)");
     static const std::regex g4fused(R"(^model\.language_model\.layers\.(\d+)\.experts\.(gate_up_proj|down_proj)$)");
@@ -66,6 +72,20 @@ class HFSource : public WeightSource {
           map_[p + "up_proj.weight"] = {n, Kind::UpHalf};
         } else {
           map_[p + "down_proj.weight"] = {n, Kind::Plain};
+        }
+        continue;
+      }
+      if (qwen4_ && n.rfind("mtp.", 0) == 0) {  // Qwen4-Exp: the MTP head under its own names
+        if (std::regex_match(n, mm, mtp_fused)) {
+          const std::string p = "mtp.layers." + mm[1].str() + ".mlp.switch_mlp.";
+          if (mm[2] == "gate_up_proj") {
+            map_[p + "gate_proj.weight"] = {n, Kind::GateHalf};
+            map_[p + "up_proj.weight"] = {n, Kind::UpHalf};
+          } else {
+            map_[p + "down_proj.weight"] = {n, Kind::Plain};
+          }
+        } else {
+          map_[n] = {n, Kind::Plain};
         }
         continue;
       }
@@ -100,6 +120,7 @@ class HFSource : public WeightSource {
   const json::Value& config() const { return raw_.config(); }
   const std::string& dir() const { return raw_.dir(); }
   bool tied() const { return tied_; }
+  bool qwen4() const { return qwen4_; }
   std::string describe() const override { return "hf:" + raw_.dir(); }
   bool has(const std::string& name) const override { return map_.count(name) != 0; }
 
@@ -198,6 +219,23 @@ class HFSource : public WeightSource {
   // The raw HF tensors (the MTP head is converted from them).
   const SafetensorsSource& raw() const { return raw_; }
 
+  // The file bytes MLX tensor `name` is made from (one range; a stack: one per expert).
+  std::vector<std::pair<const uint8_t*, size_t>> raw_ranges(const std::string& name) const {
+    auto it = map_.find(name);
+    if (it == map_.end()) fail("missing tensor " + name);
+    std::vector<std::pair<const uint8_t*, size_t>> v;
+    if (it->second.kind == Kind::Stack) {
+      for (const std::string& s : stacks_.at(name)) {
+        const auto l = raw_.locate(s);
+        v.push_back({l.data, size_t(l.nbytes)});
+      }
+    } else {
+      const auto l = raw_.locate(it->second.src);
+      v.push_back({l.data, size_t(l.nbytes)});
+    }
+    return v;
+  }
+
  private:
   enum class Kind { Plain, NormShift, GateHalf, UpHalf, Stack };
   struct Ref {
@@ -205,7 +243,7 @@ class HFSource : public WeightSource {
     Kind kind = Kind::Plain;
   };
 
-  bool shift_norms() const { return has_mtp_ || unsanitized_conv_; }
+  bool shift_norms() const { return !qwen4_ && (has_mtp_ || unsanitized_conv_); }
   static bool is_shifted_norm(const std::string& n) {
     for (const char* s : {".input_layernorm.weight", ".post_attention_layernorm.weight", "model.norm.weight",
                           ".q_norm.weight", ".k_norm.weight"})
@@ -221,7 +259,7 @@ class HFSource : public WeightSource {
   }
 
   SafetensorsSource raw_;
-  bool tied_ = false, has_mtp_ = false, unsanitized_conv_ = false, spark_ = false;
+  bool tied_ = false, has_mtp_ = false, unsanitized_conv_ = false, spark_ = false, qwen4_ = false;
   std::map<std::string, Ref> map_;
   std::map<std::string, std::vector<std::string>> stacks_;
   mutable std::mutex mu_;

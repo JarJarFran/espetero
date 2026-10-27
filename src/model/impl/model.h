@@ -65,6 +65,7 @@ struct Layer {
   // gates of one layout only; empty otherwise).
   Mat router_sg;
   QW experts_gu, experts_down;
+  int E = 0;  // this layer's routed experts when fewer than the config's (pruned per layer), else 0
   // Gated DeltaNet: in_proj = [qkv; z; a; b]; full attention: [q|gate; k; v].
   std::vector<Mat> in_proj;
   Mat out;
@@ -96,13 +97,15 @@ struct Layer {
 // when mapping fails); the table is not copied into memory, but a background
 // reader can warm the file cache with it (ensure_ngram_preload).
 struct NgramTable {
-  struct Shard { int file = -1; uint64_t w = 0, s = 0, b = 0; };
+  // file: of the codes; fs / fb: of the scales / biases (the same file in oQ4e,
+  // possibly the next one in espetero quantize output, whose shards split by size).
+  struct Shard { int file = -1, fs = -1, fb = -1; uint64_t w = 0, s = 0, b = 0; };
   std::vector<std::string> files;
   std::vector<int> fds;
   std::vector<const uint8_t*> maps;  // per file: its whole mapping, or nullptr (never unmapped)
   std::vector<Shard> shards;
   int64_t shard_rows = 0, rows = 0;
-  int width = 160, group = 32;
+  int width = 160, group = 32, bits = 4;  // MLX affine 4-bit (oQ4e) or 8-bit (espetero quantize --ple-bits 8)
   float scale = 1.0f;
   // 0: MLX 4-bit affine shards (codes, bf16 scales, bf16 biases); 1: one GGUF
   // IQ4_NL tensor (rows of width / 32 blocks: fp16 d + 16 bytes of codebook

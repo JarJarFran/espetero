@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Francisco José García Barbero
 
 // espetero quantize: a Hugging Face BF16 checkpoint (Qwen3.5 / Qwen3.6
-// family, dense Gemma 4) -> an EQ checkpoint (Espetero's own format), without Python.
+// family, dense Gemma 4, Qwen4-Exp / Qwen3.8-Flash-Next) -> an EQ checkpoint
+// (Espetero's own format), without Python. Qwen4-Exp can also be converted
+// from an MLX checkpoint (oQ4e-mtp: its matrices dequantized), and its
+// routed experts pruned to a kept list per layer (--keep-experts).
 // The C++ form of kld/eq_convert.py (+ quant_lab.py, kld_harness.py calib):
 // calibration statistics from Espetero's own forward of the BF16 weights,
 // the converter's presets and rules, its encoders, and its output: the MLX
@@ -19,6 +22,8 @@
 #include <fstream>
 #include <regex>
 #include <set>
+
+#include "../model/impl/tensors.h"
 
 #include "../model/api.h"
 #include "../model/impl/hf_source.h"
@@ -182,6 +187,13 @@ std::string preset(const std::string& name) {
          std::string("*=") + (x ? "eql:6:16+gptq" : "eql:8:16+gptq")};
   } else if (name == "eq6") {
     r = {"*switch_mlp*=eql:6:16+imat", "*embed_tokens=affine:8:64:f16", "*lm_head=affine:8:64:f16", "*=eql:6:16+gptq"};
+  } else if (name == "fnx3" || name == "fnx3m") {
+    // Qwen3.8-Flash-Next (qwen4_exp) at ~30 GB with ~240 kept experts per layer (route A): routed
+    // experts (trunk and MTP) EQ3 codebooks, everything else EQ6 (fnx3m: EQ5), LM head MLX 6-bit,
+    // embedding MLX 8-bit (gathered rows: 5/6-bit ones are widened to bytes in memory anyway); the
+    // n-gram table stays outside the rules (--ple-bits).
+    const std::string rest = name == "fnx3" ? "eql:6:16+gptq" : "eql:5:16+gptq";
+    r = {"*switch_mlp*=eql:3:16:cb+imat", "*embed_tokens=affine:8:64:f16", "*lm_head=affine:6:64:f16+gptq", "*=" + rest};
   } else {
     fail("unknown preset " + name);
   }
@@ -252,7 +264,7 @@ int text_layers(const std::string& model_dir) {
 
 bool known_preset(const std::string& p) {
   if (is_dense_preset(p)) return true;
-  if (p == "eq4dhb" || p == "eq3h" || p == "eq3dh" || p == "eq3dx" || p == "eq3dhb" ||
+  if (p == "eq4dhb" || p == "eq3h" || p == "eq3dh" || p == "eq3dx" || p == "eq3dhb" || p == "fnx3" || p == "fnx3m" ||
       std::find(kPresets.begin(), kPresets.end(), p) != kPresets.end())
     return true;
   const std::string b = p.substr(0, p.size() - 1);
@@ -308,7 +320,7 @@ std::vector<StTensor> outputs(const Item& it) {
   if (it.f.kind == Fmt::EQ || it.f.kind == Fmt::EQC) {
     v.push_back({it.path + ".weight", "U32", with(C * it.f.bits / 32)});
     v.push_back({it.path + ".scales", "I8", with(C / 16)});
-    v.push_back({it.path + ".super", "F16", with(C / 256)});
+    v.push_back({it.path + ".super", "F16", with((C + 255) / 256)});  // (the last super-block partial when C % 256)
     if (it.f.kind == Fmt::EQC) {
       const int64_t R = numel(it.shape) / C;
       const int64_t rows = it.f.cbrows ? it.f.cbrows : (it.shape.size() == 3 ? it.shape[1] : R);
@@ -372,6 +384,216 @@ json::Value encode_write(StWriter& w, const Item& it, const float* W, const Stat
     q.set("group_size", json::Value(it.f.group));
   }
   return q;
+}
+
+// ---------------------------------------------------------------- sources
+
+// What the converter reads: tensors by MLX name, their shapes, fp32 copies.
+// HfSrc: a Hugging Face BF16 checkpoint (HFSource). MlxSrc: an MLX checkpoint
+// whose affine-quantized matrices are dequantized to fp32 (w = q s + b with
+// its own scales; Qwen4-Exp oQ4e-mtp files, while no BF16 copy is at hand).
+struct QSource {
+  virtual ~QSource() = default;
+  virtual const json::Value& config() const = 0;
+  virtual std::vector<std::string> names() const = 0;
+  virtual std::pair<std::string, std::vector<int64_t>> info(const std::string& name) const = 0;
+  virtual std::vector<float> f32(const std::string& name) const = 0;
+  // A tensor's bytes as stored (dense tensors; I64 constants).
+  virtual TensorView view(const std::string& name) const = 0;
+  virtual bool quantized(const std::string& name) const { return false; }
+  virtual void release() const {}
+  virtual const native::SafetensorsSource& raw() const = 0;
+};
+
+// A tensor's file bytes into the page cache front to back, one 64 MB read at a
+// time, before the conversion's parallel copies fault the mapping in: on a
+// spinning disk (the vault) those page-sized faults from many threads read
+// ~70 MB/s, a sequential read ~250 MB/s. Nothing is read when it is resident.
+void prefetch_sequential(const uint8_t* p, size_t n) {
+  int fd = -1;
+  size_t base = 0;
+  if (n < (size_t(64) << 20) || !native::mapped_at(p, n, fd, base)) return;
+  const size_t pg = size_t(::getpagesize());
+  const uintptr_t a = reinterpret_cast<uintptr_t>(p) / pg * pg;
+  const size_t len = reinterpret_cast<uintptr_t>(p) + n - a;
+  std::vector<char> in((len + pg - 1) / pg);
+  if (::mincore(reinterpret_cast<void*>(a), len, in.data()) == 0) {
+    size_t resident = 0;
+    for (char c : in) resident += (c & 1);
+    if (resident * 10 >= in.size() * 9) return;
+  }
+  std::vector<uint8_t> buf(size_t(64) << 20);
+  for (size_t o = 0; o < n; o += buf.size()) native::pread_all(fd, buf.data(), std::min(buf.size(), n - o), base + o);
+}
+
+struct HfSrc : QSource {
+  explicit HfSrc(const std::string& dir) : s(dir) {}
+  HFSource s;
+  const json::Value& config() const override { return s.config(); }
+  std::vector<std::string> names() const override { return s.names(); }
+  std::pair<std::string, std::vector<int64_t>> info(const std::string& n) const override { return s.info(n); }
+  std::vector<float> f32(const std::string& n) const override {
+    for (const auto& [p, len] : s.raw_ranges(n)) prefetch_sequential(p, len);
+    return to_f32(s.tensor(n));
+  }
+  TensorView view(const std::string& n) const override {
+    const auto [dtype, shape] = s.info(n);
+    if (dtype == "BF16" || dtype == "F16" || dtype == "F32") return s.tensor(n);
+    // other dtypes (the n-gram hashing constants, I64): their bytes as they are
+    const auto l = s.raw().locate(n.rfind("language_model.model.", 0) == 0 ? "model.language_model." + n.substr(21) : n);
+    TensorView t;
+    t.name = n;
+    t.dtype = l.dtype;
+    t.shape = l.shape;
+    t.data = l.data;
+    t.nbytes = l.nbytes;
+    return t;
+  }
+  void release() const override { s.release(); }
+  const native::SafetensorsSource& raw() const override { return s.raw(); }
+};
+
+struct MlxSrc : QSource {
+  explicit MlxSrc(const std::string& dir) : s(dir) {
+    for (const std::string& n : s.names()) {
+      if (n.rfind("vision_tower", 0) == 0) continue;
+      const auto l = s.locate(n);
+      if (ends_with(n, ".weight") && l.dtype == "U32" && s.has(n.substr(0, n.size() - 7) + ".scales")) quant_.insert(n);
+    }
+    for (const std::string& n : s.names()) {
+      if (n.rfind("vision_tower", 0) == 0) continue;
+      bool companion = false;
+      for (const char* x : {".scales", ".biases", ".super", ".codebook"})
+        if (ends_with(n, x) && quant_.count(n.substr(0, n.size() - std::strlen(x)) + ".weight")) companion = true;
+      if (!companion) names_.push_back(n);
+    }
+    std::sort(names_.begin(), names_.end());
+  }
+  native::SafetensorsSource s;
+  std::set<std::string> quant_;
+  std::vector<std::string> names_;
+  const json::Value& config() const override { return s.config(); }
+  std::vector<std::string> names() const override { return names_; }
+  bool quantized(const std::string& n) const override { return quant_.count(n) != 0; }
+  std::pair<std::string, std::vector<int64_t>> info(const std::string& n) const override {
+    const auto l = s.locate(n);
+    if (!quant_.count(n)) return {l.dtype, l.shape};
+    const auto [bits, group] = s.quant_of(n.substr(0, n.size() - 7));
+    std::vector<int64_t> sh = l.shape;  // [.., in * bits / 32] codes
+    sh.back() = sh.back() * 32 / bits;
+    return {"BF16", sh};  // (as dequantized: written as bf16 when no rule re-encodes it)
+  }
+  std::vector<float> f32(const std::string& n) const override {
+    const TensorView t = s.tensor(n);
+    if (t.kind == TensorView::Dense) return to_f32(t);
+    if (t.kind != TensorView::MLXQuant) fail(n + ": only MLX affine matrices are dequantized");
+    const int64_t R = t.rows(), C = t.cols();
+    const int bits = t.bits, g = t.group;
+    const size_t rb = size_t(C) * size_t(bits) / 8;
+    std::vector<float> w(size_t(R) * size_t(C));
+    native::parallel_for(size_t((R + 255) / 256), [&](size_t b) {
+      const int64_t r0 = int64_t(b) * 256, r1 = std::min<int64_t>(R, r0 + 256);
+      for (int64_t r = r0; r < r1; ++r) {
+        const uint8_t* row = t.data + size_t(r) * rb;
+        for (int64_t c = 0; c < C; ++c) {
+          const size_t bit = size_t(c) * size_t(bits);
+          uint32_t v = 0;
+          for (int k = 0; k < bits; ++k) v |= uint32_t((row[(bit + k) / 8] >> ((bit + k) % 8)) & 1u) << k;
+          const size_t gi = size_t(r) * size_t(C / g) + size_t(c / g);
+          w[size_t(r) * size_t(C) + size_t(c)] = float(v) * native::dense_at(t.scales, t.dtype, gi) + native::dense_at(t.biases, t.dtype, gi);
+        }
+      }
+    });
+    return w;
+  }
+  TensorView view(const std::string& n) const override {
+    if (quant_.count(n)) fail(n + ": a quantized tensor has no dense bytes");
+    const auto l = s.locate(n);
+    TensorView t;
+    t.name = n;
+    t.dtype = l.dtype;
+    t.shape = l.shape;
+    t.data = l.data;
+    t.nbytes = l.nbytes;
+    return t;
+  }
+  const native::SafetensorsSource& raw() const override { return s; }
+};
+
+// ---------------------------------------------------------------- pruned experts
+
+// --keep-experts FILE: {"<layer>": [expert ids], ..., "mtp": [...]}; list order
+// = new expert id. Layers may keep different counts (multiples of 8): the
+// config's num_experts becomes the largest, each layer's stacks and router
+// say its own (text_config.num_experts_per_layer lists them). Without an
+// "mtp" list the MTP layer keeps all its experts.
+struct Keep {
+  std::map<std::string, std::vector<int>> lists;  // "0".."L-1", "mtp"
+  int E = 0, K = 0;  // K: the largest count
+  // The list of the expert stack / router `name` belongs to (null: not pruned).
+  const std::vector<int>* of(const std::string& name) const {
+    if (lists.empty()) return nullptr;
+    static const std::regex re(R"(^(language_model\.model\.|mtp\.)layers\.(\d+)\.mlp\.(switch_mlp\.(gate|up|down)_proj|gate)\.weight$)");
+    std::smatch m;
+    if (!std::regex_match(name, m, re)) return nullptr;
+    const std::string key = m[1] == "mtp." ? "mtp" : m[2].str();
+    auto it = lists.find(key);
+    if (it == lists.end() && key == "mtp") return nullptr;  // (no list: the MTP layer keeps its experts)
+    if (it == lists.end()) fail("--keep-experts: no list for layer " + key);
+    return &it->second;
+  }
+};
+
+Keep read_keep(const std::string& path, int E, int L, bool mtp) {
+  Keep k;
+  k.E = E;
+  const json::Value v = json::parse(native::read_file(path));
+  const json::Object& o = v.as_object();
+  for (size_t i = 0; i < o.size(); ++i) {
+    std::vector<int> ids;
+    std::set<int> seen;
+    for (const json::Value& x : o.vals[i].as_array()) {
+      const int e = int(x.as_int());
+      if (e < 0 || e >= E || !seen.insert(e).second) fail(path + ": layer " + o.keys[i] + ": expert " + std::to_string(e) + " out of range or repeated");
+      ids.push_back(e);
+    }
+    if (ids.empty() || ids.size() % 8) fail(path + ": layer " + o.keys[i] + " keeps " + std::to_string(ids.size()) + " experts (a positive multiple of 8)");
+    k.K = std::max(k.K, int(ids.size()));
+    k.lists[o.keys[i]] = std::move(ids);
+  }
+  for (int l = 0; l < L; ++l)
+    if (!k.lists.count(std::to_string(l))) fail(path + ": no list for layer " + std::to_string(l));
+  if (mtp && !k.lists.count("mtp")) k.K = E;  // the MTP layer unpruned: the config's count stays the largest
+  return k;
+}
+
+// Rows of `keep`'s experts from W [E][rows_per][C] (or a router [E][C]).
+std::vector<float> slice_experts(const std::vector<float>& W, int E, const std::vector<int>& keep) {
+  const size_t per = W.size() / size_t(E);
+  std::vector<float> o(per * keep.size());
+  native::parallel_for(keep.size(), [&](size_t i) { std::memcpy(&o[i * per], &W[size_t(keep[i]) * per], per * 4); });
+  return o;
+}
+
+// Per-expert statistics of a pruned stack: the kept experts' rows.
+const Stats* slice_stats(const Stats* st, int E, const std::vector<int>* keep, Stats& tmp, std::vector<float>& d,
+                         std::vector<float>& x) {
+  if (!st || !keep) return st;
+  tmp = *st;
+  const size_t C = size_t(st->C);
+  if (st->diag && st->diag_rows == E) {
+    d.resize(keep->size() * C);
+    for (size_t i = 0; i < keep->size(); ++i) std::memcpy(&d[i * C], st->diag + size_t((*keep)[i]) * C, C * 4);
+    tmp.diag = d.data();
+    tmp.diag_rows = int(keep->size());
+  }
+  if (st->Hexp && st->nexp == E) {
+    x.resize(keep->size() * C * C);
+    for (size_t i = 0; i < keep->size(); ++i) std::memcpy(&x[i * C * C], st->Hexp + size_t((*keep)[i]) * C * C, C * C * 4);
+    tmp.Hexp = x.data();
+    tmp.nexp = int(keep->size());
+  }
+  return &tmp;
 }
 
 // ---------------------------------------------------------------- MTP head
@@ -488,12 +710,15 @@ const char* kUsage =
     "         [--calib FILE | --calib none] [--calib-data file:PATH[+...]] [--calib-tokens N] [--ctx N]\n"
     "         [--calib-out FILE] [--calib-only] [--calib-experts f16|q8] [--calib-layers A:B]\n"
     "         [--hessian-max N] [--hessian-pack N] [--no-mtp] [--shard-gb G] [--tiles]\n"
+    "         [--calib-model DIR] [--keep-experts FILE] [--ple-bits 4|8]\n"
     "       espetero quantize --preset NAME --print-rules [--model HF_DIR | --layers N]\n"
     "\n"
-    "A Hugging Face BF16 checkpoint (Qwen3.5 / Qwen3.6, dense Gemma 4) to an EQ checkpoint.\n"
+    "A Hugging Face BF16 checkpoint (Qwen3.5 / Qwen3.6, dense Gemma 4, Qwen4-Exp) to an EQ checkpoint;\n"
+    "Qwen4-Exp (Qwen3.8-Flash-Next) also from an MLX checkpoint (its affine matrices dequantized).\n"
     "  --preset   eq4 eq5 eq6 eq4x eq5x eq4d eq5d eq4f eq4s eq6h eq5dh eq4dh, a 4-bit one + c\n"
     "             (EQ4 experts with codebooks: eq4dhc ...), eq4dhb (default eq4);\n"
     "             EQ3 codebook experts (MoE only): eq3h eq3dh eq3dx eq3dhb;\n"
+    "             Qwen3.8-Flash-Next: fnx3 (experts EQ3 codebooks, the rest EQ6), fnx3m (the rest EQ5);\n"
     "             dense Qwen3.5 / 3.6 (widths by tensor class and layer position, sized at or\n"
     "             under the GGUF named): eqd4m (Q4_K_M) eqd4l (UD-Q4_K_XL) eqd5 (UD-Q5_K_XL) eqd6 (Q6_K)\n"
     "  --fmt      rules GLOB=FMT;... instead (eql:B:16[+enc], eql:4:16:cb[+enc], eql:3:16:cb[+enc],\n"
@@ -508,7 +733,20 @@ const char* kUsage =
     "  --hessian-max   capture the full E[x x^T] of inputs up to N wide (16384), else only its\n"
     "             diagonal (+gptq then falls back to +imat); --hessian-pack N saves full ones wider\n"
     "             than N (16384) as their upper triangle (half the bytes)\n"
-    "  --tiles    also write the checkpoint's tile image (faster loads)\n";
+    "  --tiles    also write the checkpoint's tile image (faster loads)\n"
+    "  --only GLOB[,GLOB]  write only the tensors whose names match a GLOB and no !GLOB (a partial\n"
+    "             checkpoint, e.g. a few layers or everything but the n-gram table, to overlay on another\n"
+    "             file of the model: tools/dev/fnx_overlay.py)\n"
+    "  --expert-hessian-max N  capture per-expert E[x x^T] of expert inputs up to N wide (1024;\n"
+    "             Qwen4-Exp 0: 40 GB, and no encoder reads them yet)\n"
+    "  --calib-model DIR  capture the statistics with the forward of another checkpoint of the model\n"
+    "             (Qwen4-Exp: the MLX 4-bit file, as the BF16 one does not fit in memory)\n"
+    "  --keep-experts FILE  routed experts pruned to a kept list per layer: JSON {\"0\": [ids], ...,\n"
+    "             \"mtp\": [ids] (optional)}, counts multiples of 8, possibly different per layer (list order = new\n"
+    "             expert id); expert stacks, routers and statistics are sliced, num_experts set to the\n"
+    "             largest count\n"
+    "  --ple-bits Qwen4-Exp n-gram table (read from disk at run time, outside the rules): MLX affine\n"
+    "             4-bit (default, the oQ4e layout, 100 B per row) or 8-bit, group 32, bf16 scales\n";
 
 struct Args {
   std::map<std::string, std::string> kv;
@@ -569,7 +807,8 @@ int cmd_quantize(int argc, char** argv) {
   if (calib.empty()) {
     calib = a.get("calib-out", (out.empty() ? model : out) + ".calib.safetensors");
     CaptureOptions co;
-    co.model = model;
+    co.model = a.get("calib-model", model);  // (another checkpoint of the model: its forward, its taps)
+    while (co.model.size() > 1 && co.model.back() == '/') co.model.pop_back();
     co.data = a.get("calib-data", "file:~/.cache/mlx-lm/calibration_v5.txt");
     co.out = calib;
     co.ctx = std::stoi(a.get("ctx", "2048"));
@@ -585,6 +824,13 @@ int cmd_quantize(int argc, char** argv) {
     if (ex != "f16" && ex != "q8") fail("--calib-experts: f16 or q8");
     co.experts_f16 = ex == "f16";
     co.hessian_max = std::stoi(a.get("hessian-max", std::to_string(co.hessian_max)));
+    {  // per-expert E[x x^T] (unused by the encoders so far): Qwen4-Exp's 512 x 640^2 per layer (40 GB) only when asked
+      const json::Value mc = json::parse(native::read_file(co.model + "/config.json"));
+      const json::Value* t = mc.get("text_config");
+      const bool fnx = mc.get_string("model_type", "").rfind("qwen4_exp", 0) == 0 ||
+                       (t && t->is_object() && t->get_string("model_type", "").rfind("qwen4_exp", 0) == 0);
+      co.expert_hessian_max = std::stoi(a.get("expert-hessian-max", fnx ? "0" : std::to_string(co.expert_hessian_max)));
+    }
     co.hessian_pack = std::stoi(a.get("hessian-pack", std::to_string(co.hessian_pack)));
     capture(co);
   }
@@ -592,11 +838,50 @@ int cmd_quantize(int argc, char** argv) {
   std::unique_ptr<CalibFile> stats;
   if (calib != "none") stats = std::make_unique<CalibFile>(calib);
 
-  HFSource src(model);
+  std::unique_ptr<QSource> srcp;
+  {
+    bool hf = false;
+    {
+      native::SafetensorsSource probe(model);
+      hf = HFSource::is_hf_dir(probe);
+    }
+    if (hf) srcp = std::make_unique<HfSrc>(model);
+    else srcp = std::make_unique<MlxSrc>(model);
+  }
+  const QSource& src = *srcp;
   const json::Value& cfg = src.config();
   const json::Value* tcp = cfg.get("text_config");
   const json::Value& tc = tcp && tcp->is_object() ? *tcp : cfg;
   const bool moe = tc.get_int("num_experts", 0) > 0;
+  const bool q4 = cfg.get_string("model_type", "").rfind("qwen4_exp", 0) == 0 || tc.get_string("model_type", "").rfind("qwen4_exp", 0) == 0;
+  if (!q4 && !dynamic_cast<const HfSrc*>(&src)) fail(model + ": an MLX source is supported for Qwen4-Exp only (give the BF16 checkpoint)");
+  const bool no_mtp = a.has("no-mtp");
+  const int nexp = int(tc.get_int("num_experts", 0));
+  Keep keep;
+  if (a.has("keep-experts")) {
+    if (!moe) fail("--keep-experts: not a mixture-of-experts model");
+    keep = read_keep(a.get("keep-experts"), nexp, int(tc.get_int("num_hidden_layers", 0)), q4 && !no_mtp);
+  }
+  const int ple_bits = std::stoi(a.get("ple-bits", "4"));
+  if (ple_bits != 4 && ple_bits != 8) fail("--ple-bits: 4 or 8");
+  // Qwen4-Exp's n-gram table (shards of [rows, 160]): MLX affine, outside the rules.
+  static const std::regex ple_re(R"(^(.*\.ngram_embedding\.)shards?[._](\d+)\.weight$)");
+  auto is_ple = [&](const std::string& n) { return q4 && n.find(".ngram_embedding.") != std::string::npos; };
+  std::vector<std::string> only;
+  if (a.has("only")) only = split(a.get("only"), ',');
+  auto wanted = [&](const std::string& n) {  // a match of a GLOB and of no !GLOB
+    bool in = false, pos = false;
+    for (const std::string& g : only) {
+      const bool neg = !g.empty() && g[0] == '!';
+      pos = pos || !neg;
+      if (fnmatch(n.c_str(), g.c_str() + (neg ? 1 : 0))) {
+        if (neg) return false;
+        in = true;
+      }
+    }
+    return in || !pos;
+  };
+  auto skipped = [&](const std::string& n) { return (q4 && no_mtp && n.rfind("mtp.", 0) == 0) || !wanted(n); };
 
   // The plan (kld_harness.plan_formats): an explicit rule first, then the
   // model's predicate (MoE routers 8-bit), then the first matching rule;
@@ -605,8 +890,11 @@ int cmd_quantize(int argc, char** argv) {
   std::set<std::string> replaced;
   int64_t params = 0;
   for (const std::string& name : src.names()) {
-    const auto [dtype, shape] = src.info(name);
+    if (skipped(name)) continue;
+    auto [dtype, shape] = src.info(name);
+    if (const auto* kl = keep.of(name)) shape[0] = int64_t(kl->size());
     params += numel(shape);
+    if (is_ple(name)) continue;
     if (!ends_with(name, ".weight") || shape.size() < 2 || name.find("conv1d") != std::string::npos) continue;
     const std::string p = name.substr(0, name.size() - 7);
     const Fmt* f = nullptr;
@@ -627,7 +915,8 @@ int cmd_quantize(int argc, char** argv) {
           break;
         }
     if (!f || f->kind == Fmt::BF16) continue;
-    if (shape.back() % f->group) continue;
+    // EQ: any width that is a multiple of 64 (a partial last super-block below 256)
+    if (shape.back() % (f->kind == Fmt::EQ || f->kind == Fmt::EQC ? 64 : f->group)) continue;
     Item it{p, *f, shape};
     if (it.f.kind == Fmt::EQ && !(it.f.bits == 3 || it.f.bits == 4 || it.f.bits == 5 || it.f.bits == 6 || it.f.bits == 8))
       it.f = parse_fmt("affine:8:64:f16");
@@ -636,19 +925,52 @@ int cmd_quantize(int argc, char** argv) {
   }
 
   // MTP head (eq_convert: MLX affine 8-bit, experts 4-bit +mse).
+  // (Qwen4-Exp: the mtp.* tensors are in the plan above, by the same rules)
   std::vector<MtpPart> mtp;
-  if (!a.has("no-mtp")) mtp = mtp_plan(src.raw(), parse_fmt("affine:8:64:f16"), parse_fmt("affine:4:64+mse"));
+  if (!no_mtp && !q4) mtp = mtp_plan(src.raw(), parse_fmt("affine:8:64:f16"), parse_fmt("affine:4:64+mse"));
+
+  // Qwen4-Exp n-gram table: shards as MLX affine ple_bits / 32, renamed to the
+  // oQ4e layout (...ngram_embedding.shards.<k>.{weight,scales,biases}); an MLX
+  // source of the same width is copied as it is (with its weight_scale).
+  struct PleShard {
+    std::string src, out;  // source .weight, output base
+    int64_t rows = 0, width = 0;
+    bool copy = false;
+  };
+  std::vector<PleShard> ple;
+  for (const std::string& name : src.names()) {
+    std::smatch m;
+    if (!is_ple(name) || !std::regex_match(name, m, ple_re) || !wanted(name)) continue;
+    PleShard p;
+    p.src = name;
+    p.out = m[1].str() + "shards." + m[2].str();
+    const auto [dt, sh] = src.info(name);
+    p.rows = sh[0];
+    p.width = sh[1];
+    if (p.width % 32) fail(name + ": n-gram rows of " + std::to_string(p.width) + " values (group 32)");
+    if (src.quantized(name)) {
+      const auto bg = src.raw().quant_of(name.substr(0, name.size() - 7));
+      p.copy = bg.first == ple_bits && bg.second == 32 && src.raw().locate(name.substr(0, name.size() - 7) + ".scales").dtype == "BF16";
+    }
+    ple.push_back(std::move(p));
+  }
 
   // Every output tensor, planned up front (shards and offsets known before encoding).
   std::vector<StTensor> tensors;
   for (const Item& it : plan)
     for (StTensor t : outputs(it)) tensors.push_back(std::move(t));
-  std::vector<std::string> keep;
+  std::vector<std::string> kept;
   for (const std::string& name : src.names()) {
-    if (replaced.count(name)) continue;
-    const auto [dtype, shape] = src.info(name);
+    if (replaced.count(name) || skipped(name) || (is_ple(name) && std::regex_match(name, ple_re))) continue;
+    auto [dtype, shape] = src.info(name);
+    if (const auto* kl = keep.of(name)) shape[0] = int64_t(kl->size());
     tensors.push_back({name, dtype, shape});
-    keep.push_back(name);
+    kept.push_back(name);
+  }
+  for (const PleShard& p : ple) {
+    tensors.push_back({p.out + ".weight", "U32", {p.rows, p.width * ple_bits / 32}});
+    tensors.push_back({p.out + ".scales", "BF16", {p.rows, p.width / 32}});
+    tensors.push_back({p.out + ".biases", "BF16", {p.rows, p.width / 32}});
   }
   for (const MtpPart& p : mtp) {
     if (p.kind == MtpPart::Norm || p.kind == MtpPart::Raw) tensors.push_back(p.raw);
@@ -680,10 +1002,14 @@ int cmd_quantize(int argc, char** argv) {
   int gptq_fallbacks = 0;
   for (size_t i = 0; i < plan.size(); ++i) {
     const Item& it = plan[i];
-    const TensorView t = src.tensor(it.path + ".weight");
-    const std::vector<float> W = to_f32(t);
+    std::vector<float> W = src.f32(it.path + ".weight");
     src.release();
+    const std::vector<int>* kl = keep.of(it.path + ".weight");
+    if (kl) W = slice_experts(W, nexp, *kl);
     const Stats* st = stats ? stats->get(it.path) : nullptr;
+    Stats sliced;
+    std::vector<float> sd, sx;
+    st = slice_stats(st, nexp, kl, sliced, sd, sx);
     if (st && st->C && st->C != it.shape.back()) fail(it.path + ": statistics for " + std::to_string(st->C) + " inputs");
     // A dense +gptq matrix without its full E[x x^T] is encoded with +imat (or +mse): say so.
     if (stats && it.f.enc == Fmt::GPTQ && it.shape.size() == 2 && !(st && (st->H || st->Hpacked))) {
@@ -706,11 +1032,49 @@ int cmd_quantize(int argc, char** argv) {
   if (gptq_fallbacks)
     std::fprintf(stderr, "[quantize] warning: %d +gptq matrices encoded without GPTQ (capture again with a larger --hessian-max)\n",
                  gptq_fallbacks);
-  for (const std::string& name : keep) {
-    const TensorView t = src.tensor(name);
-    w.write(name, t.data, t.nbytes);
+  for (const std::string& name : kept) {
+    const std::vector<int>* kl = keep.of(name);
+    if (src.quantized(name) || kl) {  // a dequantized MLX matrix kept as bf16; a pruned router
+      std::vector<float> v = src.f32(name);
+      if (kl) v = slice_experts(v, nexp, *kl);
+      const std::string dt = src.info(name).first;
+      if (dt == "F32") {
+        w.write(name, v.data(), v.size() * 4);
+      } else {
+        std::vector<uint16_t> b(v.size());
+        for (size_t i = 0; i < v.size(); ++i) b[i] = dt == "F16" ? f16_bits(v[i]) : bf16_bits(v[i]);
+        w.write(name, b.data(), b.size() * 2);
+      }
+    } else {
+      const TensorView t = src.view(name);
+      w.write(name, t.data, t.nbytes);
+    }
     src.release();
   }
+  for (size_t i = 0; i < ple.size(); ++i) {
+    const PleShard& p = ple[i];
+    const std::string sb = p.src.substr(0, p.src.size() - 7);
+    if (p.copy) {
+      for (const char* x : {".weight", ".scales", ".biases"}) {
+        const auto l = src.raw().locate(sb + x);
+        w.write(p.out + x, l.data, l.nbytes);
+      }
+    } else {
+      const std::vector<float> v = src.f32(p.src);
+      const AffOut o = encode_affine(v.data(), p.rows, int(p.width), 0, parse_fmt("affine:" + std::to_string(ple_bits) + ":32:bf16"), nullptr);
+      const std::vector<uint32_t> packed = pack_codes(o.q.data(), p.rows, int(p.width), ple_bits);
+      w.write(p.out + ".weight", packed.data(), packed.size() * 4);
+      const auto s16 = half_bits(o.s, "bf16"), b16 = half_bits(o.b, "bf16");
+      w.write(p.out + ".scales", s16.data(), s16.size() * 2);
+      w.write(p.out + ".biases", b16.data(), b16.size() * 2);
+    }
+    json::Value q = json::Value::object();
+    q.set("bits", json::Value(ple_bits));
+    q.set("group_size", json::Value(32));
+    qcfg.set(p.out, std::move(q));
+    std::fprintf(stderr, "\r[quantize] n-gram table %zu/%zu  %.0fs\033[K", i + 1, ple.size(), native::ms_since(t0) / 1000.0);
+  }
+  if (!ple.empty()) std::fprintf(stderr, "\n");
   for (const MtpPart& p : mtp) {
     const auto l = src.raw().locate(p.src[0]);
     TensorView t;
@@ -744,6 +1108,16 @@ int cmd_quantize(int argc, char** argv) {
   const json::DumpOptions pretty{",", ": ", false, 1, false};
   write_text(out + "/model.safetensors.index.json", json::dump(idx, pretty));
   json::Value config = json::parse(native::read_file(model + "/config.json"));
+  if (keep.K) {  // the pruned expert count (the largest; each layer's own in num_experts_per_layer)
+    json::Value* t = config.get("text_config");
+    json::Value& tcw = t && t->is_object() ? *t : config;
+    tcw.set("num_experts", json::Value(keep.K));
+    if (t && config.get("num_experts")) config.set("num_experts", json::Value(keep.K));
+    json::Value per = json::Value::array();
+    for (int l = 0; l < int(tc.get_int("num_hidden_layers", 0)); ++l) per.push_back(json::Value(int(keep.lists.at(std::to_string(l)).size())));
+    tcw.set("num_experts_per_layer", std::move(per));
+    if (keep.lists.count("mtp") && !no_mtp) tcw.set("mtp_num_experts", json::Value(int(keep.lists.at("mtp").size())));
+  }
   config.set("quantization", qcfg);
   config.set("quantization_config", qcfg);
   json::Value eqf = json::Value::object();
@@ -770,6 +1144,12 @@ int cmd_quantize(int argc, char** argv) {
   }
   std::fprintf(stderr, "[quantize] %s: %.2f GB, %.3f bits per weight; %s (%.0f s)\n", out.c_str(), double(w.total_bytes()) / 1e9,
                8.0 * double(w.total_bytes()) / double(params), mix.c_str(), native::ms_since(t0) / 1000.0);
+  if (!ple.empty()) {  // Qwen4-Exp: what is resident (the n-gram table is read from disk)
+    int64_t pb = 0, pp = 0;
+    for (const PleShard& p : ple) pp += p.rows * p.width, pb += p.rows * p.width * (ple_bits + 1) / 8;
+    std::fprintf(stderr, "[quantize] without the n-gram table (%.2f GB on disk): %.2f GB, %.3f bits per weight\n", double(pb) / 1e9,
+                 double(int64_t(w.total_bytes()) - pb) / 1e9, 8.0 * double(int64_t(w.total_bytes()) - pb) / double(params - pp));
+  }
   if (a.has("tiles")) {  // Espetero's own load of the new checkpoint writes its tile image
     ::setenv("ESPETERO_TILES", "write", 1);
     LoadOptions o;

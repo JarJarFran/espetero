@@ -35,6 +35,7 @@ CalibFile::CalibFile(const std::string& paths) {
     }
     for (const auto& [k, e] : f.entries()) {
       if (k.size() < 3 || k[1] != ':') continue;
+      if (k[0] == 'N') continue;  // per-expert routing counts (not an input statistic)
       if (e.dtype != "F32") fail(path + ": " + k + " is not float32");
       if (auto [it, fresh] = owner.emplace(k, path); !fresh) fail(path + ": " + k + " also in " + it->second);
       const std::string mod = k.substr(2);
@@ -166,6 +167,8 @@ class Sink : public ActivationSink {
     }
     moe_ = tc.get_int("num_experts", 0) > 0;
     nexp_ = int(tc.get_int("num_experts", 0));
+    q4_ = cfg.get_string("model_type", "").rfind("qwen4_exp", 0) == 0 || tc.get_string("model_type", "").rfind("qwen4_exp", 0) == 0;
+    nl_ = L;
     tied_ = cfg.get_bool("tie_word_embeddings", tc.get_bool("tie_word_embeddings", false));
     mlp_in_.resize(size_t(L));
     lm_ = o.layer_hi >= L;
@@ -174,6 +177,16 @@ class Sink : public ActivationSink {
 
   void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids, const int32_t* pos,
            int k) override {
+    if (q4_ && layer == nl_) {  // Qwen4-Exp: the final mixer's inputs (the LM head's: lm())
+      if (!lm_) return;
+      std::vector<float> X(static_cast<size_t>(n) * size_t(width));
+      to_f32(rows, X.data(), X.size());
+      const std::string M = "language_model.model.hyper_connection_mixer.";
+      if (kind == kHcAttnN) add(M + "input_mix_weight_down", X, n, width, {});
+      else if (kind == kHcAttnLow) add(M + "input_mix_weight_up", X, n, width, {});
+      else fail("calibration: unknown mixer tap kind " + std::to_string(kind));
+      return;
+    }
     if (layer < o_.layer_lo || layer >= o_.layer_hi) return;
     if (spark_) {  // spark2_5: HF names (model.*), fused q_k_v_proj beside g_proj
       const std::string P = "model.layers." + std::to_string(layer) + ".";
@@ -197,8 +210,19 @@ class Sink : public ActivationSink {
       case kAttnIn:
         if (lin) add(P + "linear_attn.in_proj_qkv", X, n, width,
                      {P + "linear_attn.in_proj_z", P + "linear_attn.in_proj_b", P + "linear_attn.in_proj_a"});
+        else if (q4_)  // (the sparse-attention indexer reads the attention input too)
+          add(P + "self_attn.q_proj", X, n, width, {P + "self_attn.k_proj", P + "self_attn.v_proj", P + "self_attn.indexer.index_qk_proj"});
         else add(P + "self_attn.q_proj", X, n, width, {P + "self_attn.k_proj", P + "self_attn.v_proj"});
         break;
+      case kHcAttnN:
+      case kHcMlpN: {
+        const std::string B = P + (kind == kHcAttnN ? "attn" : "mlp") + "_hyper_connection.";
+        add(B + "input_mix_weight_down", X, n, width, {B + "block_inject_weight"});
+        break;
+      }
+      case kHcAttnLow:
+      case kHcMlpLow: add(P + (kind == kHcAttnLow ? "attn" : "mlp") + "_hyper_connection.input_mix_weight_up", X, n, width, {}); break;
+      case kPleIn: add(P + "ple.key_proj", X, n, width, {P + "ple.value_proj"}); break;
       case kMixOut: add(P + (lin ? "linear_attn.out_proj" : "self_attn.o_proj"), X, n, width, {}); break;
       case kMlpIn:
         if (moe_) {
@@ -260,6 +284,8 @@ class Sink : public ActivationSink {
       }
       ts.push_back({{"E:" + k, "F32", {x.E, x.C}}, x.diag.data()});
       if (!x.X.empty()) ts.push_back({{"X:" + k, "F32", {x.E, x.C, x.C}}, x.X.data()});
+      // Qwen4-Exp: how many routed rows each expert saw (for pruning: tools, the --keep-experts lists)
+      if (q4_) ts.push_back({{"N:" + k, "F32", {x.E}}, x.cnt.data()});
     }
     json::Value al = json::Value::object();
     for (const auto& [a, b] : alias_) al.set(a, json::Value(b));
@@ -351,8 +377,8 @@ class Sink : public ActivationSink {
 
   const CaptureOptions& o_;
   std::vector<bool> linear_;
-  bool moe_ = false, tied_ = false, spark_ = false;
-  int nexp_ = 0;
+  bool moe_ = false, tied_ = false, spark_ = false, q4_ = false;
+  int nexp_ = 0, nl_ = 0;
   std::map<std::string, Dense> dense_;
   std::map<std::string, Experts> experts_;
   std::map<std::string, std::string> alias_;
@@ -397,6 +423,10 @@ void capture(const CaptureOptions& o) {
   // forward reads them) unless --calib-experts q8 asks for the 8-bit copies
   // (half the memory: a 35B needs ~90 GB exact, ~60 GB with q8).
   if (o.experts_f16) ::setenv("ESPETERO_EXPERTS_F16", "1", 1);
+  // Qwen4-Exp: no expert cache (its slots replace the expert ids the taps
+  // need: every layer's experts are read whole per pass, or resident).
+  lo.expert_cache_gb = -1;
+  lo.expert_store = "none";
   auto model = NativeModel::load(o.model, lo);
   const ModelInfo& I = model->info();
   std::fprintf(stderr, "[calib] %s: %d layers, hidden %d, %zu tokens -> %lld windows of %d (load %.0f ms)\n",

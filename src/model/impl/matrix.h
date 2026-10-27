@@ -30,7 +30,9 @@ struct QW {
   // 6: EQ (Espetero's own checkpoints, 3/4/5/6/8-bit codes): weight = (code -
   //    2^(bits - 1)) * half(super * sub), an int8 sub-scale per lane sub-block
   //    (16 K rows: the rows k of a 64-wide K step with (k % 8) / 2 == t, in
-  //    s [out][in / 16] at 4 * step + t) and an fp16 super-scale per 256 (z).
+  //    s [out][in / 16] at 4 * step + t) and an fp16 super-scale per 256 (z;
+  //    ceil(in / 256) per row: an input width that is a multiple of 64 but
+  //    not of 256 ends in a partial super-block, e.g. 640 = 256 + 256 + 128).
   // 7: EQ4 with codebooks: mode 6's scales, weight = half(super * sub) *
   //    cb[code] with a 16-entry fp16 codebook per row; z holds each row's
   //    super-scales followed by its codebook (16 halves), so row moves (fusion,
@@ -62,10 +64,10 @@ struct QW {
   }
   size_t z_row_bytes() const {
     switch (scale_mode) {
-      case 1:
-      case 6: return size_t(in / 256) * 2;
+      case 1: return size_t(in / 256) * 2;
+      case 6: return size_t((in / 64 + 3) / 4) * 2;
       case 7:
-      case 8: return size_t(in / 256) * 2 + 32;
+      case 8: return size_t((in / 64 + 3) / 4) * 2 + 32;
       case 2: return 0;
       case 3: return size_t(in / 256) * 4;
       default: return size_t(in / group) * 2;
@@ -100,6 +102,8 @@ inline bool sym16_mode(int mode) { return mode == 1 || mode == 6 || mode == 7 ||
 inline bool eq_mode(int mode) { return mode == 6 || mode == 7 || mode == 8; }
 // EQ with codebooks (EQ4: 16 entries, EQ3: 8).
 inline bool eqc_mode(int mode) { return mode == 7 || mode == 8; }
+// EQ super-blocks per row (the last one partial when in % 256 != 0).
+inline int eq_supers(int in) { return (in / 64 + 3) / 4; }
 inline int eq_scale_mode(int bits) {
   if ((bits < 3 || bits > 6) && bits != 8) fail("EQ: unsupported code width " + std::to_string(bits));
   return 6;
@@ -159,8 +163,8 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
   }
   if (t.kind == TensorView::EQQuant) {
     // Packed unsigned codes (MLX's bit stream), int8 sub-scale per lane
-    // sub-block of 16, fp16 scale per 256.
-    if (in % 256) fail(t.name + ": EQ rows must be a multiple of 256 wide");
+    // sub-block of 16, fp16 scale per 256 (the last super-block partial).
+    if (in % 64) fail(t.name + ": EQ rows must be a multiple of 64 wide");
     q.src_bits = t.bits;
     q.bits = t.bits == 3 ? 3 : gpu_bits_for(t.bits);  // (EQ3: a 2-bit plane and a 1-bit plane, MoE kernels only)
     q.group = 16;
@@ -177,7 +181,7 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
     if (t.bits != 4 && t.bits != 3) fail(t.name + ": codebooks need 4-bit or 3-bit EQ codes");
     if (t.ncb <= 0 || out % t.ncb || (out / t.ncb) % 8) fail(t.name + ": codebook rows must be whole 8-row groups");
     q.scale_mode = t.bits == 4 ? 7 : 8;
-    const size_t sup = size_t(in / 256) * 2, zrow = q.z_row_bytes(), per = size_t(out / t.ncb);
+    const size_t sup = size_t(eq_supers(int(in))) * 2, zrow = q.z_row_bytes(), per = size_t(out / t.ncb);
     const size_t cbb = size_t(2) << t.bits;  // bytes of one stored codebook
     q.z = ar.alloc(zrow * size_t(out));
     parallel_for(size_t(out), [&](size_t r) {
@@ -234,7 +238,7 @@ QW eq_to_affine(Arena& ar, const QW& q) {
   QW o = q;
   o.scale_mode = 0;
   o.group = 2;
-  const int gpr = q.in / 2, spr = q.in / 16, bpr = q.in / 256;
+  const int gpr = q.in / 2, spr = q.in / 16, bpr = eq_supers(q.in);
   const float off = float(1 << (q.src_bits - 1));
   o.s = ar.alloc(size_t(q.out) * gpr * 2);
   o.z = ar.alloc(size_t(q.out) * gpr * 2);
@@ -517,10 +521,10 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   // min) bytes per K step then half4 (d, dmin) per 256; affine half4 per group.
   const size_t pairs = size_t(Np) / 2;
   switch (q.scale_mode) {
-    case 1:
-    case 6: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4; break;
+    case 1: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4; break;
+    case 6: q.sb_n = pairs * KG * 8 + pairs * size_t(eq_supers(q.in)) * 4; break;
     case 7:
-    case 8: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4 + size_t(Np / 8) * 32; break;
+    case 8: q.sb_n = pairs * KG * 8 + pairs * size_t(eq_supers(q.in)) * 4 + size_t(Np / 8) * 32; break;
     case 2: q.sb_n = pairs * (q.in / 32) * 4; break;
     case 3: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 8; break;
     default: q.sb_n = pairs * size_t(q.in / q.group) * 8;
@@ -612,7 +616,7 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     // Super-scales apart from the rows' codebooks, and the codebooks of each
     // 8-row group (its first row's; the group must share one) after the
     // scales, zero for padding rows.
-    const size_t sup = size_t(q.in / 256) * 2, zrow = q.z_row_bytes();
+    const size_t sup = size_t(eq_supers(q.in)) * 2, zrow = q.z_row_bytes();
     Buf zs = tmp.alloc(sup * size_t(q.out)), cbs = tmp.alloc(size_t(Np / 8) * 32);
     std::memset(ptr(cbs), 0, size_t(Np / 8) * 32);
     const uint8_t* z = (const uint8_t*)ptr(q.z);
@@ -630,7 +634,7 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     [e setBytes:&q.in length:4 atIndex:4];
     [e dispatchThreads:MTLSizeMake(Np / 2, KG, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     const uint32_t nw = uint32_t(Np / 8) * 8;  // 32-bit words of codebooks
-    const size_t at = pairs * KG * 8 + pairs * (q.in / 256) * 4;
+    const size_t at = pairs * KG * 8 + pairs * size_t(eq_supers(q.in)) * 4;
     [e setComputePipelineState:rt.kernel("copy_words")];
     [e setBuffer:cbs.b offset:cbs.off atIndex:0];
     [e setBuffer:q.sb.b offset:q.sb.off + at atIndex:1];

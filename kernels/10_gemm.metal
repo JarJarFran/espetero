@@ -57,10 +57,18 @@ static inline float glu_gate(float x) {
   return silu(x);
 }
 
+// EQ super-blocks per row: 256 inputs each, the last one partial when K is
+// not a multiple of 256 (ceil(KG / 4); e.g. 640 = 256 + 256 + 128).
+static inline ulong eq_supers(int KGall) { return ulong((KGall + 3) / 4); }
+// Byte offset of a codebook matrix's codebooks in its scale buffer: the
+// sub-scales (8 bytes per pair and K step), then the super-scales (4 bytes
+// per pair and super-block); 9 KGall Np2 when K is a multiple of 256.
+static inline ulong eqc_offset(int KGall, int Np2) { return (8ul * ulong(KGall) + 4ul * eq_supers(KGall)) * ulong(Np2); }
+
 // Copy the codebooks of 32-column block nb (scale buffer SB of a KGall-step,
 // Np2-pair matrix) into this simdgroup's 64 halves of threadgroup memory.
 static inline void eqc_load(device const half4* SB, int KGall, int Np2, int nb, threadgroup half* t, ushort lane) {
-  device const half2* C = (device const half2*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 32;
+  device const half2* C = (device const half2*)((device const uchar*)SB + eqc_offset(KGall, Np2)) + ulong(nb) * 32;
   const half2 v = C[lane];
   simdgroup_barrier(mem_flags::mem_threadgroup);  // this simdgroup's lookups of a previous block are done
   ((threadgroup half2*)t)[lane] = v;
@@ -76,7 +84,7 @@ static inline void eqc_load(device const half4* SB, int KGall, int Np2, int nb, 
 // waits on a threadgroup barrier.
 static inline void eqc_pairs_load(device const half4* SB, int KGall, int Np2, int nb, threadgroup half2* t,
                                   int tid, int nthreads) {
-  device const half* C = (device const half*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 64;
+  device const half* C = (device const half*)((device const uchar*)SB + eqc_offset(KGall, Np2)) + ulong(nb) * 64;
   for (int i = tid; i < 4 * 256; i += nthreads) {
     const int j = i >> 8, e = i & 255;
     t[i] = half2(C[j * 16 + (e & 15)], C[j * 16 + (e >> 4)]);
@@ -97,7 +105,7 @@ static inline void eq_lane_scales(device const half4* SB, ulong g, int KGall, in
   device const uint4* DD4 = (device const uint4*)((device const uint2*)SB + ulong(KGall) * Np2);
   const ulong blk = ulong(pair0 >> 4), q = ulong(pair0 & 15);
   const uint2 sc = SC2[((blk * ulong(KGall) + g) * 4 + ulong(fm >> 1)) * 4 + q];
-  const uint4 dd = DD4[(blk * ulong(KGall / 4) + g / 4) * 4 + q];
+  const uint4 dd = DD4[(blk * eq_supers(KGall) + g / 4) * 4 + q];
   const char4 lo = as_type<char4>(sc.x), hi = as_type<char4>(sc.y);
   s4[0] = float2(as_type<half2>(dd.x) * half2(lo.xy));
   s4[1] = float2(as_type<half2>(dd.y) * half2(lo.zw));
@@ -698,7 +706,7 @@ kernel void repack_q6k_scales(
 }
 
 // EQ scales: int8 sub-scales S [N][K/16] (index 4 g + t: K step g, lane
-// sub-block t) and fp16 super-scales D [N][K/256] -> per column block and K
+// sub-block t) and fp16 super-scales D [N][ceil(K/256)] -> per column block and K
 // step [sub-block][16 pair slots] char2, then per column block and 256-wide
 // super-block [16 pair slots] half2, slots in lane order (eq_lane_scales).
 kernel void repack_eq_scales(
@@ -722,11 +730,12 @@ kernel void repack_eq_scales(
       const int col = n + c;
       sc[(((blk * KG + g) * 4 + t) * 16 + slot) * 2 + c] = col < N ? uchar(S[ulong(col) * (K / 16) + g * 4 + t]) : uchar(0);
     }
-  if (g % 4 == 0) {
+  if (g % 4 == 0) {  // (K not a multiple of 256: the last super-block is partial)
+    const int KB = (KG + 3) / 4;
     device half2* DD = (device half2*)(SC + ulong(KG) * (Np / 2));
-    const half d0 = n < N ? D[ulong(n) * (K / 256) + g / 4] : half(0);
-    const half d1 = n + 1 < N ? D[ulong(n + 1) * (K / 256) + g / 4] : half(0);
-    DD[(blk * (KG / 4) + g / 4) * 16 + slot] = half2(d0, d1);
+    const half d0 = n < N ? D[ulong(n) * KB + g / 4] : half(0);
+    const half d1 = n + 1 < N ? D[ulong(n + 1) * KB + g / 4] : half(0);
+    DD[(blk * KB + g / 4) * 16 + slot] = half2(d0, d1);
   }
 }
 
@@ -2131,7 +2140,7 @@ kernel void dequant_hr(
       }
       const int gi = (jj * 8) / kGroup;
       if (eqc_on<BITS>()) {
-        device const half* C = (device const half*)((device const uchar*)SB + 9ul * ulong(KGall) * ulong(Np2)) + ulong(nb) * 64 + j * 16;
+        device const half* C = (device const half*)((device const uchar*)SB + eqc_offset(KGall, Np2)) + ulong(nb) * 64 + j * 16;
         const uint u = as_type<uint>(q);
         out[j] = as_type<uint>(half2(C[u & 15u], C[(u >> 16) & 15u]) * s2[gi * 4 + j]);
         continue;

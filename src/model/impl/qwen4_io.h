@@ -41,8 +41,8 @@ inline void ngram_rows(const NgramTable& T, int per_ngram, int64_t c0, int64_t c
   for (int h = 0; h < 2 * per_ngram; ++h) rows[h] = T.offs[size_t(h)] + (h < per_ngram ? x2 : x3) % T.vocab[size_t(h)];
 }
 
-// One table row dequantized (4-bit affine, bf16 scales and biases) times the
-// table's weight_scale, as fp16.
+// One table row dequantized (4- or 8-bit affine, bf16 scales and biases)
+// times the table's weight_scale, as fp16.
 inline void ngram_read_row(const NgramTable& T, int64_t row, __fp16* out) {
   if (T.fmt == 1) {  // GGUF IQ4_NL: w = d * kIQ4NL[q] (ggml dequantize_row_iq4_nl)
     const int nb = T.width / 32;
@@ -69,18 +69,20 @@ inline void ngram_read_row(const NgramTable& T, int64_t row, __fp16* out) {
   const int ng = T.width / T.group;
   uint32_t codes[64];
   uint16_t sc[16], bi[16];
-  const uint64_t ow = S.w + uint64_t(r) * uint64_t(T.width / 2), os = S.s + uint64_t(r) * uint64_t(ng) * 2,
+  // MLX affine 4-bit rows (oQ4e) or 8-bit ones (espetero quantize --ple-bits 8);
+  // a shard's codes, scales and biases may sit in different files (S.file,
+  // S.fs, S.fb: espetero quantize splits its output files by size).
+  const size_t rb = size_t(T.width) * size_t(T.bits) / 8;
+  if (rb > sizeof(codes) || ng > 16) fail("n-gram rows wider than 256 bytes");
+  const uint64_t ow = S.w + uint64_t(r) * uint64_t(rb), os = S.s + uint64_t(r) * uint64_t(ng) * 2,
                  ob = S.b + uint64_t(r) * uint64_t(ng) * 2;
-  if (const uint8_t* base = T.maps.empty() ? nullptr : T.maps[size_t(S.file)]) {
-    std::memcpy(codes, base + ow, size_t(T.width / 2));
-    std::memcpy(sc, base + os, size_t(ng) * 2);
-    std::memcpy(bi, base + ob, size_t(ng) * 2);
-  } else {
-    const int fd = T.fds[size_t(S.file)];
-    pread_all(fd, codes, size_t(T.width / 2), ow);
-    pread_all(fd, sc, size_t(ng) * 2, os);
-    pread_all(fd, bi, size_t(ng) * 2, ob);
-  }
+  auto read = [&](int file, void* dst, size_t n, uint64_t off) {
+    if (const uint8_t* base = T.maps.empty() ? nullptr : T.maps[size_t(file)]) std::memcpy(dst, base + off, n);
+    else pread_all(T.fds[size_t(file)], dst, n, off);
+  };
+  read(S.file, codes, rb, ow);
+  read(S.fs, sc, size_t(ng) * 2, os);
+  read(S.fb, bi, size_t(ng) * 2, ob);
   auto bf = [](uint16_t x) {
     uint32_t u = uint32_t(x) << 16;
     float f;
@@ -88,7 +90,7 @@ inline void ngram_read_row(const NgramTable& T, int64_t row, __fp16* out) {
     return f;
   };
   for (int j = 0; j < T.width; ++j) {
-    const uint32_t q = (codes[j / 8] >> (4 * (j % 8))) & 0xFu;
+    const uint32_t q = T.bits == 8 ? (codes[j / 4] >> (8 * (j % 4))) & 0xFFu : (codes[j / 8] >> (4 * (j % 8))) & 0xFu;
     const int g = j / T.group;
     out[j] = __fp16((float(q) * bf(sc[g]) + bf(bi[g])) * T.scale);
   }

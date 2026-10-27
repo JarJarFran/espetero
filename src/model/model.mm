@@ -226,7 +226,7 @@ class MetalModel final : public NativeModel {
       // reads), when the Mac keeps 12 GB beside it and the GPU's memory.
       if (m.ple.present) {
         const NgramTable& T = m.ple.table;
-        const double table = double(T.rows) * double(T.width / 2 + (T.width / T.group) * 4);
+        const double table = double(T.rows) * double(T.width * T.bits / 8 + (T.width / T.group) * 4);
         uint64_t ram = 0;
         size_t len = sizeof ram;
         sysctlbyname("hw.memsize", &ram, &len, nullptr, 0);
@@ -438,7 +438,8 @@ class MetalModel final : public NativeModel {
     I.vision = m.vis.c.present;
     I.mtp = m.mtp.present;
     I.leaves = true;  // Qwen4-Exp verifies draft leaves too
-    I.hidden_states = !m.cfg.q4;  // run_forest refuses out_hidden for qwen4_exp
+    I.hidden_states = !m.cfg.q4;  // the engine's hidden-state features stay off for qwen4_exp
+    I.hidden_rows = true;         // out_hidden: for qwen4_exp the final mixer's output, the LM head input
     {  // Verify-commit (ESPETERO_COMMIT=0: accepted drafts re-run as roots, as before)
       const char* v = std::getenv("ESPETERO_COMMIT");
       I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma && !m.cfg.q3moe && !m.cfg.lfm2;  // Qwen4-Exp too; not Gemma 4, Qwen3-Omni, LFM2
@@ -1013,8 +1014,8 @@ class MetalModel final : public NativeModel {
   }
 
   void set_activation_sink(ActivationSink* sink) override {
-    if (sink && (m_.cfg.q4 || (m_.cfg.gemma && m_.cfg.E) || m_.cfg.q3moe || m_.cfg.lfm2))
-      fail("calibration taps: Qwen3.5-family and dense Gemma 4 models only");
+    if (sink && ((m_.cfg.gemma && m_.cfg.E) || m_.cfg.q3moe || m_.cfg.lfm2))
+      fail("calibration taps: Qwen3.5-family (with Qwen4-Exp) and dense Gemma 4 models only");
     m_.tap_sink = sink;
   }
   void set_profile(bool on) override {

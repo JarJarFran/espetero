@@ -38,6 +38,7 @@ quantization format Espetero's kernels are shaped for, without Python:
 | eq4x / eq5x, eq4d / eq5d | EQ4 / EQ5 (down one width up for d) | EQ6 | MLX 6 / 8-bit |
 | eq3dhb | gate/up EQ3 codebook (EQ4 codebook in layers 0-3, 36-39), down EQ4 codebook | EQ8 | MLX 8-bit |
 | eq3dh / eq3dx / eq3h | gate/up EQ3 codebook, down EQ4 codebook / the same / all EQ3 codebook | EQ8 / EQ6 / EQ8 | MLX 8-bit (eq3dx: LM head 6-bit) |
+| fnx3 / fnx3m | EQ3 codebook (Qwen3.8-Flash-Next, below) | EQ6 / EQ5 | MLX 8-bit / 6-bit |
 | eq4, eq5, eq6, eq4f, eq4s | dense-model presets (EQ4/5/6 body, sensitive projections EQ6) | | |
 
 Dense presets for Qwen3.5 / Qwen3.6 dense models (linear attention, full
@@ -69,6 +70,45 @@ On Qwen3.6-35B-A3B (bits per weight without the MTP head): eq3dhb 4.35, KLD
 0.0204 against BF16, vs GGUF IQ4_XS-imat 0.0243 at 4.40; eq3dx 4.12, 0.0241;
 eq3h 3.92, 0.0316. The C++ eq3dhb has the Python checkpoint's tensors and
 size, with 99.99 % of the EQ3 expert codes identical.
+
+## Qwen3.8-Flash-Next (qwen4_exp)
+
+    espetero quantize --model Qwen3.8-Flash-Next --preset fnx3 --keep-experts keep.json \
+        --calib-model Qwen3.8-Flash-Next-oQ4e-mtp --hessian-max 8192 --out Flash-Next-EQ3
+
+* **Sources.** The BF16 checkpoint (transformers names; fused `experts.gate_up_proj` /
+  `down_proj` split into `switch_mlp.*`, the MTP head kept as `mtp.*` with its experts split
+  the same way, the vision tower left out, norm weights kept zero-centred: the loader adds 1),
+  or an MLX checkpoint of the model such as oQ4e-mtp (its affine matrices dequantized; for
+  tests while no BF16 copy is at hand). The output uses the oQ4e-mtp names.
+* **Calibration.** The BF16 model (360 GB) does not fit in memory: `--calib-model` captures the
+  statistics with the forward of another checkpoint of the model (the oQ4e-mtp file; its experts
+  are read whole per pass from the SSD, no expert cache). The taps cover every matrix: attention /
+  DeltaNet / indexer inputs, mixer outputs, router and shared-expert inputs, routed-expert rows,
+  both hyper-connection blocks of every layer and the final mixer (normed streams, 10240 wide, and
+  the rank-320 activations), the n-gram rows and the LM head input. `--hessian-max 8192` keeps only
+  the diagonal of the 10240-wide inputs (97 matrices of 420 MB otherwise). Qwen4-Exp files also
+  hold each expert's routed-row count (`N:` tensors) for pruning.
+* **Pruning.** `--keep-experts FILE` (JSON `{"0": [ids], ..., "47": [ids], "mtp": [ids]}`; each
+  count a multiple of 8, layers may differ; list order = new expert id; without `"mtp"` the MTP
+  layer keeps its 512) slices the expert stacks, the routers' rows and the per-expert statistics;
+  `num_experts` becomes the largest count and `num_experts_per_layer` lists them (the loader reads
+  each layer's count from its stacks). Top-k routing over the kept experts with `norm_topk_prob` is
+  exactly the original routing restricted to them.
+* **Formats.** `fnx3`: routed experts (trunk and MTP) EQ3 codebooks, every other matrix EQ6 GPTQ
+  (`fnx3m`: EQ5), LM head MLX 6-bit, embedding MLX 8-bit, routers BF16. The n-gram table (51.2 B
+  values, read from disk at run time) stays MLX affine group 32 with bf16 scales, `--ple-bits 4`
+  (the oQ4e layout, 100 B per row, 32 GB; an MLX source of that width is copied) or 8 (180 B per
+  row). EQ checkpoints keep their routed experts resident (no streamed form), and load their own
+  `mtp.*` head.
+* **Widths not a multiple of 256.** EQ rows that are a multiple of 64 wide end in a partial
+  super-block: `ceil(in / 256)` fp16 super-scales per row (the expert down projection 640 = 256 +
+  256 + 128, the hyper-connections' up projection 320 = 256 + 64), the same scale-buffer layout the
+  NVFP4 path uses; every width that is a multiple of 256 is unchanged.
+* `--only GLOB,...,!GLOB` writes part of a checkpoint; `tools/dev/fnx_overlay.py BASE PART VIEW` lays
+  such a part over another checkpoint of the model (symlinks, merged index and config), e.g. a few
+  layers converted to EQ over the oQ4e-mtp file, or a pruned conversion that reuses the file's
+  n-gram table.
 
 ## Relation to the Python converter
 

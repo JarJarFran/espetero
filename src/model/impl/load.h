@@ -56,7 +56,7 @@ inline Buf dequant_f16(Arena& ar, const QW& q_in) {
     __fp16* dst = (__fp16*)ptr(out);
     const uint32_t* codes = (const uint32_t*)ptr(q.w);
     const int8_t* ss = (const int8_t*)ptr(q.s);
-    const int in = q.in, spr = in / 16, bpr = in / 256;
+    const int in = q.in, spr = in / 16, bpr = eq_supers(in);
     const size_t zrow = q.z_row_bytes() / 2;
     parallel_for(size_t(q.out), [&](size_t r) {
       const uint16_t* z = (const uint16_t*)ptr(q.z) + r * zrow;
@@ -732,6 +732,7 @@ namespace espetero::native {
 inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head = false);
 inline void load_q4_mtp(Model& m, const std::string& dir);
 inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src);
+inline void load_q4_mtp_eq(Model& m, const SafetensorsSource& src);
 inline void load_q4_mtp_gguf(Model& m, const std::string& file);
 inline void load_q4_gguf(Model& m, const GGUFSource& src);
 
@@ -918,12 +919,15 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     // Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16; --mtp own, the file's own
     // mtp.* head (the oQ4e file carries one, 4-bit); by default a drafter
     // directory beside the model whose config says qwen4_exp_mtp, else the
-    // file's own head when it has one.
-    const std::string dir = mtp == "own" ? "" : mtp.empty() ? find_q4_drafter(path) : mtp;
-    const bool own = mtp == "own" || (mtp.empty() && dir.empty() && src.has("mtp.fc_embedding.weight"));
+    // file's own head when it has one. An EQ checkpoint (espetero quantize)
+    // drafts with its own mtp.* head by default.
+    const bool eq_own = mtp.empty() && src.config().get("eq_format") && src.has("mtp.fc_embedding.weight");
+    const std::string dir = mtp == "own" || eq_own ? "" : mtp.empty() ? find_q4_drafter(path) : mtp;
+    const bool own = mtp == "own" || eq_own || (mtp.empty() && dir.empty() && src.has("mtp.fc_embedding.weight"));
     const bool drafting = own || (!dir.empty() && dir != "none");
     load_q4(m, src, want_vision, drafting && (m.mtp.head4 || m.mtp.coarse_c > 0));
-    if (own) load_q4_mtp_own(m, src);
+    if (eq_own) load_q4_mtp_eq(m, src);
+    else if (own) load_q4_mtp_own(m, src);
     else if (drafting) load_q4_mtp(m, dir);
     return;
   }

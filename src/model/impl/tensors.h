@@ -23,7 +23,7 @@ struct TensorView {
   size_t nbytes = 0;
   int bits = 0, group = 0;       // MLXQuant / EQQuant: code width and group size along cols
   const uint8_t* scales = nullptr;  // MLXQuant: [rows, cols / group]; EQQuant: int8 [rows, cols / 16]
-  const uint8_t* biases = nullptr;  // EQQuant: fp16 scale per 256 [rows, cols / 256]
+  const uint8_t* biases = nullptr;  // EQQuant: fp16 scale per 256 [rows, ceil(cols / 256)] (the last one partial)
   const uint8_t* codebook = nullptr;  // EQQuant with codebooks: fp16 [ncb, 2^bits] (EQ4 16, EQ3 8), codebook r / (rows / ncb) of row r
   int64_t ncb = 0;
   int gguf_type = -1;            // GGUFQuant: ggml type id
@@ -68,12 +68,15 @@ class SafetensorsSource : public WeightSource {
       json::Value idx = json::parse(read_file(index));
       std::vector<std::string> files;
       if (const json::Value* wm = idx.get("weight_map")) {
-        for (const json::Value& f : wm->as_object().vals) {
-          const std::string& name = f.as_string();
+        const json::Object& o = wm->as_object();
+        for (size_t i = 0; i < o.size(); ++i) {
+          const std::string& name = o.vals[i].as_string();
           if (std::find(files.begin(), files.end(), name) == files.end()) files.push_back(name);
+          owner_[o.keys[i]] = name;
         }
       }
-      for (const auto& f : files) add_file(dir + "/" + f);
+      for (const auto& f : files) add_file(dir + "/" + f, f);
+      owner_.clear();
     } else {
       add_file(dir + "/model.safetensors");
     }
@@ -126,8 +129,8 @@ class SafetensorsSource : public WeightSource {
         int64_t rows = 1;
         for (size_t i = 0; i + 1 < e.shape.size(); ++i) rows *= e.shape[i];
         const int64_t in = e.shape.back() * 32 / bits;
-        if (e.shape.back() * 32 % bits || in % 256 || s->second.shape.back() * 16 != in ||
-            sup->second.shape.back() * 256 != in || sup->second.dtype != "F16")
+        if (e.shape.back() * 32 % bits || in % 64 || s->second.shape.back() * 16 != in ||
+            sup->second.shape.back() != (in + 255) / 256 || sup->second.dtype != "F16")
           fail(base + ": EQ tensors do not match their width");
         t.kind = TensorView::EQQuant;
         t.shape = {rows, in};
@@ -227,7 +230,10 @@ class SafetensorsSource : public WeightSource {
   // The header is checked as the safetensors library checks it (offsets inside
   // the data, elements x dtype size = bytes) with overflow-safe arithmetic: a
   // crafted file fails to load instead of pointing reads outside the mapping.
-  void add_file(const std::string& path) {
+  // file: the name the index gives it; a tensor the index puts in another
+  // file is not taken from this one (views that lay one checkpoint's files
+  // over another's, tools/dev/fnx_overlay.py, have such duplicates).
+  void add_file(const std::string& path, const std::string& file = std::string()) {
     auto mf = std::make_unique<MappedFile>(path);
     if (mf->size < 8) fail(path + ": not a safetensors file");
     uint64_t hlen = 0;
@@ -262,6 +268,7 @@ class SafetensorsSource : public WeightSource {
       e.file = fi;
       if (const size_t eb = dtype_bytes(e.dtype); eb && (count > SIZE_MAX / eb || count * eb != e.nbytes))
         fail(where + ": " + std::to_string(e.nbytes) + " bytes do not hold its shape");
+      if (auto ow = owner_.find(o.keys[i]); ow != owner_.end() && ow->second != file) continue;
       entries_[o.keys[i]] = std::move(e);
     }
     files_.push_back(std::move(mf));
@@ -292,6 +299,7 @@ class SafetensorsSource : public WeightSource {
   }
 
   std::string dir_;
+  std::map<std::string, std::string> owner_;  // tensor -> its file in the index (while loading)
   std::vector<std::unique_ptr<MappedFile>> files_;
   std::unordered_map<std::string, Entry> entries_;
   json::Value config_;

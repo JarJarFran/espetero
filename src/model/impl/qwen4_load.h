@@ -8,6 +8,11 @@
 // experts, the n-gram mix, embedding and LM head (~4 GB for the oQ4e file).
 // The routed experts (67.95 GB) and the n-gram table (32 GB) stay in the
 // safetensors files; their byte locations are recorded for pread.
+// EQ checkpoints (espetero quantize; matrices EQ or MLX affine, possibly
+// pruned to fewer experts per layer) load their routed experts too: resident
+// stacks that the MoE kernels read in place, as the Qwen3.5 MoE loader does
+// (an EQ expert format has no streamed form); their MTP head is the file's
+// own mtp.*.
 //
 // Norm weights of this family are zero-centred in the file (the runtime norm
 // multiplies by 1 + w); the loader folds the +1 like the Qwen3.5 converters
@@ -34,7 +39,8 @@ inline float q4_norm_add(const Model& m) { return q4_gguf(m) ? 0.0f : 1.0f; }
 inline HostMat q4_mat(Model& m, Arena& tmp, const WeightSource& src, const std::string& name, int out, int in,
                       bool native8 = false) {
   HostMat h = host_mat(m, tmp, src, name, out, in);
-  if (!h.dense && h.q.scale_mode && !(native8 && h.q.scale_mode == 2)) h.q = to_affine(tmp, h.q);
+  // (EQ matrices keep their own layout: espetero quantize's Qwen4-Exp checkpoints.)
+  if (!h.dense && h.q.scale_mode && !eq_mode(h.q.scale_mode) && !(native8 && h.q.scale_mode == 2)) h.q = to_affine(tmp, h.q);
   return h;
 }
 
@@ -43,7 +49,9 @@ inline HostMat q4_mat(Model& m, Arena& tmp, const WeightSource& src, const std::
 // so a 32-column GEMV block holds every stream of its channels.
 inline HostMat hcmix_rows(Arena& tmp, const HostMat& h, int S, int D) {
   if (32 % S || D % (32 / S) || h.out != S * D) fail("hyper-connection up matrix: unexpected shape for the hcmix order");
-  if (!h.dense && h.q.scale_mode) fail("hyper-connection up matrix: unexpected scale format");
+  // Affine or EQ rows (each row's scales move with it; not EQ codebooks, shared by 8-row groups).
+  if (!h.dense && h.q.scale_mode && (!eq_mode(h.q.scale_mode) || eqc_mode(h.q.scale_mode)))
+    fail("hyper-connection up matrix: unexpected scale format");
   const int per = 32 / S;
   auto permuted = [&](const Buf& src, size_t row_bytes) {
     Buf dst = tmp.alloc(row_bytes * size_t(h.out));
@@ -58,9 +66,9 @@ inline HostMat hcmix_rows(Arena& tmp, const HostMat& h, int S, int D) {
   if (h.dense) {
     o.f16 = permuted(h.f16, size_t(h.in) * 2);
   } else {
-    o.q.w = permuted(h.q.w, size_t(h.in) * size_t(h.q.src_bits) / 8);
-    o.q.s = permuted(h.q.s, size_t(h.in / h.q.group) * 2);
-    o.q.z = permuted(h.q.z, size_t(h.in / h.q.group) * 2);
+    o.q.w = permuted(h.q.w, h.q.row_bytes());
+    o.q.s = permuted(h.q.s, h.q.s_row_bytes());
+    o.q.z = permuted(h.q.z, h.q.z_row_bytes());
   }
   return o;
 }
@@ -139,15 +147,28 @@ inline ExpertLayer locate_experts(Model& m, const WeightSource& wsrc, const std:
   return E;
 }
 
+// A layer whose routed experts are EQ (espetero quantize): loaded resident,
+// as mixed-width experts are (an EQ format has no streamed form).
+inline bool q4_eq_experts(const SafetensorsSource& src, const std::string& p) {
+  return src.has(p + "mlp.switch_mlp.gate_proj.super");
+}
+
 // rq 8: dense matrices requantized to 8 bits (the bf16 MTP drafter);
-// resident: the routed experts are loaded (8-bit) instead of located on the
-// SSD (the MTP layer, which runs outside the expert cache).
+// resident: the routed experts are loaded (8-bit when dense) instead of
+// located on the SSD (the MTP layer, which runs outside the expert cache;
+// GGUF files, mixed-width and EQ experts). Resident EQ stacks may hold fewer
+// experts than the config's (a checkpoint pruned per layer): Layer::E.
 inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string& p, bool linear,
                            int index_in_kind, int rq = 0, bool resident = false) {
   const Config& c = m.cfg;
   Layer L;
   L.linear = linear;
   L.index_in_kind = index_in_kind;
+  // Resident experts may be fewer than the config's (a checkpoint pruned per layer: its stacks say how many).
+  const auto* stp = dynamic_cast<const SafetensorsSource*>(&src);
+  const int El = resident && stp ? int(stp->locate(p + "mlp.switch_mlp.gate_proj.weight").shape[0]) : c.E;
+  if (El < 1 || El > c.E) fail(p + ": " + std::to_string(El) + " experts (the config says at most " + std::to_string(c.E) + ")");
+  if (El != c.E) L.E = El;
   L.hca = load_hc(m, src, p + "attn_hyper_connection.", true, rq);
   L.hcm = load_hc(m, src, p + "mlp_hyper_connection.", true, rq);
   Arena tmp(m.dev);
@@ -210,10 +231,10 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
   // the routed experts stay on the SSD.
   {
     Arena t2(m.dev);
-    HostMat router = q4_mat(m, t2, src, p + "mlp.gate.weight", c.E, c.D);
+    HostMat router = q4_mat(m, t2, src, p + "mlp.gate.weight", El, c.D);
     HostMat sgate = q4_mat(m, t2, src, p + "mlp.shared_expert_gate.weight", 1, c.D);
     if (q4_gguf(m) && sgate.dense) sgate = requant<8>(t2, sgate);  // F32 in GGUF, 8-bit in oQ4e files
-    if (router.dense) L.router_f16 = m.arena->copy(ptr(router.f16), size_t(c.E) * size_t(c.D) * 2);
+    if (router.dense) L.router_f16 = m.arena->copy(ptr(router.f16), size_t(El) * size_t(c.D) * 2);
     id<MTLCommandBuffer> cb2 = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e2 = [cb2 computeCommandEncoder];
     L.router = finish(m, e2, t2, router);
@@ -224,8 +245,9 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
   }
   L.moe = true;
   if (resident) {
-    // [E, out, in] stacks, requantized to 8 bits one at a time (bf16 source:
-    // 1.7 GB each), gate and up interleaved by 8 rows per expert.
+    // [E, out, in] stacks, requantized to 8 bits one at a time when dense (bf16
+    // source: 1.7 GB each; quantized ones as they are), gate and up
+    // interleaved by 8 rows per expert.
     const std::string s = p + "mlp.switch_mlp.";
     Arena keep(m.dev);
     auto stack = [&](const std::string& name, int out, int in) {
@@ -233,11 +255,17 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
         std::vector<uint8_t> raw;
         const TensorView t = g->tensor_uncached(s + name, raw);
         HostMat h;
-        h.out = c.E * out;
+        h.out = El * out;
         h.in = in;
         h.q = qw_from_view(keep, t, h.out, in);
         if (h.q.scale_mode) h.q = to_affine(keep, h.q);
         m.source_types[ggml_type_info(t.gguf_type)->name] += 1;
+        return h;
+      }
+      if (const auto* st = dynamic_cast<const SafetensorsSource*>(&src);
+          st && st->has(s + name.substr(0, name.size() - 6) + "super")) {  // EQ (espetero quantize): as stored
+        HostMat h = host_mat(m, keep, src, s + name, El * out, in);
+        if (h.dense) fail(s + name + ": expected an EQ stack");
         return h;
       }
       if (const auto* st = dynamic_cast<const SafetensorsSource*>(&src); st && !st->locate(s + name).dtype.empty() &&
@@ -255,13 +283,13 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
           *ptrs[k] = raw[k].data();
         }
         HostMat h;
-        h.out = c.E * out;
+        h.out = El * out;
         h.in = in;
         h.q = qw_from_view(keep, t, h.out, in);
         m.source_types["mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
         return h;
       }
-      HostMat h = q4_mat(m, keep, src, s + name, c.E * out, in);  // the bf16 MTP drafter: requantized below
+      HostMat h = q4_mat(m, keep, src, s + name, El * out, in);  // the bf16 MTP drafter: requantized below
       return rq8(keep, h, 8);
     };
     const HostMat eg = stack("gate_proj.weight", c.Ie, c.D), eu = stack("up_proj.weight", c.Ie, c.D);
@@ -270,8 +298,8 @@ inline Layer load_q4_layer(Model& m, const WeightSource& src, const std::string&
     const HostMat egu = interleave_gate_up(keep, eg, eu);
     id<MTLCommandBuffer> cb3 = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e3 = [cb3 computeCommandEncoder];
-    L.experts_gu = finish(m, e3, keep, egu).q;
-    L.experts_down = finish(m, e3, keep, ed).q;
+    L.experts_gu = finish(m, e3, keep, egu, false, p + "experts_gu").q;
+    L.experts_down = finish(m, e3, keep, ed, false, p + "experts_down").q;
     [e3 endEncoding];
     commit_wait(cb3);
     return L;
@@ -364,6 +392,15 @@ inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src) {
   std::fprintf(stderr, "mtp: the file's own head (%d-bit experts, %d resident)\n", T.layer.experts_gu.bits, m.cfg.E);
 }
 
+// An EQ checkpoint's own `mtp.*` head (espetero quantize): quantized matrices
+// as stored, dense ones (the router) as 8-bit copies, as from a drafter.
+inline void load_q4_mtp_eq(Model& m, const SafetensorsSource& src) {
+  load_q4_mtp_from(m, src, "mtp.", 8, "own mtp.* head");
+  const Mtp& T = m.mtp;
+  std::fprintf(stderr, "mtp: the EQ checkpoint's own head (%d-bit experts, %d resident)\n", T.layer.experts_gu.bits,
+               T.layer.E ? T.layer.E : m.cfg.E);
+}
+
 // The n-gram mix before layer c.ple_layer and the location of its table.
 inline void load_q4_ple(Model& m, const SafetensorsSource& src, const std::string& p) {
   const Config& c = m.cfg;
@@ -396,6 +433,8 @@ inline void load_q4_ple(Model& m, const SafetensorsSource& src, const std::strin
   T.vocab = i64(pe + "ngram_heads_vocab_sizes", size_t(heads));
   T.offs = i64(pe + "ngram_heads_offsets", size_t(heads));
   const std::string sh = pe + "ngram_embedding.";
+  T.bits = src.quant_of(sh + "shards.0").first;
+  if (T.bits != 4 && T.bits != 8) fail(sh + "shards: " + std::to_string(T.bits) + "-bit rows (4 or 8 supported)");
   if (src.has(sh + "weight_scale")) {
     const std::vector<float> s = src.floats(sh + "weight_scale", 1);
     T.scale = s[0];
@@ -406,17 +445,21 @@ inline void load_q4_ple(Model& m, const SafetensorsSource& src, const std::strin
     NgramTable::Shard S;
     const SafetensorsSource::Location w = src.locate(b + "weight"), s = src.locate(b + "scales"),
                                       z = src.locate(b + "biases");
-    if (w.file != s.file || w.file != z.file) fail(b + ": codes, scales and biases in different files");
-    auto it = std::find(T.files.begin(), T.files.end(), w.file);
-    S.file = int(it - T.files.begin());
-    if (it == T.files.end()) T.files.push_back(w.file);
+    auto file_index = [&](const std::string& f) {
+      auto it = std::find(T.files.begin(), T.files.end(), f);
+      if (it == T.files.end()) T.files.push_back(f);
+      return int(std::find(T.files.begin(), T.files.end(), f) - T.files.begin());
+    };
+    S.file = file_index(w.file);
+    S.fs = file_index(s.file);
+    S.fb = file_index(z.file);
     S.w = w.offset;
     S.s = s.offset;
     S.b = z.offset;
     const int64_t rows = w.shape[0];
     if (k == 0) T.shard_rows = rows;
     else if (rows != T.shard_rows) fail(b + ": shards of different sizes");
-    if (w.shape[1] * 8 != T.width || s.shape[1] * T.group != T.width) fail(b + ": unexpected row layout");
+    if (w.shape[1] * 32 / T.bits != T.width || s.shape[1] * T.group != T.width) fail(b + ": unexpected row layout");
     T.shards.push_back(S);
     T.rows += rows;
   }
@@ -452,10 +495,14 @@ inline void ensure_ngram_preload(const NgramTable& T) {
   const uint64_t chunk = uint64_t(64) << 20;
   const uint64_t ng = uint64_t(T.width / T.group);
   for (const NgramTable::Shard& S : T.shards) {
-    const int fd = T.fds[size_t(S.file)];
     const uint64_t rows = uint64_t(T.shard_rows);
-    for (auto [off, len] : {std::pair<uint64_t, uint64_t>{S.w, rows * uint64_t(T.width / 2)}, {S.s, rows * ng * 2}, {S.b, rows * ng * 2}})
+    const uint64_t rb = uint64_t(T.width) * uint64_t(T.bits) / 8;
+    for (auto [file, off, len] : {std::tuple<int, uint64_t, uint64_t>{S.file, S.w, rows * rb}, {S.fs, S.s, rows * ng * 2},
+                                  {S.fb, S.b, rows * ng * 2}}) {
+      if (file < 0) continue;  // (GGUF tables: codes only)
+      const int fd = T.fds[size_t(file)];
       for (uint64_t o = 0; o < len; o += chunk) jobs.push_back({fd, off + o, std::min(chunk, len - o)});
+    }
   }
   std::thread([jobs = std::move(jobs)] {
     const auto t0 = Clock::now();
@@ -506,13 +553,14 @@ inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bo
   }
   m.mixer = load_hc(m, src, pre + "hyper_connection_mixer.", false);
   // Experts of mixed widths (a GGUF converted at its own widths: 4-bit gate/up
-  // beside a 5- or 8-bit down) load resident, as GGUF files do; the SSD
-  // stream, records and pools are 4-bit only. ESPETERO_Q4_RESIDENT_LOAD=1 forces it.
+  // beside a 5- or 8-bit down) and EQ experts load resident, as GGUF files do;
+  // the SSD stream, records and pools are MLX 4-bit only. ESPETERO_Q4_RESIDENT_LOAD=1 forces it.
   bool mixed = env_on("ESPETERO_Q4_RESIDENT_LOAD");
   for (int i = 0; i < c.L && !mixed; ++i) {
     const std::string s = pre + "layers." + std::to_string(i) + ".mlp.switch_mlp.";
     const auto q = src.quant_of(s + "gate_proj");
-    mixed = q != src.quant_of(s + "up_proj") || q != src.quant_of(s + "down_proj") || q.first != 4;
+    mixed = q != src.quant_of(s + "up_proj") || q != src.quant_of(s + "down_proj") || q.first != 4 ||
+            q4_eq_experts(src, pre + "layers." + std::to_string(i) + ".");  // EQ experts have no streamed form
   }
   if (mixed) m.xres_l.resize(size_t(c.L));
   const auto t0 = Clock::now();
