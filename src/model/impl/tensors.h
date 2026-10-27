@@ -14,16 +14,16 @@
 namespace espetero::native {
 
 struct TensorView {
-  enum Kind { Dense, MLXQuant, GGUFQuant };
+  enum Kind { Dense, MLXQuant, GGUFQuant, EQQuant };
   std::string name;              // source-side name, for messages
   Kind kind = Dense;
   std::vector<int64_t> shape;    // logical, row-major: matrices are [rows = out, cols = in]
   std::string dtype;             // Dense: F32, F16 or BF16 (MLXQuant: scale dtype)
   const uint8_t* data = nullptr;
   size_t nbytes = 0;
-  int bits = 0, group = 0;       // MLXQuant: code width and group size along cols
-  const uint8_t* scales = nullptr;  // MLXQuant: [rows, cols / group]
-  const uint8_t* biases = nullptr;
+  int bits = 0, group = 0;       // MLXQuant / EQQuant: code width and group size along cols
+  const uint8_t* scales = nullptr;  // MLXQuant: [rows, cols / group]; EQQuant: int8 [rows, cols / 16]
+  const uint8_t* biases = nullptr;  // EQQuant: fp16 scale per 256 [rows, cols / 256]
   int gguf_type = -1;            // GGUFQuant: ggml type id
 
   int64_t rows() const { return shape.empty() ? 0 : (shape.size() == 1 ? 1 : shape[0]); }
@@ -77,6 +77,7 @@ class SafetensorsSource : public WeightSource {
     }
     warm();
     config_ = json::parse(read_file(dir + "/config.json"));
+    if (const json::Value* eq = config_.get("eq_format"); eq && eq->is_object()) eq_version_ = int(eq->get_int("version", 0));
     const json::Value* qz = config_.get("quantization");
     if (!qz || !qz->is_object()) qz = config_.get("quantization_config");
     if (qz && qz->is_object()) {
@@ -109,6 +110,32 @@ class SafetensorsSource : public WeightSource {
     if (e.dtype == "U32" && ends_with(name, ".weight")) {
       const std::string base = name.substr(0, name.size() - 7);
       auto s = entries_.find(base + ".scales");
+      auto sup = entries_.find(base + ".super");
+      if (s != entries_.end() && s->second.dtype == "I8" && sup != entries_.end()) {
+        // EQ (Espetero's own format): packed unsigned codes, int8 sub-scale per
+        // lane sub-block of 16, fp16 scale per 256 (quantization config: bits,
+        // group_size 16; config eq_format.version 2).
+        if (eq_version_ != 2)
+          fail(base + ": EQ format version " + std::to_string(eq_version_) +
+               " (this build reads version 2, lane sub-blocks): convert the checkpoint again with espetero quantize");
+        auto ov = overrides_.find(base);
+        const int bits = ov != overrides_.end() ? ov->second.first : default_bits_;
+        if (e.shape.size() != 2 && e.shape.size() != 3) fail(base + ": unexpected EQ rank");
+        int64_t rows = 1;
+        for (size_t i = 0; i + 1 < e.shape.size(); ++i) rows *= e.shape[i];
+        const int64_t in = e.shape.back() * 32 / bits;
+        if (e.shape.back() * 32 % bits || in % 256 || s->second.shape.back() * 16 != in ||
+            sup->second.shape.back() * 256 != in || sup->second.dtype != "F16")
+          fail(base + ": EQ tensors do not match their width");
+        t.kind = TensorView::EQQuant;
+        t.shape = {rows, in};
+        t.bits = bits;
+        t.group = 16;
+        t.scales = files_[size_t(s->second.file)]->at(s->second.offset);
+        t.biases = files_[size_t(sup->second.file)]->at(sup->second.offset);
+        t.dtype = "F16";
+        return t;
+      }
       auto z = entries_.find(base + ".biases");
       if (s == entries_.end() || z == entries_.end()) fail(base + ": quantized weight without scales/biases");
       auto ov = overrides_.find(base);
@@ -253,6 +280,7 @@ class SafetensorsSource : public WeightSource {
   std::unordered_map<std::string, Entry> entries_;
   json::Value config_;
   int default_bits_ = 4, default_group_ = 64;
+  int eq_version_ = 0;  // config.json eq_format.version (EQ checkpoints)
   std::unordered_map<std::string, std::pair<int, int>> overrides_;
 };
 

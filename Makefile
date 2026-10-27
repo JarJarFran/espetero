@@ -51,6 +51,11 @@ $(BUILD)/batch_kld: tests/batch_kld.mm $(BUILD)/model.o $(BUILD)/json.o
 $(BUILD)/bench_native: tests/bench_native.mm $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
+# Final-normed hidden states over a KLD harness reference's windows
+# (kld_harness.py eval --fmt espetero:...).
+$(BUILD)/kld_dump: tests/kld_dump.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 # ---- modules (plain C++ unless noted)
 TOK_SRC    := $(wildcard src/tok/*.cpp)
 TMPL_SRC   := $(wildcard src/tmpl/*.cpp)

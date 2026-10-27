@@ -36,7 +36,8 @@ inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std
   } else {
     h.q = qw_from_view(tmp, t, out, in);
     m.source_types[t.kind == TensorView::GGUFQuant ? ggml_type_info(t.gguf_type)->name
-                                                    : "mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
+                   : t.kind == TensorView::EQQuant ? "eq" + std::to_string(t.bits)
+                                                   : "mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
   }
   return h;
 }
@@ -169,7 +170,8 @@ inline HW densify(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, QW q) {
   d.out = q.out;
   d.in = d.kp = q.in;
   const int Np = (q.out + 31) / 32 * 32;
-  d.wr = m.arena->alloc(size_t(Np) * q.in * 2);
+  d.wr_n = size_t(Np) * q.in * 2;
+  d.wr = m.arena->alloc(d.wr_n);
   const int KG = q.in / 64;
   [e setComputePipelineState:m.kernel("dequant_hr" + std::to_string(q.bits), q.fc())];
   [e setBuffer:q.wr.b offset:q.wr.off atIndex:0];
@@ -269,6 +271,7 @@ inline void load_embedding(Model& m, Arena& tmp, const WeightSource& src, const 
     std::memcpy(ptr(E.codes), ptr(h), size_t(c.V) * c.D * 2);
     return;
   }
+  if (t.kind == TensorView::EQQuant) fail(name + ": EQ embeddings are not supported (espetero quantize keeps them MLX affine)");
   QW q = to_affine(tmp, qw_from_view(tmp, t, c.V, c.D));  // rows are gathered: affine
   if (q.src_bits != 4 && q.src_bits != 8) q = widen8(tmp, q);
   q = to_half_scales(tmp, q);

@@ -26,16 +26,23 @@ struct QW {
   // 2: Q8_0: s = fp16 scale per 32, no z; weight = (code - 128) * scale.
   // 3: Q4_K/Q5_K: s = (scale, min) bytes per 32, z = fp16 (d, dmin) per 256;
   //    weight = code * d * scale - dmin * min.
+  // (4 and 5 are reserved.)
+  // 6: EQ (Espetero's own checkpoints, 4/5/6/8-bit codes): weight = (code -
+  //    2^(bits - 1)) * half(super * sub), an int8 sub-scale per lane sub-block
+  //    (16 K rows: the rows k of a 64-wide K step with (k % 8) / 2 == t, in
+  //    s [out][in / 16] at 4 * step + t) and an fp16 super-scale per 256 (z).
   int scale_mode = 0;
   // Gated epilogue of a gate/up matrix: 0 SiLU (SwiGLU), 1 tanh-GELU
   // (GeGLU, Gemma 4). A function constant of the kernels (fc() bit 24).
   int act = 0;
   Buf w, s, z;        // host layout (row-major), released after repack
   Buf wr, sb, wh;     // GPU layout (wh: high-bit plane of 5/6-bit codes)
+  size_t wr_n = 0, sb_n = 0, wh_n = 0;  // their sizes in bytes (tile images)
   size_t row_bytes() const { return size_t(in) * size_t(src_bits) / 8; }
   size_t s_row_bytes() const {
     switch (scale_mode) {
-      case 1: return size_t(in / 16);
+      case 1:
+      case 6: return size_t(in / 16);
       case 2: return size_t(in / 32) * 2;
       case 3: return size_t(in / 32) * 2;
       default: return size_t(in / group) * 2;
@@ -43,7 +50,8 @@ struct QW {
   }
   size_t z_row_bytes() const {
     switch (scale_mode) {
-      case 1: return size_t(in / 256) * 2;
+      case 1:
+      case 6: return size_t(in / 256) * 2;
       case 2: return 0;
       case 3: return size_t(in / 256) * 4;
       default: return size_t(in / group) * 2;
@@ -70,6 +78,17 @@ int native_scale_mode(int gguf_type) {
   }
 }
 
+// Symmetric two-level scales (int8 per 16 x fp16 per 256): Q6_K and EQ,
+// codes offset by 2^(bits - 1).
+inline bool sym16_mode(int mode) { return mode == 1 || mode == 6; }
+// EQ: sub-blocks shaped by the GPU's fragment lanes (no affine form wider
+// than 2 columns; fused only with EQ matrices of the same code width).
+inline bool eq_mode(int mode) { return mode == 6; }
+inline int eq_scale_mode(int bits) {
+  if ((bits < 4 || bits > 6) && bits != 8) fail("EQ: unsupported code width " + std::to_string(bits));
+  return 6;
+}
+
 // GPU width for codes of `bits`: 4, 5 and 6 are native; others use bytes.
 int gpu_bits_for(int bits) { return (bits == 4 || bits == 5 || bits == 6) ? bits : 8; }
 
@@ -78,6 +97,7 @@ struct HW {
   bool has_bias = false;
   int act = 0;                  // gate/up matrices: 1 for a tanh-GELU gate (QW::act)
   Buf wr, bias;
+  size_t wr_n = 0, bias_n = 0;  // their sizes in bytes (tile images)
 };
 
 // A decoder matrix: quantized or dense.
@@ -121,6 +141,20 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
       fail(t.name + ": unsupported group size " + std::to_string(q.group));
     return q;
   }
+  if (t.kind == TensorView::EQQuant) {
+    // Packed unsigned codes (MLX's bit stream), int8 sub-scale per lane
+    // sub-block of 16, fp16 scale per 256.
+    if (in % 256) fail(t.name + ": EQ rows must be a multiple of 256 wide");
+    q.src_bits = t.bits;
+    q.bits = gpu_bits_for(t.bits);
+    q.group = 16;
+    q.half_scales = true;
+    q.scale_mode = eq_scale_mode(t.bits);
+    q.w = ar.copy(t.data, q.row_bytes() * size_t(out));
+    q.s = ar.copy(t.scales, q.s_row_bytes() * size_t(out));
+    q.z = ar.copy(t.biases, q.z_row_bytes() * size_t(out));
+    return q;
+  }
   if (t.kind != TensorView::GGUFQuant) fail(t.name + ": not a quantized tensor");
   const GGMLTypeInfo* ti = ggml_type_info(t.gguf_type);
   q.bits = ti->code_bits;
@@ -160,11 +194,39 @@ QW qw_from_view(Arena& ar, const TensorView& t, int64_t out, int64_t in) {
   return q;
 }
 
+// EQ -> affine half scale and bias per 2 columns (exact: a lane sub-block is
+// the column pairs 2 t, 2 t + 1 of every 8 in a 64-wide K step), for the host
+// paths that dequantize (requant, dequant_f16); no GPU kernel takes group 2.
+QW eq_to_affine(Arena& ar, const QW& q) {
+  QW o = q;
+  o.scale_mode = 0;
+  o.group = 2;
+  const int gpr = q.in / 2, spr = q.in / 16, bpr = q.in / 256;
+  const float off = float(1 << (q.src_bits - 1));
+  o.s = ar.alloc(size_t(q.out) * gpr * 2);
+  o.z = ar.alloc(size_t(q.out) * gpr * 2);
+  const int8_t* ss = (const int8_t*)ptr(q.s);
+  const uint16_t* zz = (const uint16_t*)ptr(q.z);
+  uint16_t* sd = (uint16_t*)ptr(o.s);
+  uint16_t* zd = (uint16_t*)ptr(o.z);
+  parallel_for(size_t(q.out), [&](size_t r) {
+    for (int c2 = 0; c2 < gpr; ++c2) {
+      const int k = c2 * 2, step = k / 64, t = (k % 8) / 2;
+      // half(super * sub), as the GPU and the converter round it
+      const float sc = f16_to_f32(f32_to_f16_bits(f16_to_f32(zz[r * bpr + k / 256]) * float(ss[r * spr + step * 4 + t])));
+      sd[r * gpr + c2] = f32_to_f16_bits(sc);
+      zd[r * gpr + c2] = f32_to_f16_bits(-off * sc);
+    }
+  });
+  return o;
+}
+
 // Native GGUF scales -> affine half scale and bias per group (exactly what
 // convert_row writes otherwise): Q6_K per 16 (s = d * sub, b = -32 * s), Q8_0
 // per 32 (b = -128 * s), Q4_K/Q5_K per 32 (s = d * scale, b = -dmin * min).
 QW to_affine(Arena& ar, const QW& q) {
   if (q.scale_mode == 0) return q;
+  if (eq_mode(q.scale_mode)) return eq_to_affine(ar, q);
   QW o = q;
   o.scale_mode = 0;
   const int mode = q.scale_mode;
@@ -305,7 +367,9 @@ std::vector<QW> unify(Arena& ar, std::vector<QW> parts) {
     group = std::min(group, p.group);
     target = std::max(target, p.bits);
   }
-  if (same_native && same_bits) return parts;  // one native GGUF layout
+  if (same_native && same_bits) return parts;  // one native GGUF / EQ layout
+  for (const QW& p : parts)
+    if (eq_mode(p.scale_mode)) fail("EQ matrices fuse only with EQ matrices of the same code width");
   for (QW& p : parts) p = to_affine(ar, p);
   for (const QW& p : parts) group = std::min(group, p.group);
   for (QW& p : parts) {
@@ -350,7 +414,10 @@ std::vector<QW> fuse_rows(Arena& ar, const std::vector<QW>& parts) {
     cur.clear();
   };
   for (const auto& p : parts) {
-    if (!cur.empty() && cur.back().bits != p.bits) flush();
+    // (EQ parts stay out of other layouts' runs: they have no shared form)
+    if (!cur.empty() && (cur.back().bits != p.bits || eq_mode(cur.back().scale_mode) != eq_mode(p.scale_mode) ||
+                         (eq_mode(p.scale_mode) && cur.back().src_bits != p.src_bits)))
+      flush();
     cur.push_back(p);
   }
   flush();
@@ -405,7 +472,9 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   const int Np = (q.out + 31) / 32 * 32;
   const int KG = q.in / 64;
   if (q.in % 64) fail("quantized matrices need an input width that is a multiple of 64");
-  if (q.scale_mode == 1 && q.bits != 6) fail("repack: native Q6_K scales need 6-bit codes");
+  if ((q.scale_mode == 1 && q.bits != 6) ||
+      (q.scale_mode == 6 && (((q.bits < 4 || q.bits > 6) && q.bits != 8) || q.bits != q.src_bits)))
+    fail("repack: Q6_K / EQ scales with an unexpected code width");
   if ((q.scale_mode == 2 && q.bits != 8) || (q.scale_mode == 3 && q.bits != 4 && q.bits != 5))
     fail("repack: native GGUF scales with an unexpected code width");
   // Per column pair: Q6_K a uint2 of int8 sub-scales per K step then half2
@@ -413,11 +482,13 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   // min) bytes per K step then half4 (d, dmin) per 256; affine half4 per group.
   const size_t pairs = size_t(Np) / 2;
   switch (q.scale_mode) {
-    case 1: q.sb = ga.alloc(pairs * KG * 8 + pairs * (q.in / 256) * 4); break;
-    case 2: q.sb = ga.alloc(pairs * (q.in / 32) * 4); break;
-    case 3: q.sb = ga.alloc(pairs * KG * 8 + pairs * (q.in / 256) * 8); break;
-    default: q.sb = ga.alloc(pairs * size_t(q.in / q.group) * 8);
+    case 1:
+    case 6: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 4; break;
+    case 2: q.sb_n = pairs * (q.in / 32) * 4; break;
+    case 3: q.sb_n = pairs * KG * 8 + pairs * (q.in / 256) * 8; break;
+    default: q.sb_n = pairs * size_t(q.in / q.group) * 8;
   }
+  q.sb = ga.alloc(q.sb_n);
   if (q.bits == 5 || q.bits == 6) {
     Buf codes = q.w;
     if (q.src_bits != 8) {
@@ -429,8 +500,10 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
       [e setBytes:&q.src_bits length:4 atIndex:3];
       [e dispatchThreads:MTLSizeMake(q.in, q.out, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    q.wr = ga.alloc(size_t(Np) * q.in / 2);
-    q.wh = ga.alloc(size_t(Np) * q.in * (q.bits - 4) / 8);
+    q.wr_n = size_t(Np) * q.in / 2;
+    q.wh_n = size_t(Np) * q.in * (q.bits - 4) / 8;
+    q.wr = ga.alloc(q.wr_n);
+    q.wh = ga.alloc(q.wh_n);
     [e setComputePipelineState:rt.kernel("repack_planes")];
     [e setBuffer:codes.b offset:codes.off atIndex:0];
     [e setBuffer:q.wr.b offset:q.wr.off atIndex:1];
@@ -442,7 +515,8 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
   } else if (q.bits == 2) {
     // The coarse MTP draft head: packed 2-bit codes, one uint4 per lane and K step.
     if (q.src_bits != 2) fail("repack: 2-bit layout expects packed 2-bit codes");
-    q.wr = ga.alloc(size_t(Np) * q.in / 4);
+    q.wr_n = size_t(Np) * q.in / 4;
+    q.wr = ga.alloc(q.wr_n);
     [e setComputePipelineState:rt.kernel("repack_weights2")];
     [e setBuffer:q.w.b offset:q.w.off atIndex:0];
     [e setBuffer:q.wr.b offset:q.wr.off atIndex:1];
@@ -451,7 +525,8 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     [e dispatchThreads:MTLSizeMake(size_t(Np / 32) * KG * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   } else if (q.bits == 4) {
     if (q.src_bits != 4) fail("repack: 4-bit layout expects nibble codes");
-    q.wr = ga.alloc(size_t(Np) * q.in / 8 * 4);
+    q.wr_n = size_t(Np) * q.in / 8 * 4;
+    q.wr = ga.alloc(q.wr_n);
     [e setComputePipelineState:rt.kernel("repack_weights")];
     [e setBuffer:q.w.b offset:q.w.off atIndex:0];
   } else {
@@ -465,7 +540,8 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
       [e setBytes:&q.src_bits length:4 atIndex:3];
       [e dispatchThreads:MTLSizeMake(q.in, q.out, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
-    q.wr = ga.alloc(size_t(Np) * q.in);
+    q.wr_n = size_t(Np) * q.in;
+    q.wr = ga.alloc(q.wr_n);
     [e setComputePipelineState:rt.kernel("repack_weights8")];
     [e setBuffer:codes.b offset:codes.off atIndex:0];
   }
@@ -475,8 +551,9 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     [e setBytes:&q.in length:4 atIndex:3];
     [e dispatchThreads:MTLSizeMake(size_t(Np / 32) * KG * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
-  if (q.scale_mode == 1 || q.scale_mode == 3) {
-    [e setComputePipelineState:rt.kernel(q.scale_mode == 1 ? "repack_q6k_scales" : "repack_kq_scales")];
+  if (sym16_mode(q.scale_mode) || q.scale_mode == 3) {
+    [e setComputePipelineState:rt.kernel(q.scale_mode == 3 ? "repack_kq_scales"
+                                         : q.scale_mode == 6 ? "repack_eq_scales" : "repack_q6k_scales")];
     [e setBuffer:q.s.b offset:q.s.off atIndex:0];
     [e setBuffer:q.z.b offset:q.z.off atIndex:1];
     [e setBuffer:q.sb.b offset:q.sb.off atIndex:2];
@@ -514,7 +591,8 @@ HW repack_dense(Runtime& rt, id<MTLComputeCommandEncoder> e, const Buf& host, in
   h.in = in;
   h.kp = (in + 63) / 64 * 64;
   const int Np = (out + 31) / 32 * 32;
-  h.wr = rt.arena->alloc(size_t(Np) * h.kp * 2);
+  h.wr_n = size_t(Np) * h.kp * 2;
+  h.wr = rt.arena->alloc(h.wr_n);
   [e setComputePipelineState:rt.kernel("repack_f16")];
   [e setBuffer:host.b offset:host.off atIndex:0];
   [e setBuffer:h.wr.b offset:h.wr.off atIndex:1];
@@ -525,7 +603,8 @@ HW repack_dense(Runtime& rt, id<MTLComputeCommandEncoder> e, const Buf& host, in
       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   if (bias) {
     if (bias->size() != size_t(out)) fail("dense bias size mismatch");
-    h.bias = rt.arena->copy(bias->data(), bias->size() * 4);
+    h.bias_n = bias->size() * 4;
+    h.bias = rt.arena->copy(bias->data(), h.bias_n);
     h.has_bias = true;
   }
   return h;

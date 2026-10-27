@@ -314,7 +314,7 @@ static inline void gemv_block_partial(device const half* arow, device const uint
       hw[0] = h.x, hw[1] = h.y;
     }
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (nb * 32 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (nb * 32 + fn) / 2, fm, s2, b2);
     float xv[8];
     UNROLL for (int jj = 0; jj < 8; ++jj) xv[jj] = float(arow[g * 64 + jj * 8 + fm]);
     UNROLL for (int jj = 0; jj < 8; ++jj) {
@@ -333,7 +333,7 @@ static inline void gemv_block_partial(device const half* arow, device const uint
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const float2 wv = float2(dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]));
+        const float2 wv = float2(dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]));
         acc[2 * j] = fma(xv[jj], wv.x, acc[2 * j]);
         acc[2 * j + 1] = fma(xv[jj], wv.y, acc[2 * j + 1]);
       }
@@ -1138,7 +1138,7 @@ kernel void moe_gemv8(
     if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
     if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     half2 av[8];
     UNROLL for (int jj = 0; jj < 8; ++jj)
       av[jj] = row_ok ? *((device const half2*)(arow + g * 64 + jj * 8 + fn)) : half2(0.0h);
@@ -1161,7 +1161,7 @@ kernel void moe_gemv8(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]);
         simdgroup_matrix<half, 8, 8> b;
         b.thread_elements()[0] = wv.x;
         b.thread_elements()[1] = wv.y;
@@ -1201,6 +1201,9 @@ kernel void moe_gemv8(
 // moe_gemm_bm: the same tile with BM = 16 or 32 rows (moe_gemm16* / moe_gemm32*, option moe_bm) for
 // passes of more than 8 rows. Kept separate from moe_gemv8 so the default kernel stays main's code
 // (templating moe_gemv8 on BM changed the generated code of the 8-row tile: 2048-row prefill +2 %).
+// EQ experts take these tiles too, as every other layout does (rather than staying on 8 rows): each
+// weight is dequantized as in moe_gemv8 and every fragment accumulates in moe_gemv8's order, so a
+// row's sums are the 8-row kernel's.
 template <int BITS, int EPI, int BM>
 kernel void moe_gemm_bm(
     device const half* A [[buffer(0)]],
@@ -1281,7 +1284,7 @@ kernel void moe_gemm_bm(
     if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
     if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     half2 av[FM][8];
     UNROLL for (int i = 0; i < FM; ++i)
       UNROLL for (int jj = 0; jj < 8; ++jj)
@@ -1307,7 +1310,7 @@ kernel void moe_gemm_bm(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]);
         simdgroup_matrix<half, 8, 8> b;
         b.thread_elements()[0] = wv.x;
         b.thread_elements()[1] = wv.y;
@@ -1431,31 +1434,37 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
     if (!PF) load_kstep<BITSX, WPL>(wp, hp, g, words, hw);
     if (PF && g + 1 < g_end) load_kstep<BITSX, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    float2 s4[4];  // EQ: one scale per column and lane for the K step (eq_kstep)
+    if (kEQS) eq_lane_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s4);
+    else kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     float xv[MM][8];
     UNROLL for (int m = 0; m < MM; ++m)
       UNROLL for (int jj = 0; jj < 8; ++jj)
         xv[m][jj] = m < rows ? float(arow[m][g * 64 + jj * 8 + fm]) : 0.0f;
-    UNROLL for (int jj = 0; jj < 8; ++jj) {
-      UNROLL for (int j = 0; j < 4; ++j) {
-        half2 q;
-        if (BITSX == 4) {
-          const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
-          q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
-        } else if (BITSX == 6 || BITSX == 5) {
-          const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
-          const uint h = BITSX == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
-                                    : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
-          q = as_type<half2>(x | (h << 4) | 0x64006400u);
-        } else {
-          const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
-          q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
-        }
-        const int gi = (jj * 8) / kGroup;
-        const float2 wv = float2(dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]));
-        UNROLL for (int m = 0; m < MM; ++m) {
-          acc[m * 8 + 2 * j] = fma(xv[m][jj], wv.x, acc[m * 8 + 2 * j]);
-          acc[m * 8 + 2 * j + 1] = fma(xv[m][jj], wv.y, acc[m * 8 + 2 * j + 1]);
+    if (kEQS) {
+      eq_kstep<BITSX, MM>(words, hw, s4, &xv[0][0], acc);
+    } else {
+      UNROLL for (int jj = 0; jj < 8; ++jj) {
+        UNROLL for (int j = 0; j < 4; ++j) {
+          half2 q;
+          if (BITSX == 4) {
+            const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
+            q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
+          } else if (BITSX == 6 || BITSX == 5) {
+            const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
+            const uint h = BITSX == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
+                                      : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+            q = as_type<half2>(x | (h << 4) | 0x64006400u);
+          } else {
+            const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
+            q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
+          }
+          const int gi = (jj * 8) / kGroup;
+          const float2 wv = float2(dequant_pair<BITSX>(q, s2[gi * 4 + j], b2[gi * 4 + j]));
+          UNROLL for (int m = 0; m < MM; ++m) {
+            acc[m * 8 + 2 * j] = fma(xv[m][jj], wv.x, acc[m * 8 + 2 * j]);
+            acc[m * 8 + 2 * j + 1] = fma(xv[m][jj], wv.y, acc[m * 8 + 2 * j + 1]);
+          }
         }
       }
     }
@@ -1660,6 +1669,16 @@ INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv6_", 6)
+// EQ (one layout for every width): a wider EQ shared expert, suffix _s5 / _s6.
+#define INSTANTIATE_MOE_GEMV_SX(PRE, BITS, SB, S)                                              \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 8, 0, S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 8, 0, S)             \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 4, 0, "_k4" S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 4, 0, "_k4" S) \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 2, 0, "_k2" S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 2, 0, "_k2" S) \
+  INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 8, "_route" S) INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 4, "_route_k4" S) \
+  INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 2, "_route_k2" S)
+INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 5, "_s5")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 6, "_s6")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv5_", 5, 6, "_s6")
 // Fase 3 (option moe_pf): the single-row kernels with two K steps' loads in
 // flight per simdgroup (moe_kloop PF 1): `_pf` after the K-slice suffix.
 #define INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, KS, DIAG, TAG)                                \
@@ -1700,6 +1719,9 @@ INSTANTIATE_MOE_GEMV_PF("moe_gemv8_", 8, 8, "")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 8, "_s8")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 8, "_s8")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv6_", 6, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 5, "_s5")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 6, "_s6")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 6, "_s6")
 
 struct MoeCombineParams {
   int D;
@@ -1998,3 +2020,10 @@ INSTANTIATE_DOWN_COMB_B(8)
 INSTANTIATE_DOWN_COMB_S8(4)
 INSTANTIATE_DOWN_COMB_S8(5)
 INSTANTIATE_DOWN_COMB_S8(6)
+// EQ: a wider EQ5 / EQ6 shared expert beside narrower routed experts.
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s5", 4, 5, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s5", 4, 5, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s6", 4, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s6", 4, 6, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb5_k1_s6", 5, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb5_k2_s6", 5, 6, 2)

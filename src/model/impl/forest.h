@@ -373,15 +373,22 @@ inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<
 // The shared expert of MoE layer L as one more expert tile of the grouped
 // GEMVs: 1 on every GEMV-sized pass (the experts' widths and layouts), 2 on
 // the 1-2-row FMA kernels only (an 8-bit shared expert beside 4/5/6-bit
-// experts, the _s8 kernels), 0 never: its own GEMMs (another layout, e.g. a
-// Q8_0 shared expert beside Q6_K experts: a kernel takes one layout's
+// experts, the _s8 kernels; in EQ's one layout, a wider EQ5 / EQ6 shared
+// expert, the _s5 / _s6 kernels), 0 never: its own GEMMs (another layout,
+// e.g. a Q8_0 shared expert beside Q6_K experts: a kernel takes one layout's
 // function constants; or another width on both projections).
 inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
   if (L.gate_up.q.fc() != L.experts_gu.fc() || L.down.q.fc() != L.experts_down.fc()) return 0;
   if (L.gate_up.q.bits == L.experts_gu.bits && L.down.q.bits == L.experts_down.bits) return 1;
   // Per matrix: GGUF experts mix widths (Q4_K gate/up beside a Q5_1 or Q8_0 down).
-  auto s8_ok = [](const QW& sh, const QW& ex) { return sh.bits == ex.bits || (sh.bits == 8 && ex.bits >= 4 && ex.bits <= 6); };
+  // EQ (one layout for every width) also has a wider EQ5 / EQ6 shared expert
+  // beside narrower routed experts (the _s5 / _s6 kernels; EQ8: _s8), e.g.
+  // EQ4 gate/up and EQ5 down experts with an EQ6 shared expert.
+  auto s8_ok = [](const QW& sh, const QW& ex) {
+    if (sh.bits == ex.bits || (sh.bits == 8 && ex.bits >= 4 && ex.bits <= 6)) return true;
+    return eq_mode(ex.scale_mode) && ex.bits >= 4 && sh.bits > ex.bits && sh.bits <= 6;
+  };
   return s8_ok(L.gate_up.q, L.experts_gu) && s8_ok(L.down.q, L.experts_down) ? 2 : 0;
 }
 
@@ -494,7 +501,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   bool route_in_gemv = false;
   bool sort_folded = false;  // fuse_sort: the >8-row route's moe_topk also wrote the tile table
   // Rows per expert tile of the MMA kernel on a pass without the expert cache
-  // (the pooled passes' staged records need the 8-row kernel; see `bm` below).
+  // (the pooled passes' staged records need the 8-row kernel; see `bm` below);
+  // EQ experts too (moe_gemm_bm reads every EQ layout; a row's sums are the 8-row kernel's).
   // The wide tiles pay only once an expert holds tens of rows (moe_bm_rows); below that, and on
   // the 16-row step, the half-empty fragments and the halved tile count cost more than the
   // weight re-reads they save (M4 Max: 512 rows +3.1 %, 16-row step +24 %; 2048 rows -1.4 %).

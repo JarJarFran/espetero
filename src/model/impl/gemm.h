@@ -356,7 +356,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
   // 6-bit matrix's tuned tile.
   QW w8;
   size_t widen_bytes = 0;
-  if (M > 8 && w.bits == 6 && T.widen6_m > 0 && M >= T.widen6_m) {
+  if (M > 8 && w.bits == 6 && w.scale_mode != 6 && T.widen6_m > 0 && M >= T.widen6_m) {  // (not EQ6: EQ's 8 bits are EQ8)
     const int Np = (w.out + 31) / 32 * 32;
     widen_bytes = size_t(Np) * size_t(w.in);
     T.ensure_widen(E.rt, widen_bytes);
@@ -563,6 +563,7 @@ inline std::string tune_key(const QW* w) {
   if (w->bits != 4) k += "q" + std::to_string(w->bits);
   if (w->group != 64) k += "g" + std::to_string(w->group);
   if (w->scale_mode == 1) k += "q6k";
+  else if (w->scale_mode == 6) k += "eq";
   else if (w->scale_mode) k += "m" + std::to_string(w->scale_mode);
   return k;
 }
