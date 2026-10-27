@@ -19,6 +19,19 @@
 // Qwen2 / Llama-3 use \p{L}+ in 2 and [^\s\p{L}\p{N}] in 4 (marks are symbols);
 // LFM2's pattern is Llama-3's (pretok.cpp).
 // Every code point can start one of 2, 3, 4 or 7, so the pieces tile the input.
+//
+// Spark-X2.5 / X2.6 (DeepSeek-V3 style) is a sequence: Split(\p{N}{1,3}),
+// Split([一-龥぀-ゟ゠-ヿ]+), Split(the pattern below), Digits(individual), all
+// Isolated. Every \p{N} character ends up a piece of its own and CJK runs
+// (U+4E00..9FA5, U+3040..30FF) are pieces; the text between them (a segment:
+// the regex sees its end as the end of the input) is split by
+//   a  [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+    ASCII punctuation + ASCII letters
+//   b  [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+               one optional prefix char + a letter run
+//   c   ?[\p{P}\p{S}]+                                 optional space + punctuation / symbol run
+//   d  [\r\n]                                         one CR or LF
+//   e  \s+(?!\S);  f  \s+
+// and characters no alternative matches (controls, format characters) are
+// pieces of their own runs (the gaps between matches).
 #pragma once
 
 #include <cstddef>
@@ -28,10 +41,11 @@
 #include <vector>
 
 #include "unicode.h"
+#include "unicode_ps.h"
 
 namespace espetero::tok {
 
-enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3, kDeepSeekV3, kLfm2 };  // kLfm2 splits as kLlama3
+enum class SplitPattern : uint8_t { kQwen2, kQwen35, kLlama3, kDeepSeekV3, kLfm2, kSpark };  // kLfm2 splits as kLlama3
 
 // Exact pattern strings as they appear in tokenizer.json.
 std::optional<SplitPattern> split_pattern_from_regex(std::string_view regex);
@@ -46,6 +60,7 @@ class PieceSplitter {
         b_(p_),
         e_(p_ + s.size()),
         marks_are_letters_(pat == SplitPattern::kQwen35),
+        spark_(pat == SplitPattern::kSpark),
         max_digits_(pat == SplitPattern::kLlama3 || pat == SplitPattern::kLfm2 ? 3 : 1) {}
 
   // Yields the next piece as byte offsets [begin, end) into s; false at the end.
@@ -110,7 +125,76 @@ class PieceSplitter {
     }
   }
 
+  static bool cjk(uint32_t cp) { return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF); }
+  static bool ps(const Ch& c) { return c.cls == ucd::kOther && c.cp != kInvalidCp && ucd::is_punct_symbol(c.cp); }
+  static bool ascii_punct(uint32_t cp) {
+    return (cp >= '!' && cp <= '/') || (cp >= ':' && cp <= '@') || (cp >= '[' && cp <= '`') || (cp >= '{' && cp <= '~');
+  }
+  static bool ascii_alpha(uint32_t cp) { return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z'); }
+  static bool letter_mark(const Ch& c) { return c.cls == ucd::kLetter || c.cls == ucd::kMark; }
+
+  // Spark: the alternatives a-f at p within a segment ending at se (nullptr: none matches).
+  const unsigned char* spark_alt(const unsigned char* p, const unsigned char* se) const {
+    const Ch c = at(p);
+    const unsigned char* after = p + c.len;
+    auto run = [&](const unsigned char* q, auto pred) {
+      while (q < se) {
+        const Ch d = at(q);
+        if (!pred(d)) break;
+        q += d.len;
+      }
+      return q;
+    };
+    if (ascii_punct(c.cp) && after < se && ascii_alpha(*after))  // a
+      return run(after, [](const Ch& d) { return d.cp < 0x80 && ascii_alpha(d.cp); });
+    const bool prefix = !crlf(c.cp) && c.cls != ucd::kLetter && !ps(c);
+    if (prefix && after < se && letter_mark(at(after))) return run(after, letter_mark);  // b with its prefix
+    if (letter_mark(c)) return run(after, letter_mark);                                // b
+    if (ps(c)) return run(after, ps);                                                   // c
+    if (c.cp == ' ' && after < se && ps(at(after))) return run(after, ps);              // c with the space
+    if (crlf(c.cp)) return after;                                                       // d
+    if (c.cls == ucd::kSpace) {                                                         // e, f
+      const unsigned char* last_start = p;
+      const unsigned char* q = after;
+      while (q < se) {
+        const Ch d = at(q);
+        if (d.cls != ucd::kSpace) break;
+        last_start = q;
+        q += d.len;
+      }
+      if (q == se || last_start == p) return q;
+      return last_start;
+    }
+    return nullptr;
+  }
+
+  const unsigned char* spark_match(const unsigned char* p) const {
+    const Ch c = at(p);
+    if (c.cls == ucd::kNumber) return p + c.len;  // Digits(individual)
+    auto boundary = [&](const Ch& d) { return d.cls == ucd::kNumber || cjk(d.cp); };
+    if (cjk(c.cp)) {
+      const unsigned char* q = p + c.len;
+      while (q < e_) {
+        const Ch d = at(q);
+        if (!cjk(d.cp)) break;
+        q += d.len;
+      }
+      return q;
+    }
+    const unsigned char* se = p + c.len;  // the segment's end: the next digit or CJK character
+    while (se < e_) {
+      const Ch d = at(se);
+      if (boundary(d)) break;
+      se += d.len;
+    }
+    if (const unsigned char* q = spark_alt(p, se)) return q;
+    const unsigned char* q = p + c.len;  // a gap: up to the next position where an alternative matches
+    while (q < se && !spark_alt(q, se)) q += at(q).len;
+    return q;
+  }
+
   const unsigned char* match(const unsigned char* p) const {
+    if (spark_) return spark_match(p);
     const Ch c = at(p);
     const unsigned char* after = p + c.len;
     // 1. contractions
@@ -164,6 +248,7 @@ class PieceSplitter {
   const unsigned char* b_;
   const unsigned char* e_;
   bool marks_are_letters_;
+  bool spark_;
   int max_digits_;
 };
 

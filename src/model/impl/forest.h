@@ -159,6 +159,7 @@ inline void ensure_scratch(Model& m, int rows, int readouts) {
     s.h = f(size_t(R) * size_t(c.D));
     s.xn = hf(size_t(R) * size_t(c.D));
     s.proj = f(size_t(R) * size_t(c.proj_ld()));
+    if (c.spark) s.sp_rope = f(size_t(R) * size_t(c.rot / 2 + c.rot_g / 2) * 2);
     s.qo = hf(size_t(R) * size_t(c.C()));
     s.gb = f(size_t(R) * 2 * size_t(c.Hv));
     s.y = f(size_t(R) * size_t(c.Vd()));
@@ -2546,7 +2547,13 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     // Single-row trees take g4_attention_dec (one threadgroup per KV head, all its query heads).
     const bool g4dec = g4_dec(m, trees.size(), [&](size_t i) { return trees[i].M; });
     g4_plan_tiles(g4g, c.Hkv_g * (g4dec && g4_geom(c, false).G <= 8 ? 1 : g4_geom(c, false).split), m.attn_split, 0, pos);
-    g4_plan_tiles(g4s, c.Hkv, m.attn_split, c.window, pos);
+    // Sliding layers: their span is at most the window; ESPETERO_SWA_SPLIT sets
+    // their split-K tile (default attn_split; 0: one tile per row group).
+    static const int swa_split = [] {
+      const char* e = std::getenv("ESPETERO_SWA_SPLIT");
+      return e && *e ? std::atoi(e) : -1;
+    }();
+    g4_plan_tiles(g4s, c.Hkv, swa_split >= 0 ? swa_split : m.attn_split, c.window, pos);
     upload(meta.a_trees, g4g.trees);
     upload(meta.a_tiles, g4g.tiles);
     upload(meta.a_comb, g4g.combine);
@@ -2643,7 +2650,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     E.threads(MTLSizeMake(size_t(c.D / 8), size_t(M), 1), MTLSizeMake(size_t(std::min(c.D / 8, 256)), 1, 1));
   }
   if (n_patch && !c.gemma) encode_vision(m, E, n_patch, s.h);
-  if (c.gemma) {  // Gemma 4: embeddings times sqrt(D); the soft tokens are written after it
+  if (c.gemma && !c.spark) {  // Gemma 4: embeddings times sqrt(D); the soft tokens are written after it
     const uint32_t n4 = uint32_t(size_t(M) * size_t(c.D) / 4);
     E.pipe("g4_scale_rows");
     E.set(0, s.h);

@@ -38,13 +38,22 @@ static inline bool eqc_on() { return (kScaleMode == 7 && BITS == 4) || (kScaleMo
 template <int BITS>
 static inline half sym_bias() { return half(1024 + (BITS == 8 && !kEQS ? 32 : 1 << (BITS - 1))); }
 // Gate of the gated epilogues (EPI_SWIGLU): constant 2 = 1 is the
-// tanh-approximated GELU of Gemma 4's GeGLU; undefined (every SwiGLU matrix:
-// the host sets it only for GELU gates) is SiLU, so those pipelines compile as
-// before.
+// tanh-approximated GELU of Gemma 4's GeGLU, 2 the exact (erf) GELU of
+// Spark's; undefined (every SwiGLU matrix: the host sets it only for GELU
+// gates) is SiLU, so those pipelines compile as before.
 constant int kAct [[function_constant(2)]];
 constant int kActV = is_function_constant_defined(kAct) ? kAct : 0;
+// erf with |error| < 1.5e-7 (Abramowitz & Stegun 7.1.26).
+static inline float glu_erf(float x) {
+  const float ax = fabs(x);
+  const float t = 1.0f / (1.0f + 0.3275911f * ax);
+  const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t +
+                          0.254829592f) * t * exp(-ax * ax);
+  return copysign(y, x);
+}
 static inline float glu_gate(float x) {
   if (kActV == 1) return 0.5f * x * (1.0f + precise::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+  if (kActV == 2) return 0.5f * x * (1.0f + glu_erf(x * 0.70710678118654752f));
   return silu(x);
 }
 
@@ -2184,6 +2193,7 @@ constant constexpr int HEPI_GELU_TANH = 2;  // fp16 = gelu_tanh(acc + bias)
 constant constexpr int HEPI_GELU_ERF = 3;   // fp16 = gelu(acc + bias)
 constant constexpr int HEPI_SWIGLU = 4;     // fp16 [M, N/2], gate/up interleaved in blocks of 8
 constant constexpr int HEPI_GEGLU = 5;      // as HEPI_SWIGLU with a tanh-GELU gate (Gemma 4)
+constant constexpr int HEPI_GEGLU_ERF = 6;  // as HEPI_SWIGLU with an exact-GELU gate (Spark)
 
 // erf with |error| < 1.5e-7 (Abramowitz & Stegun 7.1.26).
 static inline float erf_as(float x) {
@@ -2284,7 +2294,7 @@ kernel void hgemm(
   UNROLL for (int i = 0; i < FM; ++i) {
     const int row = m0 + i * 8 + fm;
     if (row >= p.M) continue;
-    if (EPI == HEPI_SWIGLU || EPI == HEPI_GEGLU) {
+    if (EPI == HEPI_SWIGLU || EPI == HEPI_GEGLU || EPI == HEPI_GEGLU_ERF) {
       device half* y = (device half*)Yv + ulong(row) * p.ldy;
       UNROLL for (int j = 0; j < 4; j += 2) {
         const int col = n0 + j * 8;
@@ -2295,6 +2305,7 @@ kernel void hgemm(
         const float u0 = acc[i][j + 1].thread_elements()[0];
         const float u1 = acc[i][j + 1].thread_elements()[1];
         if (EPI == HEPI_GEGLU) *((device half2*)(y + out)) = half2(half(gelu_tanh(g0) * u0), half(gelu_tanh(g1) * u1));
+        else if (EPI == HEPI_GEGLU_ERF) *((device half2*)(y + out)) = half2(half(gelu_erf(g0) * u0), half(gelu_erf(g1) * u1));
         else *((device half2*)(y + out)) = half2(half(silu(g0) * u0), half(silu(g1) * u1));
       }
       continue;
@@ -2344,6 +2355,9 @@ kernel void hgemm(
       device const half*, device const uint4*, device const float*, device void*,    \
       constant HGemmParams&, uint3, uint, uint, uint);                               \
   template [[host_name("hgemm_" TAG "_geglu")]] kernel void hgemm<BM, WN, 5, WL>(    \
+      device const half*, device const uint4*, device const float*, device void*,    \
+      constant HGemmParams&, uint3, uint, uint, uint);                               \
+  template [[host_name("hgemm_" TAG "_geglu_erf")]] kernel void hgemm<BM, WN, 6, WL>( \
       device const half*, device const uint4*, device const float*, device void*,    \
       constant HGemmParams&, uint3, uint, uint, uint);
 

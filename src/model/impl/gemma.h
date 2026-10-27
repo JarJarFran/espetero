@@ -50,6 +50,14 @@ struct G4MoeOutParamsHost {
 struct G4RouteParamsHost {
   int32_t E, k, build, pad;
 };
+struct SpPrepParamsHost {
+  int32_t H, Hkv, ld, k_off, v_off, q_ld, kv_ld;
+  float scale;
+  int32_t rope_off, rope_ld;
+};
+struct SpGateParamsHost {
+  int32_t q_ld, D, hd, pad;
+};
 
 // The attention work of one layer kind over the pass's trees.
 struct G4Plan {
@@ -113,6 +121,7 @@ struct G4Geom {
 };
 inline G4Geom g4_geom(const Config& c, bool sliding) {
   G4Geom g;
+  if (c.spark) sliding = true;  // Spark: both layer kinds have the sliding layers' 256-dim geometry
   g.hd = sliding ? c.HD : c.HDg;
   g.hkv = sliding ? c.Hkv : c.Hkv_g;
   g.G = c.H / g.hkv;
@@ -280,7 +289,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     } else {
       gemm(E, m.tune, L.gate, X, 0, c.D, s.g32, 0, L.I, rows, 0);
       gemm(E, m.tune, L.up, X, 0, c.D, s.u32, 0, L.I, rows, 0);
-      E.pipe("geglu_f32");
+      E.pipe(c.spark ? "geglu_erf_f32" : "geglu_f32");
       E.set(0, s.g32);
       E.set(1, s.u32);
       E.set(2, act);
@@ -389,6 +398,18 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     grouped(L.experts_down, z.act, c.Ie, 0, z.ys, c.D, c.D, 0);
   };
 
+  const int sp_nf = c.rot / 2 + c.rot_g / 2;
+  if (c.spark) {  // the RoPE (cos, sin) of every row, once per pass for all 36 layers
+    const int32_t nr[2] = {c.rot / 2, sp_nf};
+    E.pipe("sp_rope_table");
+    E.set(0, P.pos);
+    E.set(1, m.inv_freq);
+    E.set(2, m.inv_freq_g);
+    E.set(3, s.sp_rope);
+    E.bytes(4, nr);
+    E.wr(s.sp_rope);
+    E.threads(MTLSizeMake(size_t(sp_nf), size_t(M), 1), MTLSizeMake(size_t(std::min(sp_nf, 256)), 1, 1));
+  }
   rmsnorm(s.h, m.layers[0].in_norm, s.xn, M);
   for (int li = 0; li < c.L; ++li) {
     const Layer& L = m.layers[size_t(li)];
@@ -399,7 +420,24 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     const int k = L.index_in_kind;
     tap_rows(m, E, li, 0, s.xn, M, c.D);  // ActivationSink::kAttnIn
     gemm_runs(E, m.tune, L.in_proj, s.xn, 0, c.D, s.proj, 0, ld, M, 0);
-    {
+    if (c.spark) {
+      const int rot = sw ? c.rot : c.rot_g;
+      const SpPrepParamsHost pp{c.H, g.hkv, ld, qd, qd + kvd, qd, kvd, float(1.0 / std::sqrt(double(g.hd))),
+                                sw ? 0 : c.rot / 2, sp_nf};
+      E.pipe("sp_attn_prep" + std::to_string(rot));
+      E.set(0, s.proj);
+      E.set(1, s.sp_rope);
+      E.rd(s.sp_rope);
+      E.set(3, s.Q);
+      E.set(4, s.Kb);
+      E.set(5, s.Vb);
+      E.bytes(6, pp);
+      E.rd(s.proj);
+      E.wr(s.Q);
+      E.wr(s.Kb);
+      E.wr(s.Vb);
+      E.groups(MTLSizeMake(size_t(c.H + 2 * g.hkv + 3) / 4, size_t(M), 1), MTLSizeMake(128, 1, 1));
+    } else {
       const G4PrepParamsHost pp{c.H, g.hkv, ld, qd, has_v ? qd + kvd : qd, qd, kvd, c.eps};
       E.pipe(sw ? "g4_attn_prep256" : "g4_attn_prep512");
       E.set(0, s.proj);
@@ -419,6 +457,18 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     }
     attention(sw, k);
     kv_save(sw, k);
+    if (c.spark) {  // O *= sigmoid(x g_proj^T) per query head (x: the layer input s.xn)
+      const SpGateParamsHost gp{qd, c.D, g.hd, 0};
+      E.pipe("sp_head_gate");
+      E.set(0, s.O);
+      E.set(1, s.xn);
+      E.set(2, L.head_gate);
+      E.bytes(3, gp);
+      E.rd(s.xn);
+      E.rd(s.O);
+      E.wr(s.O);
+      E.groups(MTLSizeMake(size_t(c.H), size_t(M), 1), MTLSizeMake(256, 1, 1));
+    }
     // The last layer of a pruned pass continues with the rows read out only.
     const bool last = li == c.L - 1 && P.prune;
     int rows = M;
@@ -431,7 +481,20 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     }
     tap_rows(m, E, li, 1, Ob, rows, qd);  // ActivationSink::kMixOut
     gemm(E, m.tune, L.out, Ob, 0, qd, s.proj, 0, c.D, rows, 0);
-    {
+    if (c.spark) {  // h += o, x = rmsnorm(h) * post_attention_layernorm
+      const G4NormParamsHost np{c.D, c.eps, 1.0f, 1};
+      E.pipe("sp_add_norm");
+      E.set(0, s.proj);
+      E.set(1, Hb);
+      E.set(2, L.post_norm);
+      E.set(3, Xb);
+      E.bytes(4, np);
+      E.rd(s.proj);
+      E.rd(Hb);
+      E.wr(Hb);
+      E.wr(Xb);
+      E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
+    } else {
       const G4NormParamsHost np{c.D, c.eps, 1.0f, L.moe ? 3 : 1};
       E.pipe("g4_post_attn");
       E.set(0, s.proj);
@@ -456,8 +519,21 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     }
     mlp(L, Xb, Ab, s.proj, rows);
     const bool next = li + 1 < c.L && !last;
-    const Buf& w_next = next ? m.layers[size_t(li + 1)].in_norm : L.post_ffn;
-    if (L.moe) {
+    const Buf& w_next = next ? m.layers[size_t(li + 1)].in_norm : (c.spark ? L.post_norm : L.post_ffn);
+    if (c.spark) {  // h += mlp, x = rmsnorm(h) * the next layer's input_layernorm
+      const G4NormParamsHost np{c.D, c.eps, 1.0f, next ? 1 : 0};
+      E.pipe("sp_add_norm");
+      E.set(0, s.proj);
+      E.set(1, Hb);
+      E.set(2, w_next);
+      E.set(3, s.xn);
+      E.bytes(4, np);
+      E.rd(s.proj);
+      E.rd(Hb);
+      E.wr(Hb);
+      if (next) E.wr(s.xn);
+      E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
+    } else if (L.moe) {
       experts(L, s.g_xn2, s.g_xr, rows);
       MoeScratch& z = m.mz;
       const G4MoeOutParamsHost op{c.D, c.k, c.eps, L.scalar, next ? 1 : 0};
@@ -508,6 +584,11 @@ inline void g4_pipelines(const Model& m, std::vector<std::pair<std::string, int>
   for (const char* k : {"g4_scale_rows", "softcap_rows", "g4_attn_prep256", "g4_attn_prep512", "g4_post_attn", "g4_post_ffn",
                         "g4_attention_combine256", "g4_attention_combine512", "kv_save", "kv_copy_blocks", "geglu_f32"})
     out.push_back({k, 0});
+  if (c.spark) {
+    for (const char* k : {"sp_rope_table", "sp_head_gate", "sp_add_norm", "geglu_erf_f32"}) out.push_back({k, 0});
+    out.push_back({"sp_attn_prep" + std::to_string(c.rot), 0});
+    out.push_back({"sp_attn_prep" + std::to_string(c.rot_g), 0});
+  }
   out.push_back({g4_geom(c, true).kernel, 0});
   out.push_back({g4_geom(c, false).kernel, 0});
   for (bool sliding : {true, false}) {

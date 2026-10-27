@@ -845,6 +845,13 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   }
   SafetensorsSource src(path);
   if (const std::string other = family::mlx_check(path, src.config()); !other.empty()) fail(other);
+  if (is_spark_type(src.config().get_string("model_type", ""))) {  // Spark-X2.5 / X2.6: HF, MLX or EQ (model.* names)
+    if (!mtp.empty() && mtp != "none") fail("--mtp: Spark has no drafting head (prompt lookup drafts only)");
+    m.format = src.config().get("quantization") ? "mlx" : "hf";
+    m.cfg = config_from_spark(src.config());
+    load_spark(m, src);
+    return;
+  }
   {  // Gemma 4 (no drafting head), with its vision tower when the checkpoint has one
     const json::Value& cfg = src.config();
     const json::Value* tc = cfg.get("text_config");

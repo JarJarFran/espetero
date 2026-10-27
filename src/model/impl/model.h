@@ -70,6 +70,7 @@ struct Layer {
   Mat out;
   Buf conv_w, a_log, dt_bias, gnorm;
   Buf q_norm, k_norm;
+  Buf head_gate;  // Spark: g_proj, fp16 [H][D] row-major (sp_head_gate computes its dots)
   int index_in_kind = 0;  // index among full or linear layers
   // Qwen4-Exp: the two hyper-connection blocks (token mixer, MoE) and the
   // sparse-attention indexer ([q 4 x 128 | k 128] rows, zero-centred norms + 1).
@@ -427,6 +428,7 @@ struct Scratch {
   id<MTLBuffer> g_xn2, g_xr;           // Gemma 4 MoE layers: the experts' and the router's normalized rows (fp16 [rows, D])
   id<MTLBuffer> tokens, h, xn, proj, qo, gb, y, yn;
   id<MTLBuffer> Q, Kb, Vb, O, act;
+  id<MTLBuffer> sp_rope;  // Spark: (cos, sin) of every row's RoPE angles, both layer kinds ([rows][rot / 2 + rot_g / 2])
   id<MTLBuffer> hc, xc, mixc, actc;  // last-layer rows actually scored
   id<MTLBuffer> g32, u32;            // split gate/up outputs (fp32 [rows, I])
   id<MTLBuffer> hn, logits, lse, argmax, cand_out;

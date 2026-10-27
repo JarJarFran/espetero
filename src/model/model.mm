@@ -446,7 +446,7 @@ class MetalModel final : public NativeModel {
     I.end_ids = m.cfg.eos_ids;  // Gemma 4: <eos>, <turn|>, <|tool_response>
     if (m.cfg.q3moe) I.family = "qwen3_omni_moe";
     if (m.cfg.gemma) {
-      I.family = "gemma4";
+      I.family = m.cfg.spark ? "spark2_5" : "gemma4";
       I.kv_heads = c.Hkv_g;  // the paged pool's (global layers'); the sliding layers' rings are slot state
     }
     if (m.cfg.lfm2) I.family = "lfm2";

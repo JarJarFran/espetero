@@ -54,6 +54,7 @@ std::string_view split_pattern_name(SplitPattern p) {
     case SplitPattern::kLlama3: return "llama3";
     case SplitPattern::kDeepSeekV3: return "deepseek-v3";
     case SplitPattern::kLfm2: return "lfm2";
+    case SplitPattern::kSpark: return "spark";
   }
   return "?";
 }

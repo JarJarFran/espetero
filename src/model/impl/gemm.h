@@ -438,11 +438,12 @@ inline HTile hgemm_tile(int M, int N) {
 }
 
 // Dense fp16 GEMM: 0 store fp32, 1 add fp32, 2 gelu_tanh fp16, 3 gelu_erf
-// fp16, 4 SwiGLU fp16, 5 GeGLU fp16; the bias is applied when the matrix has one.
+// fp16, 4 SwiGLU fp16, 5 GeGLU fp16, 6 exact-GELU GeGLU fp16; the bias is
+// applied when the matrix has one.
 inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, id<MTLBuffer> Y, size_t yoff,
                    int ldy, int M, int epi) {
   if (M <= 0) return;
-  static const char* suffix[6] = {"store", "add", "gelu_tanh", "gelu_erf", "swiglu", "geglu"};
+  static const char* suffix[7] = {"store", "add", "gelu_tanh", "gelu_erf", "swiglu", "geglu", "geglu_erf"};
   const HTile t = hgemm_tile(M, w.out);
   struct {
     int M, N, K, lda, ldy, has_bias;
@@ -457,7 +458,7 @@ inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, i
   E.set(4, Y, yoff);
   E.bytes(5, p);
   const size_t elt = (epi == 0 || epi == 1) ? 4 : 2;
-  const int ncols = (epi == 4 || epi == 5) ? w.out / 2 : w.out;
+  const int ncols = (epi == 4 || epi == 5 || epi == 6) ? w.out / 2 : w.out;
   E.rd(A, aoff, aoff + (size_t(M - 1) * size_t(lda) + size_t(w.kp)) * 2);
   E.wr(Y, yoff, yoff + (size_t(M - 1) * size_t(ldy) + size_t(ncols)) * elt);
   E.groups(MTLSizeMake(size_t(M + t.bm - 1) / size_t(t.bm), size_t(w.out + t.bn - 1) / size_t(t.bn), 1),
@@ -471,7 +472,7 @@ inline void gemm(Enc& E, Tuner& T, const Mat& m, id<MTLBuffer> A, size_t aoff, i
   if (m.dense) {
     if (nin || nout) fail("fused norm on a dense matrix");
     if (so) *so = SplitOut{};
-    gemm_h(E, m.d, A, aoff, lda, Y, yoff, ldy, M, epi == 2 ? (m.d.act == 1 ? 5 : 4) : epi);
+    gemm_h(E, m.d, A, aoff, lda, Y, yoff, ldy, M, epi == 2 ? (m.d.act == 1 ? 5 : m.d.act == 2 ? 6 : 4) : epi);
   } else {
     gemm_q(E, T, m.q, A, aoff, lda, Y, yoff, ldy, M, epi, n_cols, nin, nout, so);
   }
@@ -521,7 +522,8 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
   if (m.out() <= 0) return;
   if (m.dense) {
     for (const char* t : {"8x8", "16x4", "32x4"})
-      for (const char* e : {"store", "add", m.d.act == 1 ? "geglu" : "swiglu"}) out.push_back({std::string("hgemm_") + t + "_" + e, 0});
+      for (const char* e : {"store", "add", m.d.act == 1 ? "geglu" : m.d.act == 2 ? "geglu_erf" : "swiglu"})
+        out.push_back({std::string("hgemm_") + t + "_" + e, 0});
     return;
   }
   const QW& w = m.q;

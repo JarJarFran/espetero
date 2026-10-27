@@ -169,11 +169,25 @@ class Sink : public ActivationSink {
     tied_ = cfg.get_bool("tie_word_embeddings", tc.get_bool("tie_word_embeddings", false));
     mlp_in_.resize(size_t(L));
     lm_ = o.layer_hi >= L;
+    spark_ = cfg.get_string("model_type", "") == "spark2_5";
   }
 
   void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids, const int32_t* pos,
            int k) override {
     if (layer < o_.layer_lo || layer >= o_.layer_hi) return;
+    if (spark_) {  // spark2_5: HF names (model.*), fused q_k_v_proj beside g_proj
+      const std::string P = "model.layers." + std::to_string(layer) + ".";
+      std::vector<float> X(static_cast<size_t>(n) * size_t(width));
+      to_f32(rows, X.data(), X.size());
+      switch (kind) {
+        case kAttnIn: add(P + "self_attn.q_k_v_proj", X, n, width, {P + "self_attn.g_proj"}); break;
+        case kMixOut: add(P + "self_attn.out_proj", X, n, width, {}); break;
+        case kMlpIn: add(P + "mlp.gate_proj", X, n, width, {P + "mlp.up_proj"}); break;
+        case kDownIn: add(P + "mlp.down_proj", X, n, width, {}); break;
+        default: fail("calibration: unknown tap kind " + std::to_string(kind));
+      }
+      return;
+    }
     const std::string P = "language_model.model.layers." + std::to_string(layer) + ".";
     const bool lin = linear_.at(size_t(layer));
     // kExpertIn: one row per routed pair (n * k rows)
@@ -205,7 +219,8 @@ class Sink : public ActivationSink {
   void lm(const float* hid, int n, int D) {
     if (!lm_) return;
     std::vector<float> X(hid, hid + size_t(n) * size_t(D));
-    add(tied_ ? "language_model.model.embed_tokens" : "language_model.lm_head", X, n, D, {});
+    if (spark_) add(tied_ ? "model.embedding" : "lm_head", X, n, D, {});
+    else add(tied_ ? "language_model.model.embed_tokens" : "language_model.lm_head", X, n, D, {});
   }
 
   void save(const std::string& path, int64_t tokens) {
@@ -336,7 +351,7 @@ class Sink : public ActivationSink {
 
   const CaptureOptions& o_;
   std::vector<bool> linear_;
-  bool moe_ = false, tied_ = false;
+  bool moe_ = false, tied_ = false, spark_ = false;
   int nexp_ = 0;
   std::map<std::string, Dense> dense_;
   std::map<std::string, Experts> experts_;

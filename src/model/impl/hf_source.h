@@ -42,6 +42,7 @@ class HFSource : public WeightSource {
     const json::Value* tc = cfg.get("text_config");
     const json::Value& t = tc && tc->is_object() ? *tc : cfg;
     tied_ = cfg.get_bool("tie_word_embeddings", t.get_bool("tie_word_embeddings", false));
+    spark_ = cfg.get_string("model_type", "") == "spark2_5";
     static const std::regex fused(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$)");
     static const std::regex single(R"(^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$)");
     static const std::regex g4fused(R"(^model\.language_model\.layers\.(\d+)\.experts\.(gate_up_proj|down_proj)$)");
@@ -88,7 +89,7 @@ class HFSource : public WeightSource {
         if (s.empty()) fail(dir + ": " + key + " misses an expert");
       map_[key] = {v[0], Kind::Stack};
     }
-    if (tied_) map_.erase("language_model.lm_head.weight");
+    if (tied_) map_.erase(spark_ ? "lm_head.weight" : "language_model.lm_head.weight");
   }
 
   // The HF layout this source reads: Qwen3.5-family tensors under model.language_model.
@@ -211,7 +212,8 @@ class HFSource : public WeightSource {
       if (ends_with(n, s)) return true;
     return false;
   }
-  static std::string mlx_name(const std::string& n) {
+  std::string mlx_name(const std::string& n) const {
+    if (spark_) return n.rfind("model.", 0) == 0 || n == "lm_head.weight" ? n : "";  // spark2_5: mlx-lm's names are HF's
     if (n.rfind("model.language_model.", 0) == 0) return "language_model.model." + n.substr(21);
     if (n == "lm_head.weight") return "language_model.lm_head.weight";
     if (n.rfind("language_model.", 0) == 0) return n;
@@ -219,7 +221,7 @@ class HFSource : public WeightSource {
   }
 
   SafetensorsSource raw_;
-  bool tied_ = false, has_mtp_ = false, unsanitized_conv_ = false;
+  bool tied_ = false, has_mtp_ = false, unsanitized_conv_ = false, spark_ = false;
   std::map<std::string, Ref> map_;
   std::map<std::string, std::vector<std::string>> stacks_;
   mutable std::mutex mu_;
