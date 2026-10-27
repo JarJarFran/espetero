@@ -134,13 +134,15 @@ class MetalModel final : public NativeModel {
     // purgeable pages (the expert cache bound). Inactive pages are not
     // counted: many belong to other applications and would be compressed; a
     // large file cache (after reading model files) is counted.
-    double sys_avail0 = 0;
+    double sys_avail0 = 0, held0 = 0;  // held0: wired + compressed before loading
     {
       vm_statistics64_data_t vs0;
       mach_msg_type_number_t cnt0 = HOST_VM_INFO64_COUNT;
-      if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs0), &cnt0) == KERN_SUCCESS)
+      if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs0), &cnt0) == KERN_SUCCESS) {
         sys_avail0 = (double(vs0.free_count) - double(vs0.speculative_count) + double(vs0.external_page_count) +
                       double(vs0.purgeable_count)) * double(vm_kernel_page_size);
+        held0 = (double(vs0.wire_count) + double(vs0.compressor_page_count)) * double(vm_kernel_page_size);
+      }
     }
     load_qwen35(m, path, o.vision, o.mmproj, o.mtp);
     m.weight_bytes = m.arena->total();
@@ -184,14 +186,25 @@ class MetalModel final : public NativeModel {
         //   runs out of GPU memory.
         // - System: what it could give before this model loaded (sys_avail0)
         //   less 2 GB for macOS, so other applications keep their memory.
+        // - RAM: wired + compressed memory (held0 before loading, plus this
+        //   server) at least 12 GB under the RAM. The file cache counted in
+        //   sys_avail0 is not all reclaimable at once, and a raised GPU limit
+        //   (iogpu.wired_limit_mb) lifts the working-set bound: on a 64 GB M1
+        //   Max at 58 GB, Flash-Next's 39 GB cache left wired + compressed at
+        //   59 of 64 GB and the first photo request took the Mac to memory
+        //   pressure (2026-10-27).
         const double kv = (o.memory_gb > 0 ? o.memory_gb * 1e9 : 3e9) + 9.0 * double(slot_state_bytes(c, m.mtp.present));
         const double mine = double([m.dev currentAllocatedSize]), rest = mine + kv + 2.5e9;
         const double ws = double([m.dev recommendedMaxWorkingSetSize]);
-        gb = std::min({record_store_gb(m), (ws - rest - 3e9) / 1e9, (sys_avail0 - rest - 2e9) / 1e9});
-        std::fprintf(stderr, "expert cache: automatic size from the GPU working set %.1f GB and %.1f GB available before "
-                             "loading, less %.1f GB allocated (weights %.1f GB in %.1f GB of buffers) and %.1f GB of "
-                             "slots + KV -> %.1f GB\n", ws / 1e9, sys_avail0 / 1e9, mine / 1e9, double(m.weight_bytes) / 1e9,
-                     double(m.arena->held()) / 1e9, kv / 1e9, gb);
+        uint64_t ram = 0;
+        size_t ram_len = sizeof ram;
+        sysctlbyname("hw.memsize", &ram, &ram_len, nullptr, 0);
+        const double by_ram = ram && held0 > 0 ? (double(ram) - 12e9 - held0 - rest) / 1e9 : 1e9;
+        gb = std::min({record_store_gb(m), (ws - rest - 3e9) / 1e9, (sys_avail0 - rest - 2e9) / 1e9, by_ram});
+        std::fprintf(stderr, "expert cache: automatic size from the GPU working set %.1f GB, %.1f GB available and %.1f GB "
+                             "wired + compressed before loading, less %.1f GB allocated (weights %.1f GB in %.1f GB of "
+                             "buffers) and %.1f GB of slots + KV -> %.1f GB\n", ws / 1e9, sys_avail0 / 1e9, held0 / 1e9,
+                     mine / 1e9, double(m.weight_bytes) / 1e9, double(m.arena->held()) / 1e9, kv / 1e9, gb);
         if (gb < 3) gb = -1;  // too little memory for a useful cache: whole layers per pass
       }
       // Every expert fits: load them all once instead of a cache, so passes
