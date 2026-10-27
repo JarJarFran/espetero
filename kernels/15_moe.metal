@@ -1119,8 +1119,8 @@ kernel void moe_gemv8(
   const short qid = lane / 4;
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
-  constexpr int WPL = BITS == 8 ? 4 : 2;
-  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  constexpr int WPL = BITS == 8 ? 4 : (BITS == 3 ? 1 : 2);
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 || BITS == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4)
@@ -1160,7 +1160,9 @@ kernel void moe_gemv8(
       a.thread_elements()[1] = av[jj].y;
       UNROLL for (int j = 0; j < 4; ++j) {
         half2 q;
-        if (BITS == 4) {
+        if (BITS == 3) {  // EQ3 (EQ only)
+          q = kstep_code<BITS>(words, hw, jj, j);
+        } else if (BITS == 4) {
           const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
           q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
         } else if (BITS == 6 || BITS == 5) {
@@ -1272,8 +1274,8 @@ kernel void moe_gemm_bm(
   const short qid = lane / 4;
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
-  constexpr int WPL = BITS == 8 ? 4 : 2;
-  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  constexpr int WPL = BITS == 8 ? 4 : (BITS == 3 ? 1 : 2);
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 || BITS == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4)
@@ -1322,7 +1324,9 @@ kernel void moe_gemm_bm(
       }
       UNROLL for (int j = 0; j < 4; ++j) {
         half2 q;
-        if (BITS == 4) {
+        if (BITS == 3) {  // EQ3 (EQ only)
+          q = kstep_code<BITS>(words, hw, jj, j);
+        } else if (BITS == 4) {
           const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
           q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
         } else if (BITS == 6 || BITS == 5) {
@@ -1412,6 +1416,7 @@ INSTANTIATE_MOE("moe_gemv8r4", 4)
 INSTANTIATE_MOE("moe_gemv8r5", 5)
 INSTANTIATE_MOE("moe_gemv8r6", 6)
 INSTANTIATE_MOE("moe_gemv8r8", 8)
+INSTANTIATE_MOE("moe_gemv8r3", 3)  // EQ3 experts (EQ only)
 // 16- and 32-row tiles (passes of more than 8 rows).
 INSTANTIATE_MOE_BM("moe_gemm16r4", 4, 16)
 INSTANTIATE_MOE_BM("moe_gemm16r5", 5, 16)
@@ -1421,6 +1426,8 @@ INSTANTIATE_MOE_BM("moe_gemm32r4", 4, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r5", 5, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r6", 6, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r8", 8, 32)
+INSTANTIATE_MOE_BM("moe_gemm16r3", 3, 16)  // EQ3 experts (EQ only)
+INSTANTIATE_MOE_BM("moe_gemm32r3", 3, 32)
 
 // h[row] += sum over slots (fixed order) of w * y_sorted[slotpos] +
 // sigmoid(gate[row]) * shared[row]. Grid (rows, column slices): each
@@ -1453,8 +1460,8 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
   constexpr int MAXG = 4;
   const bool cbp = CBP && eqc_pairs_on<BITSX>();
   if (!cbp && eqc_on<BITSX>()) eqc_load(SB, KGall, Np2, nb, eqct, lane);
-  constexpr int WPL = BITSX == 8 ? 4 : 2;
-  constexpr int HPL = BITSX == 6 ? 4 : (BITSX == 5 ? 2 : 0);
+  constexpr int WPL = BITSX == 8 ? 4 : (BITSX == 3 ? 1 : 2);
+  constexpr int HPL = BITSX == 6 ? 4 : (BITSX == 5 || BITSX == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   device const half* arow[2] = {arow0, arow1};
@@ -1480,7 +1487,9 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
       UNROLL for (int jj = 0; jj < 8; ++jj) {
         UNROLL for (int j = 0; j < 4; ++j) {
           half2 q;
-          if (BITSX == 4) {
+          if (BITSX == 3) {  // (EQ3 is EQ only: kEQS takes eq_kstep above)
+            q = kstep_code<BITSX>(words, hw, jj, j);
+          } else if (BITSX == 4) {
             const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
             q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
           } else if (BITSX == 6 || BITSX == 5) {
@@ -1701,6 +1710,7 @@ INSTANTIATE_MOE_GEMV("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV("moe_gemv6_", 6)
 INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
+INSTANTIATE_MOE_GEMV("moe_gemv3_", 3)
 // Mixed: BITS-bit routed experts with an 8-bit shared expert as tile k
 // (name suffix _s8), 1-2 rows, the K-slice variants and the folded route.
 #define INSTANTIATE_MOE_GEMV_S8(PRE, BITS)                                                     \
@@ -1712,7 +1722,8 @@ INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv6_", 6)
-// EQ (one layout for every width): a wider EQ shared expert, suffix _s5 / _s6.
+INSTANTIATE_MOE_GEMV_S8("moe_gemv3_", 3)
+// EQ (one layout for every width): a wider EQ shared expert, suffix _s4 / _s5 / _s6.
 #define INSTANTIATE_MOE_GEMV_SX(PRE, BITS, SB, S)                                              \
   INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 8, 0, S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 8, 0, S)             \
   INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 4, 0, "_k4" S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 4, 0, "_k4" S) \
@@ -1722,6 +1733,9 @@ INSTANTIATE_MOE_GEMV_S8("moe_gemv6_", 6)
 INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 5, "_s5")
 INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 6, "_s6")
 INSTANTIATE_MOE_GEMV_SX("moe_gemv5_", 5, 6, "_s6")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 4, "_s4")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 5, "_s5")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 6, "_s6")
 // Fase 3 (option moe_pf): the single-row kernels with two K steps' loads in
 // flight per simdgroup (moe_kloop PF 1): `_pf` after the K-slice suffix.
 #define INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, KS, DIAG, TAG)                                \
@@ -1765,6 +1779,11 @@ INSTANTIATE_MOE_GEMV_PF("moe_gemv6_", 6, 8, "_s8")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 5, "_s5")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 6, "_s6")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 6, "_s6")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 3, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 4, "_s4")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 5, "_s5")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 6, "_s6")
 
 struct MoeCombineParams {
   int D;
@@ -2064,10 +2083,18 @@ INSTANTIATE_DOWN_COMB_B(8)
 INSTANTIATE_DOWN_COMB_S8(4)
 INSTANTIATE_DOWN_COMB_S8(5)
 INSTANTIATE_DOWN_COMB_S8(6)
-// EQ: a wider EQ5 / EQ6 shared expert beside narrower routed experts.
+// EQ: a wider EQ4 / EQ5 / EQ6 shared expert beside narrower routed experts; EQ3 experts.
 INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s5", 4, 5, 1)
 INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s5", 4, 5, 2)
 INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s6", 4, 6, 1)
 INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s6", 4, 6, 2)
 INSTANTIATE_DOWN_COMB("moe_down_comb5_k1_s6", 5, 6, 1)
 INSTANTIATE_DOWN_COMB("moe_down_comb5_k2_s6", 5, 6, 2)
+INSTANTIATE_DOWN_COMB_B(3)
+INSTANTIATE_DOWN_COMB_S8(3)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s4", 3, 4, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s4", 3, 4, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s5", 3, 5, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s5", 3, 5, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s6", 3, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s6", 3, 6, 2)

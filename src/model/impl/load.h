@@ -44,7 +44,7 @@ inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std
 
 // Dequantize a host QW to fp16 (identical to the GPU's half-precision fma).
 inline Buf dequant_f16(Arena& ar, const QW& q_in) {
-  if (eqc_mode(q_in.scale_mode)) {  // EQ4 codebooks: half(half(super * sub) * cb[code]), as the GPU's GEMMs
+  if (eqc_mode(q_in.scale_mode)) {  // EQ codebooks: half(half(super * sub) * cb[code]), as the GPU's GEMMs
     const QW& q = q_in;
     Buf out = ar.alloc(size_t(q.out) * q.in * 2);
     __fp16* dst = (__fp16*)ptr(out);
@@ -55,7 +55,14 @@ inline Buf dequant_f16(Arena& ar, const QW& q_in) {
     parallel_for(size_t(q.out), [&](size_t r) {
       const uint16_t* z = (const uint16_t*)ptr(q.z) + r * zrow;
       for (int c = 0; c < in; ++c) {
-        const uint32_t code = (codes[(r * size_t(in) + c) / 8] >> (4 * (c % 8))) & 0xF;
+        uint32_t code;
+        if (q.src_bits == 4) {
+          code = (codes[(r * size_t(in) + c) / 8] >> (4 * (c % 8))) & 0xF;
+        } else {  // EQ3: MLX's little-endian 3-bit stream
+          const uint8_t* rb = (const uint8_t*)codes + r * (size_t(in) * 3 / 8);
+          const size_t bit = size_t(c) * 3;
+          code = ((uint32_t(rb[bit / 8]) | (bit % 8 > 5 ? uint32_t(rb[bit / 8 + 1]) << 8 : 0u)) >> (bit % 8)) & 7u;
+        }
         const int step = c / 64, t = (c % 8) / 2;
         const float sc = f16_to_f32(f32_to_f16_bits(f16_to_f32(z[c / 256]) * float(ss[r * spr + step * 4 + t])));
         dst[r * size_t(in) + c] = __fp16(sc * f16_to_f32(z[bpr + code]));
@@ -204,7 +211,9 @@ inline HW densify(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, QW q) {
   return d;
 }
 
-inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat h, bool dense = false) {
+// key: the matrix's load site (EQ3 codes are accepted for routed expert stacks only).
+inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat h, bool dense = false,
+                  const std::string& key = std::string()) {
   Mat out;
   if (h.dense) {
     out.dense = true;
@@ -216,9 +225,13 @@ inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat 
     ++m.n_dense;
   } else {
     out.q = h.q;
+    // EQ3 has MoE kernels only (moe_gemv3 / moe_gemv8r3 / moe_down_comb3).
+    auto ends = [&](const char* s) { return key.size() >= std::strlen(s) && key.compare(key.size() - std::strlen(s), std::string::npos, s) == 0; };
+    if (out.q.bits == 3 && !ends("experts_gu") && !ends("experts_down"))
+      fail((key.empty() ? std::string("a matrix") : key) + ": EQ3 codes are for routed expert stacks only (convert it with EQ4 or wider)");
     repack(m, e, out.q, tmp);
     out.q.w = out.q.s = out.q.z = Buf{};  // host staging stays with `tmp`
-    ++(out.q.bits == 4 ? m.n_q4 : out.q.bits == 5 ? m.n_q5 : out.q.bits == 6 ? m.n_q6 : m.n_q8);
+    ++(out.q.bits == 4 ? m.n_q4 : out.q.bits == 5 ? m.n_q5 : out.q.bits == 6 ? m.n_q6 : out.q.bits == 3 ? m.n_q3 : m.n_q8);
   }
   return out;
 }
@@ -421,8 +434,8 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   // kernels (or plain GEMMs without norm links): a dense one does not block
   // the fused RMSNorm of the decoder GEMVs.
   m.n_dense_mtp += (L.router.dense ? 1 : 0) + (L.shared_gate.dense ? 1 : 0);
-  L.experts_gu = finish(m, e, tmp, egu).q;
-  L.experts_down = finish(m, e, tmp, ed).q;
+  L.experts_gu = finish(m, e, tmp, egu, false, p + "experts_gu").q;
+  L.experts_down = finish(m, e, tmp, ed, false, p + "experts_down").q;
   [e endEncoding];
   commit_wait(cb);
   L.moe = true;

@@ -470,6 +470,7 @@ class MetalModel final : public NativeModel {
       d.set("sliding_window", c.window);
       d.set("ring_gb", m.kvs.buf ? double([m.kvs.buf length]) / 1e9 : 0.0);
     }
+    if (m.n_q3) d.set("matrices_3bit", m.n_q3);
     d.set("matrices_4bit", m.n_q4);
     d.set("matrices_5bit", m.n_q5);
     d.set("matrices_6bit", m.n_q6);

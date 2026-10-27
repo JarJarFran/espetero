@@ -661,7 +661,7 @@ struct Model : Runtime {
   int attn_split = 512;      // cached keys per split-K tile (0: never split)
   int attn_min_chunk = 32;   // ... and at least this many per tile (a short context then runs unsplit, no combine). "attn_min_chunk"
   bool qsa = true;           // Qwen4-Exp: sparse attention past 2051 visible tokens (false: dense, the approximation before)
-  int n_q4 = 0, n_q5 = 0, n_q6 = 0, n_q8 = 0, n_dense = 0;
+  int n_q3 = 0, n_q4 = 0, n_q5 = 0, n_q6 = 0, n_q8 = 0, n_dense = 0;
   int n_dense_mtp = 0;       // dense matrices that never take a fused-norm link (the MTP layer's, MoE routers and shared gates)
   bool split_mlp = false;
   std::map<std::string, int> source_types;

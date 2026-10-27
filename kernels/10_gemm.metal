@@ -8,31 +8,32 @@ constant int kGroup [[function_constant(0)]];
 // 0: affine (half scale and bias per group). 1: GGUF Q6_K kept native (int8
 // sub-scale per 16 codes times the block's fp16 super-scale; codes offset -32).
 // (4 and 5 are reserved.)
-// 6: EQ (Espetero's own checkpoints, 4/5/6/8-bit codes): symmetric two-level
+// 6: EQ (Espetero's own checkpoints, 3/4/5/6/8-bit codes): symmetric two-level
 // scales like Q6_K's, with sub-blocks shaped by the fragment lanes (kEQS).
 // 7: EQ4 with codebooks: EQ's scales, the 4-bit code an index into a 16-entry
-// fp16 codebook (eqc_on).
+// fp16 codebook (eqc_on). 8: EQ3 with codebooks (8 entries).
 constant int kScaleMode [[function_constant(1)]];
 // Symmetric two-level scales (signed int8 sub-scale x fp16 super-scale per
 // 256): Q6_K and EQ. Their codes are offset by 2^(BITS - 1) (sym_bias).
-constant bool kQ6K = kScaleMode == 1 || kScaleMode == 6 || kScaleMode == 7;
+constant bool kQ6K = kScaleMode == 1 || kScaleMode == 6 || kScaleMode == 7 || kScaleMode == 8;
 // EQ's sub-blocks follow the fragment lanes instead of contiguous K: within a
 // 64-wide K step, sub-block t holds the K rows k with (k % 8) / 2 == t (16
 // rows: two fm lanes x 8 jj slices), so a lane's 8 rows of a step share one
 // sub-scale per column (vs 4 for Q6_K's contiguous 16-wide sub-blocks).
-constant bool kEQS = kScaleMode == 6 || kScaleMode == 7;
+constant bool kEQS = kScaleMode == 6 || kScaleMode == 7 || kScaleMode == 8;
 // EQ4 codebooks: weight = half(super * sub) * cb[code], with the codebook of
 // the weight's 8-column group. A 32-column block's 4 codebooks (16 halves
 // each, group j = columns 8 j .. 8 j + 7, which are a lane's column pair j)
 // follow the scale buffer's scales (eqc_load); each simdgroup copies its
 // block's into threadgroup memory, so a code costs one threadgroup load.
-// Only codes of the codebook width read them (eqc_on), so a shared expert of
-// another width streamed beside codebook experts (moe kernels' BITS2) keeps
-// EQ's uniform codes.
+// Mode 7 holds 4-bit codebooks, mode 8 3-bit ones (8 entries in the same
+// 16-half slots): only codes of that width read them (eqc_on), so a shared
+// expert of another width streamed beside codebook experts (moe kernels'
+// BITS2) keeps EQ's uniform codes.
 template <int BITS>
-static inline bool eqc_on() { return kScaleMode == 7 && BITS == 4; }
+static inline bool eqc_on() { return (kScaleMode == 7 && BITS == 4) || (kScaleMode == 8 && BITS == 3); }
 // Exponent-biased code (1024 + code) minus the symmetric offset of the code
-// width: 2^(BITS - 1) (EQ4/5/6/8, Q6_K). For Q6_K, BITS 8 is its 6-bit codes
+// width: 2^(BITS - 1) (EQ3/4/5/6/8, Q6_K). For Q6_K, BITS 8 is its 6-bit codes
 // widened to bytes for the prefill GEMMs (widen6_8; EQ6 is never widened).
 template <int BITS>
 static inline half sym_bias() { return half(1024 + (BITS == 8 && !kEQS ? 32 : 1 << (BITS - 1))); }
@@ -187,13 +188,18 @@ static inline half2 code_value(half2 biased, threadgroup const half* t = nullptr
 }
 
 // The code pair of fragment jj, column pair j of a K step (the rgemv
-// layout: words of 8 nibbles or 4 bytes, 5/6-bit high planes in hw) as
-// exponent-biased halves (value 1024 + code).
+// layout: words of 8 nibbles or 4 bytes, 5/6-bit high planes in hw; 3-bit
+// codes: the 2-bit layout's words plus a 1-bit high plane laid out as
+// 5-bit's) as exponent-biased halves (value 1024 + code).
 template <int BITS>
 static inline half2 kstep_code(thread const uint* words, thread const uint* hw, int jj, int j) {
   if (BITS == 2) {
     const uint x = words[j] >> (2 * jj);
     return as_type<half2>((x & 0x00030003u) | 0x64006400u);
+  } else if (BITS == 3) {
+    const uint x = (words[j] >> (2 * jj)) & 0x00030003u;
+    const uint h = (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+    return as_type<half2>(x | (h << 2) | 0x64006400u);
   } else if (BITS == 4) {
     const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
     return as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
@@ -529,6 +535,43 @@ kernel void repack_planes(
   dst[1] = uint4(lo[4], lo[5], lo[6], lo[7]);
   if (bits == 6) ((device uint4*)Wh)[ulong(bg) * 32 + lane] = uint4(hi[0], hi[1], hi[2], hi[3]);
   else ((device uint2*)Wh)[ulong(bg) * 32 + lane] = uint2(hi[0], hi[1]);
+}
+
+// Byte codes [N, K] of 3-bit values (EQ3) -> the 2-bit fragment layout of
+// repack_weights2 for the low two bits (Wr, one uint4 per lane and K step:
+// word j = column pair j, row n at bits 2 jj, n + 1 at 16 + 2 jj) plus
+// 5-bit's 1-bit high plane for bit 2 (Wh, one uint2: word j / 2, row n at
+// bit jj + 8 (j % 2), n + 1 at 16 + that). 24 bytes per lane and K step.
+kernel void repack_planes3(
+    device const uchar* W [[buffer(0)]],
+    device uint* Wr [[buffer(1)]],
+    device uint* Wh [[buffer(2)]],
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  const int KG = K / 64;
+  const int lane = gid % 32;
+  const int bg = gid / 32;
+  const int nb = bg / KG;
+  const int g = bg % KG;
+  if (nb >= (N + 31) / 32) return;
+  const int qid = lane / 4;
+  const int fm = (qid & 4) + ((lane / 2) % 4);
+  const int fn = (qid & 2) * 2 + (lane % 2) * 2;
+  uint lo[4] = {0u, 0u, 0u, 0u};
+  uint hi[2] = {0u, 0u};
+  UNROLL for (int j = 0; j < 4; ++j) {
+    const int n0 = nb * 32 + j * 8 + fn;
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      const int k = g * 64 + jj * 8 + fm;
+      const uint a = byte_code(W, N, K, n0, k), b = byte_code(W, N, K, n0 + 1, k);
+      lo[j] |= ((a & 3u) << (2 * jj)) | ((b & 3u) << (16 + 2 * jj));
+      const int sh = jj + 8 * (j % 2);
+      hi[j / 2] |= (((a >> 2) & 1u) << sh) | (((b >> 2) & 1u) << (16 + sh));
+    }
+  }
+  ((device uint4*)Wr)[ulong(bg) * 32 + lane] = uint4(lo[0], lo[1], lo[2], lo[3]);
+  ((device uint2*)Wh)[ulong(bg) * 32 + lane] = uint2(hi[0], hi[1]);
 }
 
 kernel void repack_scales(
@@ -1283,7 +1326,7 @@ static inline void load_kstep(device const uint4* wp, device const uint* hp, int
   if (BITS == 6) {
     const uint4 h = *((device const uint4*)(hp + ulong(g) * 32 * 4));
     hw[0] = h.x, hw[1] = h.y, hw[2] = h.z, hw[3] = h.w;
-  } else if (BITS == 5) {
+  } else if (BITS == 5 || BITS == 3) {
     const uint2 h = *((device const uint2*)(hp + ulong(g) * 32 * 2));
     hw[0] = h.x, hw[1] = h.y;
   }

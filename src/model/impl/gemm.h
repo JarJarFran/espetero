@@ -565,6 +565,7 @@ inline std::string tune_key(const QW* w) {
   if (w->scale_mode == 1) k += "q6k";
   else if (w->scale_mode == 6) k += "eq";
   else if (w->scale_mode == 7) k += "eqc";
+  else if (w->scale_mode == 8) k += "eqc3";
   else if (w->scale_mode) k += "m" + std::to_string(w->scale_mode);
   return k;
 }

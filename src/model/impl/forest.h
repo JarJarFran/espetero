@@ -379,22 +379,24 @@ inline void shared_mlp_in(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<
 // function constants; or another width on both projections).
 inline int moe_shared_tile_kind(const Config& c, const Layer& L) {
   if (L.I != c.Ie || L.gate_up.out() <= 0 || L.gate_up.dense || L.down.dense) return 0;
-  // (EQ4 codebook experts, mode 7, stream a shared expert of another EQ
-  // width with mode 6's uniform codes: the kernels read codebooks for 4-bit
-  // codes only.)
+  // (EQ4 / EQ3 codebook experts, mode 7 / 8, stream a shared expert of
+  // another EQ width with mode 6's uniform codes: the kernels read codebooks
+  // for 4-bit codes under mode 7 and 3-bit codes under mode 8 only.)
   auto same = [](const QW& s, const QW& x) {
-    return s.fc() == x.fc() ||
-           (eqc_mode(x.scale_mode) && s.scale_mode == 6 && s.bits != x.bits && (s.fc() & ~(0xFF << 16)) == (x.fc() & ~(0xFF << 16)));
+    return s.fc() == x.fc() || (eqc_mode(x.scale_mode) && s.scale_mode == 6 && s.bits != x.bits &&
+                                (s.fc() & ~(0xFF << 16)) == (x.fc() & ~(0xFF << 16)));
   };
   if (!same(L.gate_up.q, L.experts_gu) || !same(L.down.q, L.experts_down)) return 0;
   if (L.gate_up.q.bits == L.experts_gu.bits && L.down.q.bits == L.experts_down.bits) return 1;
   // Per matrix: GGUF experts mix widths (Q4_K gate/up beside a Q5_1 or Q8_0 down).
-  // EQ (one layout for every width) also has a wider EQ5 / EQ6 shared expert
-  // beside narrower routed experts (the _s5 / _s6 kernels; EQ8: _s8), e.g.
-  // EQ4 gate/up and EQ5 down experts with an EQ6 shared expert.
+  // EQ (one layout for every width) also has a wider EQ4 / EQ5 / EQ6 shared
+  // expert beside narrower routed experts (the _s4 / _s5 / _s6 kernels; EQ8:
+  // _s8), e.g. EQ3 gate/up and EQ4 down experts with an EQ6 shared expert.
+  // EQ3 is routed-only, so its shared expert is always wider.
   auto s8_ok = [](const QW& sh, const QW& ex) {
-    if (sh.bits == ex.bits || (sh.bits == 8 && ex.bits >= 4 && ex.bits <= 6)) return true;
-    return eq_mode(ex.scale_mode) && ex.bits >= 4 && sh.bits > ex.bits && sh.bits <= 6;
+    const bool eq = eq_mode(ex.scale_mode);
+    if (sh.bits == ex.bits || (sh.bits == 8 && ex.bits >= (eq ? 3 : 4) && ex.bits <= 6)) return true;
+    return eq && ex.bits >= 3 && sh.bits > ex.bits && sh.bits <= 6;
   };
   return s8_ok(L.gate_up.q, L.experts_gu) && s8_ok(L.down.q, L.experts_down) ? 2 : 0;
 }
