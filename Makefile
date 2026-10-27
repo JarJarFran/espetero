@@ -56,6 +56,10 @@ $(BUILD)/bench_native: tests/bench_native.mm $(BUILD)/model.o $(BUILD)/json.o
 $(BUILD)/kld_dump: tests/kld_dump.mm $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
+# A checkpoint's tile image (src/model/impl/tiles.h).
+$(BUILD)/espetero_tiles: tests/tiles.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 # ---- modules (plain C++ unless noted)
 TOK_SRC    := $(wildcard src/tok/*.cpp)
 TMPL_SRC   := $(wildcard src/tmpl/*.cpp)

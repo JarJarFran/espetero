@@ -128,6 +128,7 @@ class MetalModel final : public NativeModel {
       char buf[24];
       std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
       build_id_ = buf;
+      m.build_id = build_id_;
     }
     // Memory the system can give before this model's allocations without
     // compressing or swapping anything: free pages, the file cache and
@@ -145,7 +146,7 @@ class MetalModel final : public NativeModel {
       }
     }
     load_qwen35(m, path, o.vision, o.mmproj, o.mtp);
-    m.weight_bytes = m.arena->total();
+    m.weight_bytes = m.arena->total() + (m.tiles ? m.tiles->bytes : 0);
     mark("weights");
 
     const Config& c = m.cfg;
@@ -497,6 +498,9 @@ class MetalModel final : public NativeModel {
     I.gpu_family = devprof_.family;
     I.devprof_measured = devprof_.measured;
     I.load_ms = ms_since(t0);
+    if (const char* lt = std::getenv("ESPETERO_LOAD_TRACE"); lt && *lt == '1')
+      std::fprintf(stderr, "[load] %.0f ms: host_mat %.0f ms, GPU waits %.0f ms, tune %.0f ms\n", I.load_ms,
+                   load_trace().host_ms, load_trace().wait_ms, I.tune_ms);
   }
 
   const ModelInfo& info() const override { return info_; }

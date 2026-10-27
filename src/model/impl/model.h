@@ -432,6 +432,8 @@ struct Scratch {
   int tk_k = 0;  // K of the last pass's top-k (0: none)
 };
 
+struct TileImage;  // tiles.h
+
 struct Model : Runtime {
   Config cfg;
   // Decode chains (NativeModel::run_chain): pass j of a chain reads its
@@ -666,6 +668,8 @@ struct Model : Runtime {
   bool split_mlp = false;
   std::map<std::string, int> source_types;
   size_t weight_bytes = 0;
+  std::string build_id;               // this build (kernels + host code): tile images are valid for it only
+  std::shared_ptr<TileImage> tiles;   // the checkpoint's tile image (tiles.h), while it loads and maps it
 
   // ---------------------------------------------------------------- KV
   int kv_free() const { return int(kv.free_list.size()); }

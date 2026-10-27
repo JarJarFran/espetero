@@ -600,7 +600,19 @@ class Enc {
 // and removing the spin cut the sustained 27B decode step 8 % and prefill
 // 3 % (kernel-guidelines.md, measured facts); the ~0.1-0.3 ms of wake-up
 // latency it saved is not worth that.
+// Load-phase timers (ESPETERO_LOAD_TRACE=1 prints them after a load).
+struct LoadTrace {
+  double host_ms = 0, wait_ms = 0;
+};
+inline LoadTrace& load_trace() {
+  static LoadTrace t;
+  return t;
+}
 inline void commit_wait(id<MTLCommandBuffer> cb) {
+  struct WaitTimer {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    ~WaitTimer() { load_trace().wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); }
+  } wait_timer;
   Residency::get().commit();
   [cb commit];
   [cb waitUntilCompleted];
