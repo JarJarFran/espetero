@@ -276,6 +276,14 @@ int main(int argc, char** argv) {
         // reference: the one-stack table split at the first tile of an expert >= H
         size_t cut = 0;
         while (cut < i1[0] && t1[4 * cut] < H) ++cut;
+        // rows are placed inside an expert's range with atomics: compare each expert's rows as a set
+        for (size_t i = 0, j; i < i1[0]; i = j) {
+          for (j = i + 1; j < i1[0] && t1[4 * j] == t1[4 * i]; ++j) {
+          }
+          const int32_t lo = t1[4 * i + 1], hi = t1[4 * (j - 1) + 1] + t1[4 * (j - 1) + 2];
+          std::sort(r1.begin() + lo, r1.begin() + hi);
+          std::sort(r2.begin() + lo, r2.begin() + hi);
+        }
         bool ok = ia[0] == cut && ia[3] == cut && ib[0] == i1[0] - cut && ib[3] == ib[0] && ib[1] == 40 && ib[4] == 80 &&
                   r1 == r2 && std::equal(ta.begin(), ta.end(), t1.begin());
         for (size_t i = 0; ok && i < ib[0]; ++i) {
@@ -284,6 +292,22 @@ int main(int argc, char** argv) {
           ok = b[0] == a[0] - H && b[1] == a[1] && b[2] == a[2];
         }
         std::printf("moe_sort split %d of %d, %3d rows: %zu + %u tiles %s\n", H, E, M, cut, ib[0], ok ? "ok" : "MISMATCH");
+        if (!ok) {
+          size_t dt = 0;
+          while (dt < ta.size() && ta[dt] == t1[dt]) ++dt;
+          size_t dr = 0;
+          while (dr < r1.size() && r1[dr] == r2[dr]) ++dr;
+          std::printf("  ia %u %u (cut %zu) ib %u %u %u %u (want %zu) table prefix differs at int %zu/%zu, rowmap at %zu/%zu\n",
+                      ia[0], ia[3], cut, ib[0], ib[1], ib[3], ib[4], size_t(i1[0]) - cut, dt, ta.size(), dr, r1.size());
+          for (size_t i = 0; i < ib[0]; ++i) {
+            const int32_t* a = &t1[4 * (cut + i)];
+            const int32_t* b = &tb[4 * i];
+            if (b[0] != a[0] - H || b[1] != a[1] || b[2] != a[2]) {
+              std::printf("  tile_b %zu: got (%d %d %d) want (%d %d %d)\n", i, b[0], b[1], b[2], a[0] - H, a[1], a[2]);
+              break;
+            }
+          }
+        }
         if (!ok) ++fails;
       }
     }
