@@ -65,27 +65,30 @@ struct G4Plan {
   std::vector<G4TileRec> tiles;
   std::vector<AttnCombineRec> combine;
   int parts = 0;
+  int rows = 8;  // query rows per tile (above 8: unsplit tiles, g4_attention256_r<rows / 8>)
 };
 
-// Tiles of 8 query rows per tree. Sliding layers (window > 0) read only the
-// cached keys and batch rows the tile's earliest row can still see (cached
+// Tiles of 8 query rows per tree (`rows` when no tile is split). Sliding
+// layers (window > 0) read only the cached keys and batch rows the tile's
+// earliest row can still see (cached
 // key j and root row j sit at positions j and P + j; leaf rows are never
 // earlier than their index says, so skipping by index is safe). Few-tile
 // passes split the cached range (flash decoding), as plan_tiles does.
-inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const int32_t* pos) {
+inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const int32_t* pos, int rows = 8) {
   A.tiles.clear();
   A.combine.clear();
   A.parts = 0;
   int n_tiles = 0;
   for (const auto& t : A.trees) n_tiles += (t.M + 7) / 8;
   const int budget = std::max(1, 256 / std::max(1, groups * n_tiles));
+  A.rows = budget == 1 ? rows : 8;
   for (int ti = 0; ti < int(A.trees.size()); ++ti) {
     const AttnTreeRec& t = A.trees[size_t(ti)];
-    for (int r = 0; r < t.M; r += 8) {
+    for (int r = 0; r < t.M; r += A.rows) {
       int k0 = 0, b0 = 0;
       if (window > 0) {
         int minpos = INT32_MAX;
-        for (int i = r; i < std::min(t.M, r + 8); ++i) minpos = std::min(minpos, pos[4 * (t.base + i)]);
+        for (int i = r; i < std::min(t.M, r + A.rows); ++i) minpos = std::min(minpos, pos[4 * (t.base + i)]);
         k0 = std::clamp(minpos - window + 1, 0, t.P);
         b0 = std::max(0, minpos - window + 1 - t.P);
       }
@@ -118,6 +121,7 @@ inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const in
 struct G4Geom {
   int hd, hkv, G, Gk, split;
   std::string kernel, combine;
+  int rt_rows = 8;  // rows per tile of unsplit prompt-pass tiles
 };
 inline G4Geom g4_geom(const Config& c, bool sliding) {
   G4Geom g;
@@ -130,6 +134,12 @@ inline G4Geom g4_geom(const Config& c, bool sliding) {
     g.split = 1;
     g.kernel = "g4_attention256_g" + std::to_string(g.G);
     g.combine = "g4_attention_combine256";
+    // Spark prompt passes: 16-row tiles (ESPETERO_G4_RT=0: 8).
+    static const bool rt = [] {
+      const char* e = std::getenv("ESPETERO_G4_RT");
+      return !(e && *e == '0');
+    }();
+    if (c.spark && g.G == 4 && rt) g.rt_rows = 16;
   } else {
     g.Gk = 2;
     g.split = g.G / 2;
@@ -203,6 +213,13 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     const char* e = std::getenv("ESPETERO_ATTN_SPLIT");
     return size_t(e && *e ? std::atoi(e) : 16) << 20;
   }();
+  // Spark: a group holds at least this many threadgroups (up to 4x the
+  // row-key budget): at 256K the budget is 8 tiles of 8 rows, 32
+  // threadgroups, which ran at 60% of the speed of 64 (ESPETERO_ATTN_MIN_TGS).
+  static const size_t min_tgs = [] {
+    const char* e = std::getenv("ESPETERO_ATTN_MIN_TGS");
+    return size_t(e && *e ? std::atoi(e) : 64);
+  }();
   auto attention = [&](bool sliding, int layer_k) {
     const G4Plan& A = sliding ? *P.plan_s : *P.plan_g;
     if (A.tiles.empty()) return;
@@ -218,18 +235,22 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
                               sliding ? m.ring_blocks : 0, bidi, uint64_t(K.layer_base(layer_k))};
     std::vector<size_t> cut{0};
     if (split_rk > 0 && !dec && !P.chained && !m.chain_active && M >= 64) {
+      const size_t min_tiles = c.spark ? (min_tgs + size_t(groups) - 1) / size_t(groups) : 0;
       size_t acc = 0;
       for (size_t i = 0; i < A.tiles.size(); ++i) {
         const G4TileRec& tr = A.tiles[i];
-        const size_t w = size_t(8) * (size_t(tr.k1 - tr.k0) + size_t(A.trees[size_t(tr.tree)].M));
-        if (acc > 0 && acc + w > split_rk) cut.push_back(i), acc = 0;
+        const size_t w = size_t(A.rows) * (size_t(tr.k1 - tr.k0) + size_t(A.trees[size_t(tr.tree)].M));
+        if (acc > 0 && acc + w > split_rk && (i - cut.back() >= min_tiles || acc + w > 4 * split_rk))
+          cut.push_back(i), acc = 0;
         acc += w;
       }
     }
     cut.push_back(A.tiles.size());
     for (size_t gi = 0; gi + 1 < cut.size(); ++gi) {
       if (gi > 0) E.flush();
-      E.pipe(dec ? "g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G) : g.kernel);
+      const int rg = A.rows / 8;  // row groups per tile
+      E.pipe(dec ? "g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G)
+                 : rg > 1 ? "g4_attention256_r" + std::to_string(rg) + "_g" + std::to_string(g.G) : g.kernel);
       E.set(0, s.Q);
       E.set(1, s.Kb);
       E.set(2, s.Vb);
@@ -249,7 +270,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       E.wr(s.O);
       if (A.parts) E.wr(P.parts.b, P.parts.off, P.parts.off + P.parts_bytes);
       E.groups(MTLSizeMake(size_t(groups), cut[gi + 1] - cut[gi], 1),
-               MTLSizeMake(size_t(dec ? 32 * (g.hd / 128) * 2 : 32 * (g.hd / 128) * g.Gk), 1, 1));
+               MTLSizeMake(size_t(dec ? 32 * (g.hd / 128) * 2 : 32 * (g.hd / 128) * g.Gk * rg), 1, 1));
     }
     if (!A.combine.empty()) {
       E.pipe(g.combine);
@@ -591,6 +612,8 @@ inline void g4_pipelines(const Model& m, std::vector<std::pair<std::string, int>
   }
   out.push_back({g4_geom(c, true).kernel, 0});
   out.push_back({g4_geom(c, false).kernel, 0});
+  if (g4_geom(c, true).rt_rows > 8)
+    out.push_back({"g4_attention256_r" + std::to_string(g4_geom(c, true).rt_rows / 8) + "_g" + std::to_string(g4_geom(c, true).G), 0});
   for (bool sliding : {true, false}) {
     const G4Geom g = g4_geom(c, sliding);
     if (g.G <= 8) out.push_back({"g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G), 0});
