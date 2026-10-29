@@ -39,6 +39,7 @@ quantization format Espetero's kernels are shaped for, without Python:
 | eq3dhb | gate/up EQ3 codebook (EQ4 codebook in layers 0-3, 36-39), down EQ4 codebook | EQ8 | MLX 8-bit |
 | eq3dh / eq3dx / eq3h | gate/up EQ3 codebook, down EQ4 codebook / the same / all EQ3 codebook | EQ8 / EQ6 / EQ8 | MLX 8-bit (eq3dx: LM head 6-bit) |
 | fnx3 / fnx3m | EQ3 codebook (Qwen3.8-Flash-Next, below) | EQ6 / EQ5 | MLX 8-bit / 6-bit |
+| fnxvq / fnxmix | EQV 13 / EQ3 codebook + EQV 13 (Flash-Next, below) | EQ5 | MLX 8-bit / 6-bit |
 | eq4, eq5, eq6, eq4f, eq4s | dense-model presets (EQ4/5/6 body, sensitive projections EQ6) | | |
 
 Dense presets for Qwen3.5 / Qwen3.6 dense models (linear attention, full
@@ -65,6 +66,19 @@ text with prose as well as code: with one of wikitext-103, C4 and PG19 train
 plus calibration_v5, chat and Python (452k tokens), KLD 0.00127 at 6.417 bpw
 against UD-Q6_K's 0.00137 at 6.431 (fp32 BF16 reference, wikitext-2 test and
 C++/Metal code); with calibration_v5 alone 0.00149.
+
+**Other families.** Dense Gemma 4 and Spark-X2.5 / X2.6 (`spark2_5`) convert
+with `--fmt` rules. Spark-X2.6-4B's `c3` (5.21 bits per weight; KLD 0.026
+against BF16, MLX 4-bit 0.238, the official Q4_K_M 0.071 at 6.19):
+
+    espetero quantize --model Spark-X2.6-4B --calib calib.safetensors --fmt "$(cat rules_c3.txt)" --out Spark-X2.6-4B-EQ-c3
+
+where `rules_c3.txt` holds (one line): `*g_proj=bf16;model.layers.0.*=eql:6:16+gptq;`
+... the same for layers 1-3, `model.layers.4.*=eql:5:16+gptq;` ... for layers 5-7, then
+`model.embedding=affine:6:64:f16;*q_k_v_proj=eql:5:16+gptq;*out_proj=eql:5:16+gptq;*=eql:4:16:cb+gptq`:
+layers 0-3 EQ6, layers 4-7 and the attention projections EQ5, everything else EQ4 with codebooks,
+the tied embedding / LM head MLX 6-bit. `c4` (5.67 bits per weight, KLD 0.018) raises layers 0-7 and
+the attention projections to EQ6 and the down projections to EQ5.
 
 A 4-bit preset with a trailing `c` (`eq4dhc`, `eq4xc`, ...) gives its EQ4
 experts codebooks. `espetero quantize --preset NAME --print-rules` prints a
@@ -114,25 +128,59 @@ size, with 99.99 % of the EQ3 expert codes identical.
   super-block: `ceil(in / 256)` fp16 super-scales per row (the expert down projection 640 = 256 +
   256 + 128, the hyper-connections' up projection 320 = 256 + 64), the same scale-buffer layout the
   NVFP4 path uses; every width that is a multiple of 256 is unchanged.
+* **EQV and two expert formats** (experimental, Macs with 48-64 GB; [eq.md](eq.md#eqv-vector-quantized-experts-experimental)).
+  `fnxvq[K]`: every routed expert EQV with 2^K-entry codebooks (K 13 by default, ~1.69 bits per
+  weight), the rest as `fnx3m`. `fnxmix` with `--expert-split H|FILE`: each layer's first H experts
+  in the `--keep-experts` order (most routed first) EQ3 codebooks, the rest EQV 13 in a second stack
+  (`mlp.switch_mlp_b.*`); `FILE` is JSON `{"<layer>": H, ...}`. The EQV down projections use each
+  expert's own Hessian when the calibration has one (`--expert-hessian-max 640` at capture). Example
+  (Flash-Next for 64 GB Macs, 3.31 bits per weight):
+
+      espetero quantize --model Qwen3.8-Flash-Next --preset fnxmix --keep-experts order.json \
+          --expert-split 408 --calib calib-x640.safetensors --no-mtp --ple-bits 4 --out Flash-Next-mix408
+
 * `--only GLOB,...,!GLOB` writes part of a checkpoint; `tools/dev/fnx_overlay.py BASE PART VIEW` lays
   such a part over another checkpoint of the model (symlinks, merged index and config), e.g. a few
   layers converted to EQ over the oQ4e-mtp file, or a pruned conversion that reuses the file's
   n-gram table.
 
-## Relation to the Python converter
+## Time and memory
 
-The encoders are ports of `kld/quant_lab.py` and `kld/eq_convert.py` with
-the same float roundings (fp16 / bf16 stores, ties to even, MLX's own
-affine quantize rounding half away from zero, no fused multiply-adds):
-given the same statistics (`tools/dev/calib_npz.py` converts the Python
-harness's `.npz`), Qwen3.5-0.8B checkpoints have the same tensors, the
-non-EQ tensors bit for bit, 99.97-99.998 % of the imatrix and codebook codes
-identical, and Espetero KLD within 0.5 % (GPTQ spreads float-order
-differences: EQ4 -0.05 %). `tools/dev/eq_compare.py A B` compares two checkpoints.
+The encoders run on the CPU (Accelerate, all cores); the calibration forward
+runs on the GPU. Measured with `/usr/bin/time -l`:
+
+| job | Mac | time | peak footprint |
+|---|---|---|---|
+| Qwen3.6-35B-A3B calibration capture (`--calib-only`, 110k tokens) | M4 Max | 4 min | 64 GB |
+| Qwen3.6-35B-A3B `eq4dhb` from a saved calibration | M4 Max | 8.5 min | 7.5 GB |
+| Qwen3.6-35B-A3B `eq3dhb` from a saved calibration | M4 Max | 15 min | 6.0 GB |
+| Qwen3.5-9B `eqd4l` / `eqd6` / `eqd4m` from a saved calibration | M1 Max | 13 / 15 / 21 min | 11 GB |
+| Qwen3.8-Flash-Next `fnx4h` rules from a saved calibration | M4 Max | 74 min | 12 GB |
+
+The BF16 source is memory-mapped: the resident size grows with the pages the
+encoder has read (56 GB for the 35B, 123 GB for Flash-Next) but those pages
+are file cache that macOS reclaims; the footprint column is what the process
+holds. Calibration statistics are large (the 35B's 15 GB, Flash-Next's with
+per-expert down Hessians 50 GB): save them once with `--calib-out` and reuse
+them. A model whose BF16 weights do not fit in memory is captured in layer
+ranges (`--calib-layers A:B`, merged with `tools/calib_merge.py`) or, for
+Flash-Next, with the forward of a smaller checkpoint (`--calib-model`).
+
+GPTQ sums in the order the BLAS threads take: with
+`VECLIB_MAXIMUM_THREADS=1` a conversion is byte-for-byte reproducible (every
+0.8B preset and the 35B `eq4dhb` were checked), with all cores it differs in
+the last bits of some codes (KLD within noise, about 2 %).
+
+## Checking a conversion
+
+`tools/dev/eq_compare.py A B` compares two checkpoints tensor by tensor
+(names, dtypes, shapes, the share of identical codes). `tests/kld_dump`
+writes the final-normed hidden states of a checkpoint over a KLD reference's
+windows, for scoring against a BF16 reference outside the engine.
 
 The capture tokenizes with `tokenizer.json` (as the `tokenizers` library and
 Espetero's server do). transformers 5's tokenizer for this family applies an
 older pre-tokenizer without the mark class (`\p{M}`), which on
 calibration_v5.txt gives 1 % more tokens and shifts every later window; at
 0.8B such a shift alone moves the KLD of a GPTQ EQ4 checkpoint by ~8 %, so
-calibrations from the two tokenizers are different samples, not a port error.
+calibrations from the two tokenizers are different samples.

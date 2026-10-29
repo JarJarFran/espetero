@@ -72,6 +72,32 @@ Same protocol as above (greedy, thinking off, 16 parallel slots, 40K context, no
 ³ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF. Flash-Next drafts with the oQ4e file's own 4-bit MTP head.
 ⁴ DeepSeek-V4.1 (measured with 0.1.2's code on 2026-10-21) runs with 6 sequence slots (its state is a slot of its own), so *8 users* queue: 6 at a time. Its first token includes the experts a new prompt reads from the SSD.
 
+## EQ formats
+
+Espetero has a quantization format of its own, **EQ** ([docs/eq.md](docs/eq.md)): 3-, 4-, 5-, 6- and 8-bit codes with an int8 scale per 16 inputs and an fp16 scale per 256, the 16 inputs of a scale chosen so that each GPU lane needs one scale per step, and optional 16- or 8-entry codebooks. `espetero quantize` converts a Hugging Face BF16 checkpoint without Python ([docs/quantize.md](docs/quantize.md)):
+
+```bash
+build/espetero quantize --model ~/models/Qwen3.6-35B-A3B --preset eq4dhb --out ~/models/Qwen3.6-35B-A3B-EQ4DHB   # from the BF16 checkpoint
+build/espetero serve --model ~/models/Qwen3.6-35B-A3B-EQ4DHB
+```
+
+Against the GGUF and MLX files of the same size, in the same engine. KLD is the mean per-token KL divergence to the BF16 model with fp32 activations over 123K tokens of WikiText-2 and code (lower is better); bits per weight over all parameters, without the MTP head; decode at batch 1 with a 128-token context:
+
+| Model | EQ file | Bits/weight | KLD | Rival | Bits/weight | KLD | Decode M4 Max, tok/s | Decode M1 Max, tok/s |
+|:--|:--|--:|--:|:--|--:|--:|--:|--:|
+| Qwen3.6-35B-A3B (MoE) | EQ3DHB | 4.35 | **0.0204** | IQ4_XS (imatrix) | 4.32 | 0.0243 | **113** vs 102 | |
+| | EQ4DHB | 5.19 | **0.0086** | UD-Q4_K_XL | 5.16 | 0.0098 | **120.5** vs 96.6 | **84.5** vs 63.9 |
+| | EQ6H | 6.71 | **0.0038** | UD-Q6_K | 6.76 | 0.0040 | **112.9** vs 89.3 | **80.7** vs 60.4 |
+| Qwen3.8-27B | d2 (`eqd6-27b`) | 6.42 | **0.0013** | UD-Q6_K | 6.43 | 0.00137 | **21.3** vs 20.2 | **12.3** vs 10.3 |
+| Qwen3.5-9B | `eqd4m` | 5.03 | **0.0100** | Q4_K_M | 5.07 | 0.0141 | | |
+| | `eqd4l` | 5.30 | **0.0078** | UD-Q4_K_XL | 5.32 | 0.0121 | | |
+| | `eqd5` | 6.00 | **0.0043** | UD-Q5_K_XL | 6.02 | 0.0053 | | |
+| | `eqd6` | 6.65 | **0.0019** | Q6_K | 6.65 | 0.0026 | | |
+| Spark-X2.6-4B | c3 | 5.21 | **0.026** | MLX 4-bit | 4.50 | 0.238 | | 76.6 vs 75.3 (4K) |
+| | c4 | 5.67 | **0.018** | Q4_K_M (official) | 6.19 | 0.071 | | |
+
+EQ4DHB and EQ3DHB are 0.03 bits per weight larger than their rivals, EQ6H and the dense presets as large or smaller. GGUF sizes are read from the file headers. Rivals' decode is the same engine on the GGUF file; the Spark row compares runtimes (MLX 4-bit in mlx-lm 0.32), and c3 prefills 51 % faster at 4K and 23 % faster at 128K and 256K. At 4 and 5 bits, EQ does not yet beat unsloth's files on Qwen3.8-27B; those presets are not listed. **Qwen3.8-Flash-Next** in EQ (experts with 3- and 4-bit codebooks; `fnx3`, `fnxmix` and `fnxvq` for 48-64 GB Macs) is in [docs/quantize.md](docs/quantize.md#qwen38-flash-next-qwen4_exp).
+
 ## Quick start
 
 ```bash
