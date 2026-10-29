@@ -135,6 +135,7 @@ void sampling_options(const json::Value& body, ChatJob& job, int default_max, co
   g.sampling.repetition_penalty = num(body, "repetition_penalty", 1.0, 1e-3, 10);
   g.sampling.presence_penalty = num(body, "presence_penalty", 0, -2, 2);
   g.sampling.frequency_penalty = num(body, "frequency_penalty", 0, -2, 2);
+  g.sampling.no_repeat_ngram_size = int(num(body, "no_repeat_ngram_size", 0, 0, 1 << 20));
   int max_tokens = default_max;
   for (const char* k : {"max_completion_tokens", "max_tokens"}) {
     const json::Value* v = body.get(k);

@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **MiniCPM-OCR** (`openbmb/MiniCPM-OCR-1.0`, `minicpm_ocr`, from the Hugging Face release, bf16): the Qwen3.5 decoder read from the release's own tensor names (`MinicpmTextSource`: MLX names, the (1 + w) RMSNorm weights shifted by one), the SigLIP tower on the SigLIP2 structures (Conv2d patch embedding, nearest-bucket position table, the merger's 4 D LayerNorm in a new `layernorm_h` kernel) and the release's slicing processor (an overview and up to 9 slices of about 448 x 448 pixels, `<image_id>N</image_id>` numbering per prompt). Greedy replies equal transformers' on a scanned page, a text line and a two-image prompt up to the first near-tie, where the logits agree with an fp32 reference to about 0.002; the geometry of 13 image sizes is checked against transformers' processor in `vision_limits_test`.
+- **`no_repeat_ngram_size`** on chat and completions requests: no N-gram of the reply twice (transformers' `NoRepeatNGramLogitsProcessor` over the reply's tokens; speculative verify scopes add and take back their tokens). MiniCPM-OCR's SDK sends 100: without it, greedy table crops loop to their 8192-token cap.
 
 ## 0.1.2 (2026-10-22)
 

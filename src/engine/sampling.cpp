@@ -19,6 +19,13 @@ void PenaltyState::apply(float* logits, const SamplingParams& p) const {
     if (count > 0 && (p.presence_penalty != 0 || p.frequency_penalty != 0))
       x -= float(p.presence_penalty + p.frequency_penalty * count);
   }
+  const int n = p.no_repeat_ngram_size;
+  if (n > 0 && out_.size() + 1 >= size_t(n)) {
+    const size_t L = out_.size(), k = size_t(n - 1);  // the gram's prefix: out_[L - k, L)
+    for (size_t j = 0; j + k < L; ++j)
+      if (std::equal(out_.begin() + j, out_.begin() + j + k, out_.end() - k))
+        logits[out_[j + k]] = -std::numeric_limits<float>::infinity();
+  }
 }
 
 int32_t argmax(const float* logits, int vocab) {

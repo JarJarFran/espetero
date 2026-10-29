@@ -194,6 +194,9 @@ unchanged, and fields the model does not set keep OpenAI's defaults
 (temperature 1, top_p 1, top_k off, min_p 0); `do_sample` is ignored, as in
 vLLM. A `top_k` of 1 to 32 also puts sampled requests on the GPU sampling
 path (drafts drawn as the target draws its tokens).
+`no_repeat_ngram_size` N (vLLM's and transformers' field; 0, the default:
+off) gives -inf to every token that would repeat an N-gram of the reply,
+the loop guard OCR pipelines such as MiniCPM-OCR's SDK send (N = 100).
 `--no-generation-config` gives every request OpenAI's defaults again.
 `--print-config` and `GET /v1/config` show the defaults in effect and where
 they come from (`effective.sampling-defaults`). `espetero chat` uses
