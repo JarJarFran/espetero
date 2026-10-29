@@ -791,7 +791,7 @@ void mkdirs(const std::string& d) {
 const char* kUsage =
     "usage: espetero quantize --model HF_DIR --out DIR [--preset NAME | --fmt RULES]\n"
     "         [--calib FILE | --calib none] [--calib-data file:PATH[+...]] [--calib-tokens N] [--ctx N]\n"
-    "         [--calib-out FILE] [--calib-only] [--calib-experts f16|q8] [--calib-layers A:B]\n"
+    "         [--calib-out FILE] [--calib-only] [--calib-experts f16|q8] [--calib-expert-weight count|router] [--calib-layers A:B]\n"
     "         [--hessian-max N] [--hessian-pack N] [--no-mtp] [--shard-gb G] [--tiles]\n"
     "         [--calib-model DIR] [--keep-experts FILE] [--expert-split H|FILE] [--ple-bits 4|8]\n"
     "       espetero quantize --preset NAME --print-rules [--model HF_DIR | --layers N]\n"
@@ -815,6 +815,8 @@ const char* kUsage =
     "             tokens up to --calib-tokens (262144), saved to --calib-out (default\n"
     "             OUT.calib.safetensors); --calib none: unweighted encoders; --calib-experts q8\n"
     "             runs the forward's experts as 8-bit copies (less memory; default f16, exact);\n"
+    "             --calib-expert-weight router weights each routed pair of an expert's statistics by\n"
+    "             its routing weight (default count: every pair once)\n"
     "             several comma-separated files read as one (the parts of --calib-layers captures)\n"
     "  --hessian-max   capture the full E[x x^T] of inputs up to N wide (16384), else only its\n"
     "             diagonal (+gptq then falls back to +imat); --hessian-pack N saves full ones wider\n"
@@ -912,6 +914,9 @@ int cmd_quantize(int argc, char** argv) {
     const std::string ex = a.get("calib-experts", "f16");
     if (ex != "f16" && ex != "q8") fail("--calib-experts: f16 or q8");
     co.experts_f16 = ex == "f16";
+    const std::string ew = a.get("calib-expert-weight", "count");
+    if (ew != "count" && ew != "router") fail("--calib-expert-weight: count or router");
+    co.expert_route_weight = ew == "router";
     co.hessian_max = std::stoi(a.get("hessian-max", std::to_string(co.hessian_max)));
     {  // per-expert E[x x^T] (unused by the encoders so far): Qwen4-Exp's 512 x 640^2 per layer (40 GB) only when asked
       const json::Value mc = json::parse(native::read_file(co.model + "/config.json"));

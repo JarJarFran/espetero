@@ -375,10 +375,10 @@ inline size_t tap_bytes(const Config& c, int rows) {
   const size_t W = std::max<size_t>(size_t(c.Vd()), size_t(c.H) * size_t(std::max(c.HD, c.HDg)));
   const size_t I = size_t(std::max(c.I, c.I_shared));
   size_t per = size_t(rows) * (2 * size_t(c.D) + W + I) * 2;
-  if (c.E) per += size_t(rows) * size_t(c.k) * (size_t(c.Ie) * 2 + 8);
-  if (!c.q4) return (per + 8 * 256) * size_t(c.L);
+  if (c.E) per += size_t(rows) * size_t(c.k) * (size_t(c.Ie) * 2 + 12);  // act rows, ids, positions, routing weights
+  if (!c.q4) return (per + 9 * 256) * size_t(c.L);
   const size_t hc = size_t(rows) * (size_t(c.W()) + size_t(c.hc_rank)) * 2;
-  return (per + 2 * hc + 12 * 256) * size_t(c.L) + hc + size_t(rows) * 2 * size_t(c.D) * 2 + 8 * 256;
+  return (per + 2 * hc + 13 * 256) * size_t(c.L) + hc + size_t(rows) * 2 * size_t(c.D) * 2 + 8 * 256;
 }
 
 // Copy `bytes` of `src` from `src_off` into the tap buffer; returns where.
@@ -1069,6 +1069,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     r.off = tap_copy(m, E, z.act, 0, pairs * size_t(c.Ie) * 2);
     r.ids_off = tap_copy(m, E, z.ids, 0, pairs * 4);
     r.pos_off = tap_copy(m, E, z.slotpos, 0, pairs * 4);
+    r.w_off = tap_copy(m, E, z.w, 0, pairs * 4);  // the routing weights of the pairs ([rows][k])
+    r.has_w = true;
     m.tap_recs.push_back(r);
   }
   // Single-row passes: the down projection and the combine in one kernel.

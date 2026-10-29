@@ -607,7 +607,8 @@ struct Model : Runtime {
   // handed to the sink once the pass is done.
   struct TapRec {
     int layer = 0, kind = 0, n = 0, width = 0, k = 0;
-    size_t off = 0, ids_off = 0, pos_off = 0;
+    size_t off = 0, ids_off = 0, pos_off = 0, w_off = 0;
+    bool has_w = false;  // kExpertIn: w_off holds the pairs' routing weights
   };
   espetero::ActivationSink* tap_sink = nullptr;
   bool tap_pass = false;  // this pass copies

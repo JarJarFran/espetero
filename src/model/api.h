@@ -239,6 +239,9 @@ class ActivationSink {
   virtual ~ActivationSink() = default;
   virtual void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids,
                    const int32_t* pos, int k) = 0;
+  // Before a layer's kExpertIn tap: the routing weight of each pair p = row * k + j (the
+  // normalized top-k probabilities the MoE combine applies), float [pairs].
+  virtual void tap_route_weights(int layer, const float* w, int pairs) { (void)layer, (void)w, (void)pairs; }
 };
 
 class NativeModel {

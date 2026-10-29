@@ -746,10 +746,13 @@ class MetalModel final : public NativeModel {
       run_forest(m_, meta_, trees, stats);
       if (m_.tap_pass) {  // calibration taps: the pass is done, its copies are in tap_buf
         const uint8_t* base = static_cast<const uint8_t*>([m_.tap_buf contents]);
-        for (const auto& r : m_.tap_recs)
+        for (const auto& r : m_.tap_recs) {
+          if (r.has_w)
+            m_.tap_sink->tap_route_weights(r.layer, reinterpret_cast<const float*>(base + r.w_off), r.n * r.k);
           m_.tap_sink->tap(r.layer, r.kind, reinterpret_cast<const uint16_t*>(base + r.off), r.n, r.width,
                            r.k ? reinterpret_cast<const int32_t*>(base + r.ids_off) : nullptr,
                            r.k ? reinterpret_cast<const int32_t*>(base + r.pos_off) : nullptr, r.k);
+        }
         m_.tap_recs.clear();
         m_.tap_pass = false;
       }

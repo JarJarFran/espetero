@@ -61,6 +61,10 @@ struct CaptureOptions {
   // together (--calib A,B,...).
   int layer_lo = 0;
   int layer_hi = 1 << 30;
+  // Routed experts' statistics: each routed (token, expert) pair weighted by its routing weight
+  // (the normalized top-k probability the combine applies; MoEQuant's gate-weighted Hessians) and
+  // normalized by the weight sum, instead of every pair counting once (--calib-expert-weight router).
+  bool expert_route_weight = false;
 };
 void capture(const CaptureOptions& o);
 

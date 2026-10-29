@@ -7,6 +7,7 @@
 #include <Accelerate/Accelerate.h>
 #include <glob.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -149,6 +150,7 @@ struct Dense {
 struct Experts {
   int E = 0, C = 0;
   std::vector<float> diag, cnt;  // [E][C], [E]
+  std::vector<double> wsum;      // [E] routing-weight sums (expert_route_weight)
   std::vector<float> X;          // [E][C][C] (upper) or empty
 };
 
@@ -270,8 +272,16 @@ class Sink : public ActivationSink {
       }
     }
     for (auto& [k, x] : experts_) {
+      if (k.find("gate_proj") != std::string::npos) {  // routed rows per expert of the layer (the coverage)
+        std::vector<float> c = x.cnt;
+        std::sort(c.begin(), c.end());
+        const int zero = int(std::count(c.begin(), c.end(), 0.0f));
+        std::fprintf(stderr, "[calib] %s: routed rows per expert min %.0f p10 %.0f median %.0f max %.0f%s\n", k.c_str(), c.front(),
+                     c[c.size() / 10], c[c.size() / 2], c.back(), zero ? (", " + std::to_string(zero) + " never routed").c_str() : "");
+      }
       for (int e = 0; e < x.E; ++e) {
-        const float inv = 1.0f / std::max(x.cnt[size_t(e)], 1.0f);
+        const float inv = o_.expert_route_weight ? float(1.0 / std::max(x.wsum[size_t(e)], 1e-12))
+                                                 : 1.0f / std::max(x.cnt[size_t(e)], 1.0f);
         for (int i = 0; i < x.C; ++i) x.diag[size_t(e) * x.C + i] *= inv;
         if (!x.X.empty()) {
           float* h = x.X.data() + size_t(e) * x.C * x.C;
@@ -292,6 +302,7 @@ class Sink : public ActivationSink {
     std::map<std::string, std::string> meta{{"ALIAS", json::dump(al)},
                                             {"tokens", std::to_string(tokens)},
                                             {"source", "espetero quantize (fp16 activations)"}};
+    if (o_.expert_route_weight) meta["expert_weight"] = "router";
     st_save(path, ts, meta);
     std::fprintf(stderr, "[calib] %zu matrices (+%zu sharing an input), %lld tokens -> %s\n", ts.size(), alias_.size(),
                  (long long)tokens, path.c_str());
@@ -322,8 +333,16 @@ class Sink : public ActivationSink {
     d.n += n;
   }
 
+  void tap_route_weights(int layer, const float* w, int pairs) override {
+    route_w_.assign(w, w + pairs);
+    route_w_layer_ = layer;
+  }
+
   void experts(const std::string& P, int layer, const std::vector<float>& act, int n, int Ie, const int32_t* ids,
                const int32_t* pos, int k) {
+    const bool rw = o_.expert_route_weight;
+    if (rw && (route_w_layer_ != layer || route_w_.size() != size_t(n) * size_t(k)))
+      fail("calibration: routing weights missing for layer " + std::to_string(layer));
     const std::vector<float>& xin = mlp_in_.at(size_t(layer));
     if (xin.empty()) fail("calibration: expert rows without the layer's MLP input");
     const int D = int(xin.size() / size_t(n));
@@ -345,6 +364,8 @@ class Sink : public ActivationSink {
       gu.cnt.assign(size_t(E), 0.0f);
       dn.diag.assign(size_t(E) * Ie, 0.0f);
       dn.cnt.assign(size_t(E), 0.0f);
+      gu.wsum.assign(size_t(E), 0.0);
+      dn.wsum.assign(size_t(E), 0.0);
       if (Ie <= o_.expert_hessian_max) dn.X.assign(size_t(E) * Ie * Ie, 0.0f);
       if (D <= o_.expert_hessian_max) gu.X.assign(size_t(E) * D * D, 0.0f);
     }
@@ -354,17 +375,31 @@ class Sink : public ActivationSink {
       float* g = gu.diag.data() + e * D;
       float* d = dn.diag.data() + e * Ie;
       std::vector<float> rows_dn(ps.size() * size_t(Ie)), rows_gu(gu.X.empty() ? 0 : ps.size() * size_t(D));
+      double ws = 0;
       for (size_t i = 0; i < ps.size(); ++i) {
         const int p = ps[i];
         const float* x = xin.data() + size_t(p / k) * D;
-        for (int c = 0; c < D; ++c) g[c] += x[c] * x[c];
-        if (!rows_gu.empty()) std::memcpy(&rows_gu[i * D], x, sizeof(float) * D);
         const float* a = act.data() + size_t(pos[p]) * Ie;
-        for (int c = 0; c < Ie; ++c) d[c] += a[c] * a[c];
-        std::memcpy(&rows_dn[i * Ie], a, sizeof(float) * Ie);
+        if (!rw) {
+          for (int c = 0; c < D; ++c) g[c] += x[c] * x[c];
+          if (!rows_gu.empty()) std::memcpy(&rows_gu[i * D], x, sizeof(float) * D);
+          for (int c = 0; c < Ie; ++c) d[c] += a[c] * a[c];
+          std::memcpy(&rows_dn[i * Ie], a, sizeof(float) * Ie);
+          continue;
+        }
+        // Weighted: w x x^T (the rows scaled by sqrt(w) for the syrk)
+        const float wt = std::max(route_w_[size_t(p)], 0.0f), s = std::sqrt(wt);
+        ws += wt;
+        for (int c = 0; c < D; ++c) g[c] += wt * x[c] * x[c];
+        if (!rows_gu.empty())
+          for (int c = 0; c < D; ++c) rows_gu[i * D + c] = s * x[c];
+        for (int c = 0; c < Ie; ++c) d[c] += wt * a[c] * a[c];
+        for (int c = 0; c < Ie; ++c) rows_dn[i * Ie + c] = s * a[c];
       }
       gu.cnt[e] += float(ps.size());
       dn.cnt[e] += float(ps.size());
+      gu.wsum[e] += ws;
+      dn.wsum[e] += ws;
       if (!dn.X.empty())
         cblas_ssyrk(CblasRowMajor, CblasUpper, CblasTrans, Ie, int(ps.size()), 1.0f, rows_dn.data(), Ie, 1.0f,
                     dn.X.data() + e * Ie * Ie, Ie);
@@ -383,6 +418,8 @@ class Sink : public ActivationSink {
   std::map<std::string, Experts> experts_;
   std::map<std::string, std::string> alias_;
   std::vector<std::vector<float>> mlp_in_;
+  std::vector<float> route_w_;  // the routing weights of the next kExpertIn tap (tap_route_weights)
+  int route_w_layer_ = -1;
   bool lm_ = true;
 };
 
