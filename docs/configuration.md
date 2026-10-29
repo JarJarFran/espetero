@@ -124,14 +124,15 @@ same Hugging Face cache:
 Only models Espetero runs are loaded: an MLX `config.json` whose `model_type`
 (or `text_config.model_type`) is of the Qwen3.5 family (`qwen3_5`,
 `qwen3_5_moe`, `qwen3_5_mtp`, and `_text` variants), Qwen3.8-Flash-Next
-(`qwen4_exp`), Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`) or LFM2 (`lfm2`, `lfm2_vl`:
-an MLX conversion or the Hugging Face release itself), a GGUF whose
+(`qwen4_exp`), Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`), LFM2 (`lfm2`, `lfm2_vl`:
+an MLX conversion or the Hugging Face release itself) or MiniCPM-OCR (`minicpm_ocr`, the
+Hugging Face release), a GGUF whose
 `general.architecture` is `qwen35`, `qwen35moe` or `gemma4`. Any other model
 stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.2; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.2; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers
 ```
 
 Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models with their
@@ -980,6 +981,39 @@ reference's (`tests/ref/kev_fixtures.json`: 20 requests, 9 with images)
 and the answers' rounding, confidences and `output_tokens`. Known
 difference: integers beyond the int64 range in a JSON state are rendered
 as floats.
+
+### MiniCPM-OCR
+
+OpenBMB's MiniCPM-OCR 1.0 (`openbmb/MiniCPM-OCR-1.0`, 1.3B: a SigLIP tower and
+a Qwen3.5 decoder of 24 layers) runs from the Hugging Face release itself
+(bf16, served as fp16; no conversion):
+
+```
+espetero serve --model openbmb/MiniCPM-OCR-1.0
+```
+
+Its decoder takes the Qwen3.5 path (the release's `model.language_model.*`
+tensors read under their MLX names, the RMSNorm weights shifted by one as
+mlx-lm's conversion writes them); there is no MTP head, so drafts come from
+prompt lookup only. Images go through the release's processor
+(`preprocessor_config.json`, `downsample_mode` `"4x"`): an image of more than
+448 x 448 pixels is cut into a grid of 2 to 9 slices (the grid closest to its
+aspect ratio), each view (an overview of about 448 x 448 pixels, then the
+slices row by row; smaller images are enlarged to that size) becomes
+(h / 14) x (w / 14) / 4 image tokens (SigLIP patches of 14 pixels, the
+position table read at each patch's nearest bucket, 2 x 2 merged), and the
+placeholder becomes `<image_id>N</image_id><image>` + the overview's tokens
++ `</image>`, then `<slice>` + tokens + `</slice>` per slice with a `\n`
+between grid rows (N: the image's index in the prompt). A scanned A4 page is
+3 x 3 slices, 2,520 image tokens; a text line of 1010 x 120 pixels 276. The
+chat image budget (`image_detail`) does not apply. The model card's prompts
+name the task: `Text Recognition:`, `Table Recognition:`, `Formula
+Recognition:`, `Seal Recognition:`, `Chart to Table:`. Greedy replies equal
+transformers' (5.21) on a page, a text line and two images in one prompt
+until the first near-tie, where Espetero's logits agree with an fp32
+reference to about 0.002. The processor's `small_image_upsize` `"adaptive"`
+mode (OpenCV glyph statistics) and `"16x"` checkpoints (the window-attention
+merger) are refused.
 
 ### LFM2-VL and d1 decision models
 

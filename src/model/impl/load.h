@@ -591,6 +591,7 @@ inline std::string find_mmproj(const std::string& gguf_path) {
 #include "gemma_load.h"
 #include "qwen3_omni_load.h"
 #include "lfm2_load.h"
+#include "minicpm_load.h"
 
 namespace espetero::native {
 
@@ -742,6 +743,13 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       load_lfm2(m, src, cfg, want_vision);
       return;
     }
+  }
+  if (is_minicpm_type(src.config().get_string("model_type", ""))) {  // MiniCPM-OCR (minicpm_load.h): no drafting head
+    if (!mtp.empty() && mtp != "none") fail("--mtp: MiniCPM-OCR has no MTP head (prompt lookup drafts only)");
+    m.format = "mlx";
+    m.cfg = config_from_mlx(src.config());
+    load_minicpm(m, src, want_vision);
+    return;
   }
   if (!src.has("language_model.model.embed_tokens.weight"))
     fail("expected an MLX-converted Qwen3.5 checkpoint (language_model.model.* tensors)");

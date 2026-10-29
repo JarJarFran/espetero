@@ -60,6 +60,61 @@ kernel void layernorm(
   for (int i = tid; i < D4; i += ntg) y[i] = half4((x[i] - mean) * inv * w[i] + b[i]);
 }
 
+// The same LayerNorm over fp16 rows (MiniCPM-OCR's merger pre_norm over the
+// post_layernorm output, 4 D wide; X and Y must not alias).
+kernel void layernorm_h(
+    device const half* X [[buffer(0)]],
+    device const float* Wt [[buffer(1)]],
+    device const float* Bs [[buffer(2)]],
+    device half* Y [[buffer(3)]],
+    constant int& D [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float partial[32];
+  device const half4* x = (device const half4*)(X + ulong(row) * D);
+  const int D4 = D / 4;
+  const int nsg = (ntg + 31) / 32;
+  float s = 0.0f;
+  for (int i = tid; i < D4; i += ntg) {
+    const float4 v = float4(x[i]);
+    s += v.x + v.y + v.z + v.w;
+  }
+  s = simd_sum(s);
+  if (lane == 0) partial[sg] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float t = (int(lane) < nsg) ? partial[lane] : 0.0f;
+    t = simd_sum(t);
+    if (lane == 0) partial[0] = t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float mean = partial[0] / float(D);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float q = 0.0f;
+  for (int i = tid; i < D4; i += ntg) {
+    const float4 v = float4(x[i]) - mean;
+    q += dot(v, v);
+  }
+  q = simd_sum(q);
+  if (lane == 0) partial[sg] = q;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float t = (int(lane) < nsg) ? partial[lane] : 0.0f;
+    t = simd_sum(t);
+    if (lane == 0) partial[0] = t;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = rsqrt(partial[0] / float(D) + eps);
+  device const float4* w = (device const float4*)Wt;
+  device const float4* b = (device const float4*)Bs;
+  device half4* y = (device half4*)(Y + ulong(row) * D);
+  for (int i = tid; i < D4; i += ntg) y[i] = half4((float4(x[i]) - mean) * inv * w[i] + b[i]);
+}
+
 // Learned position embedding, bilinearly interpolated to the patch grid:
 // X[r] += sum_i wts[r][i] * P[idx[r][i]].
 kernel void vit_pos_add(

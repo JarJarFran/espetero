@@ -359,6 +359,26 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
         ls.grid_ids[size_t((r - 1) * 10 + c - 1)] = tok_->token_id("<|img_row_" + std::to_string(r) + "_col_" + std::to_string(c) + "|>");
     if (ls.thumb_id < 0 || ls.grid_ids[size_t((ls.max_tiles - 1) * 10)] < 0)
       throw std::runtime_error("LFM2-VL model without its tile tokens in its vocabulary");
+  } else if (I.vision && I.vision_layout == "minicpm") {
+    // MiniCPM-OCR: the template writes <|image_pad|>; the processor's run is
+    // <image_id>N</image_id><image> (overview) </image> and the slices.
+    image_token = tok_->token_id("<|image_pad|>");
+    run_start = tok_->token_id("<image_id>");
+    minicpm_spec_ = std::make_unique<vision::MinicpmSpec>(vision::minicpm_spec_from_model_dir(path));
+    vision::MinicpmSpec& ms = *minicpm_spec_;
+    ms.image_id = image_token;
+    ms.im_start_id = tok_->token_id("<image>");
+    ms.im_end_id = tok_->token_id("</image>");
+    ms.sl_start_id = tok_->token_id("<slice>");
+    ms.sl_end_id = tok_->token_id("</slice>");
+    ms.id_start_id = run_start;
+    ms.id_end_id = tok_->token_id("</image_id>");
+    const std::vector<int32_t> nl = tok_->encode("\n", false);
+    ms.newline_id = nl.size() == 1 ? nl[0] : -1;
+    if (!ms.use_image_id) run_start = ms.im_start_id;
+    if (image_token < 0 || ms.im_start_id < 0 || ms.im_end_id < 0 || ms.sl_start_id < 0 || ms.sl_end_id < 0 ||
+        ms.id_start_id < 0 || ms.id_end_id < 0 || ms.newline_id < 0)
+      throw std::runtime_error("MiniCPM-OCR model without its image tokens in its vocabulary");
   } else if (I.vision) {
     const bool g4 = I.family == "gemma4";
     image_token = run_start = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
@@ -450,7 +470,7 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     // its run brings the start and end tokens).
     const std::string image_block =
         !I.vision ? ""
-        : gemma_vision() || vision_start < 0 || lfm2_spec_ ? tok_->decode(std::vector<int32_t>{image_token})
+        : gemma_vision() || vision_start < 0 || lfm2_spec_ || minicpm_spec_ ? tok_->decode(std::vector<int32_t>{image_token})
                                                            : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
@@ -776,6 +796,9 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
   try {
     if (lfm2_spec_) {  // LFM2-VL: its own layout, no pixel budget
       n = int(vision::lfm2_run(vision::lfm2_layout(int(h), int(w), *lfm2_spec_), *lfm2_spec_).size());
+    } else if (minicpm_spec_) {  // MiniCPM-OCR: likewise, with a one-digit <image_id> prefix
+      n = int(vision::minicpm_run(vision::minicpm_layout(int(h), int(w), *minicpm_spec_), *minicpm_spec_).size()) +
+          (minicpm_spec_->use_image_id ? 3 : 0);
     } else {
       const vision::Spec spec = image_spec(max_pixels, min_pixels);
       n = vision::image_tokens(vision::grid_for(int(h), int(w), spec), spec.merge);
@@ -830,6 +853,7 @@ PreparedImage Engine::prepare_image_capped(const std::string& data_url, int64_t 
     return out;
   }
   if (lfm2_spec_) return prepare_lfm2_image(rgb, max_pixels_lfm2);
+  if (minicpm_spec_) return prepare_minicpm_image(rgb);
   vision::Spec spec = image_spec(max_pixels, min_pixels);
   // Normalization from the processor config when the checkpoint has one
   // (Gemma 4 rescales only).
@@ -891,6 +915,46 @@ PreparedImage Engine::prepare_lfm2_image(const vision::RGBImage& rgb, int64_t ma
   return out;
 }
 
+PreparedImage Engine::prepare_minicpm_image(const vision::RGBImage& rgb) const {
+  vision::MinicpmPrepared p;
+  try {
+    p = vision::minicpm_preprocess(rgb, *minicpm_spec_);
+  } catch (const std::exception& e) {
+    throw RequestError(422, std::string("image: ") + e.what());
+  }
+  PreparedImage out;
+  out.pixels = std::move(p.pixels);
+  out.run = std::move(p.run);
+  for (const auto& v : p.views) out.views.push_back({v.gh, v.gw, v.offset, v.token});
+  out.grid_h = out.views.empty() ? 0 : out.views.front().grid_h;
+  out.grid_w = out.views.empty() ? 0 : out.views.front().grid_w;
+  out.digest = hex(p.digest.data(), p.digest.size());
+  if (minicpm_spec_->use_image_id) {  // the prefix of image 0; number_images renumbers
+    out.run.insert(out.run.begin(), {minicpm_spec_->id_start_id, tok_->encode("0", false).at(0), minicpm_spec_->id_end_id});
+    for (auto& v : out.views) v.token += 3;
+  }
+  check_image_rows(out.tokens(0), model_->info().max_rows);
+  return out;
+}
+
+void Engine::number_images(std::vector<PreparedImage>& images) const {
+  if (!minicpm_spec_ || !minicpm_spec_->use_image_id) return;
+  const vision::MinicpmSpec& ms = *minicpm_spec_;
+  for (size_t k = 0; k < images.size(); ++k) {
+    PreparedImage& im = images[k];
+    if (im.run.empty() || im.run[0] != ms.id_start_id) continue;
+    const auto end = std::find(im.run.begin(), im.run.end(), ms.id_end_id);
+    if (end == im.run.end()) continue;
+    const int old_len = int(end - im.run.begin()) + 1;
+    std::vector<int32_t> prefix{ms.id_start_id};
+    for (const int32_t t : tok_->encode(std::to_string(k), false)) prefix.push_back(t);
+    prefix.push_back(ms.id_end_id);
+    im.run.erase(im.run.begin(), end + 1);
+    im.run.insert(im.run.begin(), prefix.begin(), prefix.end());
+    for (auto& v : im.views) v.token += int(prefix.size()) - old_len;
+  }
+}
+
 std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const {
   std::vector<int32_t> out;
   size_t g = 0;
@@ -921,7 +985,7 @@ std::vector<int32_t> Engine::mrope_positions(const std::vector<int32_t>& ids, co
     return {};
   }
   std::vector<int32_t> pos(ids.size() * 3);
-  if (lfm2_spec_) {  // LFM2-VL: plain positions, image runs included
+  if (lfm2_spec_ || minicpm_spec_) {  // LFM2-VL, MiniCPM-OCR: plain positions, image runs included
     for (size_t i = 0; i < ids.size(); ++i) pos[3 * i] = pos[3 * i + 1] = pos[3 * i + 2] = int32_t(i);
     if (next_pos) *next_pos = int(ids.size());
     return pos;
@@ -1163,6 +1227,7 @@ json::Value Engine::decide(const json::Value& body) {
                                   " tokens)");
   }
   for (const std::string& url : r.images) job->images.push_back(prepare_image(url, px > 0 ? px : 0));
+  number_images(job->images);
   if (!job->images.empty()) {
     const size_t before = plan.prefix.size();
     plan.prefix = expand_images(plan.prefix, job->images);
@@ -1353,6 +1418,7 @@ json::Value Engine::systemone(const json::Value& body) {
                                   std::to_string(max_length));
   }
   for (const std::string& url : urls) job->images.push_back(prepare_image(url, px > 0 ? px : 0, min_px));
+  number_images(job->images);
   std::vector<int> itoks;
   for (const PreparedImage& im : job->images) itoks.push_back(im.tokens(I.vision_merge));
   // max_state_tokens as the release slices: state_ids[:n] (0 = no state, negative = drop from the end).

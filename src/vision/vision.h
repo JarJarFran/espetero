@@ -300,4 +300,53 @@ struct Lfm2Prepared {
 };
 Lfm2Prepared lfm2_preprocess(const RGBImage& image, const Lfm2Spec& spec);
 
+
+// ---- MiniCPM-OCR (SigLIP slices; minicpm.cpp) ---------------------------------
+//
+// transformers' MiniCPMOcrImageProcessor and MiniCPMOcrProcessor (downsample_mode
+// "4x", small_image_upsize "always"): an image larger than scale x scale pixels
+// is cut into a rows x cols grid (2 to max_slices cells, the grid closest to its
+// aspect ratio); its overview is resized (aspect ratio kept) to about
+// scale x scale pixels, sides multiples of 2 * patch (small images enlarged),
+// and the slices are the cells of the image resized so that each cell is such a
+// size. Views: the overview, then the slices row by row; each becomes patch rows
+// (row-major patches, (py, px, channel) inside a patch, (x / 255 - mean) / std)
+// and (h / patch) x (w / patch) / 4 image tokens. The placeholder becomes
+// <image> + the overview's tokens + </image>, then per grid row (rows joined by
+// "\n") <slice> + a slice's tokens + </slice> per column; the engine puts
+// <image_id>N</image_id> before it, N the image's index in the prompt
+// (use_image_id). Images are resized with Pillow's bicubic filter
+// (transformers' torchvision backend agrees with it on uint8 images to one level).
+struct MinicpmSpec {
+  int patch = 14, scale = 448, max_slices = 9;
+  bool slice_mode = true, use_image_id = true;
+  float mean[3] = {0.5f, 0.5f, 0.5f}, std[3] = {0.5f, 0.5f, 0.5f};
+  // Token ids (the caller's: the tokenizer's lookup): <|image_pad|>, <image>,
+  // </image>, <slice>, </slice>, "\n", <image_id>, </image_id>.
+  int32_t image_id = -1, im_start_id = -1, im_end_id = -1, sl_start_id = -1, sl_end_id = -1, newline_id = -1;
+  int32_t id_start_id = -1, id_end_id = -1;
+  int row_dim() const { return 3 * patch * patch; }
+};
+
+// preprocessor_config.json (or processor_config.json) of a MiniCPM-OCR directory
+// over the defaults (the token ids are the caller's).
+MinicpmSpec minicpm_spec_from_model_dir(const std::string& dir);
+
+// The views of an image of this size: the overview's size and, when the image
+// is sliced (rows > 0), the grid and the size of every slice.
+struct MinicpmLayout {
+  int rows = 0, cols = 0;
+  int source_h = 0, source_w = 0;
+  int slice_h = 0, slice_w = 0;
+  bool sliced() const { return rows > 0 && cols > 0; }
+  int views() const { return 1 + (sliced() ? rows * cols : 0); }
+};
+MinicpmLayout minicpm_layout(int height, int width, const MinicpmSpec& spec);
+// The token run of that layout (without the <image_id> prefix).
+std::vector<int32_t> minicpm_run(const MinicpmLayout& layout, const MinicpmSpec& spec);
+
+// Views, patch rows and run as Lfm2Prepared holds them.
+using MinicpmPrepared = Lfm2Prepared;
+MinicpmPrepared minicpm_preprocess(const RGBImage& image, const MinicpmSpec& spec);
+
 }  // namespace espetero::vision

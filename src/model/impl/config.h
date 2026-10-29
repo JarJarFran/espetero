@@ -182,6 +182,12 @@ struct VisionConfig {
   // linear(4 D -> proj) -> GELU -> linear(proj -> out).
   bool siglip = false;
   int proj = 0;
+  // MiniCPM-OCR (minicpm_ocr, downsample_mode 4x; minicpm_load.h): the SigLIP
+  // tower above with a Conv2d patch embedding, the position table looked up
+  // at each patch's nearest bucket (no interpolation), post_layernorm on
+  // every patch and a LayerNorm over each 2x2 merged row (4 D) before the
+  // projector (proj = 4 D, GELU, then out).
+  bool minicpm = false;
   int patch_dim() const { return in_ch * tps * patch * patch; }
   int unified_dim() const { return in_ch * patch * patch * merge * merge; }
   int Ip() const { return (I + 63) / 64 * 64; }
@@ -203,7 +209,7 @@ struct VisionConfig {
     }
     side = int(std::lround(std::sqrt(double(n_pos))));
     if (merge != 2 || side * side != n_pos || D % 64 || out != text_hidden || tps != (siglip ? 1 : 2) ||
-        (siglip && (proj % 64 || patch_dim() % 64)))
+        (siglip && (proj % 64 || (!minicpm && patch_dim() % 64))))
       fail("unsupported vision geometry");
     for (size_t j = 0; j < deepstack.size(); ++j)
       if (deepstack[j] < 0 || deepstack[j] >= depth || (j > 0 && deepstack[j] <= deepstack[j - 1]))
@@ -510,6 +516,41 @@ inline VisionConfig vision_from_lfm2(const json::Value& root) {
   v.tps = 1;
   v.merge = int(root.get_int("downsample_factor", 2));
   v.proj = int(root.get_int("projector_hidden_size", 0));
+  v.out = tcp && tcp->is_object() ? int(tcp->get_int("hidden_size", 0)) : 0;
+  v.present = v.depth > 0;
+  return v;
+}
+
+// MiniCPM-OCR's tower and merger (transformers' MiniCPMOcrVisionModel and
+// MiniCPMOcrMerger with downsample_mode "4x": the ViT window merger after
+// insert_layer_id is skipped, one 2x2 merge round).
+inline VisionConfig vision_from_minicpm(const json::Value& root) {
+  VisionConfig v;
+  const json::Value* vcp = root.get("vision_config");
+  if (!vcp || !vcp->is_object()) return v;
+  const json::Value& vc = *vcp;
+  if (vc.get_string("hidden_act", "gelu_pytorch_tanh") != "gelu_pytorch_tanh")
+    fail("unsupported vision activation " + vc.get_string("hidden_act", ""));
+  if (root.get_string("downsample_mode", "16x") != "4x")
+    fail("MiniCPM-OCR: only downsample_mode \"4x\" is supported (the window-attention merger of \"16x\" is not)");
+  if (root.get_int("merger_times", 1) != 1) fail("MiniCPM-OCR: only one merge round (merger_times 1) is supported");
+  if (const json::Value* k = root.get("merge_kernel_size"); k && k->is_array() &&
+      (k->size() != 2 || (*k)[0].as_int() != 2 || (*k)[1].as_int() != 2))
+    fail("MiniCPM-OCR: only a 2x2 merge kernel is supported");
+  const json::Value* tcp = root.get("text_config");
+  v.siglip = v.minicpm = true;
+  v.depth = int(vc.get_int("num_hidden_layers", 0));
+  v.D = int(vc.get_int("hidden_size", 0));
+  v.I = int(vc.get_int("intermediate_size", 0));
+  v.heads = int(vc.get_int("num_attention_heads", 0));
+  v.patch = int(vc.get_int("patch_size", 14));
+  v.in_ch = int(vc.get_int("num_channels", 3));
+  const int side = int(vc.get_int("image_size", 980)) / v.patch;
+  v.n_pos = side * side;
+  v.eps = float(vc.get_double("layer_norm_eps", 1e-6));
+  v.tps = 1;
+  v.merge = 2;
+  v.proj = 4 * v.D;
   v.out = tcp && tcp->is_object() ? int(tcp->get_int("hidden_size", 0)) : 0;
   v.present = v.depth > 0;
   return v;

@@ -749,6 +749,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   }
   // Images (decoded in this thread; preprocessing is CPU work).
   for (size_t i = 0; i < urls.size(); ++i) g.images.push_back(engine.prepare_image(urls[i], detail_pixels[i]));
+  engine.number_images(g.images);
   if (!g.images.empty()) {
     if (!marks.empty()) {  // each image's placeholder becomes its run of image tokens: shift the marks after it
       std::vector<int> shift(marks.size(), 0);

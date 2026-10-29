@@ -294,6 +294,7 @@ struct Vision {
   Buf pos;  // fp32 [n_pos, D] (Gemma 4: [2][n_pos][D], the column then the row table)
   std::vector<VBlock> blocks;
   Buf mnw, mnb, inv_freq;
+  Buf pnw, pnb;             // MiniCPM-OCR: the merger's pre_norm over each 2x2 merged row (fp32 [4 D])
   Buf std_bias, std_scale;  // Gemma 4 (standardize)
   Mat proj;                 // Gemma 4: embed_vision's projection to the language model's width
   // Gemma 4 unified (no blocks): patch_ln1, patch_ln2 and pos_norm weights

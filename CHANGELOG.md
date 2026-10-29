@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **MiniCPM-OCR** (`openbmb/MiniCPM-OCR-1.0`, `minicpm_ocr`, from the Hugging Face release, bf16): the Qwen3.5 decoder read from the release's own tensor names (`MinicpmTextSource`: MLX names, the (1 + w) RMSNorm weights shifted by one), the SigLIP tower on the SigLIP2 structures (Conv2d patch embedding, nearest-bucket position table, the merger's 4 D LayerNorm in a new `layernorm_h` kernel) and the release's slicing processor (an overview and up to 9 slices of about 448 x 448 pixels, `<image_id>N</image_id>` numbering per prompt). Greedy replies equal transformers' on a scanned page, a text line and a two-image prompt up to the first near-tie, where the logits agree with an fp32 reference to about 0.002; the geometry of 13 image sizes is checked against transformers' processor in `vision_limits_test`.
+
 ## 0.1.2 (2026-10-22)
 
 - **Macs with 128 GB (M4 Max)**: Qwen3.8-Flash-Next (`qwen4_exp`) keeps every expert resident when the whole store fits and routes on the GPU with no per-layer handshake (`ESPETERO_RESIDENT=0` keeps the expert cache); a fused parallel route for 257-512 experts and hyper-connection fusions. The fusions are bit-identical; the parallel route sums each expert's partial logits in another order, so 1-row decode, verify and split rows differ in the last bits from the expert-cache path (M4 Max verification, 3 cases: no expert, argmax or greedy token changed; `ESPETERO_ROUTE_PAR=0` restores the bit-identical route). M4 Max 128 GB, Flash-Next oQ4e: 26.5 -> 16.5 ms per decode step against 0.1.1 (33.4 -> 60.2 tok/s).
