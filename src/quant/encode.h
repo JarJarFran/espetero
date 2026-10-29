@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Francisco José García Barbero
 
-// The encoders of espetero quantize (CPU): a C++ port of the reference
-// Python converter (kld/quant_lab.py + eq_convert.py), same math and the same
-// float roundings, run on Accelerate (BLAS, LAPACK) and GCD.
+// The encoders of espetero quantize (CPU): the same math and float roundings
+// as the reference Python encoder the format was developed with, run on
+// Accelerate (BLAS, LAPACK) and GCD.
 //
-// Formats (specs as in eq_convert.py's rules):
+// Formats (rule specs, --fmt):
 //   eql:B:16[+ENC]        EQ, B in 3, 4, 5, 6, 8: signed codes, an int8 sub-scale
 //                         per lane sub-block of 16 inputs, an fp16 super-scale
 //                         per 256 (the last super-block of a row partial when

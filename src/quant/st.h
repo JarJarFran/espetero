@@ -51,7 +51,7 @@ struct StTensor {
 };
 
 // Shards of at most `shard_bytes` (tensors sorted by name, a new shard when
-// the next tensor would pass the limit: eq_convert.py's split), created with
+// the next tensor would pass the limit: the MLX converters' split), created with
 // their headers; write() puts a tensor's bytes in place.
 class StWriter {
  public:

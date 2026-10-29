@@ -7,7 +7,7 @@
 // K-bit code, one fp16 codebook [2^K][8] per stack and an fp16 scale per 256
 // inputs (the last one partial: 640 = 256 + 256 + 128).
 //
-// Encoder (the C++ port of fnx-vq/vqlab.py eqv_stack):
+// Encoder:
 //   codebook  weighted k-means (16 rounds) of rms-normalized vectors from a
 //             sample of the stack's rows, importances = the expert's imatrix
 //             times the group scale squared; rounded to fp16

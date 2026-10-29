@@ -119,7 +119,7 @@ std::string expand_home(const std::string& p) {
   return p;
 }
 
-// kld_harness.source_text: file:PATH, or glob:PATTERN (files sorted, joined
+// Calibration text: file:PATH, or glob:PATTERN (files sorted, joined
 // by blank lines).
 std::string source_text(const std::string& src) {
   if (src.rfind("file:", 0) == 0) return read_text(expand_home(src.substr(5)));

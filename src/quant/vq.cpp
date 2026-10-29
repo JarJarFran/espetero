@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Francisco José García Barbero
 
-// EQV encoder (vq.h): the C++ port of fnx-vq/vqlab.py's eqv_stack.
+// EQV encoder (vq.h).
 #define ACCELERATE_NEW_LAPACK
 #include "vq.h"
 
@@ -58,7 +58,7 @@ void assign(const float* X, const float* T, int64_t N, const float* cb, int K, i
   });
 }
 
-// The expert's normalized imatrix (vqlab.expert_imp): experts never routed take the routed experts'
+// The expert's normalized imatrix: experts never routed take the routed experts'
 // mean; each row divided by its mean, + 1e-3. d: [E][C] (or null: ones).
 std::vector<float> expert_imp(const float* d, int E, int C) {
   std::vector<float> imp(size_t(E) * C, 1.0f);
@@ -94,7 +94,7 @@ float wrms(const float* x, const float* w, int G) {
   return float(std::sqrt(a / std::max(b, 1e-30))) + 1e-12f;
 }
 
-// Weighted k-means of [N][8] vectors with importances, K centers, `iters` rounds (vqlab.kmeans).
+// Weighted k-means of [N][8] vectors with importances, K centers, `iters` rounds.
 std::vector<float> kmeans(const std::vector<float>& X, const std::vector<float>& T, int K, int iters) {
   const int64_t N = int64_t(X.size() / 8);
   std::vector<float> cb(size_t(K) * 8);
@@ -129,7 +129,7 @@ std::vector<float> kmeans(const std::vector<float>& X, const std::vector<float>&
   return cb;
 }
 
-// Upper factor U of (H + damping)^-1 (H^-1 = U^T U), quant_lab's damping (encode.cpp hinv_upper, double).
+// Upper factor U of (H + damping)^-1 (H^-1 = U^T U), the damping of encode.cpp's hinv_upper (double).
 std::vector<float> hinv_upper_d(const double* H, int C) {
   std::vector<double> A(size_t(C) * C);
   std::memcpy(A.data(), H, A.size() * 8);
@@ -215,7 +215,7 @@ void group_scales(const Block& b, int g0, int g1, const float* full, int K, floa
   }
 }
 
-// Encode the rows of `b` (vqlab.eqv_encode / eqv_encode_batched): codes [n][C/8], scales [n][ns].
+// Encode the rows of `b`: codes [n][C/8], scales [n][ns].
 void encode_rows(const Block& b, const float* full, int K, bool feedback, int32_t* codes, float* scales) {
   const int C = b.C, nv = C / 8;
   const auto sp = spans(C);
@@ -330,11 +330,11 @@ VqOut encode_vq(const float* W, int64_t R, int C, int nexp, int kbits, bool ldlq
   }
   const std::vector<float> imp = expert_imp(d, E, C);
   // codebook from a sample of rows
-  const int64_t nsamp = std::min<int64_t>(R, (int64_t(1) << 20) * 8 / C + 1);  // vqlab: sample * 8 // C + 1
+  const int64_t nsamp = std::min<int64_t>(R, (int64_t(1) << 20) * 8 / C + 1);
   const std::vector<int64_t> rows = choice_sorted(0, R, nsamp);
   std::vector<float> Xs(size_t(nsamp) * C), Ts(size_t(nsamp) * C);
   {
-    // vectors in span order: all sampled rows' vectors of span 0, then span 1, ... (vqlab concatenates per span)
+    // vectors in span order: all sampled rows' vectors of span 0, then span 1, ...
     size_t off = 0;
     for (const auto& [g0, g1] : sp) {
       const int G = g1 - g0;
@@ -380,7 +380,7 @@ VqOut encode_vq(const float* W, int64_t R, int C, int nexp, int kbits, bool ldlq
       for (int j = 0; j < C; ++j) s[j] = std::max(s[j], lo);
     }
   }
-  const int chunk = 128;  // experts per pass (vqlab: 128)
+  const int chunk = 128;  // experts per pass
   std::vector<float> Wc;
   for (int e0 = 0; e0 < E; e0 += chunk) {
     const int ec = std::min(chunk, E - e0);

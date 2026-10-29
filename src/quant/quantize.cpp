@@ -6,7 +6,7 @@
 // (Espetero's own format), without Python. Qwen4-Exp can also be converted
 // from an MLX checkpoint (oQ4e-mtp: its matrices dequantized), and its
 // routed experts pruned to a kept list per layer (--keep-experts).
-// The C++ form of kld/eq_convert.py (+ quant_lab.py, kld_harness.py calib):
+// What it does:
 // calibration statistics from Espetero's own forward of the BF16 weights,
 // the converter's presets and rules, its encoders, and its output: the MLX
 // directory layout with NAME.weight / .scales / .super (/ .codebook) per EQ
@@ -109,7 +109,7 @@ std::string replace_all(std::string s, const std::string& a, const std::string& 
   return s;
 }
 
-// eq_convert.preset
+// The presets
 std::string preset(const std::string& name) {
   if (name == "eq3dhb") {  // eq3dh, gate/up one width up in layers 0-3 and 36-39 (block probe on Qwen3.6-35B-A3B)
     const std::vector<std::string> r = split(preset("eq3dh"), ';');
@@ -974,7 +974,7 @@ int cmd_quantize(int argc, char** argv) {
   };
   auto skipped = [&](const std::string& n) { return (q4 && no_mtp && n.rfind("mtp.", 0) == 0) || !wanted(n); };
 
-  // The plan (kld_harness.plan_formats): an explicit rule first, then the
+  // The plan: an explicit rule first, then the
   // model's predicate (MoE routers 8-bit), then the first matching rule;
   // bf16 and widths the format cannot divide stay as they are.
   std::vector<Item> plan;
@@ -1034,7 +1034,7 @@ int cmd_quantize(int argc, char** argv) {
     replaced.insert(name);
   }
 
-  // MTP head (eq_convert: MLX affine 8-bit, experts 4-bit +mse).
+  // MTP head: MLX affine 8-bit, experts 4-bit +mse.
   // (Qwen4-Exp: the mtp.* tensors are in the plan above, by the same rules)
   std::vector<MtpPart> mtp;
   if (!no_mtp && !q4) mtp = mtp_plan(src.raw(), parse_fmt("affine:8:64:f16"), parse_fmt("affine:4:64+mse"));

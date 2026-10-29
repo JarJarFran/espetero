@@ -4,8 +4,7 @@
 // The EQV encoder's nearest-codeword search on the GPU (vq.cpp): for N
 // 8-weight vectors x with per-weight importances w, argmin_k sum_j w_j (x_j -
 // cb_kj)^2 over a 2^K-entry codebook, one thread per vector, the codebook
-// staged through threadgroup memory 512 entries at a time. The same search
-// as fnx-vq/vqlab.py's MLX kernel (vq_assign8), so the two encoders agree.
+// staged through threadgroup memory 512 entries at a time.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Francisco José García Barbero
 
-"""Compare two EQ checkpoints tensor by tensor (espetero quantize against
-eq_convert.py): names, dtypes and shapes must agree; per tensor the share of
+"""Compare two EQ checkpoints tensor by tensor (two conversions, e.g. of
+two builds): names, dtypes and shapes must agree; per tensor the share of
 identical elements (codes unpacked per matrix from the config's bits) and,
 for float tensors, the largest difference. numpy only.
 

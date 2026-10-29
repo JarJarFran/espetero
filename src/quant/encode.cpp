@@ -62,7 +62,7 @@ double damp_factor() {
 
 // ---------------------------------------------------------------- EQ (symmetric two-level)
 
-// Signed scale of one 16-wide sub-block (quant_lab._sym_search): the element
+// Signed scale of one 16-wide sub-block: the element
 // of largest magnitude maps near -2^(B-1); 19 candidates, the least-squares
 // scale for each candidate's codes, the largest error reduction wins.
 float sym_search(const float* x, const float* w, int bits, bool rtn) {
@@ -99,7 +99,7 @@ float sym_search(const float* x, const float* w, int bits, bool rtn) {
 }
 
 // Two-level form of nt (16; fewer in a partial last super-block) sub-block
-// scales (quant_lab._fit_eq, eqs): fp16 super-scale amax / 127, int8
+// scales: fp16 super-scale amax / 127, int8
 // sub-scales, and the products half(sc * d) the codes are chosen for.
 void two_level(const float* s, uint16_t& d_out, int8_t* sc_out, float* s2, int nt = 16) {
   float amax = 0;
@@ -133,7 +133,7 @@ void eq_superblock(const float* x, const float* w, const Fmt& f, uint16_t& d, in
 
 // ---------------------------------------------------------------- affine
 
-// quant_lab's affine search (qkernels._SRC_AFFINE, one group): nstep 0 is
+// The affine search (MLX affine, one group): nstep 0 is
 // min/max round to nearest, 20 the weighted least-squares search.
 void affine_search(const float* v, const float* w, int g, int bits, int nstep, const std::string& sd, float& s_out,
                    float& b_out) {
@@ -229,7 +229,7 @@ void mlx_quantize_group(const float* v, int g, int bits, const std::string& sd, 
 
 // ---------------------------------------------------------------- GPTQ
 
-// The upper Cholesky factor U of H^-1 (H^-1 = U^T U) after quant_lab's
+// The upper Cholesky factor U of H^-1 (H^-1 = U^T U) after the reference encoder's
 // damping: dead inputs (diag <= 0) get 1 on the diagonal, every input
 // damp * mean(live diagonal). Row-major [C][C]; dead flags out.
 std::vector<float> hinv_upper(const float* H, int C, std::vector<uint8_t>& dead) {
@@ -324,7 +324,7 @@ void gptq(float* Wr, int64_t R, int C, const float* U, int g, Fit&& fit, Code&& 
 
 const float kCb4Init[16] = {-8.98f, -7.41f, -5.84f, -4.63f, -3.59f, -2.68f, -1.85f, -1.05f,
                             -0.20f, 0.67f,  1.58f,  2.55f,  3.59f,  4.71f,  6.04f,  7.80f};
-// EQ3's start (quant_lab.CB3_INIT): the uniform grid code - 4.
+// EQ3's start: the uniform grid code - 4.
 const float kCb3Init[8] = {-4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f};
 
 // Codebooks have L = 2^bits entries (EQ4 16, EQ3 8) and L - 1 midpoints.
@@ -334,7 +334,7 @@ inline int cb_nearest(float u, const float* mids, int L) {
   return q;
 }
 
-// quant_lab._cb_scales for one sub-block: the largest element mapped near
+// Codebook scales for one sub-block: the largest element mapped near
 // either end of the codebook, 19 stretches each, least-squares scale.
 float cb_scale(const float* x, const float* w, const float* cb, const float* mids, int L) {
   int imax = 0;
@@ -485,7 +485,7 @@ std::vector<int64_t> np_choice(uint32_t seed, int64_t n, int64_t k) {
   return a;
 }
 
-// quant_lab.eqc_fit: rows Xp [R][C] (lane order), importance per row (or
+// Codebook fit (Lloyd): rows Xp [R][C] (lane order), importance per row (or
 // shared), codebook group per row; `iters` Lloyd rounds then the encoding.
 // out: codes in lane order [R][C] (when q_out), d, sc; cb [ng][L] updated in place.
 void eqc_fit(const float* Xp, int64_t R, int C, const std::function<const float*(int64_t)>& imp_row,
@@ -592,7 +592,7 @@ void eqc_fit(const float* Xp, int64_t R, int C, const std::function<const float*
   }
 }
 
-// The importance a matrix's encoder weighs inputs by (quant_lab.qdq, imat):
+// The importance a matrix's encoder weighs inputs by (imat):
 // diag(H) or the stored diagonal; per expert for stacked experts (experts
 // never routed: uniform).
 struct Imp {
@@ -730,7 +730,7 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
   std::vector<float> dtmp;
 
   if (f.kind == Fmt::EQC) {
-    // quant_lab._eqc_qdq: importance (imat / gptq) with +1e-3, codebook groups.
+    // Codebook encode: importance (imat / gptq) with +1e-3, codebook groups.
     std::vector<float> imp;  // [nimp][C] permuted
     int nimp = 0;
     const bool weighted = st && (f.enc == Fmt::IMAT || f.enc == Fmt::GPTQ);
@@ -847,7 +847,7 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
   const int nmax = 1 << (f.bits - 1);
   // GPTQ: dense matrices with a full Hessian; stacked experts are refused
   // (the reference's EQ path cannot store them either); without a Hessian the
-  // imatrix search, without statistics the plain one (quant_lab.qdq).
+  // imatrix search, without statistics the plain one.
   Fmt fe = f;
   if (fe.enc == Fmt::GPTQ && nexp) fail("EQ + gptq on stacked experts is not supported (use +imat)");
   if (fe.enc == Fmt::GPTQ && !(st && st->H)) fe.enc = Fmt::IMAT;
@@ -889,7 +889,7 @@ EqOut encode_eq(const float* W, int64_t R, int C, int nexp, const Fmt& f, const 
     return out;
   }
 
-  // imat / mse / rtn: the search per super-block (quant_lab.qdq_rows).
+  // imat / mse / rtn: the search per super-block.
   std::vector<float> imp;  // [nimp][C] permuted, normalized per row as qdq_rows does
   int nimp = 0;
   if (fe.enc == Fmt::IMAT) {
@@ -993,7 +993,7 @@ AffOut encode_affine(const float* W, int64_t R, int C, int nexp, const Fmt& f, c
         });
     return out;
   }
-  // imat / mse (quant_lab.qdq_rows -> qkernels.affine_search, 20 steps)
+  // imat / mse (the affine search, 20 steps)
   std::vector<float> imp;
   int nimp = 0;
   if (fe.enc == Fmt::IMAT) {

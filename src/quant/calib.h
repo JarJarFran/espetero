@@ -4,7 +4,7 @@
 // Calibration statistics for espetero quantize: E[x x^T] of every matrix
 // input (its diagonal past --hessian-max inputs), per-expert diagonals for
 // stacked experts and per-expert E[x x^T] for narrow expert inputs, captured
-// from Espetero's own forward of the BF16 checkpoint (kld_harness.py calib's
+// from Espetero's own forward of the BF16 checkpoint (the reference harness's
 // statistics, fp16 activations instead of fp32; experts as exact fp16
 // copies, or 8-bit with --calib-experts q8).
 //
