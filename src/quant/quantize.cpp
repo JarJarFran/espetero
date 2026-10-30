@@ -948,7 +948,10 @@ int cmd_quantize(int argc, char** argv) {
   const json::Value& tc = tcp && tcp->is_object() ? *tcp : cfg;
   const bool moe = tc.get_int("num_experts", 0) > 0;
   const bool q4 = cfg.get_string("model_type", "").rfind("qwen4_exp", 0) == 0 || tc.get_string("model_type", "").rfind("qwen4_exp", 0) == 0;
-  if (!q4 && !dynamic_cast<const HfSrc*>(&src)) fail(model + ": an MLX source is supported for Qwen4-Exp only (give the BF16 checkpoint)");
+  // A quantized MLX source (its matrices dequantized) only for Qwen4-Exp; an unquantized checkpoint in its own
+  // names (Spark-X2.5 / X2.6: model.*) is a BF16 source like a Hugging Face directory.
+  if (const auto* ms = dynamic_cast<const MlxSrc*>(&src); !q4 && ms && !ms->quant_.empty())
+    fail(model + ": an MLX source is supported for Qwen4-Exp only (give the BF16 checkpoint)");
   const bool no_mtp = a.has("no-mtp");
   const int nexp = int(tc.get_int("num_experts", 0));
   Keep keep;
