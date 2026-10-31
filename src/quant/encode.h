@@ -16,6 +16,9 @@
 //                         weight = half(super * sub) * cb[code]
 //   eql:3:16:cb[:R][+ENC] EQ3 with an 8-entry codebook, the same way (Espetero
 //                         runs EQ3 for routed expert stacks only)
+//   eql:5:16:cb, eql:6:16:cb  EQ5 / EQ6 with 32 / 64-entry codebooks: emulation only
+//                         (the stored layout is mode eqc; Espetero has no kernels for them,
+//                         the KLD harness dequantizes them)
 //   eqv:K[+ENC]           EQV (vq.h): 8-weight vectors, a 2^K-entry codebook per
 //                         stack, an fp16 scale per 256 inputs; routed experts
 //                         only (+gptq, the default: LDLQ; +imat: no feedback)
@@ -43,6 +46,32 @@ struct Fmt {
   std::string spec;
 };
 Fmt parse_fmt(const std::string& spec);
+
+// Encoder options (EQ 1.x; the file format is unchanged), set once per run (--enc-opts):
+//   psd      a Hessian whose float32 Cholesky fails and that is indefinite (a capture defect) is
+//            projected to PSD (negative eigenvalues clipped to 0) before the damping ladder (default on;
+//            "nopsd" turns it off)
+//   schurR   GPTQ (EQ / EQ codebooks): each int8 sub-scale chosen when GPTQ reaches its sub-block, among
+//            the candidates within +-R of the searched one and of the best other-orientation one, by the
+//            exact increase of the GPTQ objective over the sub-block (Schur-complement replay)
+//   refit    after GPTQ, each row's fp16 super-scales refit jointly by least squares under E[x x^T]
+//            (codes and sub-scales fixed), kept when the objective is lower
+//   sign     uniform EQ: both grid orientations searched (the largest element to either end)
+struct EncOpts {
+  bool psd = true;
+  int schur = 0;
+  bool refit = false;
+  bool sign = false;
+};
+EncOpts parse_enc_opts(const std::string& spec);  // comma list: psd,nopsd,schur[R],refit,sign
+void set_enc_opts(const EncOpts& o);
+const EncOpts& enc_opts();
+std::string enc_opts_str(const EncOpts& o);
+
+// Smallest eigenvalue of a symmetric matrix given by its upper triangle (row-major [C][C], scaled by
+// `scale`; the largest in *lmax), or NaN when its double-precision Cholesky succeeds (definite: not
+// computed). For the capture's definiteness check.
+double hessian_min_eig_if_indefinite(const float* upper, int C, double scale, double* lmax);
 
 // Calibration statistics of one matrix's input (pointers into the mapped
 // statistics file; any may be null).

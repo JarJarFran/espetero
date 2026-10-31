@@ -253,6 +253,12 @@ class Sink : public ActivationSink {
     std::vector<std::pair<StTensor, const void*>> ts;
     for (auto& [k, d] : dense_) {
       const float inv = float(1.0 / std::max(d.n, 1.0));
+      if (d.full) {  // definiteness: Σ x xᵀ is PSD, so a negative eigenvalue is a capture defect (recapture it)
+        double lmax = 0;
+        const double lmin = hessian_min_eig_if_indefinite(d.a.data(), d.C, inv, &lmax);
+        if (lmin < -1e-9 * std::fabs(lmax))
+          std::fprintf(stderr, "[calib] warning: %s: E[x x^T] indefinite, lambda_min %.4g (lambda_max %.4g)\n", k.c_str(), lmin, lmax);
+      }
       if (d.full && d.C > o_.hessian_pack) {
         // Upper triangle by rows, packed in place (row i's start never passes its old position)
         size_t o = 0;

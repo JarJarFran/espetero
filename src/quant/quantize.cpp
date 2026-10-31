@@ -822,6 +822,11 @@ const char* kUsage =
     "             diagonal (+gptq then falls back to +imat); --hessian-pack N saves full ones wider\n"
     "             than N (16384) as their upper triangle (half the bytes)\n"
     "  --tiles    also write the checkpoint's tile image (faster loads)\n"
+    "  --enc-opts LIST  encoder options, comma-separated (the file format is unchanged): nopsd (do not\n"
+    "             project an indefinite E[x x^T] to PSD before GPTQ's damping ladder; projection is the\n"
+    "             default), schur[R] (GPTQ sub-scales chosen in the recurrence among +-R int8 candidates,\n"
+    "             R 6 by default), refit (least-squares refit of the super-scales after GPTQ), sign (uniform\n"
+    "             EQ: both grid orientations searched)\n"
     "  --only GLOB[,GLOB]  write only the tensors whose names match a GLOB and no !GLOB (a partial\n"
     "             checkpoint, e.g. a few layers or everything but the n-gram table, to overlay on another\n"
     "             file of the model: tools/dev/fnx_overlay.py)\n"
@@ -892,6 +897,11 @@ int cmd_quantize(int argc, char** argv) {
                                  : is_dense_preset(pname) ? dense_preset(pname, text_layers(model))
                                                           : preset(pname);
   const std::vector<Rule> rules = parse_rules(rules_spec);
+  set_enc_opts(parse_enc_opts(a.get("enc-opts", "")));
+  for (const Rule& r : rules)
+    if (r.f.kind == Fmt::EQC && r.f.bits > 4)
+      std::fprintf(stderr, "[quantize] warning: %s: EQ%d codebooks are for emulation (the KLD harness); Espetero cannot run them\n",
+                   r.f.spec.c_str(), r.f.bits);
 
   // Calibration statistics: given, none, or captured now.
   std::string calib = a.get("calib");
@@ -1249,6 +1259,7 @@ int cmd_quantize(int argc, char** argv) {
   eqf.set("version", json::Value(2));
   eqf.set("preset", json::Value(a.has("fmt") ? "custom" : pname));
   eqf.set("rules", json::Value(rules_spec));
+  if (a.has("enc-opts")) eqf.set("encoder", json::Value(enc_opts_str(enc_opts())));
   config.set("eq_format", std::move(eqf));
   write_text(out + "/config.json", json::dump(config, pretty));
   if (DIR* d = ::opendir(model.c_str())) {
