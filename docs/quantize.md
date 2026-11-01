@@ -63,9 +63,10 @@ text (Wikipedia, C4, Python), gave `eqd6-27b`: every matrix EQ6, the MLPs of
 the first 5/16 of the layers (L0-19) EQ5, v_proj, LM head and in_proj_a/b
 EQ8, the embedding MLX 5-bit, the vision tower BF16. It needs a calibration
 text with prose as well as code: with one of wikitext-103, C4 and PG19 train
-plus calibration_v5, chat and Python (452k tokens), KLD 0.00127 at 6.417 bpw
-against UD-Q6_K's 0.00137 at 6.431 (fp32 BF16 reference, wikitext-2 test and
-C++/Metal code); with calibration_v5 alone 0.00149.
+plus calibration_v5, chat and Python (452k tokens), KLD 0.00132 at 6.417 bpw
+against UD-Q6_K's 0.00142 at 6.431, both run by Espetero (−7 %, 95 % interval
+−14 % to +1 %: lower but not significantly; fp32 BF16 reference, wikitext-2
+test and C++/Metal code); with calibration_v5 alone 0.00149.
 
 **Other families.** Dense Gemma 4 and Spark-X2.5 / X2.6 (`spark2_5`) convert
 with `--fmt` rules. Spark-X2.6-4B's `c3` (5.21 bits per weight; KLD 0.026
@@ -90,9 +91,19 @@ expert stacks only),
 MoE routers stay BF16 in every preset.
 
 On Qwen3.6-35B-A3B (bits per weight without the MTP head): eq3dhb 4.35, KLD
-0.0204 against BF16, vs GGUF IQ4_XS-imat 0.0243 at 4.40; eq3dx 4.12, 0.0241;
-eq3h 3.92, 0.0316. The C++ eq3dhb has the Python checkpoint's tensors and
-size, with 99.99 % of the EQ3 expert codes identical.
+0.0204 against BF16, vs llama.cpp IQ4_XS with an imatrix 0.0279 at 4.32 (both
+run by Espetero; 0.0243 dequantized into the reference); eq3dx 4.12, 0.0241;
+eq3h 3.92, 0.0316.
+
+**Router-weighted expert statistics.** `--calib-expert-weight router` weights
+each routed (token, expert) pair of an expert's statistics by its routing
+weight instead of counting every pair once. With it and a broader calibration
+text (calibration_v5 plus chat rendered with the chat template, multilingual
+chat, tool-use conversations and C4 prose, 262K tokens; every routed expert sees at least 264 rows, against 19 with
+the default 112K tokens), Qwen3.6-35B-A3B's
+`eq6h` lowers its KLD by 3.8 % (95 % interval −6.9 % to −0.7 %; 0.00378), but
+`eq4dhb` (−1.2 %, not significant) and `eq3dhb` (+0.5 %) do not change; the
+default stays `count`.
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
@@ -151,11 +162,14 @@ runs on the GPU. Measured with `/usr/bin/time -l`:
 
 | job | Mac | time | peak footprint |
 |---|---|---|---|
-| Qwen3.6-35B-A3B calibration capture (`--calib-only`, 110k tokens) | M4 Max | 4 min | 64 GB |
-| Qwen3.6-35B-A3B `eq4dhb` from a saved calibration | M4 Max | 8.5 min | 7.5 GB |
-| Qwen3.6-35B-A3B `eq3dhb` from a saved calibration | M4 Max | 15 min | 6.0 GB |
-| Qwen3.5-9B `eqd4l` / `eqd6` / `eqd4m` from a saved calibration | M1 Max | 13 / 15 / 21 min | 11 GB |
-| Qwen3.8-Flash-Next `fnx4h` rules from a saved calibration | M4 Max | 74 min | 12 GB |
+| Qwen3.6-35B-A3B calibration capture (`--calib-only`, 112K tokens) | M4 Max | 4 min | 64 GB |
+| Qwen3.6-35B-A3B calibration capture, 262K tokens, router-weighted | M4 Max | 36 min | 94 GB |
+| Qwen3.6-35B-A3B `eq4dhb` / `eq6h` / `eq3dhb` (single-threaded BLAS) | M4 Max | 30 / 20 / 34 min | 6 GB |
+| Qwen3.6-35B-A3B `eq4dhb` (all cores) | M4 Max | 8.5 min | 7.5 GB |
+| Qwen3.8-27B `eqd6-27b` (single-threaded BLAS) | M4 Max | 43 min | 12 GB |
+| Qwen3.5-9B `eqd4m` / `eqd4l` / `eqd5` / `eqd6` (single-threaded BLAS) | M1 Max | 34 / 31 / 23 / 19 min | 11 GB |
+| Spark-X2.6-4B c3 / c4 (single-threaded BLAS) | M1 Max | 27 / 16 min | 3 GB |
+| Qwen3.8-Flash-Next `fnx4h` rules / `fnxmix` / `fnxvq` (all cores) | M4 Max | 70 / 88 / 117 min | 12 / 15 / 12 GB |
 
 The BF16 source is memory-mapped: the resident size grows with the pages the
 encoder has read (56 GB for the 35B, 123 GB for Flash-Next) but those pages
