@@ -235,6 +235,7 @@ struct Runtime {
   id<MTLEvent> chain_ev = nil;
   uint64_t chain_wait = 0, chain_signal = 0;
   std::map<std::string, std::pair<double, int>> prof;
+  std::string prof_tag;  // profiling: prefix of the labels of the dispatches encoded now (e.g. "mtp:")
 
   void init(const std::string& kernel_source) {
     dev = MTLCreateSystemDefaultDevice();
@@ -564,7 +565,7 @@ class Enc {
     if (before_commit) before_commit();
     [cb commit];
     [cb waitUntilCompleted];
-    auto& slot = rt.prof[cur];
+    auto& slot = rt.prof[rt.prof_tag + cur];
     slot.first += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
     slot.second += 1;
     cb = [rt.queue commandBuffer];
