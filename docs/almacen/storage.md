@@ -112,6 +112,12 @@ El MacBook (y Macs futuros) cargan desde el almacén del Studio por red:
 - **Compartir `/Volumes/Almacen` por SMB** en el Studio (Ajustes > General > Compartir > Compartir
   archivos) y montarlo en el MacBook como `/Volumes/Almacen` (mismo path en todos los Macs: los
   `--model PATH` valen en cualquiera).
+- Hecho en el MacBook (2026-10-25): `smb://user@10.10.0.2/Almacen` por Thunderbolt, contraseña en el
+  Llavero. Lectura medida 122-133 MB/s. Remontaje automático: agente
+  `~/Library/LaunchAgents/com.franjar.almacen-remount.plist` (cada 60 s y al cambiar `/Volumes`) que
+  ejecuta `~/.local/share/almacen/remount.sh`; log en `~/Library/Logs/almacen-remount.log`. Tras una
+  caída vuelve en ~15 s; un montaje sin respuesta solo se da por muerto a los 120 s y nunca se fuerza
+  el desmontaje (el HDD se para hasta 40 s con carga). Un Mac nuevo: copiar los dos ficheros y cambiar el usuario del plist.
 - Por el enlace Thunderbolt (~10 Gbit/s) el cuello sigue siendo el HDD (~2.2 Gbit/s). Por WiFi o
   1 GbE la carga baja a ~110 MB/s: hay que usar el cable.
 - Las cargas remotas compiten con las locales por el mismo disco: la cola de §3.3 es del disco,
