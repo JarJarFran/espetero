@@ -256,6 +256,8 @@ void usage_all() {
                "                        ESPETERO_API_KEY sets it too, out of the process list. Without a key the server\n"
                "                        only answers requests addressed to localhost, 127.0.0.1, [::1] or --host, and\n"
                "                        refuses requests from web pages of other origins (DNS rebinding, cross-site requests)\n"
+               "  --harness NAME        print the client setup for an agent harness at start: deepseek (deepseek-harness,\n"
+               "                        the default: Messages and Files), claude-code, codex, opencode, or none\n"
                "  --cors                allow cross-origin requests (web pages of any origin)\n"
                "  --no-webui            no chat page at / and /chat (GET / answers a line of text instead)\n"
                "  --data-dir DIR        Batch API storage (default ~/.cache/espetero/batches)\n"
@@ -828,6 +830,36 @@ struct Listener {
   }
 };
 
+// The client setup a harness needs to reach this server (--harness), printed
+// with the address the server listens on. The harness's own config keeps the
+// key; without --api-key any value does.
+void print_harness(const std::string& harness, const std::string& base, bool keyed) {
+  const std::string key = keyed ? "the --api-key value (ESPETERO_API_KEY)" : "any value (no --api-key is set)";
+  if (harness == "deepseek") {
+    // deepseek-harness adds /v1/messages and /v1/files to baseURL; its model id passes through unchanged.
+    std::fprintf(stderr,
+                 "[espetero] harness deepseek (deepseek-harness, profile config of llm-deepseek):\n"
+                 "[espetero]   baseURL: \"%s\"   apiKeyEnv: a variable holding %s\n"
+                 "[espetero]   the model id in its requests is not checked; this server answers with its own name\n",
+                 base.c_str(), key.c_str());
+  } else if (harness == "claude-code") {
+    std::fprintf(stderr,
+                 "[espetero] harness claude-code:\n"
+                 "[espetero]   ANTHROPIC_BASE_URL=%s   ANTHROPIC_API_KEY=%s\n",
+                 base.c_str(), key.c_str());
+  } else if (harness == "codex") {
+    std::fprintf(stderr,
+                 "[espetero] harness codex (~/.codex/config.toml, see docs/configuration.md):\n"
+                 "[espetero]   wire_api = \"responses\"   base_url = \"%s/v1\"   env_key = a variable holding %s\n",
+                 base.c_str(), key.c_str());
+  } else if (harness == "opencode") {
+    std::fprintf(stderr,
+                 "[espetero] harness opencode (provider options):\n"
+                 "[espetero]   baseURL: \"%s/v1\"   apiKey: %s\n",
+                 base.c_str(), key.c_str());
+  }
+}
+
 void open_port(Listener& L, const Args& a) {
   http::Options& ho = L.opts;
   ho.host = a.get("host", "127.0.0.1");
@@ -837,6 +869,9 @@ void open_port(Listener& L, const Args& a) {
     if (const char* k = std::getenv("ESPETERO_API_KEY")) ho.api_key = k;
   ho.cors = a.has("cors");
   ho.log_requests = a.has("verbose");
+  const std::string harness = a.get("harness", "deepseek");
+  if (harness != "none" && harness != "deepseek" && harness != "claude-code" && harness != "codex" && harness != "opencode")
+    config_error("--harness: deepseek, claude-code, codex, opencode or none");
   try {
     L.server = std::make_unique<http::Server>(ho);
   } catch (const http::ListenError& e) {
@@ -849,6 +884,12 @@ void open_port(Listener& L, const Args& a) {
   L.thread = std::thread([&L] { L.server->run(); });
   std::fprintf(stderr, "[espetero] listening on http://%s:%d (requests get 503 until the model is ready)\n",
                ho.host.find(':') != std::string::npos ? ("[" + ho.host + "]").c_str() : ho.host.c_str(), L.server->port());
+  if (harness != "none") {
+    const std::string host = ho.host == "0.0.0.0" || ho.host == "::" ? "127.0.0.1" : ho.host;
+    print_harness(harness, "http://" + (host.find(':') != std::string::npos ? "[" + host + "]" : host) + ":" +
+                               std::to_string(L.server->port()),
+                  !ho.api_key.empty());
+  }
   if (ho.api_key.empty() && !http::is_loopback_host(ho.host))
     std::fprintf(stderr,
                  "[espetero] warning: listening on %s without --api-key: any client that can reach this port can use "

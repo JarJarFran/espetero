@@ -6,6 +6,7 @@
 #include "api.h"
 
 #include <chrono>
+#include <ctime>
 
 #include "../engine/chat.h"
 #include "../engine/embed.h"
@@ -66,6 +67,48 @@ http::Handler guarded(std::function<void(const http::Request&, http::Response&)>
 }
 
 // Minimal multipart/form-data parser (file uploads): name -> (filename, bytes).
+// DeepSeek's Messages clients (and Anthropic's) send anthropic-beta with the
+// Files API: their uploads, lists and deletions answer in that API's shapes.
+bool files_api_request(const http::Request& req) {
+  const std::string* beta = req.header("anthropic-beta");
+  return beta && beta->find("files-api") != std::string::npos;
+}
+
+std::string iso8601(int64_t epoch_s) {
+  const time_t t = time_t(epoch_s);
+  struct tm utc;
+  gmtime_r(&t, &utc);
+  char buf[32];
+  std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &utc);
+  return buf;
+}
+
+// A stored file as the Anthropic Files API shows it.
+json::Value files_api_object(const json::Value& f) {
+  json::Value o = json::Value::object();
+  o.set("id", f.get_string("id", ""));
+  o.set("type", "file");
+  o.set("filename", f.get_string("filename", ""));
+  o.set("mime_type", f.get_string("mime_type", "application/octet-stream"));
+  o.set("size_bytes", f.get_int("bytes", 0));
+  o.set("created_at", iso8601(f.get_int("created_at", 0)));
+  o.set("downloadable", false);
+  return o;
+}
+
+json::Value files_api_list(const json::Value& list) {
+  json::Value data = json::Value::array();
+  for (const json::Value& f : list.get("data")->as_array()) data.push_back(files_api_object(f));
+  json::Value o = json::Value::object();
+  if (data.size()) {
+    o.set("first_id", data.as_array().front().get_string("id", ""));
+    o.set("last_id", data.as_array().back().get_string("id", ""));
+  }
+  o.set("data", std::move(data));
+  o.set("has_more", false);
+  return o;
+}
+
 std::map<std::string, std::pair<std::string, std::string>> parse_multipart(const http::Request& req) {
   std::map<std::string, std::pair<std::string, std::string>> out;
   const std::string* ct = req.header("content-type");
@@ -307,7 +350,7 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
     res.send_json(200, o);
   }), http::Body::Json);
 
-  install_compat_routes(server, engine);
+  install_compat_routes(server, engine, batches);
   install_ollama_routes(server, engine);  // /api/*
 
   server.route("POST", "/v1/cache/clear", guarded([&engine](const http::Request&, http::Response& res) {
@@ -323,10 +366,15 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
     auto parts = parse_multipart(req);
     auto file = parts.find("file");
     if (file == parts.end()) throw RequestError(422, "file: required (multipart field 'file')");
-    const std::string purpose = parts.count("purpose") ? parts["purpose"].second : "batch";
-    res.send_json(200, B.upload(file->second.first, purpose, file->second.second));
+    const bool anthropic = files_api_request(req);
+    const std::string purpose = parts.count("purpose") ? parts["purpose"].second : anthropic ? "user_data" : "batch";
+    const json::Value f = B.upload(file->second.first, purpose, file->second.second);
+    res.send_json(200, anthropic ? files_api_object(f) : f);
   }), http::Body::Multipart);
-  server.route("GET", "/v1/files", guarded([&B](const http::Request&, http::Response& res) { res.send_json(200, B.list_files()); }));
+  server.route("GET", "/v1/files", guarded([&B](const http::Request& req, http::Response& res) {
+    const json::Value list = B.list_files();
+    res.send_json(200, files_api_request(req) ? files_api_list(list) : list);
+  }));
   server.route_prefix("GET", "/v1/files/", guarded([&B](const http::Request& req, http::Response& res) {
     std::string rest = req.path.substr(std::string("/v1/files/").size());
     const std::string suffix = "/content";
@@ -335,10 +383,19 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
       res.send(200, "application/jsonl", B.file_content(rest));
       return;
     }
-    res.send_json(200, B.file_info(rest));
+    const json::Value f = B.file_info(rest);
+    res.send_json(200, files_api_request(req) ? files_api_object(f) : f);
   }));
   server.route_prefix("DELETE", "/v1/files/", guarded([&B](const http::Request& req, http::Response& res) {
-    res.send_json(200, B.delete_file(req.path.substr(std::string("/v1/files/").size())));
+    const json::Value deleted = B.delete_file(req.path.substr(std::string("/v1/files/").size()));
+    if (!files_api_request(req)) {
+      res.send_json(200, deleted);
+      return;
+    }
+    json::Value o = json::Value::object();  // Anthropic: {"id", "type": "file_deleted"}
+    o.set("id", deleted.get_string("id", ""));
+    o.set("type", "file_deleted");
+    res.send_json(200, o);
   }));
   server.route("POST", "/v1/batches", guarded([&B](const http::Request& req, http::Response& res) {
     res.send_json(200, B.create(parse_body(req)));

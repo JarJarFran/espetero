@@ -208,6 +208,17 @@ else 0.7, 0.95 and 20.
 All presets serve the same OpenAI-compatible API (`/v1/chat/completions`,
 `/v1/completions`, `/v1/embeddings`, images in messages, `/v1/batches`) plus
 `/v1/decisions`.
+`--harness NAME` prints, when the server starts, the client setup for an agent
+harness, with the address the server listens on. The default is `deepseek`
+(deepseek-harness: its `llm-deepseek` `baseURL`, which gets `/v1/messages` and
+`/v1/files` added); `claude-code` (`ANTHROPIC_BASE_URL`), `codex`
+(`wire_api = "responses"`) and `opencode` (`baseURL` with `/v1`) are the other
+choices, and `none` prints nothing. It only prints: the harness's own config is
+still written by hand. Its Messages side covers image blocks that name an
+uploaded file (`source` `{"type": "file", "file_id"}`), `tool_addition` /
+`tool_removal` blocks in system turns with `defer_loading` tools, and Files
+requests that carry `anthropic-beta: files-api-…` answer in Anthropic's shapes
+(without that header `/v1/files` keeps the OpenAI shape).
 Other clients' APIs run the same chat job (same prompt, same tokens):
 OpenAI's `/v1/responses` (`previous_response_id` continues one of the newest
 256 stored responses; `GET` / `DELETE /v1/responses/{id}`), Anthropic's
@@ -221,7 +232,7 @@ follows each API: Anthropic requests think only with `"thinking": {"type":
 `minimal`, and their effort reaches templates that take one (Flash-Next:
 `low`, `medium`, `high` = `xhigh`). Not supported (an error, never
 ignored): a non-empty `logit_bias` (422), built-in or server tools, images
-by file id, images inside tool results. `tool_choice` `none` renders the prompt without the
+inside tool results. `tool_choice` `none` renders the prompt without the
 tools, so no call is parsed. An Anthropic reply that one of its
 `stop_sequences` ended has `stop_reason` `stop_sequence` and that string in
 `stop_sequence`.
