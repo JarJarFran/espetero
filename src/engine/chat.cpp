@@ -800,6 +800,9 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
         g.split = i + 1 + int(assistant.size());
       break;
     }
+  // Gemma 4 continues the model's turn after tool results (no new turn
+  // header): the prompt end is where the next turn's prompt still matches.
+  if (mk.gemma && !ids.empty() && ids.back() == tok.token_id("<tool_response|>")) g.split = int(ids.size());
   // System boundary: the start of the first user turn, when the prompt opens
   // with a system message. A checkpoint there is shared by every
   // conversation with the same system prompt (the "prefix cache").
