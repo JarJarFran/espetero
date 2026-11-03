@@ -27,7 +27,7 @@ namespace espetero::family {
 inline bool mlx_type_supported(std::string_view t) {
   return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text" ||
          t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41" ||
-         t == "lfm2" || t == "lfm2_vl";
+         t == "lfm2" || t == "lfm2_vl" || t == "videojev";
 }
 
 inline bool gguf_arch_supported(std::string_view a) {
@@ -53,9 +53,11 @@ inline std::string unsupported_gguf(const std::string& path, const std::string& 
 // top-level or text_config model_type is of a supported family passes (the
 // loader reads text_config's first).
 inline std::string mlx_check(const std::string& path, const json::Value& config) {
-  const json::Value* tc = config.get("text_config");
+  const json::Value* bcp = config.get("backbone_config");
+  const json::Value& bc = bcp && bcp->is_object() ? *bcp : config;
+  const json::Value* tc = bc.get("text_config");
   const std::string top = config.get_string("model_type", "");
-  const std::string text = tc && tc->is_object() ? tc->get_string("model_type", "") : std::string();
+  const std::string text = tc && tc->is_object() ? tc->get_string("model_type", "") : bc.get_string("model_type", "");
   if (top.empty() && text.empty()) return "";
   if (mlx_type_supported(top) || mlx_type_supported(text)) return "";
   return unsupported_mlx(path, top.empty() ? text : top);

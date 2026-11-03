@@ -124,6 +124,7 @@ static void test_family() {
   CHECK(error_of(dir_with("ok_gemma", "{\"model_type\": \"gemma4\", \"text_config\": {\"model_type\": \"gemma4_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_lfm2_vl", "{\"model_type\": \"lfm2_vl\", \"text_config\": {\"model_type\": \"lfm2\"}}")).empty());
   CHECK(error_of(dir_with("ok_lfm2", "{\"model_type\": \"lfm2\"}")).empty());
+  CHECK(error_of(dir_with("ok_videojev", "{\"model_type\": \"videojev\", \"backbone_config\": {\"model_type\": \"qwen3_5\", \"text_config\": {\"model_type\": \"qwen3_5_text\"}}}")).empty());
   // A finetune wrapper whose text model is of the family, and a config without any model_type: left to the loader.
   CHECK(error_of(dir_with("ok_wrapper", "{\"model_type\": \"ornith\", \"text_config\": {\"model_type\": \"qwen3_5_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_untyped", "{\"hidden_size\": 1024}")).empty());

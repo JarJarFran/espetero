@@ -218,7 +218,9 @@ struct VisionConfig {
 };
 
 // ---------------------------------------------------------------- MLX
-inline Config config_from_mlx(const json::Value& root) {
+inline Config config_from_mlx(const json::Value& root0) {
+  const json::Value* bcp = root0.get("backbone_config");
+  const json::Value& root = bcp && bcp->is_object() ? *bcp : root0;
   const json::Value* tcp = root.get("text_config");
   const json::Value& tc = tcp && tcp->is_object() ? *tcp : root;
   Config c;
@@ -255,7 +257,8 @@ inline Config config_from_mlx(const json::Value& root) {
       c.set_mrope(s, rp->get_bool("mrope_interleaved", false));
     }
   }
-  const json::Value* tie = tc.get("tie_word_embeddings");
+  const json::Value* tie = bcp && bcp->is_object() ? root0.get("tie_word_embeddings") : nullptr;
+  if (!tie || tie->is_null()) tie = tc.get("tie_word_embeddings");
   if (!tie || tie->is_null()) tie = root.get("tie_word_embeddings");
   c.tie = tie && tie->is_bool() ? tie->as_bool() : false;
   c.set_layers(int(tc.get_int("full_attention_interval", 4)), tc.get("layer_types"));
@@ -558,8 +561,10 @@ inline VisionConfig vision_from_minicpm(const json::Value& root) {
 
 // deepstack: the decoder adds DeepStack features (qwen3_omni.h); other
 // families refuse towers that have them.
-inline VisionConfig vision_from_mlx(const json::Value& root, bool deepstack = false) {
+inline VisionConfig vision_from_mlx(const json::Value& root0, bool deepstack = false) {
   VisionConfig v;
+  const json::Value* bcp = root0.get("backbone_config");
+  const json::Value& root = bcp && bcp->is_object() ? *bcp : root0;
   const json::Value* vcp = root.get("vision_config");
   if (!vcp || !vcp->is_object()) return v;
   const json::Value& vc = *vcp;

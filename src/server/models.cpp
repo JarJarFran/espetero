@@ -273,8 +273,10 @@ std::string mlx_quant_label(const json::Value& config, const MlxQuant& q) {
   const json::Value* qz = config.get("quantization");
   if (!qz || !qz->is_object()) qz = config.get("quantization_config");
   if (!q.bits) {
-    const json::Value* tc = config.get("text_config");
-    std::string dt = config.get_string("torch_dtype", config.get_string("dtype", ""));
+    const json::Value* bcp = config.get("backbone_config");
+    const json::Value& bc = bcp && bcp->is_object() ? *bcp : config;
+    const json::Value* tc = bc.get("text_config");
+    std::string dt = config.get_string("torch_dtype", config.get_string("dtype", bc.get_string("torch_dtype", bc.get_string("dtype", ""))));
     if (dt.empty() && tc && tc->is_object()) dt = tc->get_string("torch_dtype", tc->get_string("dtype", ""));
     if (dt == "bfloat16") return "bf16";
     if (dt == "float16") return "fp16";
@@ -452,9 +454,11 @@ Geometry lfm2_geometry(const json::Value& tc) {
   return g;
 }
 
-Geometry geometry_from_config(const json::Value& root) {
+Geometry geometry_from_config(const json::Value& root0) {
   Geometry g;
-  if (!root.is_object()) return g;
+  if (!root0.is_object()) return g;
+  const json::Value* bcp = root0.get("backbone_config");
+  const json::Value& root = bcp && bcp->is_object() ? *bcp : root0;
   const json::Value* tcp = root.get("text_config");
   const json::Value& tc = tcp && tcp->is_object() ? *tcp : root;
   {
@@ -809,10 +813,13 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
   Footprint f;
   f.format = "MLX";
   f.geo = geometry_from_config(config);
+  const json::Value* bcp = config.get("backbone_config");
+  const json::Value& bc = bcp && bcp->is_object() ? *bcp : config;
   {
-    const json::Value* tc = config.get("text_config");
-    f.arch = tc && tc->is_object() ? tc->get_string("model_type", "") : std::string();
-    if (f.arch.empty()) f.arch = config.get_string("model_type", "");
+    const json::Value* tc = bc.get("text_config");
+    f.arch = config.get_string("model_type", "");
+    if (f.arch.empty() && tc && tc->is_object()) f.arch = tc->get_string("model_type", "");
+    if (f.arch.empty()) f.arch = bc.get_string("model_type", "");
   }
   const MlxQuant q = mlx_quant(config);
   f.quant = mlx_quant_label(config, q);
@@ -832,9 +839,10 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
   } else if (size_of("model.safetensors")) {
     shards.push_back("model.safetensors");
   }
-  const json::Value* tcp = config.get("text_config");
-  const json::Value* tie = tcp && tcp->is_object() ? tcp->get("tie_word_embeddings") : nullptr;
-  if (!tie || tie->is_null()) tie = config.get("tie_word_embeddings");
+  const json::Value* tcp = bc.get("text_config");
+  const json::Value* tie = bcp && bcp->is_object() ? config.get("tie_word_embeddings") : nullptr;
+  if (!tie || tie->is_null()) tie = tcp && tcp->is_object() ? tcp->get("tie_word_embeddings") : nullptr;
+  if (!tie || tie->is_null()) tie = bc.get("tie_word_embeddings");
   const bool tied = tie && tie->is_bool() && tie->as_bool();
   bool lm_head = false, own_mtp = false, vision_tower = false;
   int64_t embed_bytes = 0;
@@ -853,18 +861,22 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
       if (code && gpu_bits(mq.bits) != mq.bits) bytes = bytes * gpu_bits(mq.bits) / mq.bits;  // 2- and 3-bit codes widen to bytes
       if (mq.bits && mq.group == 128 && (ends_with(t.name, ".scales") || ends_with(t.name, ".biases")))
         bytes *= 2;  // group 128 is split in two groups of 64 (exact)
-      if (starts_with(t.name, "language_model.model.embed_tokens.") || (hf_names && starts_with(t.name, "model.language_model.embed_tokens."))) {
+      if (starts_with(t.name, "language_model.model.embed_tokens.") ||
+          starts_with(t.name, "backbone.language_model.embed_tokens.") ||
+          (hf_names && starts_with(t.name, "model.language_model.embed_tokens."))) {
         // Rows are gathered from nibbles or bytes (load_embedding: 5- and 6-bit codes widen).
         if (code && mq.bits != 4 && mq.bits != 8) bytes = t.bytes * 8 / mq.bits;
         embed_bytes += bytes;
         embed_quantized = embed_quantized || code;
       }
       if (starts_with(t.name, "language_model.lm_head.")) lm_head = true;
-      if (t.name == "language_model.model.embed_tokens.weight" || (hf_names && t.name == "model.language_model.embed_tokens.weight"))
+      if (t.name == "language_model.model.embed_tokens.weight" ||
+          t.name == "backbone.language_model.embed_tokens.weight" ||
+          (hf_names && t.name == "model.language_model.embed_tokens.weight"))
         f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
-      if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "vision_tower.patch_embedder.input_proj.weight" ||
-          t.name == "vision_embedder.patch_dense.weight" ||
+      if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "backbone.visual.patch_embed.proj.weight" ||
+          t.name == "vision_tower.patch_embedder.input_proj.weight" || t.name == "vision_embedder.patch_dense.weight" ||
           (f.geo.lfm2 && (t.name == "vision_tower.embeddings.patch_embedding.weight" ||
                           t.name == "model.vision_tower.vision_model.embeddings.patch_embedding.weight")))
         vision_tower = true;  // Qwen3-VL, Gemma 4, Gemma 4 unified; LFM2-VL (MLX and Hugging Face names)
@@ -882,8 +894,8 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         f.streamed += t.bytes;  // read from the SSD (expert cache, n-gram rows)
         continue;
       }
-      if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "embed_vision.") ||
-          starts_with(t.name, "vision_embedder.") ||
+      if (starts_with(t.name, "vision_tower.") || starts_with(t.name, "backbone.visual.") ||
+          starts_with(t.name, "embed_vision.") || starts_with(t.name, "vision_embedder.") ||
           (f.geo.lfm2 && (starts_with(t.name, "multi_modal_projector.") || starts_with(t.name, "model.vision_tower.") ||
                           starts_with(t.name, "model.multi_modal_projector."))))
         f.vision += bytes;
@@ -898,7 +910,7 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
     f.mtp += c;
     f.weights += c;
   }
-  const json::Value* vc = config.get("vision_config");
+  const json::Value* vc = bc.get("vision_config");
   f.has_vision = vision_tower && vc && vc->is_object();
   if (!f.has_vision) {
     f.weights -= f.vision;

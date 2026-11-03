@@ -90,13 +90,15 @@ double round_prob(double x);
 
 class PointerHead {
  public:
-  // pointer_head.safetensors + pointer_head.json of `dir` (tools/kev_convert.py).
+  // pointer_head.safetensors + pointer_head.json of `dir` (tools/kev_convert.py),
+  // or a VideoJev checkpoint (`model_type == "videojev"`).
   // Throws std::runtime_error on a malformed head.
   static std::unique_ptr<PointerHead> load(const std::string& dir);
   int hidden() const { return hidden_; }
   int dim() const { return dim_; }
   double temperature() const { return temperature_; }
   bool grafted_vision() const { return grafted_; }
+  bool is_videojev() const { return videojev_; }
   // The delimiters' ids in `tok` (pointer_head.json names them); throws when one is not a token.
   void bind(const Tokenizer& tok);
   const Delimiters& delimiters() const { return ids_; }
@@ -107,7 +109,8 @@ class PointerHead {
  private:
   int hidden_ = 0, dim_ = 0;
   double temperature_ = 1.0;
-  bool grafted_ = false;
+  double logit_scale_ = 1.0, logit_bias_ = 0.0;
+  bool grafted_ = false, videojev_ = false;
   std::vector<std::string> names_;  // state, question, option, option_end, decide
   Delimiters ids_;
   std::vector<double> wq_, bq_, wk_, bk_;  // q / k weight [head_dim][hidden] and bias [head_dim]

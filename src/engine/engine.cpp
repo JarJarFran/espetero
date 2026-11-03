@@ -631,6 +631,26 @@ void Engine::warmup() {
   std::vector<int32_t> root(static_cast<size_t>(n_root)), leaves(static_cast<size_t>(2 * n_leaf));
   for (size_t i = 0; i < root.size(); ++i) root[i] = int32_t(100 + 7 * i);
   for (size_t i = 0; i < leaves.size(); ++i) leaves[i] = int32_t(200 + 3 * i);
+  if (kev_ && kev_->is_videojev()) {
+    std::vector<float> hid(size_t(model_->info().hidden), 0.0f);
+    const int s = model_->slot_alloc();
+    TreeSpec t;
+    t.root = root.data();
+    t.root_len = n_root;
+    t.save = s;
+    t.out_last_hidden = hid.data();
+    model_->run({t});
+    int32_t tok = 100;
+    TreeSpec d;
+    d.parent = s;
+    d.save = s;
+    d.root = &tok;
+    d.root_len = 1;
+    d.out_last_hidden = hid.data();
+    model_->run({d});
+    model_->slot_free(s);
+    return;
+  }
   const int32_t leaf_off[3] = {0, n_leaf, 2 * n_leaf};
   const int32_t cand_off[3] = {0, 2, 4};
   const int32_t cand_ids[4] = {1, 2, 3, 4};
@@ -1181,7 +1201,7 @@ int Engine::answer_reserve(int remaining) const {
 
 // ---------------------------------------------------------------- decisions
 json::Value Engine::decide(const json::Value& body) {
-  if (clef_) return clef_decide(body);
+  if (clef_ || (kev_ && kev_->is_videojev())) return clef_decide(body);
   if (d1_) return d1_decide(body);
   if (kev_)
     throw RequestError(422, "this is a Kev decision model: it answers the SystemOne body (state, questions) at /v1/systemone");
