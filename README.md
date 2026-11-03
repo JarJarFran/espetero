@@ -125,7 +125,7 @@ The port opens at once; `GET /health` answers 503 `{"status": "loading"}` until 
 ```bash
 make && sudo make install      # /usr/local/bin/espetero (PREFIX=... and DESTDIR=... change where)
 sudo make uninstall
-make dist                      # build/espetero-0.1.2-macos-arm64.tar.gz: the binary, README, licenses and notices
+make dist                      # build/espetero-0.1.3-macos-arm64.tar.gz: the binary, README, licenses and notices
 ```
 
 Homebrew: `brew install JarJarFran/espetero/espetero` builds Espetero from the release's source ([packaging/homebrew/espetero.rb](packaging/homebrew/espetero.rb)).
