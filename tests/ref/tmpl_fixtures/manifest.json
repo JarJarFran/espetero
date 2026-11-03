@@ -307,5 +307,17 @@
   "origin": "synthetic, render_typescript_type from openai/gpt-oss-20b",
   "license": "apache-2.0",
   "synthetic": true
+ },
+ {
+  "name": "zai-org__GLM-5.3-Flash",
+  "file": "zai-org__GLM-5.3-Flash.jinja",
+  "sha256": "2614a3c896d53e265f564c23701173c0049f985dacfbae79fc4bcd9f5ba083f4",
+  "special_tokens": {
+   "eos_token": "<|endoftext|>",
+   "pad_token": "<|endoftext|>"
+  },
+  "origin": "zai-org/GLM-5.3-Flash",
+  "license": "mit",
+  "synthetic": false
  }
 ]

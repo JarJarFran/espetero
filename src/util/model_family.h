@@ -11,9 +11,11 @@
 //   Gemma 4 (gemma4, gemma4_text: 31B and 26B-A4B; gemma4_unified,
 //   gemma4_unified_text: the 12B with the encoder-free vision embedder), the
 //   Qwen3-Omni thinker (qwen3_omni_moe, converted by tools/clef_convert.py: Clef-Omni)
-//   LFM2 (lfm2, lfm2_vl: LFM2.5-VL and the d1 decision models) and
-//   MiniCPM-OCR (minicpm_ocr: its text_config is qwen3_5_text).
-//   GGUF general.architecture: qwen35, qwen35moe, gemma4.
+//   LFM2 (lfm2, lfm2_vl: LFM2.5-VL and the d1 decision models), DeepSeek-V4.1
+//   (deepseek_v41), GLM-5.3-Flash (glm5_next, glm5_next_text: text only),
+//   MiniCPM-OCR (minicpm_ocr: its text_config is qwen3_5_text) and VideoJev
+//   (videojev: a qwen3_5 backbone_config).
+//   GGUF general.architecture: qwen35, qwen35moe, gemma4, qwen4exp, glm5-next.
 #pragma once
 
 #include <string>
@@ -27,24 +29,26 @@ namespace espetero::family {
 inline bool mlx_type_supported(std::string_view t) {
   return t.substr(0, 7) == "qwen3_5" || t.substr(0, 9) == "qwen4_exp" || t == "gemma4" || t == "gemma4_text" ||
          t == "gemma4_unified" || t == "gemma4_unified_text" || t == "qwen3_omni_moe" || t.substr(0, 12) == "deepseek_v41" ||
-         t == "lfm2" || t == "lfm2_vl" || t == "videojev";
+         t == "lfm2" || t == "lfm2_vl" || t.substr(0, 9) == "glm5_next" || t == "videojev";
 }
 
 inline bool gguf_arch_supported(std::string_view a) {
-  return a == "qwen35" || a == "qwen35moe" || a == "gemma4" || a == "qwen4exp";
+  return a == "qwen35" || a == "qwen35moe" || a == "gemma4" || a == "qwen4exp" || a == "glm5-next";
 }
 
 inline std::string unsupported_mlx(const std::string& path, const std::string& model_type) {
   return path + ": model_type '" + model_type + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
          "Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL "
-         "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers";
+         "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), DeepSeek-V4.1 (deepseek_v41), GLM-5.3-Flash (glm5_next), "
+         "MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers";
 }
 
 inline std::string unsupported_gguf(const std::string& path, const std::string& arch) {
   return path + ": GGUF architecture '" + arch + "' is not supported by Espetero " + kVersion +
          "; it runs the Qwen3.5 family (qwen35, qwen35moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as "
-         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4exp; MLX: qwen4_exp) and Gemma 4 (gemma4: 31B, 26B-A4B, 12B); "
+         "Ornith 1.5), Qwen3.8-Flash-Next (qwen4exp; MLX: qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B, 12B) and "
+         "GLM-5.3-Flash (glm5-next); "
          "LFM2 / LFM2-VL (lfm2, lfm2_vl) and Cloudflare Clef classifiers run from MLX directories";
 }
 
