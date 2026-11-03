@@ -162,6 +162,22 @@ void encode_tests(const json::Value& fx, const Tokenizer& tok) {
   for (size_t i = 0; i < big.size(); i += 2) big[i] = 'a' + char(i % 26);
   check(status_of([&] { kev::encode(tok, d, json::Value(big), json::parse(R"({"q": {"type": "noul"}})")); }) == 422,
         "state over 65,536 tokens");
+
+  // VideoJev canonical prompt encoding: <|im_start|>user\n{state} and \nTask: ...\nQuestion: ...\nOptions:\n{opt}<|option_end|>\n...<|decide|>
+  kev::Delimiters vjd;
+  vjd.option_end = d.option_end;
+  vjd.decide = d.decide;
+  const kev::Record vjr = kev::encode(tok, vjd, json::Value("video context"),
+                                      json::parse(R"({"action": {"type": "choice", "instructions": "Pick best", "criteria": {"yes": "Good", "no": "Bad"}}})"),
+                                      {4}, vs, pad, ve);
+  check(!vjr.state.empty() && vjr.questions.size() == 1, "videojev encode record");
+  if (vjr.questions.size() == 1) {
+    const kev::Question& vjq = vjr.questions[0];
+    check(vjq.rows.size() == 3, "videojev 3 readout rows (<|decide|> + 2 options)");
+    check(vjq.ids[size_t(vjq.rows[0])] == vjd.decide, "videojev row 0 is <|decide|>");
+    check(vjq.ids[size_t(vjq.rows[1])] == vjd.option_end, "videojev row 1 is <|option_end|>");
+    check(vjq.ids[size_t(vjq.rows[2])] == vjd.option_end, "videojev row 2 is <|option_end|>");
+  }
 }
 
 void head_tests() {
@@ -208,7 +224,67 @@ void head_tests() {
     check(false, std::string("head load: ") + e.what());
   }
   for (const char* f : {"/pointer_head.safetensors", "/pointer_head.json"}) std::remove((std::string(dir) + f).c_str());
+
+  // A small VideoJev CosineDecisionHead in config.json + model.safetensors.
+  json::Value vj_hdr = json::Value::object();
+  size_t vj_off = 0;
+  std::string vj_data;
+  const float vj_bias[1] = {0.25f};
+  for (auto [name, ptr, shape] : {std::tuple{"head.q.weight", wq, std::vector<int64_t>{P, D}},
+                                  std::tuple{"head.q.bias", bq, std::vector<int64_t>{P}},
+                                  std::tuple{"head.k.weight", wk, std::vector<int64_t>{P, D}},
+                                  std::tuple{"head.k.bias", bk, std::vector<int64_t>{P}},
+                                  std::tuple{"head.bias", vj_bias, std::vector<int64_t>{}}}) {
+    size_t n = 1;
+    json::Value sh = json::Value::array();
+    for (int64_t s : shape) n *= size_t(s), sh.push_back(s);
+    json::Value t = json::Value::object(), offs = json::Value::array();
+    offs.push_back(int64_t(vj_off));
+    offs.push_back(int64_t(vj_off + 4 * n));
+    t.set("dtype", "F32");
+    t.set("shape", sh);
+    t.set("data_offsets", offs);
+    vj_hdr.set(name, t);
+    vj_data.append(reinterpret_cast<const char*>(ptr), 4 * n);
+    vj_off += 4 * n;
+  }
+  const std::string vjh = json::dump(vj_hdr);
+  const uint64_t vjhl = vjh.size();
+  std::ofstream(std::string(dir) + "/model.safetensors", std::ios::binary)
+      << std::string(reinterpret_cast<const char*>(&vjhl), 8) << vjh << vj_data;
+  std::ofstream(std::string(dir) + "/config.json")
+      << R"({"model_type": "videojev", "head_dim": 2, "head_logit_scale": 10.0, "backbone_config": {"text_config": {"hidden_size": 3}}})";
+  check(kev::is_release(dir), "videojev is_release");
+  try {
+    auto head = kev::PointerHead::load(dir);
+    check(head->is_videojev() && head->hidden() == 3 && head->dim() == 2 && head->temperature() == 1.0, "videojev head sizes");
+    // h_decide = (1, 2, 3) -> q = (1.5, 2), ||q|| = 2.5, q_norm = (0.6, 0.8)
+    // opt0 = (0, 0, 1) -> k0 = (1, -1), ||k0|| = sqrt(2), q_norm . k0_norm = -0.2 / sqrt(2)
+    // opt1 = (1, 1, 0) -> k1 = (0, 1), ||k1|| = 1, q_norm . k1_norm = 0.8
+    const float hs[9] = {1, 2, 3, 0, 0, 1, 1, 1, 0};
+    const std::vector<float> z = head->logits(hs, 2);
+    const double z0 = 10.0 * (-0.2 / std::sqrt(2.0)) + 0.25;
+    const double z1 = 10.0 * 0.8 + 0.25;
+    check(z.size() == 2 && std::fabs(z[0] - z0) < 1e-5 && std::fabs(z[1] - z1) < 1e-5, "videojev head logits");
+  } catch (const std::exception& e) {
+    check(false, std::string("videojev head load: ") + e.what());
+  }
+  for (const char* f : {"/model.safetensors", "/config.json"}) std::remove((std::string(dir) + f).c_str());
   rmdir(dir);
+
+  // If ZhuYuhan/VideoJev-4B is in the HF cache, verify its sharded safetensors head and added tokens.
+  const std::string vj_snap =
+      std::string(std::getenv("HOME") ? std::getenv("HOME") : "") +
+      "/.cache/huggingface/hub/models--ZhuYuhan--VideoJev-4B/snapshots/b614f1a6248ba1f169cd3bec9e4392758b566e5d";
+  if (exists(vj_snap + "/config.json") && exists(vj_snap + "/model.safetensors.index.json")) {
+    check(kev::is_release(vj_snap), "VideoJev-4B is_release");
+    auto vj_head = kev::PointerHead::load(vj_snap);
+    auto vj_tok = Tokenizer::from_hf_dir(vj_snap);
+    vj_head->bind(*vj_tok);
+    check(vj_head->is_videojev() && vj_head->hidden() == 2560 && vj_head->dim() == 512, "VideoJev-4B head dimensions");
+    check(vj_head->delimiters().decide == 248077 && vj_head->delimiters().option_end == 248078,
+          "VideoJev-4B special token ids");
+  }
 }
 
 }  // namespace

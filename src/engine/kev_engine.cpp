@@ -96,6 +96,7 @@ json::Value Engine::kev_systemone(const json::Value& body) {
                                   std::to_string(kev::kMaxState));
   }
   for (const std::string& url : urls) job->images.push_back(prepare_image(url, px > 0 ? px : 0));
+  number_images(job->images);
   std::vector<int> itoks;
   for (const PreparedImage& im : job->images) itoks.push_back(im.tokens(I.vision_merge));
   const auto t_enc = Clock::now();

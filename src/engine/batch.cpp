@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <random>
 #include <set>
@@ -25,6 +26,20 @@
 namespace espetero {
 
 namespace {
+
+// Media type from the leading bytes: the image formats an image block can
+// name by file id; anything else is application/octet-stream.
+std::string sniff_media_type(const std::string& b) {
+  auto starts = [&b](const char* magic, size_t at = 0) {
+    const size_t n = std::strlen(magic);
+    return b.size() >= at + n && b.compare(at, n, magic) == 0;
+  };
+  if (starts("\x89PNG\r\n\x1a\n")) return "image/png";
+  if (starts("\xff\xd8\xff")) return "image/jpeg";
+  if (starts("GIF87a") || starts("GIF89a")) return "image/gif";
+  if (starts("RIFF") && starts("WEBP", 8)) return "image/webp";
+  return "application/octet-stream";
+}
 
 int64_t now_s() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -263,6 +278,7 @@ json::Value BatchService::upload(const std::string& filename, const std::string&
   f.set("bytes", int64_t(bytes.size()));
   f.set("created_at", now_s());
   f.set("filename", filename.empty() ? "upload.jsonl" : filename);
+  f.set("mime_type", sniff_media_type(bytes));
   f.set("purpose", purpose);
   f.set("status", "processed");
   if (!write_all(path_of(id, ".json"), json::dump(f))) {

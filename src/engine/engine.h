@@ -51,6 +51,7 @@ class PointerHead;
 namespace vision {
 struct Spec;
 struct Lfm2Spec;
+struct MinicpmSpec;
 struct RGBImage;
 }
 namespace d1 {
@@ -409,6 +410,12 @@ class Engine {
   std::vector<int32_t> expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const;
   // LFM2-VL: a decoded image through the processor (bounded at max_pixels first when > 0, as d1 does).
   PreparedImage prepare_lfm2_image(const vision::RGBImage& rgb, int64_t max_pixels) const;
+  // MiniCPM-OCR: a decoded image through the processor (overview and slices; no pixel budget).
+  PreparedImage prepare_minicpm_image(const vision::RGBImage& rgb) const;
+  // MiniCPM-OCR: give the images of one prompt, in prompt order, their
+  // <image_id>N</image_id> prefix (N = their index; the run then starts with
+  // run_start = <image_id>). Call it before expand_images; other models: no-op.
+  void number_images(std::vector<PreparedImage>& images) const;
   // prepare_image, an LFM2-VL image first bounded at max_pixels_lfm2 pixels when > 0.
   PreparedImage prepare_image_capped(const std::string& data_url, int64_t max_pixels, int64_t min_pixels,
                                      int64_t max_pixels_lfm2) const;
@@ -442,6 +449,7 @@ class Engine {
   std::deque<std::shared_ptr<D1Job>> d1_jobs_;
   std::unique_ptr<d1::Release> d1_;
   std::unique_ptr<vision::Lfm2Spec> lfm2_spec_;  // LFM2-VL image processor
+  std::unique_ptr<vision::MinicpmSpec> minicpm_spec_;  // MiniCPM-OCR image processor
   struct EmbedJob;  // embed.cpp
   std::deque<std::shared_ptr<EmbedJob>> embed_jobs_;
   std::vector<float> embed_hidden_;  // a pass's hidden rows

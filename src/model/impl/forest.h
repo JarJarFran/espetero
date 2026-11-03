@@ -3548,7 +3548,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     NormLink l_post, l_next;
     const NormLink* nin = nullptr;  // (consumer-side norms are no longer used)
     if (fuse) {
-      l_post = link(2 * li + 1, L.post_norm);
+      if (L.post_norm) l_post = link(2 * li + 1, L.post_norm);
       if (li + 1 < c.L) l_next = link(2 * (li + 1), m.layers[size_t(li + 1)].in_norm);
     }
     // Layer 0's input norm runs as a dispatch (the embedding has no partials);
@@ -3560,7 +3560,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       rmsnorm_h(L.in_norm, s.xn, M);
     }
     id<MTLBuffer> x_in = s.xn;
-    const NormLink* out_link = fuse ? &l_post : nullptr;
+    const NormLink* out_link = fuse ? (L.post_norm ? &l_post : (li + 1 < c.L ? &l_next : nullptr)) : nullptr;
     if (L.linear) {
       const int k = L.index_in_kind;
       gemm_runs(E, m.tune, L.in_proj, x_in, 0, c.D, s.proj, 0, ldl, M, 0, nin);
@@ -3817,6 +3817,10 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       }
       continue;
     }
+    if (!L.post_norm) {
+      if (last_layer) break;
+      continue;
+    }
     if (last_layer) {
       rmsnorm(s.hc, L.post_norm, s.xc, N, nil);
       if (L.moe) {
@@ -3858,6 +3862,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     rmsnorm(s.h, m.final_norm, s.hid, M, nil);
   }
   if (N > 0) {
+    if (!m.lm_head.out()) fail("this model has no language modeling head (use /v1/decisions or /v1/systemone)");
     if (c.q4) {  // the final mixer on the rows that are read out
       gather(m.q4s.H, m.q4s.Hc, c.W(), true);
       q4_read(m.mixer, false, m.q4s.Hc, N, s.hn);

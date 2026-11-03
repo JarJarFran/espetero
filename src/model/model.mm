@@ -455,6 +455,7 @@ class MetalModel final : public NativeModel {
       I.vision_merge = m.vis.c.merge;
       I.vision_patch_dim = m.vis.c.patch_dim();
       I.vision_temporal = m.vis.c.tps;
+      if (m.vis.c.minicpm) I.vision_layout = "minicpm";
     }
     json::Value d = json::Value::object();
     if (c.lfm2) {
@@ -1103,6 +1104,7 @@ class MetalModel final : public NativeModel {
         for (const char* e : {"store", "geglu"}) list.push_back({std::string("hgemm_") + t + "_" + e, 0});
     } else if (m.vis.c.present) {
       for (const char* k : {"layernorm", "vit_pos_add", "vit_qkv_prep"}) list.push_back({k, 0});
+      if (m.vis.c.minicpm) list.push_back({"layernorm_h", 0});
       list.push_back({"vit_attention2_" + std::to_string(m.vis.c.hd), 0});  // the default variant (vision.h)
       for (const char* t : {"8x8", "16x4", "32x4"})
         for (const char* e : {"store", "add", "gelu_tanh", "gelu_erf", "swiglu"})

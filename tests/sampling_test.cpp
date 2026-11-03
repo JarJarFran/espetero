@@ -91,6 +91,32 @@ int main() {
     std::printf("uniform: mean %.5f min %.2e max %.9f\n", mean, lo, hi);
     if (std::fabs(mean - 0.5) > 0.002 || lo <= 0 || hi >= 1) ++fails;
   }
+  // (4) no_repeat_ngram_size: output 1 2 3 1 2, n = 3 bans 3 (it would
+  // repeat "1 2 3"), n = 4 bans nothing; a scope's tokens count and undo.
+  {
+    SamplingParams sp;
+    sp.no_repeat_ngram_size = 3;
+    PenaltyState pen;
+    for (int32_t t : {1, 2, 3, 1, 2}) pen.add_output(t);
+    auto banned = [&](const SamplingParams& p) {
+      std::vector<float> lg(8, 0.0f);
+      pen.apply(lg.data(), p);
+      std::vector<int> b;
+      for (int i = 0; i < 8; ++i)
+        if (std::isinf(lg[size_t(i)])) b.push_back(i);
+      return b;
+    };
+    if (banned(sp) != std::vector<int>{3}) ++fails, std::printf("ngram: n=3 should ban {3}\n");
+    SamplingParams sp4 = sp;
+    sp4.no_repeat_ngram_size = 4;
+    if (!banned(sp4).empty()) ++fails, std::printf("ngram: n=4 should ban nothing\n");
+    {
+      PenaltyScope scope(&pen);
+      scope.add(3);  // 1 2 3 1 2 3: "2 3" was followed by 1
+      if (banned(sp) != std::vector<int>{1}) ++fails, std::printf("ngram: scope should ban {1}\n");
+    }
+    if (banned(sp) != std::vector<int>{3}) ++fails, std::printf("ngram: scope undo\n");
+  }
   std::printf("%s (%d failures)\n", fails ? "FAIL" : "OK", fails);
   return fails ? 1 : 0;
 }
