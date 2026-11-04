@@ -42,10 +42,17 @@ class BatchService {
   void shutdown();
 
   // Files.
-  json::Value upload(const std::string& filename, const std::string& purpose, const std::string& bytes);
-  json::Value file_info(const std::string& id) const;   // throws RequestError(404)
+  // expires_after_s > 0: the file is gone that many seconds after its
+  // upload (its "expires_at"; OpenAI's and DeepSeek's expires_after).
+  json::Value upload(const std::string& filename, const std::string& purpose, const std::string& bytes,
+                     int64_t expires_after_s = 0);
+  json::Value file_info(const std::string& id) const;   // throws RequestError(404), also once expired
   std::string file_content(const std::string& id) const;
-  json::Value list_files() const;
+  // The files oldest first (order "desc": newest first), of `purpose` when
+  // given, after the file `after`, at most `limit` (0: all), with has_more,
+  // first_id and last_id.
+  json::Value list_files(const std::string& purpose = "", int limit = 0, const std::string& after = "",
+                         bool newest_first = false) const;
   json::Value delete_file(const std::string& id);
 
   // Batches.

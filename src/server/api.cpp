@@ -109,6 +109,42 @@ json::Value files_api_list(const json::Value& list) {
   return o;
 }
 
+// Content parts that name an upload: {"type": "file", "file_id"} (DeepSeek)
+// or {"type": "file", "file": {"file_id"}} (OpenAI). An image becomes its
+// data URL, any other file without NUL bytes its text; without a file
+// store they stay and are refused by the chat route.
+json::Value with_file_parts(json::Value body, BatchService* batches) {
+  json::Value* msgs = body.get("messages");
+  if (!batches || !msgs || !msgs->is_array()) return body;
+  for (json::Value& m : msgs->as_array()) {
+    json::Value* content = m.is_object() ? m.get("content") : nullptr;
+    if (!content || !content->is_array()) continue;
+    for (json::Value& part : content->as_array()) {
+      if (!part.is_object() || part.get_string("type", "") != "file") continue;
+      std::string id = part.get_string("file_id", "");
+      if (const json::Value* f = part.get("file"); id.empty() && f && f->is_object()) id = f->get_string("file_id", "");
+      if (id.empty()) throw RequestError(422, "file part: file_id required");
+      const json::Value info = batches->file_info(id);
+      const std::string mime = info.get_string("mime_type", "application/octet-stream");
+      std::string bytes = batches->file_content(id);
+      json::Value out = json::Value::object();
+      if (mime.compare(0, 6, "image/") == 0) {
+        json::Value url = json::Value::object();
+        url.set("url", "data:" + mime + ";base64," + base64_encode(bytes));
+        out.set("type", "image_url");
+        out.set("image_url", std::move(url));
+      } else if (bytes.find('\0') == std::string::npos) {
+        out.set("type", "text");
+        out.set("text", std::move(bytes));
+      } else {
+        throw RequestError(422, "file " + id + ": images and text files only (" + mime + ")");
+      }
+      part = std::move(out);
+    }
+  }
+  return body;
+}
+
 std::map<std::string, std::pair<std::string, std::string>> parse_multipart(const http::Request& req) {
   std::map<std::string, std::pair<std::string, std::string>> out;
   const std::string* ct = req.header("content-type");
@@ -196,7 +232,10 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   server.route("GET", "/v1/profile", guarded([&engine](const http::Request&, http::Response& res) {
     res.send(200, "application/json", engine.profile_json());
   }));
-  server.route("GET", "/v1/models", guarded([&engine](const http::Request&, http::Response& res) {
+  // DeepSeek's paths have no /v1 (baseURL https://api.deepseek.com): /models,
+  // /chat/completions and /files answer there too.
+  for (const char* path : {"/v1/models", "/models"})
+  server.route("GET", path, guarded([&engine](const http::Request&, http::Response& res) {
     json::Value m = json::Value::object();
     m.set("id", engine.model_name());
     m.set("object", "model");
@@ -243,11 +282,11 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
   server.route("POST", "/v1/decisions", decisions, http::Body::Json);
   server.route("POST", "/v1/systemone", decisions, http::Body::Json);
 
-  auto generation = [&engine](bool chat) {
-    return guarded([&engine, chat](const http::Request& req, http::Response& res) {
+  auto generation = [&engine, batches](bool chat) {
+    return guarded([&engine, batches, chat](const http::Request& req, http::Response& res) {
       if (engine.decision_only())
         throw RequestError(422, engine.chat_refusal());
-      const json::Value body = parse_body(req);
+      const json::Value body = chat ? with_file_parts(parse_body(req), batches) : parse_body(req);
       ChatJob job = chat ? prepare_chat(engine, body) : prepare_completion(engine, body);
       if (!job.stream) {
         res.send_json(200, respond(engine, job, [&res] { return res.client_gone(); }));
@@ -301,6 +340,7 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
     });
   };
   server.route("POST", "/v1/chat/completions", generation(true), http::Body::Json);
+  server.route("POST", "/chat/completions", generation(true), http::Body::Json);
   server.route("POST", "/v1/completions", generation(false), http::Body::Json);
 
   // Embeddings of the loaded model (pooled final-normed hidden states).
@@ -362,41 +402,69 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
 
   if (!batches) return;
   BatchService& B = *batches;
-  server.route("POST", "/v1/files", guarded([&B](const http::Request& req, http::Response& res) {
-    auto parts = parse_multipart(req);
-    auto file = parts.find("file");
-    if (file == parts.end()) throw RequestError(422, "file: required (multipart field 'file')");
-    const bool anthropic = files_api_request(req);
-    const std::string purpose = parts.count("purpose") ? parts["purpose"].second : anthropic ? "user_data" : "batch";
-    const json::Value f = B.upload(file->second.first, purpose, file->second.second);
-    res.send_json(200, anthropic ? files_api_object(f) : f);
-  }), http::Body::Multipart);
-  server.route("GET", "/v1/files", guarded([&B](const http::Request& req, http::Response& res) {
-    const json::Value list = B.list_files();
-    res.send_json(200, files_api_request(req) ? files_api_list(list) : list);
-  }));
-  server.route_prefix("GET", "/v1/files/", guarded([&B](const http::Request& req, http::Response& res) {
-    std::string rest = req.path.substr(std::string("/v1/files/").size());
-    const std::string suffix = "/content";
-    if (rest.size() > suffix.size() && rest.compare(rest.size() - suffix.size(), suffix.size(), suffix) == 0) {
-      rest.resize(rest.size() - suffix.size());
-      res.send(200, "application/jsonl", B.file_content(rest));
-      return;
-    }
-    const json::Value f = B.file_info(rest);
-    res.send_json(200, files_api_request(req) ? files_api_object(f) : f);
-  }));
-  server.route_prefix("DELETE", "/v1/files/", guarded([&B](const http::Request& req, http::Response& res) {
-    const json::Value deleted = B.delete_file(req.path.substr(std::string("/v1/files/").size()));
-    if (!files_api_request(req)) {
-      res.send_json(200, deleted);
-      return;
-    }
-    json::Value o = json::Value::object();  // Anthropic: {"id", "type": "file_deleted"}
-    o.set("id", deleted.get_string("id", ""));
-    o.set("type", "file_deleted");
-    res.send_json(200, o);
-  }));
+  for (const std::string base : {"/v1/files", "/files"}) {
+    server.route("POST", base, guarded([&B](const http::Request& req, http::Response& res) {
+      auto parts = parse_multipart(req);
+      auto file = parts.find("file");
+      if (file == parts.end()) throw RequestError(422, "file: required (multipart field 'file')");
+      const bool anthropic = files_api_request(req);
+      const std::string purpose = parts.count("purpose") ? parts["purpose"].second : anthropic ? "user_data" : "batch";
+      // expires_after[anchor]=created_at, expires_after[seconds]=N (OpenAI, DeepSeek).
+      int64_t expires = 0;
+      if (auto e = parts.find("expires_after[seconds]"); e != parts.end()) {
+        try {
+          expires = std::stoll(e->second.second);
+        } catch (...) {
+          expires = -1;
+        }
+        if (expires < 1) throw RequestError(422, "expires_after[seconds]: a positive number of seconds");
+        if (auto a = parts.find("expires_after[anchor]"); a != parts.end() && a->second.second != "created_at")
+          throw RequestError(422, "expires_after[anchor]: created_at");
+      }
+      const json::Value f = B.upload(file->second.first, purpose, file->second.second, expires);
+      res.send_json(200, anthropic ? files_api_object(f) : f);
+    }), http::Body::Multipart);
+    server.route("GET", base, guarded([&B](const http::Request& req, http::Response& res) {
+      if (files_api_request(req)) {
+        res.send_json(200, files_api_list(B.list_files()));
+        return;
+      }
+      const std::string order = req.query_param("order");
+      if (!order.empty() && order != "asc" && order != "desc") throw RequestError(422, "order: asc or desc");
+      int limit = 0;
+      if (const std::string l = req.query_param("limit"); !l.empty()) {
+        try {
+          limit = std::stoi(l);
+        } catch (...) {
+          limit = -1;
+        }
+        if (limit < 1) throw RequestError(422, "limit: a positive number");
+      }
+      res.send_json(200, B.list_files(req.query_param("purpose"), limit, req.query_param("after"), order == "desc"));
+    }));
+    server.route_prefix("GET", base + "/", guarded([&B, base](const http::Request& req, http::Response& res) {
+      std::string rest = req.path.substr(base.size() + 1);
+      const std::string suffix = "/content";
+      if (rest.size() > suffix.size() && rest.compare(rest.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        rest.resize(rest.size() - suffix.size());
+        res.send(200, "application/jsonl", B.file_content(rest));
+        return;
+      }
+      const json::Value f = B.file_info(rest);
+      res.send_json(200, files_api_request(req) ? files_api_object(f) : f);
+    }));
+    server.route_prefix("DELETE", base + "/", guarded([&B, base](const http::Request& req, http::Response& res) {
+      const json::Value deleted = B.delete_file(req.path.substr(base.size() + 1));
+      if (!files_api_request(req)) {
+        res.send_json(200, deleted);
+        return;
+      }
+      json::Value o = json::Value::object();  // Anthropic: {"id", "type": "file_deleted"}
+      o.set("id", deleted.get_string("id", ""));
+      o.set("type", "file_deleted");
+      res.send_json(200, o);
+    }));
+  }
   server.route("POST", "/v1/batches", guarded([&B](const http::Request& req, http::Response& res) {
     res.send_json(200, B.create(parse_body(req)));
   }), http::Body::Json);

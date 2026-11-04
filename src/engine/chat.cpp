@@ -670,6 +670,19 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   json::Value kwargs = json::Value::object();
   if (const json::Value* k = body.get("chat_template_kwargs"); k && k->is_object()) kwargs = *k;
   if (const json::Value* t = body.get("enable_thinking"); t && t->is_bool()) kwargs.set("enable_thinking", *t);
+  // DeepSeek's fields: thinking {"type": "enabled" | "disabled"} and
+  // reasoning_effort, which reaches templates that take one (Qwen3.8-Flash-Next:
+  // low, medium, high = xhigh), as on the Messages and Responses routes.
+  if (const json::Value* t = body.get("thinking"); t && t->is_object() && !body.get("enable_thinking")) {
+    const std::string type = t->get_string("type", "");
+    if (type == "enabled" || type == "adaptive") kwargs.set("enable_thinking", true);
+    else if (type == "disabled") kwargs.set("enable_thinking", false);
+  }
+  if (const json::Value* e = body.get("reasoning_effort"); e && e->is_string() && !kwargs.get("reasoning_effort")) {
+    const std::string& effort = e->as_string();
+    if (effort == "low" || effort == "medium") kwargs.set("reasoning_effort", effort);
+    else if (effort == "high" || effort == "xhigh" || effort == "max") kwargs.set("reasoning_effort", std::string("xhigh"));
+  }
   if (const json::Value* t = body.get("tools"); offer_tools && t && t->is_array() && t->size()) {
     job.tools = *t;
     if (!choice.allowed.empty()) {  // allowed_tools: the prompt offers those only

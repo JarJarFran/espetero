@@ -210,15 +210,24 @@ All presets serve the same OpenAI-compatible API (`/v1/chat/completions`,
 `/v1/decisions`.
 `--harness NAME` prints, when the server starts, the client setup for an agent
 harness, with the address the server listens on. The default is `deepseek`
-(deepseek-harness: its `llm-deepseek` `baseURL`, which gets `/v1/messages` and
-`/v1/files` added); `claude-code` (`ANTHROPIC_BASE_URL`), `codex`
-(`wire_api = "responses"`) and `opencode` (`baseURL` with `/v1`) are the other
-choices, and `none` prints nothing. It only prints: the harness's own config is
-still written by hand. Its Messages side covers image blocks that name an
-uploaded file (`source` `{"type": "file", "file_id"}`), `tool_addition` /
-`tool_removal` blocks in system turns with `defer_loading` tools, and Files
-requests that carry `anthropic-beta: files-api-…` answer in Anthropic's shapes
-(without that header `/v1/files` keeps the OpenAI shape).
+(deepseek-harness: `DEEPSEEK_BASE_URL=http://host:port/v1`, or its
+`llm-deepseek` `baseURL`, which gets `/chat/completions` and `/files` added;
+`/chat/completions`, `/models` and `/files` answer without `/v1` too);
+`claude-code` (`ANTHROPIC_BASE_URL`), `codex` (`wire_api = "responses"`) and
+`opencode` (`baseURL` with `/v1`) are the other choices, and `none` prints
+nothing. It only prints: the harness's own config is still written by hand.
+Chat requests take DeepSeek's fields: `thinking` `{"type": "enabled" |
+"disabled"}`, `reasoning_effort` (`low`, `medium`, `high` = `max` = `xhigh`
+for templates that take one), and content parts that name an upload
+(`{"type": "file", "file_id"}`, or OpenAI's `{"type": "file", "file":
+{"file_id"}}`: an image, or a text file as its text). Uploads take
+`expires_after[seconds]` (their `expires_at`; gone after it), and `GET
+/v1/files` takes `purpose`, `limit`, `after` and `order` and answers with
+`has_more`, `first_id` and `last_id`. The Messages side covers image blocks
+that name an uploaded file (`source` `{"type": "file", "file_id"}`),
+`tool_addition` / `tool_removal` blocks in system turns with `defer_loading`
+tools, and Files requests that carry `anthropic-beta: files-api-…` answer in
+Anthropic's shapes (without that header `/v1/files` keeps the OpenAI shape).
 Other clients' APIs run the same chat job (same prompt, same tokens):
 OpenAI's `/v1/responses` (`previous_response_id` continues one of the newest
 256 stored responses; `GET` / `DELETE /v1/responses/{id}`), Anthropic's

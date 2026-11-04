@@ -144,21 +144,6 @@ bool event(http::Response& res, const std::string& name, const json::Value& data
 // source {"type": "file", "file_id"}.
 using FileReader = std::function<std::pair<std::string, std::string>(const std::string& id)>;
 
-std::string base64_encode(const std::string& in) {
-  static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  out.reserve((in.size() + 2) / 3 * 4);
-  for (size_t i = 0; i < in.size(); i += 3) {
-    const bool more1 = i + 1 < in.size(), more2 = i + 2 < in.size();
-    const uint32_t n = (uint32_t(uint8_t(in[i])) << 16) | (more1 ? uint32_t(uint8_t(in[i + 1])) << 8 : 0) |
-                       (more2 ? uint32_t(uint8_t(in[i + 2])) : 0);
-    out += kAlphabet[(n >> 18) & 63];
-    out += kAlphabet[(n >> 12) & 63];
-    out += more1 ? kAlphabet[(n >> 6) & 63] : '=';
-    out += more2 ? kAlphabet[n & 63] : '=';
-  }
-  return out;
-}
 
 // An image block's source as the chat route's URL: a data URL for "base64"
 // and "file" (the uploaded bytes), the URL itself for "url" (fetched with
@@ -1259,6 +1244,22 @@ void refuse_clef(const Engine& engine) {
 }
 
 }  // namespace
+
+std::string base64_encode(const std::string& in) {
+  static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve((in.size() + 2) / 3 * 4);
+  for (size_t i = 0; i < in.size(); i += 3) {
+    const bool more1 = i + 1 < in.size(), more2 = i + 2 < in.size();
+    const uint32_t n = (uint32_t(uint8_t(in[i])) << 16) | (more1 ? uint32_t(uint8_t(in[i + 1])) << 8 : 0) |
+                       (more2 ? uint32_t(uint8_t(in[i + 2])) : 0);
+    out += kAlphabet[(n >> 18) & 63];
+    out += kAlphabet[(n >> 12) & 63];
+    out += more1 ? kAlphabet[(n >> 6) & 63] : '=';
+    out += more2 ? kAlphabet[n & 63] : '=';
+  }
+  return out;
+}
 
 void install_compat_routes(http::Server& server, Engine& engine, BatchService* batches) {
   // Image sources {"type": "file"} name uploads of the Files API (no store: refused).

@@ -625,11 +625,16 @@ static void test_recommend() {
   const models::Recommendation* p = pick(64, "Qwen3.8-27B");
   CHECK(p && p->entry->id == "unsloth/Qwen3.8-27B-GGUF:Q8_0" && p->context == 0);
   p = pick(48, "Qwen3.8-27B");
-  CHECK(p && p->entry->bits == 8 && p->context == 0 && !pick(48, "Qwen3.8-Flash-Next"));
+  CHECK(p && p->entry->id == "unsloth/Qwen3.8-27B-GGUF:Q8_0" && p->context == 16384 && p->full_context &&
+        p->full_context->id == "mlx-community/Qwen3.8-27B-8bit" && !pick(48, "Qwen3.8-Flash-Next"));
   p = pick(32, "Qwen3.8-27B");
   CHECK(p && p->entry->bits == 4 && p->context == 16384);
   CHECK(!pick(24, "Qwen3.8-27B") && pick(24, "Qwen3.5-9B") && pick(24, "Qwen3.5-9B")->entry->bits == 8);
   CHECK(!pick(8, "Qwen3.5-9B") && pick(8, "Qwen3.5-0.8B"));
+  // At one width an MTP file at 16384 beats one without MTP at the plan's context (16 GB: 9B Q4_K_M).
+  p = pick(16, "Qwen3.5-9B");
+  CHECK(p && p->entry->id == "unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M" && p->context == 16384 && p->full_context &&
+        p->full_context->id == "mlx-community/Qwen3.5-9B-4bit");
   // Every pick fits; no file of a wider tier fits at the plan's context.
   for (double ram : {8.0, 16.0, 24.0, 32.0, 36.0, 48.0, 64.0, 96.0, 128.0, 192.0})
     for (const models::Recommendation& r : models::recommend(models::mac_with_ram(ram), models::Plan{}, none)) {
@@ -646,8 +651,14 @@ static void test_recommend() {
   const models::Mac m16 = models::mac_with_ram(16);
   const std::string t = models::recommendations_text(m16, models::recommend(m16, models::Plan{}, have), false);
   CHECK_MSG(contains(t, "Models that fit a Mac with 16 GB of RAM (11.5 GB for the GPU), best first:"), t);
-  CHECK_MSG(contains(t, "\n* mlx-community/Qwen3.5-9B-4bit ") && contains(t, "also downloaded: mlx-community/Qwen3.5-0.8B-4bit"), t);
-  CHECK_MSG(contains(t, "* in the Hugging Face cache already."), t);
+  CHECK_MSG(contains(t, "\n  unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M --context 16384 ") &&
+                contains(t, "without MTP, at the full context: mlx-community/Qwen3.5-9B-4bit (downloaded)\n") &&
+                !contains(t, "also downloaded: mlx-community/Qwen3.5-9B-4bit") &&
+                contains(t, "also downloaded: mlx-community/Qwen3.5-0.8B-4bit"), t);
+  const std::string t2 = models::recommendations_text(m16, models::recommend(m16, models::Plan{}, [](const std::string& id) {
+    return id == "unsloth/Qwen3.5-4B-MTP-GGUF:Q8_0";
+  }), false);
+  CHECK_MSG(contains(t2, "\n* unsloth/Qwen3.5-4B-MTP-GGUF:Q8_0 ") && contains(t2, "* in the Hugging Face cache already."), t2);
   CHECK(contains(models::recommendations_text(models::mac_with_ram(2), {}, false), "No model of the table fits a Mac with 2 GB"));
   // The catalog's files of the same model are alternatives; finetunes and other sizes are not.
   std::vector<models::Alternative> a = models::catalog_alternatives("mlx-community/Qwen3.8-27B-8bit");

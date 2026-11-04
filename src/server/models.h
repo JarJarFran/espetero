@@ -227,11 +227,14 @@ struct Recommendation {
   bool fits = true;
   bool cached = false;
   std::vector<std::string> also;  // other files of the model in the cache that fit too
+  // An MTP pick at a shorter --context: the same width without MTP that fits the plan's.
+  const CatalogEntry* full_context = nullptr;
 };
 
 // The best file of each catalog model that fits `mac` with `plan`, best model
 // first: the model's files in order at the plan's --context, else at 16384,
-// else 8192. `all`: every file, those that do not fit too. `cached` tells
+// else 8192; at one width a file with an MTP head at 16384 before one without
+// at the plan's --context. `all`: every file, those that do not fit too. `cached` tells
 // which --model values are in the Hugging Face cache.
 std::vector<Recommendation> recommend(const Mac& mac, const Plan& plan,
                                       const std::function<bool(const std::string&)>& cached, bool all = false);

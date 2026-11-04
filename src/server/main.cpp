@@ -849,10 +849,11 @@ struct Listener {
 void print_harness(const std::string& harness, const std::string& base, bool keyed) {
   const std::string key = keyed ? "the --api-key value (ESPETERO_API_KEY)" : "any value (no --api-key is set)";
   if (harness == "deepseek") {
-    // deepseek-harness adds /v1/messages and /v1/files to baseURL; its model id passes through unchanged.
+    // deepseek-harness's llm-deepseek adds /chat/completions and /files to baseURL (answered with and
+    // without /v1); its model id passes through unchanged.
     std::fprintf(stderr,
-                 "[espetero] harness deepseek (deepseek-harness, profile config of llm-deepseek):\n"
-                 "[espetero]   baseURL: \"%s\"   apiKeyEnv: a variable holding %s\n"
+                 "[espetero] harness deepseek (deepseek-harness, profile config of llm-deepseek, or the environment):\n"
+                 "[espetero]   DEEPSEEK_BASE_URL=%s/v1   DEEPSEEK_API_KEY=%s\n"
                  "[espetero]   the model id in its requests is not checked; this server answers with its own name\n",
                  base.c_str(), key.c_str());
   } else if (harness == "claude-code") {

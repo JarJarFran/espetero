@@ -21,5 +21,7 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
 // Anthropic Messages, OpenAI Responses and Prometheus /metrics over the chat job (compat.cpp).
 // `batches` (may be null) holds the uploads that image blocks can name.
 void install_compat_routes(http::Server& server, Engine& engine, BatchService* batches);
+// Standard base64 with padding (compat.cpp).
+std::string base64_encode(const std::string& in);
 
 }  // namespace espetero
