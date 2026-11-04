@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 (2026-11-04)
 
 - **deepseek-harness works**: its `llm-deepseek` adapter speaks DeepSeek's chat completions, not Anthropic Messages, so 0.1.3's setup line (a `baseURL` without `/v1`) sent it to routes that did not exist. `--harness deepseek` now prints `DEEPSEEK_BASE_URL=http://host:port/v1`, and `/chat/completions`, `/models` and `/files` answer without `/v1` too. Chat requests take DeepSeek's `thinking` `{"type": "enabled" | "disabled"}` and `reasoning_effort`, and content parts that name an upload (`{"type": "file", "file_id"}`: images as their data, text files as their text). Uploads take `expires_after[seconds]` and report `expires_at`; `GET /v1/files` takes `purpose`, `limit`, `after` and `order` and answers with `has_more`, `first_id` and `last_id`. Checked with deepseek-harness 0.1.2-alpha.1 itself.
 - **`espetero recommend` on 16 GB Macs**: at one width a file with an MTP head at a 16K context now comes before one without MTP at the full context, so a 16 GB Mac gets `unsloth/Qwen3.5-9B-MTP-GGUF:Q4_K_M --context 16384` (MTP decoding) instead of `mlx-community/Qwen3.5-9B-4bit`, and a 48 GB Mac the 27B's Q8_0 at 16384; the file without MTP that fits the full context is listed under it.
