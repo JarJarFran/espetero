@@ -1684,6 +1684,9 @@ class Glm5Model final : public NativeModel {
   std::string profile_json() override { return "{\"expert_cache\":" + m_->cache_json() + "}"; }
   bool set_option(const std::string&, int) override { return false; }
   std::string bench_json(const std::string&) override { return profile_json(); }
+  void set_activation_sink(ActivationSink* sink) override {
+    if (sink) fail("calibration taps: not supported for GLM-5");
+  }
 
  private:
   static constexpr int kScratch = 4;  // trees without a slot, and leaves (in rounds)
