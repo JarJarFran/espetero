@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.2.0)
+## 0.2.0 (2026-11-05)
 
 - **EQ, Espetero's own quantization format** (EQ3, EQ4, EQ5, EQ6, EQ8): codes shaped by the Apple GPU's simdgroup fragments, an int8 sub-scale per lane sub-block of 16 inputs and an fp16 super-scale per 256 (scale mode 6), EQ4 and EQ3 with 16- / 8-entry codebooks (modes 7 and 8; EQ3 for routed experts only). Checkpoints carry `.weight`, `.scales`, `.super` (and `.codebook`) per matrix and `eq_format.version` 2 in config.json. Every kernel family reads them: the 1-2-row FMA GEMVs with one scale per column and lane per K step, the MMA kernels (8-, 16- and 32-row expert tiles too), the fused MoE down + combine, with a wider EQ shared expert beside narrower routed experts. Other formats' kernels and host paths are unchanged.
 - **`espetero quantize`** ([docs/quantize.md](docs/quantize.md)): a Hugging Face BF16 checkpoint to an EQ checkpoint without Python. Calibration statistics come from Espetero's own forward of the BF16 weights (`--calib-out` / `--calib`, layer ranges with `--calib-layers` and `tools/calib_merge.py`), GPTQ / imatrix / MSE / codebook encoders run on the CPU, and the presets cover MoE (`eq4dhb`, `eq3dhb`, `eq6h`, ...), dense Qwen3.5 / 3.6 (`eqd4m`, `eqd4l`, `eqd5`, `eqd6`, `eqd6-27b` for Qwen3.8-27B), dense Gemma 4, Spark-X2.6 and Qwen3.8-Flash-Next (`fnx3`, `fnx3m`; experts may be pruned per layer).
