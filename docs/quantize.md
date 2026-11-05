@@ -63,10 +63,17 @@ text (Wikipedia, C4, Python), gave `eqd6-27b`: every matrix EQ6, the MLPs of
 the first 5/16 of the layers (L0-19) EQ5, v_proj, LM head and in_proj_a/b
 EQ8, the embedding MLX 5-bit, the vision tower BF16. It needs a calibration
 text with prose as well as code: with one of wikitext-103, C4 and PG19 train
-plus calibration_v5, chat and Python (452k tokens), KLD 0.00132 at 6.417 bpw
-against UD-Q6_K's 0.00142 at 6.431, both run by Espetero (−7 %, 95 % interval
-−14 % to +1 %: lower but not significantly; fp32 BF16 reference, wikitext-2
-test and C++/Metal code); with calibration_v5 alone 0.00149.
+plus calibration_v5, chat and Python (452k tokens, "prose1"), KLD 0.00132 at
+6.417 bpw against UD-Q6_K's 0.00142 at 6.431, both run by Espetero (−7 %, 95 %
+interval −14 % to +1 %: lower but not significantly; fp32 BF16 reference,
+wikitext-2 test and C++/Metal code); with calibration_v5 alone 0.00149.
+
+The release file mixes prose1 with three domain captures (about 150k tokens
+each of Wikipedia, C/C++ and chat; weights 1/2, 1/6, 1/6, 1/6, with
+`tools/calib_mix.py`) and converts with `--enc-opts schur6,refit` (below):
+KLD 0.00115, −19 % against UD-Q6_K (95 % interval −28 % to −7 %), −16 %
+(−26 % to −5 %) on held-out prose and −22 % (−28 % to −15 %) on held-out
+C/C++, at the same 6.417 bpw.
 
 **Other families.** Dense Gemma 4 and Spark-X2.5 / X2.6 (`spark2_5`) convert
 with `--fmt` rules. Spark-X2.6-4B's `c3` (5.21 bits per weight; KLD 0.026
@@ -155,6 +162,24 @@ default stays `count`.
   layers converted to EQ over the oQ4e-mtp file, or a pruned conversion that reuses the file's
   n-gram table.
 
+## Encoder options
+
+`--enc-opts LIST` changes how the encoder picks codes and scales; the file
+format, and so the engine that reads it, stay the same.
+
+| Option | What it does |
+|:--|:--|
+| `psd` (default) / `nopsd` | An E[x x^T] whose float32 Cholesky fails is projected to the nearest positive semi-definite matrix before GPTQ's damping ladder (byte-identical wherever that fallback was not needed); `nopsd` keeps the old ladder only |
+| `schur[R]` | GPTQ's 8-bit sub-scales are chosen inside the recurrence, among ±R int8 candidates around the plain choice (R = 6 by default), scoring each with the error the remaining columns can still absorb |
+| `refit` | After GPTQ, the fp16 super-scale of each 256-input block is refitted by least squares against the calibration statistics |
+| `sign` | Uniform EQ only: both orientations of the code grid are searched |
+
+On Qwen3.8-27B (`eqd6-27b`, prose1 calibration) `schur6,refit` alone moves
+KLD within noise (−2 % on the test windows, −6 % on held-out prose, neither
+significant); with the mixed calibration it recovers the held-out prose that
+the mix alone gives up (+2.5 % against prose1 without it, −9.5 % with it).
+`sign` did not help on Qwen3.5-9B.
+
 ## Time and memory
 
 The encoders run on the CPU (Accelerate, all cores); the calibration forward
@@ -179,6 +204,8 @@ per-expert down Hessians 50 GB): save them once with `--calib-out` and reuse
 them. A model whose BF16 weights do not fit in memory is captured in layer
 ranges (`--calib-layers A:B`, merged with `tools/calib_merge.py`) or, for
 Flash-Next, with the forward of a smaller checkpoint (`--calib-model`).
+Captures of different texts mix with `tools/calib_mix.py OUTDIR W:FILES ...`
+(a weighted sum of their E[x x^T], with no new forward).
 
 GPTQ sums in the order the BLAS threads take: with
 `VECLIB_MAXIMUM_THREADS=1` a conversion is byte-for-byte reproducible (every
