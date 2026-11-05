@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Spark-X2.5 / X2.6 from the Hugging Face cache or a repository id**: the memory check before a load or download read a `spark2_5` config.json as Qwen3.5 and refused it ("incomplete Qwen3.5 configuration"), so `espetero serve --model XHToken/Spark-X2.6-4B` never got to the engine. The check now reads Spark's geometry (Gemma 4's pools with 256-dim heads in both layer kinds) and its `model.*` tensor names.
+
 ## 0.2.0 (2026-11-05)
 
 - **EQ, Espetero's own quantization format** (EQ3, EQ4, EQ5, EQ6, EQ8): codes shaped by the Apple GPU's simdgroup fragments, an int8 sub-scale per lane sub-block of 16 inputs and an fp16 super-scale per 256 (scale mode 6), EQ4 and EQ3 with 16- / 8-entry codebooks (modes 7 and 8; EQ3 for routed experts only). Checkpoints carry `.weight`, `.scales`, `.super` (and `.codebook`) per matrix and `eq_format.version` 2 in config.json. Every kernel family reads them: the 1-2-row FMA GEMVs with one scale per column and lane per K step, the MMA kernels (8-, 16- and 32-row expert tiles too), the fused MoE down + combine, with a wider EQ shared expert beside narrower routed experts. Other formats' kernels and host paths are unchanged.

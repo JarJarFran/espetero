@@ -454,6 +454,41 @@ Geometry lfm2_geometry(const json::Value& tc) {
   return g;
 }
 
+// Spark-X2.5 / X2.6: config_from_spark's reading (src/model/impl/config.h)
+// and Config::validate's Spark checks, on Gemma 4's pools and scratch.
+Geometry spark_geometry(const json::Value& tc) {
+  Geometry g;
+  g.gemma = g.spark = true;
+  g.D = int(tc.get_int("hidden_size", 0));
+  g.I = int(tc.get_int("intermediate_size", 0));
+  g.L = int(tc.get_int("num_hidden_layers", 0));
+  g.H = int(tc.get_int("num_attention_heads", 0));
+  g.Hkv = g.Hkv_g = int(tc.get_int("num_key_value_heads", 0));
+  g.HD = g.HDg = int(tc.get_int("head_dim", 256));
+  g.V = int(tc.get_int("vocab_size", 0));
+  g.window = int(tc.get_int("sliding_window", 0));
+  const json::Value* types = tc.get("layer_types");
+  for (int i = 0; i < g.L; ++i) {
+    bool s = i % 4 != 3;  // three sliding layers, then one full
+    if (types && types->is_array() && size_t(i) < types->size() && (*types)[size_t(i)].is_string())
+      s = (*types)[size_t(i)].as_string() == "sliding_attention";
+    s ? ++g.n_swa : ++g.n_full;
+  }
+  g.ld = std::max(g.H * g.HD + 2 * g.Hkv * g.HD, g.D);
+  g.known = g.D > 0 && g.L > 0 && g.V > 0;
+  if (!g.D || !g.I || !g.L || !g.H || !g.Hkv || !g.V || !g.window)
+    g.unsupported = "incomplete Spark configuration";
+  else if (g.HD != 256)
+    g.unsupported = "unsupported Spark head size (256)";
+  else if (g.H % g.Hkv)
+    g.unsupported = "unsupported Spark head grouping";
+  else if (const int G = g.H / g.Hkv; G != 1 && G != 2 && G != 4 && G != 8)
+    g.unsupported = "unsupported Spark GQA group " + std::to_string(G);
+  else if (g.D % 64 || g.I % 64 || tc.get_int("num_experts", 0) > 0)
+    g.unsupported = "unsupported Spark geometry";
+  return g;
+}
+
 Geometry geometry_from_config(const json::Value& root0) {
   Geometry g;
   if (!root0.is_object()) return g;
@@ -466,6 +501,7 @@ Geometry geometry_from_config(const json::Value& root0) {
     for (const char* t : {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"})
       if (top == t || text == t) return gemma_geometry(root, tc);
     if (top == "lfm2" || top == "lfm2_vl" || text == "lfm2") return lfm2_geometry(tc);
+    if (top == "spark2_5" || text == "spark2_5") return spark_geometry(tc);
   }
   g.D = int(tc.get_int("hidden_size", 0));
   g.I = int(tc.get_int("intermediate_size", 0));
@@ -848,6 +884,8 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
   int64_t embed_bytes = 0;
   // LFM2: the loader reads the Hugging Face names too (lfm2_load.h).
   const bool hf_names = f.geo.lfm2;
+  // Spark: Hugging Face, MLX and EQ checkpoints all use the model.* names (gemma_load.h).
+  const bool spark = f.geo.spark;
   bool embed_quantized = false;
   for (const std::string& s : shards) {
     const FileRef* r = size_of(s);
@@ -863,16 +901,18 @@ Footprint footprint_mlx(const json::Value& config, const std::vector<FileRef>& f
         bytes *= 2;  // group 128 is split in two groups of 64 (exact)
       if (starts_with(t.name, "language_model.model.embed_tokens.") ||
           starts_with(t.name, "backbone.language_model.embed_tokens.") ||
-          (hf_names && starts_with(t.name, "model.language_model.embed_tokens."))) {
+          (hf_names && starts_with(t.name, "model.language_model.embed_tokens.")) ||
+          (spark && starts_with(t.name, "model.embedding."))) {
         // Rows are gathered from nibbles or bytes (load_embedding: 5- and 6-bit codes widen).
         if (code && mq.bits != 4 && mq.bits != 8) bytes = t.bytes * 8 / mq.bits;
         embed_bytes += bytes;
         embed_quantized = embed_quantized || code;
       }
-      if (starts_with(t.name, "language_model.lm_head.")) lm_head = true;
+      if (starts_with(t.name, "language_model.lm_head.") || (spark && starts_with(t.name, "lm_head."))) lm_head = true;
       if (t.name == "language_model.model.embed_tokens.weight" ||
           t.name == "backbone.language_model.embed_tokens.weight" ||
-          (hf_names && t.name == "model.language_model.embed_tokens.weight"))
+          (hf_names && t.name == "model.language_model.embed_tokens.weight") ||
+          (spark && t.name == "model.embedding.weight"))
         f.mlx_layout = true;
       if (t.name == "language_model.mtp.fc.weight") own_mtp = true;
       if (t.name == "vision_tower.patch_embed.proj.weight" || t.name == "backbone.visual.patch_embed.proj.weight" ||

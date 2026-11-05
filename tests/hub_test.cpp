@@ -389,6 +389,13 @@ static std::vector<std::pair<std::string, uint32_t>> gguf_4b(uint32_t blocks = 3
           {"qwen35.ssm.time_step_rank", 32}, {"qwen35.full_attention_interval", 4}, {"qwen35.rope.dimension_count", 64}};
 }
 
+static const char* kSparkConfig = R"({
+  "model_type": "spark2_5", "architectures": ["Spark2_5ForCausalLM"], "hidden_size": 2560, "intermediate_size": 10240,
+  "num_hidden_layers": 36, "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256, "vocab_size": 131072,
+  "sliding_window": 512, "tie_word_embeddings": true, "hidden_act": "gelu",
+  "rope_parameters": {"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 5000000},
+                      "sliding_attention": {"partial_rotary_factor": 1.0, "rope_theta": 10000}}})";
+
 static void test_geometry() {
   std::printf("geometry, KV and state sizes\n");
   const models::Geometry g = models::geometry_from_config(json::parse(k4BConfig));
@@ -412,6 +419,16 @@ static void test_geometry() {
   q4.get("text_config")->set("hc_count", 4);
   const models::Geometry g4 = models::geometry_from_config(q4);
   CHECK(g4.q4 && g4.unsupported.empty() && g4.kv_bytes_per_token(false) == 8 * 2 * 512 * 2 + 8 * 336);
+  // Spark-X2.6-4B (spark2_5): Gemma 4's pools with 256-dim heads in both layer kinds, layer_types
+  // given or three sliding layers then one full.
+  const models::Geometry sp = models::geometry_from_config(json::parse(kSparkConfig));
+  CHECK(sp.known && sp.unsupported.empty() && sp.gemma && sp.spark && sp.n_full == 9 && sp.n_swa == 27);
+  CHECK(sp.kv_bytes_per_token(false) == 9 * 2 * 4 * 256 * 2 && sp.slot_bytes(false) == 27 * 512 * 2 * 4 * 256 * 2);
+  CHECK(sp.row_bytes() > 0 && sp.ld == 16 * 256 + 2 * 4 * 256);
+  json::Value sp8 = json::parse(kSparkConfig);
+  sp8.set("num_key_value_heads", 1);
+  sp8.set("num_attention_heads", 16);
+  CHECK(models::geometry_from_config(sp8).unsupported == "unsupported Spark GQA group 16");
 }
 
 static void test_headers() {
@@ -483,6 +500,17 @@ static void test_footprints() {
   f = models::footprint_local(mlx);
   CHECK(f.quant == "3-bit" && f.weights == (1000 * 8 / 3 + 200 * 2) + (2000 * 8 / 3) + 400 + 300 + (1000 * 8 / 3 + 200 * 2) + coarse);
   write(mlx + "/config.json", k4BConfig);
+
+  // Spark: model.* names (Hugging Face, MLX and EQ alike); a tied head is a copy of the embedding.
+  const std::string sd = g_root + "/models/spark/Spark-4bit";
+  write(sd + "/config.json", kSparkConfig);
+  write(sd + "/model.safetensors",
+        safetensors({{"model.embedding.weight", {"U32", 1000}},
+                     {"model.embedding.scales", {"BF16", 100}},
+                     {"model.layers.0.mlp.up_proj.weight", {"U32", 2000}}}) +
+            std::string(3100, '\0'));
+  f = models::footprint_local(sd);
+  CHECK(f.mlx_layout && f.geo.spark && f.weights == 3100 + 1100 && !f.has_mtp && !f.has_vision);
 
   // Flash-Next: experts and the n-gram table stay on the SSD; the drafter beside it counts.
   json::Value q4 = json::parse(k4BConfig);

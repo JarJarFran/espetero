@@ -45,6 +45,7 @@ struct Geometry {
   // paged pool), n_swa sliding layers (a ring of `window` positions per slot).
   bool gemma = false;
   int HDg = 0, Hkv_g = 0, window = 0, n_swa = 0, ld = 0;
+  bool spark = false;                       // Spark-X2.5 / X2.6 (spark2_5): Gemma 4's layer loop, 256-dim heads in both kinds
   bool ds4 = false;                         // deepseek_v41: experts and Engram tables on the SSD
   // LFM2: n_linear gated short-convolution layers (3 x D floats of conv state
   // per slot), n_full attention layers (Hkv x HD K/V per token).
