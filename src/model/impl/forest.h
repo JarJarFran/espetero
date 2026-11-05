@@ -1764,6 +1764,7 @@ struct TreePlan {
   int mtp_r0 = 0, mtp_R = 0, n_lh = 0;
   int cm_k = 0, cm_row0 = 0, mtp_C = 0;  // commit chain rows, their first Model::cm_x row, MTP rows for them
   int read_table = 0;     // offset of the parent's block list in the pass table
+  bool gdn_chain = false; // the root and its leaf chain are one delta-rule segment (Model::gdn_chain)
   std::vector<int> host, off;
   std::vector<int> dst_blocks, work_blocks;  // new block lists after the pass
 };
@@ -2571,6 +2572,26 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         sg.mid_slot = T.dst_slot;
         sg.save_t = T.save_len;
       }
+      // gdn_chain: a root whose leaves are one chain (an MTP verify pass) and
+      // that chain run as one segment from the parent state, the root's final
+      // state stored after its rows (mid save) instead of a second dispatch
+      // reading it back for the leaf. Every row takes the same per-token
+      // arithmetic either way.
+      int hosted = -1, n_hosted = 0;
+      for (int i = 0; i < T.NL; ++i)
+        if (T.host[size_t(i)] == i) hosted = i, ++n_hosted;
+      if (m.gdn_chain && n_hosted == 1 && T.off[size_t(hosted)] == 0 && sg.save_t < 0 && sg.write_state == 1 &&
+          T.Tr + b.leaf_offsets[hosted + 1] - b.leaf_offsets[hosted] <= 8) {
+        sg.len = T.Tr + b.leaf_offsets[hosted + 1] - b.leaf_offsets[hosted];
+        sg.mid_slot = sg.out_slot;
+        sg.save_t = T.Tr;
+        sg.write_state = 0;
+        roots.push_back(sg);
+        if (T.dst) conv_jobs.push_back({T.base, T.save_len, T.pstate, T.dst_slot});
+        if (T.work) conv_jobs.push_back({T.base, T.Tr, T.pstate, T.work_slot});
+        T.gdn_chain = true;
+        continue;
+      }
       roots.push_back(sg);
     }
     for (int i = 0; i < T.NL; ++i) {
@@ -2586,6 +2607,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
   // (they read the parents' taps in a later dispatch), with at most one save
   // per tree, of its root rows, into a slot no other root reads.
   std::vector<ConvSave> conv_root;
+  // (gdn_chain trees qualify: their chains run inside the root dispatch.)
   bool conv_fold = m.gdn_conv_fold && leaves.empty() && !conv_jobs.empty() && roots.size() <= size_t(Model::kGdnCtrSegs);
   if (conv_fold) {
     for (TreePlan& T : trees) {
@@ -3844,7 +3866,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     NormLink l_post, l_next;
     const NormLink* nin = nullptr;  // (consumer-side norms are no longer used)
     if (fuse) {
-      l_post = link(2 * li + 1, L.post_norm);
+      if (L.post_norm) l_post = link(2 * li + 1, L.post_norm);
       if (li + 1 < c.L) l_next = link(2 * (li + 1), m.layers[size_t(li + 1)].in_norm);
     }
     // Layer 0's input norm runs as a dispatch (the embedding has no partials);
@@ -3858,7 +3880,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       rmsnorm_h(L.in_norm, s.xn, M);
     }
     id<MTLBuffer> x_in = s.xn;
-    const NormLink* out_link = fuse ? &l_post : nullptr;
+    const NormLink* out_link = fuse ? (L.post_norm ? &l_post : (li + 1 < c.L ? &l_next : nullptr)) : nullptr;
     tap_rows(m, E, li, 0, x_in, M, c.D);  // ActivationSink::kAttnIn
     if (L.linear) {
       const int k = L.index_in_kind;
@@ -3919,7 +3941,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         };
         // Few sequences: more, thinner simdgroups hide the per-step latency.
         const int Rf_root = m.dn_rows > 0 ? m.dn_rows : (roots.size() <= 1 ? 8 : 16);
-        const int Rf_leaf = m.dn_rows > 0 ? m.dn_rows : 16;
+        const int Rf_leaf = m.dn_rows > 0 ? m.dn_rows : (m.gdn_r8 && leaves.size() <= 1 ? 8 : 16);
         fused(meta.segs_root, roots.size(), Rf_root, true, conv_fold);
         fused(meta.segs_leaf, leaves.size(), Rf_leaf, false, false);
       } else {
@@ -3974,7 +3996,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       };
       // Few sequences: more, thinner simdgroups hide the per-step latency.
       const int R_root = m.dn_rows > 0 ? m.dn_rows : (roots.size() <= 1 ? 8 : 16);
-      const int R_leaf = m.dn_rows > 0 ? m.dn_rows : 16;
+      const int R_leaf = m.dn_rows > 0 ? m.dn_rows : (m.gdn_r8 && leaves.size() <= 1 ? 8 : 16);
       if (!gdn_fused) {
         delta(meta.segs_root, roots.size(), R_root, true, max_root_len);
         delta(meta.segs_leaf, leaves.size(), R_leaf, false, max_leaf_len);
@@ -4122,6 +4144,10 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       }
       continue;
     }
+    if (!L.post_norm) {
+      if (last_layer) break;
+      continue;
+    }
     if (last_layer) {
       rmsnorm(s.hc, L.post_norm, s.xc, N, nil);
       if (L.moe) {
@@ -4176,6 +4202,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     tap_rows(m, E, c.L, 6, m.q4s.a16, M, c.hc_rank);
   }
   if (N > 0) {
+    if (!m.lm_head.out()) fail("this model has no language modeling head (use /v1/decisions or /v1/systemone)");
     if (c.q4) {  // the final mixer on the rows that are read out
       gather(m.q4s.H, m.q4s.Hc, c.W(), true);
       q4_read(m.mixer, false, m.q4s.Hc, N, s.hn);
@@ -4426,6 +4453,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       E.threads(MTLSizeMake(size_t(W / 4), rows.size(), 1), MTLSizeMake(64, 1, 1));
     }
   } else if (any_mtp) {
+    if (m.profile) m.prof_tag = "mtp:";  // bench_native --verify-rows: the MTP layer's share of the pass
   // ---- MTP draft state: extend each saved slot's MTP K/V over the root (row
   // i pairs the hidden row before token i with token i; row 0 uses the
   // parent's stored hidden row) and keep the hidden rows drafting starts from.
@@ -4583,6 +4611,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         E.threads(MTLSizeMake(size_t(c.D / 4), rows.size(), 1), MTLSizeMake(64, 1, 1));
       }
     }
+    m.prof_tag.clear();
   }
 
   if (q4_flushlog && c.q4 && q4_fl.n)
@@ -4812,9 +4841,18 @@ inline void run_commit(Model& m, PassMeta& meta, const std::vector<CommitRequest
     return;
   }
   const bool fused = jobs[0].sl->cm_fused;
-  const int R = jobs[0].sl->cm_R;
+  const int R0 = jobs[0].sl->cm_R;
   for (const Job& j : jobs)
-    if (j.sl->cm_fused != fused || j.sl->cm_R != R) fail("commit: chains of different passes");
+    if (j.sl->cm_fused != fused || j.sl->cm_R != R0) fail("commit: chains of different passes");
+  // gdn_r8: one chain replays on the 8-row layout (more, thinner simdgroups;
+  // the same sums as the 16-row one); commit_fold: the fused replay also
+  // saves the conv window (no conv_state_save dispatch).
+  const int R = R0 == 16 && m.gdn_r8 && jobs.size() <= 1 ? 8 : R0;
+  const bool cfold = fused && m.commit_fold && jobs.size() <= size_t(Model::kGdnCtrSegs);
+  if (cfold && !m.gdn_ctr) {
+    m.gdn_ctr = m.buffer(sizeof(int32_t) * size_t(Model::kGdnCtrSegs) * size_t(c.Hk));
+    std::memset([m.gdn_ctr contents], 0, sizeof(int32_t) * size_t(Model::kGdnCtrSegs) * size_t(c.Hk));
+  }
   // Rows of Model::cm_x: every chain row of the requested slots gets valid taps
   // (conv_prep runs over all rows up to the last one); segments cover n rows.
   int rows = 0;
@@ -4865,10 +4903,17 @@ inline void run_commit(Model& m, PassMeta& meta, const std::vector<CommitRequest
     const size_t st_lo = st_base * 4, st_hi = (st_base + S.st_floats * size_t(S.n_slots)) * 4;
     if (fused) {
       const DeltaFusedParams fp{c.Hk, c.Hv, C, ldl, C + Vd, c.tiled_heads ? 1 : 0, c.eps, C, Vd,
-                                conv_base, S.conv_floats, st_base, S.st_floats, 0};
+                                conv_base, S.conv_floats, st_base, S.st_floats, cfold ? 1 : 0};
       const std::string name = "gdn_decode_fused_tr" + std::to_string(R);
       const size_t nt = 32 * size_t(c.Dv / R);
       E.pipe(name);
+      if (cfold) {
+        E.set(11, meta.conv_jobs.buf);
+        E.set(12, m.gdn_ctr);
+        E.rd(m.gdn_ctr);
+        E.wr(m.gdn_ctr);
+        E.wr(S.buf, conv_lo, conv_hi);
+      }
       E.set(0, m.cm_x, loff);
       E.set(1, S.buf);
       E.set(2, meta.conv_src.buf);
@@ -4919,6 +4964,7 @@ inline void run_commit(Model& m, PassMeta& meta, const std::vector<CommitRequest
       E.threads(MTLSizeMake(32, size_t(c.Dv / R), segs.size() * size_t(c.Hv)), MTLSizeMake(32, 4, 1));
     }
     // The conv window after the committed rows (after the recurrence read the old one).
+    if (cfold) continue;
     E.pipe("conv_state_save");
     E.set(0, m.cm_x, loff);
     E.set(1, S.buf);

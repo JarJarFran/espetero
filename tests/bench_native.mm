@@ -60,6 +60,11 @@ int main(int argc, char** argv) {
   int max_ctx = 8192;            // --max-ctx N: tokens per sequence (the KV pool holds 4 GB, or 2 contexts of N)
   int long_seqs = 1;             // --long-seqs N: N sequences of the --long contexts decoded together
   double kv_gb = 0;              // --kv-gb G: the KV pool size (default: room for long_seqs + 1 contexts at 72 KB a token)
+  std::vector<int> vrows;        // --verify-rows 1,2,4,6: MTP verify passes of R rows (1 root + R - 1 chain leaves) and their commits
+  int vr_iters = 16;             // --vr-iters N: timed rounds of --verify-rows (every R once per round)
+  const char* mtp_path = nullptr;  // --mtp PATH|none: the MTP head (LoadOptions::mtp)
+  const char* vrc = nullptr;       // --vr-check OPTION A B: --verify-rows passes under set_option A / B compared bit for bit
+  int vrc_a = 0, vrc_b = 1;
   for (int i = 2; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--quick")) quick = true;
     else if (!std::strcmp(argv[i], "--load-only")) load_only = true;
@@ -83,6 +88,10 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--max-ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--long-seqs") && i + 1 < argc) long_seqs = std::max(1, std::atoi(argv[++i]));
     else if (!std::strcmp(argv[i], "--kv-gb") && i + 1 < argc) kv_gb = std::atof(argv[++i]);
+    else if (!std::strcmp(argv[i], "--verify-rows") && i + 1 < argc) vrows = parse_list(argv[++i]);
+    else if (!std::strcmp(argv[i], "--vr-iters") && i + 1 < argc) vr_iters = std::max(3, std::atoi(argv[++i]));
+    else if (!std::strcmp(argv[i], "--mtp") && i + 1 < argc) mtp_path = argv[++i];
+    else if (!std::strcmp(argv[i], "--vr-check") && i + 3 < argc) vrc = argv[++i], vrc_a = std::atoi(argv[++i]), vrc_b = std::atoi(argv[++i]);
   }
   for (int P : longs) max_ctx = std::max(max_ctx, P + 1024);
   // The verify-pass anatomy needs the diagnostic GEMV instantiations.
@@ -91,6 +100,7 @@ int main(int argc, char** argv) {
   o.slots = slots;
   if (xcache_gb != -1) o.expert_cache_gb = xcache_gb;  // --xcache: the expert cache is sized at load
   o.max_ctx = max_ctx;
+  if (mtp_path) o.mtp = mtp_path;
   o.kv_gb = kv_gb > 0 ? kv_gb : std::max(4.0, (long_seqs + 1.0) * max_ctx * 72e3 / 1e9);
   auto m = NativeModel::load(argv[1], o);
   const ModelInfo& I = m->info();
@@ -300,6 +310,174 @@ int main(int argc, char** argv) {
     for (auto* x : {&va, &vb, &pa, &pb}) std::sort(x->begin(), x->end());
     std::printf("\n## verify A/B %s\nverify: %s=%d %.2f ms  %s=%d %.2f ms  ratio %.3f\nplain:  %s=%d %.2f ms  %s=%d %.2f ms  ratio %.3f\n", vab,
                 vab, vab_a, va[8], vab, vab_b, vb[8], vb[8] / va[8], vab, vab_a, pa[8], vab, vab_b, pb[8], pb[8] / pa[8]);
+    return 0;
+  }
+  if (!vrows.empty()) {
+    // Verify-pass anatomy: the engine's verify pass of R rows (the pending
+    // token + R - 1 draft tokens as one chain, verify-commit when the model
+    // has it) from a fresh copy of the same --ctx context every time, the
+    // commit of all R - 1 drafts after it, and with --profile one pass and
+    // one commit per R with every dispatch timed alone ("mtp:" labels: the
+    // MTP layer's K/V rows). R = 1 is the plain decode step.
+    std::mt19937 rng5(17);
+    std::vector<int32_t> r(static_cast<size_t>(ctx));
+    for (auto& t : r) t = int32_t(rng5() % 100000u);
+    const int base = m->slot_alloc(), work = m->slot_alloc();
+    {
+      TreeSpec t;
+      t.root = r.data();
+      t.root_len = ctx;
+      t.save = base;
+      t.mtp = I.mtp;
+      m->run({t});
+    }
+    int32_t a = 11, ar[16];
+    std::vector<int32_t> drafts = {101, 202, 303, 404, 505, 606, 707, 808, 909, 1001, 1102, 1203, 1304, 1405, 1506};
+    auto one = [&](int R, PassStats* ps, PassStats* cs, bool prof = false) {
+      const int k = std::min(R - 1, int(drafts.size()));
+      std::vector<int32_t> lo(1, 0), lt;
+      for (int i = 0; i < k; ++i) {
+        lt.insert(lt.end(), drafts.begin(), drafts.begin() + i + 1);
+        lo.push_back(int32_t(lt.size()));
+      }
+      m->slot_fork(work, base);
+      TreeSpec v;
+      v.parent = v.save = work;
+      v.root = &a;
+      v.root_len = 1;
+      v.n_leaves = k;
+      v.leaf_offsets = k ? lo.data() : nullptr;
+      v.leaf_tokens = k ? lt.data() : nullptr;
+      v.score_root = true;
+      v.out_argmax = ar;
+      v.mtp = I.mtp;
+      v.commit_chain = I.commit ? k : 0;
+      m->set_profile(prof);
+      m->run({v}, ps);
+      if (prof) std::printf("vprof R %d pass: %s\n", R, m->profile_json().c_str());
+      m->set_profile(prof);
+      if (I.commit && k > 0) m->commit({{work, k}}, cs);
+      if (prof && I.commit && k > 0) std::printf("vprof R %d commit: %s\n", R, m->profile_json().c_str());
+      m->set_profile(false);
+    };
+    PassStats ps, cs;
+    // --vr-check A+B+C: several options set together.
+    auto setopt = [&](const char* names, int v) {
+      std::string all = names;
+      for (size_t p = 0, q; p <= all.size(); p = q + 1) {
+        q = all.find('+', p);
+        if (q == std::string::npos) q = all.size();
+        m->set_option(all.substr(p, q - p), v);
+      }
+    };
+    if (vrc) {
+      // Every readout's logits of the verify pass, then (after the commit of
+      // all drafts) a plain step's logits and 3 MTP drafts from the slot,
+      // under set_option(vrc, A) and (vrc, B): bit for bit.
+      const int V = I.vocab;
+      bool all_same = true;
+      for (int R : vrows) {
+        std::vector<float> out[2];
+        std::vector<int32_t> dr[2];
+        for (int arm = 0; arm < 2; ++arm) {
+          setopt(vrc, arm ? vrc_b : vrc_a);
+          const int k = std::min(R - 1, int(drafts.size()));
+          std::vector<int32_t> lo(1, 0), lt;
+          for (int i = 0; i < k; ++i) {
+            lt.insert(lt.end(), drafts.begin(), drafts.begin() + i + 1);
+            lo.push_back(int32_t(lt.size()));
+          }
+          m->slot_fork(work, base);
+          TreeSpec v;
+          v.parent = v.save = work;
+          v.root = &a;
+          v.root_len = 1;
+          v.n_leaves = k;
+          v.leaf_offsets = k ? lo.data() : nullptr;
+          v.leaf_tokens = k ? lt.data() : nullptr;
+          v.score_root = true;
+          v.want_logits = true;
+          v.mtp = I.mtp;
+          v.commit_chain = I.commit ? k : 0;
+          m->run({v});
+          for (int j = 0; j <= k; ++j) out[arm].insert(out[arm].end(), m->logits(0, j), m->logits(0, j) + V);
+          if (I.commit && k > 0) m->commit({{work, k}});
+          int32_t nx = 4242;
+          TreeSpec t;
+          t.parent = t.save = work;
+          t.root = &nx;
+          t.root_len = 1;
+          t.score_root = true;
+          t.want_logits = true;
+          t.mtp = I.mtp;
+          m->run({t});
+          out[arm].insert(out[arm].end(), m->logits(0, 0), m->logits(0, 0) + V);
+          if (I.mtp) {
+            int32_t d3[3], nt = 4343;
+            DraftRequest q;
+            q.slot = work;
+            q.tokens = &nt;
+            q.n_tokens = 1;
+            q.n_draft = 3;
+            q.out = d3;
+            m->draft({q});
+            dr[arm].assign(d3, d3 + 3);
+          }
+        }
+        size_t nd = 0;
+        double md = 0;
+        for (size_t i = 0; i < out[0].size(); ++i)
+          if (std::memcmp(&out[0][i], &out[1][i], 4)) ++nd, md = std::max(md, double(std::fabs(out[0][i] - out[1][i])));
+        const bool same = nd == 0 && dr[0] == dr[1];
+        all_same = all_same && same;
+        std::printf("vcheck R %d %s %d vs %d: %s (%zu values, %zu differ, max |d| %.4g, drafts %s)\n", R, vrc, vrc_a, vrc_b,
+                    same ? "BIT-IDENTICAL" : "DIFFERENT", out[0].size(), nd, md, dr[0] == dr[1] ? "equal" : "differ");
+      }
+      setopt(vrc, vrc_a);
+      std::printf("vcheck %s: %s\n", vrc, all_same ? "ALL BIT-IDENTICAL" : "DIFFERENT");
+    }
+    for (int w = 0; w < 3; ++w)
+      for (int R : vrows) one(R, &ps, &cs);
+    // With --vr-check the rounds alternate the two settings too (A, B per R).
+    const int arms = vrc ? 2 : 1;
+    std::vector<std::vector<double>> pg(vrows.size() * 2), cg(vrows.size() * 2), pw(vrows.size() * 2);
+    std::vector<int> nd(vrows.size() * 2);
+    for (int it = 0; it < vr_iters; ++it)
+      for (size_t j = 0; j < vrows.size(); ++j)
+        for (int arm = 0; arm < arms; ++arm) {
+          if (vrc) setopt(vrc, arm ? vrc_b : vrc_a);
+          const size_t x = j * 2 + size_t(arm);
+          cs = PassStats{};
+          one(vrows[j], &ps, &cs);
+          pg[x].push_back(ps.gpu_ms);
+          pw[x].push_back(ps.wall_ms);
+          cg[x].push_back(cs.gpu_ms);
+          nd[x] = ps.dispatches;
+        }
+    if (vrc) setopt(vrc, vrc_a);
+    auto med = [](std::vector<double> x) {
+      std::sort(x.begin(), x.end());
+      return x[x.size() / 2];
+    };
+    std::printf("\n## verify rows (ctx %d, commit %d, mtp %d, %d rounds, medians)\n", ctx, int(I.commit), int(I.mtp), vr_iters);
+    for (int arm = 0; arm < arms; ++arm) {
+      const double p1 = med(pg[size_t(arm)]);
+      for (size_t j = 0; j < vrows.size(); ++j) {
+        const size_t x = j * 2 + size_t(arm);
+        std::printf("vrows R %d%s: pass %.3f ms gpu (%.3f wall, %d dispatches)  commit %.3f ms gpu  ratio %.3f (pass + commit %.3f)", vrows[j],
+                    vrc ? (std::string(" ") + vrc + "=" + std::to_string(arm ? vrc_b : vrc_a)).c_str() : "", med(pg[x]), med(pw[x]),
+                    nd[x], med(cg[x]), med(pg[x]) / p1, (med(pg[x]) + med(cg[x])) / p1);
+        if (arm) std::printf("  B/A pass %.4f, pass + commit %.4f", med(pg[x]) / med(pg[x - 1]), (med(pg[x]) + med(cg[x])) / (med(pg[x - 1]) + med(cg[x - 1])));
+        std::printf("\n");
+      }
+    }
+    if (profile)
+      for (int R : vrows) {
+        one(R, &ps, &cs, false);
+        one(R, &ps, &cs, true);
+      }
+    m->slot_free(work);
+    m->slot_free(base);
     return 0;
   }
   if (pab) {

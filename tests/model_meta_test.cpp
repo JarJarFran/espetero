@@ -124,6 +124,7 @@ static void test_family() {
   CHECK(error_of(dir_with("ok_gemma", "{\"model_type\": \"gemma4\", \"text_config\": {\"model_type\": \"gemma4_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_lfm2_vl", "{\"model_type\": \"lfm2_vl\", \"text_config\": {\"model_type\": \"lfm2\"}}")).empty());
   CHECK(error_of(dir_with("ok_lfm2", "{\"model_type\": \"lfm2\"}")).empty());
+  CHECK(error_of(dir_with("ok_videojev", "{\"model_type\": \"videojev\", \"backbone_config\": {\"model_type\": \"qwen3_5\", \"text_config\": {\"model_type\": \"qwen3_5_text\"}}}")).empty());
   // A finetune wrapper whose text model is of the family, and a config without any model_type: left to the loader.
   CHECK(error_of(dir_with("ok_wrapper", "{\"model_type\": \"ornith\", \"text_config\": {\"model_type\": \"qwen3_5_text\"}}")).empty());
   CHECK(error_of(dir_with("ok_untyped", "{\"hidden_size\": 1024}")).empty());
@@ -134,7 +135,8 @@ static void test_family() {
   CHECK(contains(e, llama + ": model_type 'llama4' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family (qwen3_5, "
                             "qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), "
                             "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL "
-                            "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers"));
+                            "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), DeepSeek-V4.1 (deepseek_v41), GLM-5.3-Flash (glm5_next), "
+                    "MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers"));
   // Other Gemma generations are not Gemma 4.
   CHECK(contains(error_of(dir_with("no_gemma3", "{\"model_type\": \"gemma3\"}")), "model_type 'gemma3' is not supported"));
   for (const char* t : {"qwen3", "qwen3_vl", "qwen3_moe", "llama", "qwen2_5_vl"})
@@ -157,7 +159,7 @@ static void test_family() {
   const std::string g = Gguf().s("general.architecture", "llama").ints("x.sections", 4).file("g.gguf");
   CHECK(contains(error_of(g), g + ": GGUF architecture 'llama' is not supported by Espetero " + espetero::kVersion + "; it runs the Qwen3.5 family "
                                  "(qwen35, qwen35moe:"));
-  CHECK(contains(error_of(g), "and Gemma 4 (gemma4: 31B, 26B-A4B, 12B)"));
+  CHECK(contains(error_of(g), "Gemma 4 (gemma4: 31B, 26B-A4B, 12B) and GLM-5.3-Flash (glm5-next)"));
   CHECK(contains(error_of(g), "Cloudflare Clef classifiers run from MLX directories"));
   write(g_root + "/fake.gguf", "this is not a gguf file at all");
   CHECK(contains(error_of(g_root + "/fake.gguf"), "not a GGUF file"));

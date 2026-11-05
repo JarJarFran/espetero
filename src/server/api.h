@@ -19,6 +19,9 @@ void install_loading_routes(http::Server& server, bool webui);
 // Registers every route on `server`. `batches` may be null (no Batch API).
 void install_routes(http::Server& server, Engine& engine, BatchService* batches, const json::Value* config = nullptr);
 // Anthropic Messages, OpenAI Responses and Prometheus /metrics over the chat job (compat.cpp).
-void install_compat_routes(http::Server& server, Engine& engine);
+// `batches` (may be null) holds the uploads that image blocks can name.
+void install_compat_routes(http::Server& server, Engine& engine, BatchService* batches);
+// Standard base64 with padding (compat.cpp).
+std::string base64_encode(const std::string& in);
 
 }  // namespace espetero

@@ -12,6 +12,7 @@
 // models. A model's files go 8-bit, 6-bit, 4-bit (4-bit
 // only when memory forces it); at one width a GGUF file with an MTP head
 // (faster decoding, the same replies) comes before an MLX file without one,
+// even at a shorter context (16384 rather than the plan's),
 // except for the MoE, whose MLX files are the measured ones. Older models of
 // the same size (Qwen3.5-27B, Qwen3.6-27B, Qwen3.5-35B-A3B) are left out, and
 // so are files the engine does not read (mxfp4/nvfp4, IQ1-IQ3 GGUF) and models
@@ -226,12 +227,19 @@ std::vector<Recommendation> recommend(const Mac& mac, const Plan& plan,
       for (size_t k = i; k < j; ++k) out.push_back(check(cat[k], plan.max_ctx));
     } else {
       bool done = false;
+      // At one width a file with an MTP head at 16384 comes before one
+      // without it at the plan's --context: MTP decodes much faster.
       for (const std::vector<int>* contexts : {&wide, &last})
         for (int bits : {8, 6, 4})
-          for (int ctx : *contexts)
-            for (size_t k = i; k < j && !done; ++k)
-              if (cat[k].bits == bits)
-                if (Recommendation r = check(cat[k], ctx); r.fits) out.push_back(r), done = true;
+          for (bool mtp : {true, false})
+            for (int ctx : *contexts)
+              for (size_t k = i; k < j && !done; ++k)
+                if (cat[k].bits == bits && cat[k].footprint.has_mtp == mtp)
+                  if (Recommendation r = check(cat[k], ctx); r.fits) out.push_back(r), done = true;
+      if (done && out.back().context && out.back().entry->footprint.has_mtp)
+        for (size_t k = i; k < j && !out.back().full_context; ++k)
+          if (cat[k].bits == out.back().entry->bits && !cat[k].footprint.has_mtp && check(cat[k], plan.max_ctx).fits)
+            out.back().full_context = &cat[k];
       // Other files of the model already downloaded that fit too.
       if (done)
         for (size_t k = i; k < j; ++k)
@@ -271,7 +279,13 @@ std::string recommendations_text(const Mac& mac, const std::vector<Recommendatio
     std::snprintf(line, sizeof line, "%c %-*s  %8s  %9s  %s\n", r.cached ? '*' : ' ', int(w), arg.c_str(),
                   gb(r.entry->footprint.disk).c_str(), gb(r.need.total()).c_str(), what.c_str());
     out += line;
-    for (const std::string& id : r.also) out += "  " + std::string(w, ' ') + "  also downloaded: " + id + "\n";
+    const std::string full = r.full_context ? r.full_context->id : std::string();
+    const bool full_cached = std::find(r.also.begin(), r.also.end(), full) != r.also.end();
+    if (r.full_context)
+      out += "  " + std::string(w, ' ') + "  without MTP, at the full context: " + full +
+             (full_cached ? " (downloaded)" : "") + "\n";
+    for (const std::string& id : r.also)
+      if (id != full) out += "  " + std::string(w, ' ') + "  also downloaded: " + id + "\n";
   }
   out += "\n";
   if (any_cached) out += "* in the Hugging Face cache already.\n";

@@ -123,8 +123,29 @@ $(BUILD)/tok_load_test: tests/tok_load_test.cpp $(patsubst src/%.cpp,$(BUILD)/ob
 $(BUILD)/gemma_test: tests/gemma_test.cpp $(BUILD)/obj/engine/gemma_tools.o $(BUILD)/obj/engine/hidden_head.o $(BUILD)/obj/engine/pplx.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
+# GLM-5.3-Flash without a GPU: its tool-call format (glm_tools.cpp; chat.cpp's parse_tool_calls hands over to it).
+$(BUILD)/glm_test: tests/glm_test.cpp $(BUILD)/obj/engine/glm_tools.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
 $(BUILD)/topk_test: tests/topk_test.mm $(BUILD)/model.o $(BUILD)/json.o $(BUILD)/obj/engine/sampling.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
+
+# GGUF codebook blocks (IQ2_S, IQ3_S) against gguf-py: python3 tests/ref/gguf_iq_ref.py OUT.bin; build/gguf_iq_test OUT.bin
+$(BUILD)/gguf_iq_test: tests/gguf_iq_test.mm $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
+# Native GGUF-block GEMVs on the GPU against gguf-py (python3 tests/ref/gguf_iq_ref.py OUT --types ...; a GPU job)
+$(BUILD)/gguf_gemv_test: tests/gguf_gemv_test.mm $(BUILD)/kernels_src.h $(MODEL_HDRS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -I$(BUILD) tests/gguf_gemv_test.mm $(FRAMEWORKS) -o $@
+
+# GLM-5.3-Flash development driver: build/glm5_run MODEL_DIR REF_DIR OUT_DIR [layers] (tools/glm5_ref.py's case)
+$(BUILD)/glm5_run: tests/glm5_run.mm $(BUILD)/kernels_src.h $(BUILD)/json.o $(MODEL_HDRS)
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) -I$(BUILD) tests/glm5_run.mm $(BUILD)/json.o $(FRAMEWORKS) -o $@
+
+# GLM-5.3-Flash loader skeleton without a GPU: config and checkpoint index on a (fake) checkpoint directory
+# (python3 -I tests/ref/glm5_ref.py fake-ckpt DIR; build/glm5_load_test DIR).
+$(BUILD)/glm5_load_test: tests/glm5_load_test.mm $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
 $(BUILD)/sampling_test: tests/sampling_test.cpp $(BUILD)/obj/engine/sampling.o
 	$(CXX) $(CXXFLAGS) $^ -framework Accelerate -o $@
@@ -179,7 +200,7 @@ $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BU
 
 .PHONY: test
 test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http_test $(BUILD)/vision_limits_test $(BUILD)/hub_test $(BUILD)/model_meta_test $(BUILD)/api_test \
-      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/kev_test \
+      $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/glm_test $(BUILD)/kev_test \
       $(BUILD)/tok_load_test
 	python3 tests/ref/json_ref.py $(BUILD)/json_cases.json && $(BUILD)/json_test $(BUILD)/json_cases.json
 	$(BUILD)/sampling_test
@@ -194,6 +215,7 @@ test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http
 	$(BUILD)/service_test
 	$(BUILD)/grammar_test "" $(BUILD)/grammar_samples.jsonl && python3 tests/ref/grammar_check.py $(BUILD)/grammar_samples.jsonl
 	$(BUILD)/gemma_test
+	$(BUILD)/glm_test
 	$(BUILD)/kev_test tests/ref/kev_fixtures.json
 	$(BUILD)/tok_load_test
 

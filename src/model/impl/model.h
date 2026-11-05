@@ -310,6 +310,7 @@ struct Vision {
   Buf pos;  // fp32 [n_pos, D] (Gemma 4: [2][n_pos][D], the column then the row table)
   std::vector<VBlock> blocks;
   Buf mnw, mnb, inv_freq;
+  Buf pnw, pnb;             // MiniCPM-OCR: the merger's pre_norm over each 2x2 merged row (fp32 [4 D])
   Buf std_bias, std_scale;  // Gemma 4 (standardize)
   Mat proj;                 // Gemma 4: embed_vision's projection to the language model's width
   // Gemma 4 unified (no blocks): patch_ln1, patch_ln2 and pos_norm weights
@@ -685,6 +686,21 @@ struct Model : Runtime {
   // fewer per full layer). ESPETERO_FUSE_KVSAVE=1, "fuse_kvsave".
   bool fuse_kvsave = false;
   bool gdn_conv_fold = true; // leaf-free fused passes also save the conv state (no conv_state_save dispatch)
+  // MTP verify passes (a root whose leaves are one chain of <= 8 rows in all):
+  // the root and the chain as one delta-rule segment, the root's state saved
+  // after its rows, instead of a root dispatch and a leaf dispatch that reads
+  // that state back (one dispatch and one state read + write fewer per linear
+  // layer; the same per-token arithmetic). ESPETERO_GDN_CHAIN=1, "gdn_chain".
+  bool gdn_chain = false;
+  // Single-sequence verify leaves and commits run the fused GDN kernel with
+  // 8 state rows per simdgroup (as single roots do) instead of 16: more,
+  // thinner simdgroups for a latency-bound walk; the reduction tree is the
+  // same, so the sums are too. ESPETERO_GDN_R8=1, "gdn_r8".
+  bool gdn_r8 = false;
+  // Fused commits save the conv window inside the replay dispatch (the
+  // conv-save fold of plain decode steps) instead of a conv_state_save
+  // dispatch per linear layer. ESPETERO_COMMIT_FOLD=1, "commit_fold".
+  bool commit_fold = false;
   id<MTLBuffer> gdn_ctr = nil;  // arrival counters [segment][key head] (self-resetting)
   static constexpr int kGdnCtrSegs = 256;
   // A submission failed (or was refused) since the arrival counters

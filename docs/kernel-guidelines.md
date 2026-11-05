@@ -403,6 +403,17 @@ Rules that keep the tiers honest:
   keys +0.9 % (35B-A3B) / +0.2 % (27B), 512 keys +2.5 %, and the combine's
   regrouping changes the logits (max |Δ| 0.37 on the MoE, argmax equal). Not
   lossless, off.
+- **The grouped expert GEMVs stream at 95–97 % of the dense rate on the same
+  matrices** (M4 Max, 2026-10-24, `--micro moe`, exclusive; a chain over 24
+  layers, so the weights come from DRAM): `gu_k4` 403 GB/s against
+  `gu_dense` 423, `dn_k4_b2` 370 against `dn_dense` 395; the dense ceiling of
+  the same chain is `in_proj_dense` at 457 GB/s, and replacing the tile /
+  row-map loads by the threadgroup id (`gu_diag`, 406) costs nothing. The M1
+  Max shows the same 5 % (`gu_k4` 285, `gu_dense` 301, `dn_k4_b2` 219 vs
+  `dn_dense` 216). There is no kernel-level bandwidth gap left in the expert
+  GEMVs; what the 1-row MoE layer spends beyond its streams is the route,
+  the combine and ~3 µs (M4) / ~8 µs (M1) of dispatch bubbles per layer.
+  (Measured on the Espetero-deepseek tree; the kernels are main's.)
 - **Session-to-session numbers drift ±3–5% with the thermal state**; A/B
   inside one session, alternating, and confirm on whole-model runs.
 
@@ -567,6 +578,117 @@ Rules that keep the tiers honest:
   option drifts exactly that much, route_sg 1.4× it, both 1.6×. Flash-Next oQ4e is untouched by
   both (bf16 router: no `router_sg`; 8-bit shared expert: no grouped tile
   above 2 rows): KLD 0, identical dispatches and replies.
+
+### Measured facts: multi-row verify passes and speculation
+
+- **The verify tax.** A verify pass of the pending token plus 3 MTP drafts
+  (4 rows) against a 1-row step, `bench_native --ctx 512 --verify-ab`
+  (Espetero-deepseek tree, 2026-10-25/26, identical-arm ratios within
+  1.000–1.046): Qwen3.8-27B oQ4e on the M1 Max 108.8–110.9 ms against
+  55.8–58.4 ms (**1.93×**); Qwen3.6-35B-A3B EQ4DHB on the M4 Max 13.30
+  against 8.57 ms (**1.55×**); the 35B-A3B in bf16 on the M4 Max 27.00
+  against 20.06 ms (**1.35×**). A draft round has to return more tokens than
+  the ratio to pay; the heavier the weights against the per-row work, the
+  smaller the tax. Per kernel: the next entry.
+- **Where the verify tax goes** (2026-10-26, `bench_native --ctx 512
+  --verify-rows 1,2,3,4,5,6 --profile`: the engine's pass of the pending
+  token plus R − 1 chained drafts with verify-commit, from a fresh fork of
+  the same context every time, then the commit of every draft; exclusive
+  gputurn runs, main f471529's kernels). Pass / 1-row step at 4 rows (with
+  the commit): Qwen3.8-27B MLX 4-bit + unsloth's MTP head **1.14× (1.18×)
+  on the M4 Max, 1.94× (1.99×) on the M1 Max**; 27B oQ4e 1.96× (2.02×) M1
+  Max; 27B UD-Q6_K 1.055× (1.084×) M4 Max, 1.58× (1.61×) M1 Max;
+  Qwen3.8-Flash-Next oQ4e + the bf16 drafter 1.59× (1.65×) M4 Max. The 27B
+  grows by 6.8 ms (M4) / 36.7 ms (M1) of isolated kernel time from 1 to 4
+  rows (27B MLX 4-bit, ms):
+
+  | kernel class | M4 R1 | M4 R4 | M1 R1 | M1 R4 |
+  |---|---|---|---|---|
+  | dense GEMVs (in_proj, out, MLP, attention in) | 31.25 | 34.24 | 44.38 | 70.71 |
+  | LM head | 1.41 | 1.56 | 2.00 | 4.06 |
+  | separate RMSNorms (fused at ≤ 2 rows) | 0.01 | 0.75 | 0.02 | 1.28 |
+  | GDN recurrence + conv save + chain-input copy | 1.08 | 2.22 | 1.89 | 4.48 |
+  | attention + MTP layer | 0.87 | 1.07 | 1.36 | 2.10 |
+  | commit replay | – | 1.54 | – | 3.71 |
+  | in pass (GPU, median) | 35.02 | 39.82 | 55.79 | 107.97 |
+
+  The 3–8-row GEMVs (`rgemv8r`, one 8×8 MMA tile per 8 rows) cost ~10 %
+  more than the 1-row FMA GEMV on the M4 Max and ~60 % more on the M1 Max,
+  where they are compute-bound; on top of that the M1 Max pass runs ~20 ms
+  over its isolated sum at 2–6 rows (6 ms at 1 row): the 14-inch's clock
+  drops under the heavier arithmetic. That is 80 % of the M1 tax, and any
+  other kernel for those rows sums differently: there is no bit-identical
+  way to the 1.3× a 4-row 27B pass would need there. Flash-Next adds MoE
+  work instead (the grouped experts on 8-row MMA tiles 4.46 → 7.68 ms, the
+  separate route / sort / combine of passes over one row +1.39 ms), its
+  multi-row GEMVs (+3.8 ms) and the hyper-connection mixer in three
+  dispatches above two rows (+0.9 ms). The 35B-A3B 4-bit (M4 Max) is 1.31× (1.41×): MoE route/sort/combine +0.95 ms, commit +0.79,
+  GDN +0.66, norms +0.32, dense GEMVs +0.35.
+- **Three verify-pass switches, bit-identical, off by default**
+  (2026-10-26; `--vr-check` compares every readout's logits, the next
+  step after the commit and 3 MTP drafts; logits_dump 19,348 values;
+  parity_test ALL OK, also under ESPETERO_CONCURRENT=1): `gdn_chain`
+  (ESPETERO_GDN_CHAIN=1) runs a root and its single draft chain as one
+  delta-rule segment, the root's state stored after its rows, and the
+  conv-window save inside that dispatch (−96 dispatches on the 27B, −60 on
+  the 35B-A3B, −36 on Flash-Next per pass); `gdn_r8` (ESPETERO_GDN_R8=1)
+  runs single-sequence leaves and commits on the 8-state-row layout (the
+  transpose-reduce tree is the same for 8 and 16 rows: `dn_rows` 8 and 16
+  are bit-identical); `commit_fold` (ESPETERO_COMMIT_FOLD=1) saves the
+  commit's conv window inside the replay. In-process alternating A/B at 4
+  rows (B/A, pass + commit): `gdn_chain` 0.990 (27B M4), 0.958 (35B-A3B M4), 0.93 (27B MLX 4-bit M1), 0.985 (Flash-Next); `gdn_r8` 0.97 on
+  the 35B-A3B, 0.985 on Flash-Next and 0.94–0.96 on the M1 Max, but its 27B commit is 14 % slower on the M4 Max
+  (48 value heads × 512 threads); `commit_fold` within ±1 % on the M4 Max.
+  Against main's binary (`--verify-ab`, 1 + 3 leaves, no commit chain, 3
+  alternating pairs, all three on): 27B MLX 4-bit M4 verify 39.80 → 39.10 ms
+  (−1.8 %), UD-Q6_K 52.1 → 51.4 (−1.3 %), Flash-Next 25.3 → 24.9 (−1.6 %),
+  35B-A3B 4-bit 11.18 / 11.11 / 11.18 → 10.29 / 10.45 / 10.38 (−7 %);
+  plain steps equal; the M1 Max pairs drift 1–4 % (−1 to −3 %, inside it;
+  in-process all three 0.985 on the UD-Q6_K there).
+  Worth turning on together with the next multi-row change; `gdn_r8` only
+  where it measures faster.
+- **The lossy multi-row options stay rejected** (same runs, 4-row pass):
+  `fuse_norm_max_m` 8 +4.6 % (27B M4), +3.7 % (27B M1), −1.3 % (oQ4e M1),
+  +3.3 % (UD-Q6_K M4), max |Δlogit| 0.012; `ESPETERO_FMA34=1
+  gemv_max_m 4` +12 % (M4) / +23–27 % (M1) at 4 rows, **but −6.9 % at 3
+  rows on the 27B M4 Max** (−2.6 % on Flash-Next; max |Δlogit| 0.005): the
+  FMA GEMV for exactly 3 rows would be a lossy win there.
+- **MTP pays on an EQ body, and `--draft-auto` finds the depth** (M4 Max,
+  2026-10-25, Qwen3.6-35B-A3B EQ4DHB, 5.30 bits/weight, its own MTP head as
+  8-bit dense / 4-bit experts; tools/bench_compare.py decode and code prompts,
+  tok/s): no drafts 124.4 / 124.3; 3 drafts 171.0 / 221.7; 5 drafts
+  158.4 / 253.5; 8 drafts 146.1 / 250.7; 5 drafts with 1 or 2 siblings
+  167.1 / 220.2 and 164.7 / 220.0; `--draft-auto` 170.6 / 245.5;
+  `--mtp-coarse 64` 158.4 / 254.8; the 4-bit draft head 148.5 / 228.2;
+  prompt lookup 8/3 alone 124.4 / 124.4. Decode peaks at 3 drafts and code at
+  5 (acceptance decays with depth while the verify tax grows); the adaptive
+  depth gets within 1–3 % of each optimum, and a 2-bit draft head drafts as
+  well as the 4-bit one: acceptance, not the draft head's cost, bounds the
+  gain.
+- **bf16 recurrent states are a throughput option, not a default**
+  (Espetero-deepseek tree's `ESPETERO_STATE_BF16=1`, not in this tree;
+  2026-10-24). Every linear layer reads and writes each sequence's whole
+  recurrent state (Hv·Dk·Dv fp32, 2 MB per layer on the 35B-A3B: ~15 % of a
+  16-row step's traffic); bf16 halves it. M4 Max, 35B-A3B, 3 alternating
+  pairs: 16 sequences 25.99 → 23.95 ms (−7.9 %), 64 sequences 66.15 → 58.00
+  (−12.3 %), 1 sequence +2 % (the pack / unpack costs more than one
+  sequence's traffic). Numerics (M1 Max, logits_dump): max |Δlogit| 0.53,
+  20 of 516 teacher-forced rows change argmax, a greedy case diverges after
+  42 of 48 tokens. Lossy: only for many users who accept other wording.
+- **The Neural Engine does not help decode or prefill** (M1 Max,
+  2026-10-24, CoreML inner-product models of the Flash-Next hyper-connection
+  mixer shapes): 420 µs per call on `cpuAndNeuralEngine`, 327–1485 µs on the
+  other compute units, whatever the shape, against ~25 µs for the GPU kernel
+  it would replace. The mixers sit in the dependent chain of every layer, so
+  each call would also serialize with the GPU; a prefill offload pays the
+  same per-layer round trip. Chip-independent: the CoreML per-call floor
+  and the per-layer dependency.
+- **5-bit matrices stream ~20 % slower than 4- and 6-bit ones of the same
+  shape** (Qwen3.8-Flash-Next oQ4e, M4 Max, 2026-10-24, 1-row profile): the
+  4-bit GDN projections at 434 GB/s and the 6-bit ones at 450, the 5-bit
+  6240×2560 at 356 and 2560×6144 at 328. The split high-bit plane and the
+  extra unpacking per byte cost it; the fix is in the checkpoint (another
+  width for those matrices), not in the kernel.
 
 ## 6. Numerics and determinism
 

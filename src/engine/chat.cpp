@@ -135,6 +135,7 @@ void sampling_options(const json::Value& body, ChatJob& job, int default_max, co
   g.sampling.repetition_penalty = num(body, "repetition_penalty", 1.0, 1e-3, 10);
   g.sampling.presence_penalty = num(body, "presence_penalty", 0, -2, 2);
   g.sampling.frequency_penalty = num(body, "frequency_penalty", 0, -2, 2);
+  g.sampling.no_repeat_ngram_size = int(num(body, "no_repeat_ngram_size", 0, 0, 1 << 20));
   int max_tokens = default_max;
   for (const char* k : {"max_completion_tokens", "max_tokens"}) {
     const json::Value* v = body.get(k);
@@ -406,6 +407,11 @@ std::string parse_tool_calls(const std::string& content, const json::Value& tool
   const std::string open = "<tool_call>", close = "</tool_call>";
   size_t at = content.find(open);
   if (at == std::string::npos) return content;
+  {  // GLM: <tool_call>NAME<arg_key>... (no <function=)
+    const size_t b0 = at + open.size(), e = content.find(close, b0);
+    if (glm_tool_call_body(content.substr(b0, e == std::string::npos ? std::string::npos : e - b0)))
+      return parse_glm_tool_calls(content, tools, calls);
+  }
   std::string before = content.substr(0, at);
   while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
   json::Value out = json::Value::array();
@@ -553,9 +559,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     // which the parser must understand: Qwen's XML calls (parse_tool_calls).
     const std::string& src = engine.tokenizer().chat_template();
     const bool dsml = src.find("｜DSML｜") != std::string::npos;
-    if (!dsml && (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos))
-      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...> or DSML calls; this "
-              "model's has another format (only \"auto\" and \"none\" here)");
+    const bool glm = src.find("<arg_key>") != std::string::npos;
+    if (!dsml && !glm && (src.find("<tool_call>") == std::string::npos || src.find("<function=") == std::string::npos))
+      invalid("tool_choice: forcing a call needs a chat template with <tool_call><function=...>, GLM's "
+              "<tool_call>NAME<arg_key>... or DSML calls; this model's has another format (only \"auto\" and \"none\" here)");
     if (job.gen.ignore_eos) invalid("tool_choice: a forced call does not take ignore_eos");
   }
   const json::Value* msgs = body.get("messages");
@@ -663,6 +670,19 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   json::Value kwargs = json::Value::object();
   if (const json::Value* k = body.get("chat_template_kwargs"); k && k->is_object()) kwargs = *k;
   if (const json::Value* t = body.get("enable_thinking"); t && t->is_bool()) kwargs.set("enable_thinking", *t);
+  // DeepSeek's fields: thinking {"type": "enabled" | "disabled"} and
+  // reasoning_effort, which reaches templates that take one (Qwen3.8-Flash-Next:
+  // low, medium, high = xhigh), as on the Messages and Responses routes.
+  if (const json::Value* t = body.get("thinking"); t && t->is_object() && !body.get("enable_thinking")) {
+    const std::string type = t->get_string("type", "");
+    if (type == "enabled" || type == "adaptive") kwargs.set("enable_thinking", true);
+    else if (type == "disabled") kwargs.set("enable_thinking", false);
+  }
+  if (const json::Value* e = body.get("reasoning_effort"); e && e->is_string() && !kwargs.get("reasoning_effort")) {
+    const std::string& effort = e->as_string();
+    if (effort == "low" || effort == "medium") kwargs.set("reasoning_effort", effort);
+    else if (effort == "high" || effort == "xhigh" || effort == "max") kwargs.set("reasoning_effort", std::string("xhigh"));
+  }
   if (const json::Value* t = body.get("tools"); offer_tools && t && t->is_array() && t->size()) {
     job.tools = *t;
     if (!choice.allowed.empty()) {  // allowed_tools: the prompt offers those only
@@ -696,7 +716,10 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     // DSML (DeepSeek): the template writes "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"NAME\">\n" after the content.
     const std::string dsml_open = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"";
     const bool dsml = job.tool_open == "<｜DSML｜ calls>";
+    // GLM (docs/glm5.md 7): "<tool_call>NAME<arg_key>" right after </think> or the content, no newlines.
+    const bool glm = !dsml && engine.tokenizer().chat_template().find("<arg_key>") != std::string::npos;
     const std::string open = dsml ? (choice.mode == ToolChoice::Named ? dsml_open + choice.name + "\">\n" : dsml_open)
+                             : glm ? (choice.mode == ToolChoice::Named ? "<tool_call>" + choice.name : std::string("<tool_call>"))
                              : choice.mode == ToolChoice::Named ? "<tool_call>\n<function=" + choice.name + ">\n"
                                                                 : std::string("<tool_call>\n<function");
     // Qwen opens the reasoning with "<think>\n", DeepSeek with "<think>".
@@ -704,11 +727,11 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
     const bool think_open = ends("<think>\n") || ends("<think>");
     const int32_t think_end = engine.tokenizer().token_id("</think>");
     if (think_open && think_end >= 0) {
-      job.force_after_think = "\n\n" + open;
+      job.force_after_think = (glm ? "" : "\n\n") + open;
       job.think_end = think_end;
       job.gen.stop_ids.push_back(think_end);
     } else {
-      if (think_open) text += dsml ? "</think>" : "</think>\n\n";  // no single </think> token to stop at: no reasoning
+      if (think_open) text += dsml || glm ? "</think>" : "</think>\n\n";  // no single </think> token to stop at: no reasoning
       const std::string lead = dsml ? "\n\n" : "";
       text += lead + open;
       job.prefill = lead + open;
@@ -749,6 +772,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   }
   // Images (decoded in this thread; preprocessing is CPU work).
   for (size_t i = 0; i < urls.size(); ++i) g.images.push_back(engine.prepare_image(urls[i], detail_pixels[i]));
+  engine.number_images(g.images);
   if (!g.images.empty()) {
     if (!marks.empty()) {  // each image's placeholder becomes its run of image tokens: shift the marks after it
       std::vector<int> shift(marks.size(), 0);
@@ -789,6 +813,9 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
         g.split = i + 1 + int(assistant.size());
       break;
     }
+  // Gemma 4 continues the model's turn after tool results (no new turn
+  // header): the prompt end is where the next turn's prompt still matches.
+  if (mk.gemma && !ids.empty() && ids.back() == tok.token_id("<tool_response|>")) g.split = int(ids.size());
   // System boundary: the start of the first user turn, when the prompt opens
   // with a system message. A checkpoint there is shared by every
   // conversation with the same system prompt (the "prefix cache").

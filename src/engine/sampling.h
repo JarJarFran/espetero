@@ -21,36 +21,49 @@ struct SamplingParams {
   double repetition_penalty = 1.0;  // over prompt + output tokens
   double presence_penalty = 0.0;    // over output tokens
   double frequency_penalty = 0.0;
+  int no_repeat_ngram_size = 0;     // > 0: no n-gram of the output twice (0: off)
   bool greedy() const { return temperature <= 0 && !penalized(); }
-  bool penalized() const { return repetition_penalty != 1.0 || presence_penalty != 0 || frequency_penalty != 0; }
+  bool penalized() const {
+    return repetition_penalty != 1.0 || presence_penalty != 0 || frequency_penalty != 0 || no_repeat_ngram_size > 0;
+  }
 };
 
-// Per-sequence penalty state: tokens seen (prompt + output) and output counts.
+// Per-sequence penalty state: tokens seen (prompt + output), output counts
+// and the output in order (no_repeat_ngram_size).
 class PenaltyState {
  public:
   void add_prompt(const int32_t* ids, size_t n) {
     for (size_t i = 0; i < n; ++i) seen_[ids[i]] = seen_[ids[i]];
   }
-  void add_output(int32_t id) { ++seen_[id]; }
+  void add_output(int32_t id) {
+    ++seen_[id];
+    out_.push_back(id);
+  }
   // add_output that says whether the token was new, and its exact undo
   // (PenaltyScope).
   bool add_output_new(int32_t id) {
     auto [it, fresh] = seen_.try_emplace(id, 0);
     ++it->second;
+    out_.push_back(id);
     return fresh;
   }
   void undo_output(int32_t id, bool fresh) {
+    if (!out_.empty() && out_.back() == id) out_.pop_back();
     auto it = seen_.find(id);
     if (it == seen_.end()) return;
     if (fresh) seen_.erase(it);
     else --it->second;
   }
-  // Apply to a copy of `logits` (only the touched entries change).
+  // Apply to a copy of `logits` (only the touched entries change). With
+  // no_repeat_ngram_size n, every token that followed an earlier occurrence
+  // of the output's last n - 1 tokens gets -inf (transformers'
+  // NoRepeatNGramLogitsProcessor over the output tokens).
   void apply(float* logits, const SamplingParams& p) const;
-  bool empty() const { return seen_.empty(); }
+  bool empty() const { return seen_.empty() && out_.empty(); }
 
  private:
   std::unordered_map<int32_t, int32_t> seen_;  // token -> output count (0: prompt only)
+  std::vector<int32_t> out_;                   // the output tokens, in order
 };
 
 // The tokens a verify pass produces, counted by the penalties of the

@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <random>
 #include <set>
@@ -25,6 +26,20 @@
 namespace espetero {
 
 namespace {
+
+// Media type from the leading bytes: the image formats an image block can
+// name by file id; anything else is application/octet-stream.
+std::string sniff_media_type(const std::string& b) {
+  auto starts = [&b](const char* magic, size_t at = 0) {
+    const size_t n = std::strlen(magic);
+    return b.size() >= at + n && b.compare(at, n, magic) == 0;
+  };
+  if (starts("\x89PNG\r\n\x1a\n")) return "image/png";
+  if (starts("\xff\xd8\xff")) return "image/jpeg";
+  if (starts("GIF87a") || starts("GIF89a")) return "image/gif";
+  if (starts("RIFF") && starts("WEBP", 8)) return "image/webp";
+  return "application/octet-stream";
+}
 
 int64_t now_s() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -241,8 +256,33 @@ uint64_t BatchService::disk_used() const {
 std::string BatchService::path_of(const std::string& id, const char* ext) const { return dir_ + "/" + id + ext; }
 
 // ---------------------------------------------------------------- files
-json::Value BatchService::upload(const std::string& filename, const std::string& purpose, const std::string& bytes) {
+namespace {
+
+bool expired(const json::Value& f, int64_t now) {
+  const json::Value* e = f.get("expires_at");
+  return e && e->is_int() && e->as_int() <= now;
+}
+
+}  // namespace
+
+json::Value BatchService::upload(const std::string& filename, const std::string& purpose, const std::string& bytes,
+                                 int64_t expires_after_s) {
   if (purpose.empty()) throw RequestError(422, "purpose: required");
+  // Expired files leave the store before the quota check.
+  std::vector<std::string> gone;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& [id, f] : files_)
+      if (expired(f, now_s())) gone.push_back(id);
+  }
+  for (const std::string& id : gone) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      files_.erase(id);
+    }
+    std::remove(path_of(id, ".jsonl").c_str());
+    std::remove(path_of(id, ".json").c_str());
+  }
   // One upload at a time, so that two cannot both pass the quota check.
   static std::mutex upload_mu;
   std::lock_guard<std::mutex> ul(upload_mu);
@@ -261,8 +301,11 @@ json::Value BatchService::upload(const std::string& filename, const std::string&
   f.set("id", id);
   f.set("object", "file");
   f.set("bytes", int64_t(bytes.size()));
-  f.set("created_at", now_s());
+  const int64_t created = now_s();
+  f.set("created_at", created);
+  if (expires_after_s > 0) f.set("expires_at", created + expires_after_s);
   f.set("filename", filename.empty() ? "upload.jsonl" : filename);
+  f.set("mime_type", sniff_media_type(bytes));
   f.set("purpose", purpose);
   f.set("status", "processed");
   if (!write_all(path_of(id, ".json"), json::dump(f))) {
@@ -279,6 +322,7 @@ json::Value BatchService::file_info(const std::string& id) const {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = files_.find(id);
   if (it == files_.end()) throw RequestError(404, "No such file: " + id);
+  if (expired(it->second, now_s())) throw RequestError(404, "File expired: " + id);
   return it->second;
 }
 
@@ -289,13 +333,39 @@ std::string BatchService::file_content(const std::string& id) const {
   return out;
 }
 
-json::Value BatchService::list_files() const {
-  std::lock_guard<std::mutex> lk(mu_);
+json::Value BatchService::list_files(const std::string& purpose, int limit, const std::string& after,
+                                     bool newest_first) const {
+  std::vector<json::Value> files;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    const int64_t now = now_s();
+    for (auto& [id, f] : files_)
+      if (!expired(f, now) && (purpose.empty() || f.get_string("purpose", "") == purpose)) files.push_back(f);
+  }
+  // Ids are random: order by upload time, the id breaking ties.
+  std::stable_sort(files.begin(), files.end(), [newest_first](const json::Value& a, const json::Value& b) {
+    const int64_t ta = a.get_int("created_at", 0), tb = b.get_int("created_at", 0);
+    if (ta != tb) return newest_first ? ta > tb : ta < tb;
+    return newest_first ? a.get_string("id", "") > b.get_string("id", "") : a.get_string("id", "") < b.get_string("id", "");
+  });
+  size_t from = 0;
+  if (!after.empty())
+    for (size_t i = 0; i < files.size(); ++i)
+      if (files[i].get_string("id", "") == after) {
+        from = i + 1;
+        break;
+      }
+  const size_t to = limit > 0 ? std::min(files.size(), from + size_t(limit)) : files.size();
   json::Value data = json::Value::array();
-  for (auto& [id, f] : files_) data.push_back(f);
+  for (size_t i = from; i < to; ++i) data.push_back(files[i]);
   json::Value o = json::Value::object();
   o.set("object", "list");
+  if (data.size()) {
+    o.set("first_id", data.as_array().front().get_string("id", ""));
+    o.set("last_id", data.as_array().back().get_string("id", ""));
+  }
   o.set("data", std::move(data));
+  o.set("has_more", to < files.size());
   return o;
 }
 

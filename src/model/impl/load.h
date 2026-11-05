@@ -332,10 +332,9 @@ inline HW load_vdense(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, cons
   return repack_dense(m, e, host, out, in, &bias);
 }
 
-inline void load_vision(Model& m, const WeightSource& src, VisionConfig c) {
+inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const std::string& v = "vision_tower.") {
   c.validate(m.cfg.D);
   Arena tmp(m.dev);
-  const std::string v = "vision_tower.";
   {
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
@@ -504,27 +503,31 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
 // requant_bits (8): dense matrices of the layer become 8-bit affine copies
 // (the MTP layer of bf16 files); quantized ones stay as they are.
 inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p, bool linear, int index_in_kind,
-                        int requant_bits = 0) {
+                        int requant_bits = 0, float norm_add = 0.0f) {
   const Config& c = m.cfg;
   Layer L;
   L.linear = linear;
   L.index_in_kind = index_in_kind;
-  L.in_norm = vec(m, src, p + "input_layernorm.weight", c.D);
-  L.post_norm = vec(m, src, p + "post_attention_layernorm.weight", c.D);
+  L.in_norm = vec(m, src, p + "input_layernorm.weight", c.D, norm_add);
+  const bool has_mlp = src.has(p + "post_attention_layernorm.weight");
+  if (has_mlp) L.post_norm = vec(m, src, p + "post_attention_layernorm.weight", c.D, norm_add);
   Arena tmp(m.dev);
   // MoE layers (detected by their expert tensors): the shared expert takes the
   // dense MLP's place; dense layers inside a MoE model keep intermediate_size
   // (or their tensors' width when the config lacks it).
-  const bool moe = c.E > 0 && src.has(p + "mlp.switch_mlp.gate_proj.weight");
+  const bool moe = has_mlp && c.E > 0 && src.has(p + "mlp.switch_mlp.gate_proj.weight");
   const std::string mp = moe ? p + "mlp.shared_expert." : p + "mlp.";
-  int I = moe ? c.I_shared : c.I;
-  if (!I) I = int(src.tensor(mp + "gate_proj.weight").rows());
-  L.I = I;
+  int I = 0;
+  if (has_mlp) {
+    I = moe ? c.I_shared : c.I;
+    if (!I) I = int(src.tensor(mp + "gate_proj.weight").rows());
+    L.I = I;
+  }
   // A tile image has this layer's matrices finished: only the small tensors
   // (norms, convolution taps, gates' parameters) are read below.
   const bool img = tiles_reading(m);
   HostMat gate, up, down;
-  if (!img) {
+  if (has_mlp && !img) {
     gate = host_mat(m, tmp, src, mp + "gate_proj.weight", I, c.D);
     up = host_mat(m, tmp, src, mp + "up_proj.weight", I, c.D);
     down = host_mat(m, tmp, src, mp + "down_proj.weight", c.D, I);
@@ -552,18 +555,20 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
                host_mat(m, tmp, src, a + "v_proj.weight", c.kv_dim(), c.D)};
       out = host_mat(m, tmp, src, a + "o_proj.weight", c.D, c.H * c.HD);
     }
-    L.q_norm = vec(m, src, a + "q_norm.weight", c.HD);
-    L.k_norm = vec(m, src, a + "k_norm.weight", c.HD);
+    L.q_norm = vec(m, src, a + "q_norm.weight", c.HD, norm_add);
+    L.k_norm = vec(m, src, a + "k_norm.weight", c.HD, norm_add);
   }
   if (img) {
-    if (m.tiles->has(p + "gate_up")) {
-      L.gate_up = tile_mat(m, p + "gate_up");
-    } else {
-      L.gate = tile_mat(m, p + "gate");
-      L.up = tile_mat(m, p + "up");
-      m.split_mlp = true;
+    if (has_mlp) {
+      if (m.tiles->has(p + "gate_up")) {
+        L.gate_up = tile_mat(m, p + "gate_up");
+      } else {
+        L.gate = tile_mat(m, p + "gate");
+        L.up = tile_mat(m, p + "up");
+        m.split_mlp = true;
+      }
+      L.down = tile_mat(m, p + "down");
     }
-    L.down = tile_mat(m, p + "down");
     L.out = tile_mat(m, p + "out");
     for (int i = 0; m.tiles->has(p + "in_proj." + std::to_string(i)); ++i)
       L.in_proj.push_back(tile_mat(m, p + "in_proj." + std::to_string(i)));
@@ -571,31 +576,36 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
     return L;
   }
   if (requant_bits == 8) {
-    for (HostMat* h : {&gate, &up, &down, &out})
-      if (h->dense) *h = requant<8>(tmp, *h);
+    if (has_mlp) {
+      for (HostMat* h : {&gate, &up, &down})
+        if (h->dense) *h = requant<8>(tmp, *h);
+    }
+    if (out.dense) out = requant<8>(tmp, out);
     for (HostMat& h : parts)
       if (h.dense) h = requant<8>(tmp, h);
   }
   // Gate and up fuse (rows interleaved for the SwiGLU epilogue) when they
   // share a layout; otherwise each keeps its own and they run as two GEMMs
   // (fusing would widen both, e.g. 8 bits per weight for Q5_K + Q6_K).
-  const bool same_layout = gate.dense || up.dense ||
-                           (gate.q.bits == up.q.bits && gate.q.src_bits == up.q.src_bits &&
-                            gate.q.scale_mode == up.q.scale_mode && gate.q.group == up.q.group &&
-                            gate.q.half_scales == up.q.half_scales);
-  const HostMat gu = same_layout ? interleave_gate_up(tmp, gate, up) : HostMat{};
+  const bool same_layout = has_mlp && (gate.dense || up.dense ||
+                                       (gate.q.bits == up.q.bits && gate.q.src_bits == up.q.src_bits &&
+                                        gate.q.scale_mode == up.q.scale_mode && gate.q.group == up.q.group &&
+                                        gate.q.half_scales == up.q.half_scales));
+  const HostMat gu = (has_mlp && same_layout) ? interleave_gate_up(tmp, gate, up) : HostMat{};
   const std::vector<HostMat> runs = fuse(tmp, parts);
   id<MTLCommandBuffer> cb = [m.queue commandBuffer];
   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
   auto dn = [&](const char* k) { return m.dense_mats.count(k) > 0; };
-  if (same_layout) {
-    L.gate_up = finish(m, e, tmp, gu, dn("gate_up"), p + "gate_up");
-  } else {
-    L.gate = finish(m, e, tmp, gate, dn("gate_up"), p + "gate");
-    L.up = finish(m, e, tmp, up, dn("gate_up"), p + "up");
-    m.split_mlp = true;
+  if (has_mlp) {
+    if (same_layout) {
+      L.gate_up = finish(m, e, tmp, gu, dn("gate_up"), p + "gate_up");
+    } else {
+      L.gate = finish(m, e, tmp, gate, dn("gate_up"), p + "gate");
+      L.up = finish(m, e, tmp, up, dn("gate_up"), p + "up");
+      m.split_mlp = true;
+    }
+    L.down = finish(m, e, tmp, down, dn("down"), p + "down");
   }
-  L.down = finish(m, e, tmp, down, dn("down"), p + "down");
   L.out = finish(m, e, tmp, out, dn("out"), p + "out");
   for (size_t i = 0; i < runs.size(); ++i)
     L.in_proj.push_back(finish(m, e, tmp, runs[i], dn("in_proj"), p + "in_proj." + std::to_string(i)));
@@ -610,13 +620,15 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
 inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = false) {
   Config& c = m.cfg;
   c.validate();
-  const std::string pre = "language_model.model.";
+  const bool hf_backbone = !src.has("language_model.model.embed_tokens.weight") &&
+                           src.has("backbone.language_model.embed_tokens.weight");
+  const std::string pre = hf_backbone ? "backbone.language_model." : "language_model.model.";
+  const float norm_add = hf_backbone ? 1.0f : 0.0f;
   {
     Arena tmp(m.dev);
     load_embedding(m, tmp, src, pre + "embed_tokens.weight");
-    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    const std::string head = c.tie ? pre + "embed_tokens.weight" : "language_model.lm_head.weight";
+    const std::string head = c.tie ? pre + "embed_tokens.weight"
+                                   : (src.has("language_model.lm_head.weight") ? "language_model.lm_head.weight" : "lm_head.weight");
     if (tiles_reading(m)) {
       if (draft_head && m.mtp.head4) {
         m.mtp.head = tile_mat(m, "mtp.head4");
@@ -627,7 +639,9 @@ inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = fa
         --m.n_q8;
       }
       m.lm_head = tile_mat(m, "lm_head");
-    } else {
+    } else if (c.tie || src.has(head)) {
+      id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+      id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
       const HostMat h = host_mat(m, tmp, src, head, c.V, c.D);
       if (draft_head && m.mtp.head4) {
         m.mtp.head = finish(m, e, tmp, requant4(tmp, h), false, "mtp.head4");
@@ -638,15 +652,15 @@ inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = fa
         --m.n_q8;  // not a decoder matrix (finish counts widths without a counter as 8-bit)
       }
       m.lm_head = finish(m, e, tmp, h, false, "lm_head");
+      [e endEncoding];
+      commit_wait(cb);
     }
-    [e endEncoding];
-    commit_wait(cb);
   }
-  m.final_norm = vec(m, src, pre + "norm.weight", c.D);
+  m.final_norm = vec(m, src, pre + "norm.weight", c.D, norm_add);
   int nf = 0, nl = 0;
   for (int i = 0; i < c.L; ++i)
     m.layers.push_back(load_layer(m, src, pre + "layers." + std::to_string(i) + ".", c.linear[i],
-                                  c.linear[i] ? nl++ : nf++));
+                                  c.linear[i] ? nl++ : nf++, 0, norm_add));
   m.inv_freq = m.arena->alloc(sizeof(float) * (c.rot / 2));
   float* f = (float*)ptr(m.inv_freq);
   for (int i = 0; i < c.rot / 2; ++i) f[i] = float(1.0 / std::pow(c.theta, double(2 * i) / double(c.rot)));
@@ -725,6 +739,7 @@ inline std::string find_mmproj(const std::string& gguf_path) {
 #include "gemma_load.h"
 #include "qwen3_omni_load.h"
 #include "lfm2_load.h"
+#include "minicpm_load.h"
 
 namespace espetero::native {
 
@@ -910,7 +925,14 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     load_decoder(m, hf, false);
     return;
   }
-  if (!src.has("language_model.model.embed_tokens.weight"))
+  if (is_minicpm_type(src.config().get_string("model_type", ""))) {  // MiniCPM-OCR (minicpm_load.h): no drafting head
+    if (!mtp.empty() && mtp != "none") fail("--mtp: MiniCPM-OCR has no MTP head (prompt lookup drafts only)");
+    m.format = "mlx";
+    m.cfg = config_from_mlx(src.config());
+    load_minicpm(m, src, want_vision);
+    return;
+  }
+  if (!src.has("language_model.model.embed_tokens.weight") && !src.has("backbone.language_model.embed_tokens.weight"))
     fail("expected an MLX-converted Qwen3.5 checkpoint (language_model.model.* tensors)");
   m.format = "mlx";
   m.cfg = config_from_mlx(src.config());
@@ -940,9 +962,10 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   if (own) load_mtp(m, src);
   else if (other) external_mtp(mtp);
   save_tiles(m);
-  if (want_vision && src.has("vision_tower.patch_embed.proj.weight")) {
+  if (want_vision && (src.has("vision_tower.patch_embed.proj.weight") || src.has("backbone.visual.patch_embed.proj.weight"))) {
     const VisionConfig vc = vision_from_mlx(src.config());
-    if (vc.present) load_vision(m, src, vc);
+    if (vc.present)
+      load_vision(m, src, vc, src.has("backbone.visual.patch_embed.proj.weight") ? "backbone.visual." : "vision_tower.");
   }
 }
 

@@ -149,6 +149,35 @@ inline const std::vector<float>& siglip_pos(Model& m, int gh, int gw) {
   return cache.emplace(std::make_pair(gh, gw), std::move(out)).first->second;
 }
 
+// MiniCPM-OCR: the position table [side * side][D] read at each patch's
+// nearest bucket (transformers' get_vision_nearest_position_ids: the
+// fractional coordinate i / gh, in fp32, bucketized right=True against the
+// boundaries arange(1 / side, 1, 1 / side), computed as torch's CPU arange
+// does, in double), row-major [gh * gw][D]; kept for the 8 most recent grids.
+inline const std::vector<float>& minicpm_pos(Model& m, int gh, int gw) {
+  auto& cache = m.vis.pos_grids;
+  if (auto it = cache.find({gh, gw}); it != cache.end()) return it->second;
+  if (cache.size() >= 8) cache.clear();
+  const int side = m.vis.c.side, D = m.vis.c.D;
+  const double step = 1.0 / double(side);
+  std::vector<float> bounds;
+  const int64_t n = int64_t(std::ceil((1.0 - step) / step));
+  for (int64_t k = 0; k < n; ++k) bounds.push_back(float(step + step * double(k)));
+  auto bucket = [&](int i, int len) {
+    const float x = float(i) / float(len);
+    return int(std::upper_bound(bounds.begin(), bounds.end(), x) - bounds.begin());
+  };
+  const float* tab = static_cast<const float*>(ptr(m.vis.pos));
+  std::vector<float> out(size_t(gh) * size_t(gw) * size_t(D));
+  for (int i = 0; i < gh; ++i) {
+    const int bh = bucket(i, gh);
+    for (int j = 0; j < gw; ++j)
+      std::memcpy(&out[(size_t(i) * size_t(gw) + size_t(j)) * size_t(D)],
+                  tab + (size_t(bh) * size_t(side) + size_t(bucket(j, gw))) * size_t(D), size_t(D) * 4);
+  }
+  return cache.emplace(std::make_pair(gh, gw), std::move(out)).first->second;
+}
+
 // One image of a pass: its patch rows in the vision batch, its merged tokens
 // in the tower's output and the decoder rows they replace.
 struct ImageJob {
@@ -181,7 +210,7 @@ inline void prepare_images(Model& m, const std::vector<ImageJob>& jobs) {
     const int D = c.D;
     for (const ImageJob& J : jobs) {
       const int gh = J.im->grid_h, gw = J.im->grid_w;
-      const std::vector<float>& pos = siglip_pos(m, gh, gw);
+      const std::vector<float>& pos = c.minicpm ? minicpm_pos(m, gh, gw) : siglip_pos(m, gh, gw);
       const float* src = J.im->pixels;
       const int p0 = J.patch0;
       parallel_for(size_t(J.n_patch), [&](size_t q) {
@@ -345,7 +374,22 @@ inline void encode_vision(Model& m, Enc& E, int P, id<MTLBuffer> h) {
     }
   }
   layernorm(E, v.x, m.vis.mnw, m.vis.mnb, v.xn, P, D, c.eps);
-  gemm_h(E, m.vis.m1, v.xn, 0, Dm, v.mact, 0, Dh, P / 4, 3);
+  id<MTLBuffer> merged = v.xn;
+  if (c.minicpm) {  // the merger's pre_norm over each 2x2 merged row (4 D), eps 1e-6
+    E.pipe("layernorm_h");
+    E.set(0, v.xn);
+    E.set(1, m.vis.pnw);
+    E.set(2, m.vis.pnb);
+    E.set(3, v.o);
+    E.bytes(4, Dm);
+    const float eps = 1e-6f;
+    E.bytes(5, eps);
+    E.rd(v.xn);
+    E.wr(v.o);
+    E.groups(MTLSizeMake(size_t(P / 4), 1, 1), MTLSizeMake(256, 1, 1));
+    merged = v.o;
+  }
+  gemm_h(E, m.vis.m1, merged, 0, Dm, v.mact, 0, Dh, P / 4, 3);
   gemm_h(E, m.vis.m2, v.mact, 0, Dh, v.out, 0, c.out, P / 4, 0);
   E.pipe("scatter_rows_f32");
   E.set(0, v.out);

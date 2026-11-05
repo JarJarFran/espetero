@@ -276,6 +276,17 @@ struct Engine::Seq {
   // token), and a token the grammar refused (an internal error: the sequence fails).
   std::unique_ptr<grammar::Matcher> gm;
   bool gm_error = false;
+  // Reply checkpoint (EngineOptions::reply_checkpoint): the emitted tokens,
+  // forks of the work slot every reply_snapshot tokens (oldest first), and
+  // one taken before each decode chain (a chain computes its steps past an
+  // end token, which leaves the work slot ahead of the reply).
+  bool reply_ck = false;
+  std::vector<int32_t> reply;
+  struct Snap {
+    int slot = -1, len = 0;
+  };
+  std::vector<Snap> snaps;
+  Snap chain_snap;
 };
 
 // ---------------------------------------------------------------- setup
@@ -367,6 +378,26 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
         ls.grid_ids[size_t((r - 1) * 10 + c - 1)] = tok_->token_id("<|img_row_" + std::to_string(r) + "_col_" + std::to_string(c) + "|>");
     if (ls.thumb_id < 0 || ls.grid_ids[size_t((ls.max_tiles - 1) * 10)] < 0)
       throw std::runtime_error("LFM2-VL model without its tile tokens in its vocabulary");
+  } else if (I.vision && I.vision_layout == "minicpm") {
+    // MiniCPM-OCR: the template writes <|image_pad|>; the processor's run is
+    // <image_id>N</image_id><image> (overview) </image> and the slices.
+    image_token = tok_->token_id("<|image_pad|>");
+    run_start = tok_->token_id("<image_id>");
+    minicpm_spec_ = std::make_unique<vision::MinicpmSpec>(vision::minicpm_spec_from_model_dir(path));
+    vision::MinicpmSpec& ms = *minicpm_spec_;
+    ms.image_id = image_token;
+    ms.im_start_id = tok_->token_id("<image>");
+    ms.im_end_id = tok_->token_id("</image>");
+    ms.sl_start_id = tok_->token_id("<slice>");
+    ms.sl_end_id = tok_->token_id("</slice>");
+    ms.id_start_id = run_start;
+    ms.id_end_id = tok_->token_id("</image_id>");
+    const std::vector<int32_t> nl = tok_->encode("\n", false);
+    ms.newline_id = nl.size() == 1 ? nl[0] : -1;
+    if (!ms.use_image_id) run_start = ms.im_start_id;
+    if (image_token < 0 || ms.im_start_id < 0 || ms.im_end_id < 0 || ms.sl_start_id < 0 || ms.sl_end_id < 0 ||
+        ms.id_start_id < 0 || ms.id_end_id < 0 || ms.newline_id < 0)
+      throw std::runtime_error("MiniCPM-OCR model without its image tokens in its vocabulary");
   } else if (I.vision) {
     const bool g4 = I.family == "gemma4";
     image_token = run_start = tok_->token_id(g4 ? "<|image|>" : "<|image_pad|>");
@@ -458,7 +489,7 @@ Engine::Engine(const EngineOptions& options) : opt_(options) {
     // its run brings the start and end tokens).
     const std::string image_block =
         !I.vision ? ""
-        : gemma_vision() || vision_start < 0 || lfm2_spec_ ? tok_->decode(std::vector<int32_t>{image_token})
+        : gemma_vision() || vision_start < 0 || lfm2_spec_ || minicpm_spec_ ? tok_->decode(std::vector<int32_t>{image_token})
                                                            : tok_->decode(std::vector<int32_t>{vision_start, image_token, vision_end});
     dp_->builder = std::make_unique<DecisionPromptBuilder>(*tok_, *template_, dp_->labels, image_block);
     header_ = dp_->builder->header();
@@ -622,6 +653,26 @@ void Engine::warmup() {
   std::vector<int32_t> root(static_cast<size_t>(n_root)), leaves(static_cast<size_t>(2 * n_leaf));
   for (size_t i = 0; i < root.size(); ++i) root[i] = int32_t(100 + 7 * i);
   for (size_t i = 0; i < leaves.size(); ++i) leaves[i] = int32_t(200 + 3 * i);
+  if (kev_ && kev_->is_videojev()) {
+    std::vector<float> hid(size_t(model_->info().hidden), 0.0f);
+    const int s = model_->slot_alloc();
+    TreeSpec t;
+    t.root = root.data();
+    t.root_len = n_root;
+    t.save = s;
+    t.out_last_hidden = hid.data();
+    model_->run({t});
+    int32_t tok = 100;
+    TreeSpec d;
+    d.parent = s;
+    d.save = s;
+    d.root = &tok;
+    d.root_len = 1;
+    d.out_last_hidden = hid.data();
+    model_->run({d});
+    model_->slot_free(s);
+    return;
+  }
   const int32_t leaf_off[3] = {0, n_leaf, 2 * n_leaf};
   const int32_t cand_off[3] = {0, 2, 4};
   const int32_t cand_ids[4] = {1, 2, 3, 4};
@@ -787,6 +838,9 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
   try {
     if (lfm2_spec_) {  // LFM2-VL: its own layout, no pixel budget
       n = int(vision::lfm2_run(vision::lfm2_layout(int(h), int(w), *lfm2_spec_), *lfm2_spec_).size());
+    } else if (minicpm_spec_) {  // MiniCPM-OCR: likewise, with a one-digit <image_id> prefix
+      n = int(vision::minicpm_run(vision::minicpm_layout(int(h), int(w), *minicpm_spec_), *minicpm_spec_).size()) +
+          (minicpm_spec_->use_image_id ? 3 : 0);
     } else {
       const vision::Spec spec = image_spec(max_pixels, min_pixels);
       n = vision::image_tokens(vision::grid_for(int(h), int(w), spec), spec.merge);
@@ -841,6 +895,7 @@ PreparedImage Engine::prepare_image_capped(const std::string& data_url, int64_t 
     return out;
   }
   if (lfm2_spec_) return prepare_lfm2_image(rgb, max_pixels_lfm2);
+  if (minicpm_spec_) return prepare_minicpm_image(rgb);
   vision::Spec spec = image_spec(max_pixels, min_pixels);
   // Normalization from the processor config when the checkpoint has one
   // (Gemma 4 rescales only).
@@ -902,6 +957,46 @@ PreparedImage Engine::prepare_lfm2_image(const vision::RGBImage& rgb, int64_t ma
   return out;
 }
 
+PreparedImage Engine::prepare_minicpm_image(const vision::RGBImage& rgb) const {
+  vision::MinicpmPrepared p;
+  try {
+    p = vision::minicpm_preprocess(rgb, *minicpm_spec_);
+  } catch (const std::exception& e) {
+    throw RequestError(422, std::string("image: ") + e.what());
+  }
+  PreparedImage out;
+  out.pixels = std::move(p.pixels);
+  out.run = std::move(p.run);
+  for (const auto& v : p.views) out.views.push_back({v.gh, v.gw, v.offset, v.token});
+  out.grid_h = out.views.empty() ? 0 : out.views.front().grid_h;
+  out.grid_w = out.views.empty() ? 0 : out.views.front().grid_w;
+  out.digest = hex(p.digest.data(), p.digest.size());
+  if (minicpm_spec_->use_image_id) {  // the prefix of image 0; number_images renumbers
+    out.run.insert(out.run.begin(), {minicpm_spec_->id_start_id, tok_->encode("0", false).at(0), minicpm_spec_->id_end_id});
+    for (auto& v : out.views) v.token += 3;
+  }
+  check_image_rows(out.tokens(0), model_->info().max_rows);
+  return out;
+}
+
+void Engine::number_images(std::vector<PreparedImage>& images) const {
+  if (!minicpm_spec_ || !minicpm_spec_->use_image_id) return;
+  const vision::MinicpmSpec& ms = *minicpm_spec_;
+  for (size_t k = 0; k < images.size(); ++k) {
+    PreparedImage& im = images[k];
+    if (im.run.empty() || im.run[0] != ms.id_start_id) continue;
+    const auto end = std::find(im.run.begin(), im.run.end(), ms.id_end_id);
+    if (end == im.run.end()) continue;
+    const int old_len = int(end - im.run.begin()) + 1;
+    std::vector<int32_t> prefix{ms.id_start_id};
+    for (const int32_t t : tok_->encode(std::to_string(k), false)) prefix.push_back(t);
+    prefix.push_back(ms.id_end_id);
+    im.run.erase(im.run.begin(), end + 1);
+    im.run.insert(im.run.begin(), prefix.begin(), prefix.end());
+    for (auto& v : im.views) v.token += int(prefix.size()) - old_len;
+  }
+}
+
 std::vector<int32_t> Engine::expand_images(const std::vector<int32_t>& ids, const std::vector<PreparedImage>& images) const {
   std::vector<int32_t> out;
   size_t g = 0;
@@ -932,7 +1027,7 @@ std::vector<int32_t> Engine::mrope_positions(const std::vector<int32_t>& ids, co
     return {};
   }
   std::vector<int32_t> pos(ids.size() * 3);
-  if (lfm2_spec_) {  // LFM2-VL: plain positions, image runs included
+  if (lfm2_spec_ || minicpm_spec_) {  // LFM2-VL, MiniCPM-OCR: plain positions, image runs included
     for (size_t i = 0; i < ids.size(); ++i) pos[3 * i] = pos[3 * i + 1] = pos[3 * i + 2] = int32_t(i);
     if (next_pos) *next_pos = int(ids.size());
     return pos;
@@ -1024,10 +1119,135 @@ void Engine::cache_drop(const std::string& key) {
   cache_.erase(it);
 }
 
+// A running reply's snapshots go before any checkpoint: they are taken
+// from free slots only, so that they never cost another request a slot or a
+// checkpoint it would have had without them.
 int Engine::acquire_slot(const std::vector<int>& avoid) {
   const int s = model_->slot_alloc();
   if (s >= 0) return s;
+  if (const int st = steal_snapshot(); st >= 0) return st;
   return evict_lru(avoid);
+}
+
+// The newest reply's oldest snapshot first (the one before its decode chain
+// last: it saves the most of a reply's end).
+int Engine::steal_snapshot() {
+  for (int pass = 0; pass < 2; ++pass)
+    for (auto it = active_.rbegin(); it != active_.rend(); ++it) {
+      Seq& q = **it;
+      Seq::Snap* v = pass == 0 ? (q.snaps.empty() ? nullptr : &q.snaps.front()) : (q.chain_snap.slot >= 0 ? &q.chain_snap : nullptr);
+      if (!v) continue;
+      const int sl = v->slot;
+      if (pass == 0) q.snaps.erase(q.snaps.begin());
+      else q.chain_snap = {};
+      pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), sl), pinned_.end());
+      model_->slot_reset(sl);
+      return sl;
+    }
+  return -1;
+}
+
+void Engine::reply_snapshot(Seq& s, bool chain) {
+  if (!s.reply_ck || s.work < 0) return;
+  const int len = model_->slot_len(s.work);
+  Seq::Snap snap;
+  if (chain) {
+    if (s.chain_snap.slot >= 0 && s.chain_snap.len == len) return;
+    snap = s.chain_snap;
+    s.chain_snap = {};
+  } else {
+    if (opt_.reply_snapshot <= 0 || opt_.reply_snapshots <= 0) return;
+    const int last = s.snaps.empty() ? int(s.req.prompt.size()) : s.snaps.back().len;
+    if (len - last < opt_.reply_snapshot) return;
+    if (int(s.snaps.size()) >= opt_.reply_snapshots) {  // the oldest one's slot takes the new state
+      snap = s.snaps.front();
+      s.snaps.erase(s.snaps.begin());
+    }
+  }
+  if (snap.slot < 0) {
+    snap.slot = model_->slot_alloc();  // never evicts (acquire_slot takes snapshots back)
+    if (snap.slot < 0) return;
+    pinned_.push_back(snap.slot);
+  }
+  try {
+    model_->slot_fork(snap.slot, s.work);
+  } catch (const std::exception& e) {
+    if (opt_.verbose) std::fprintf(stderr, "[espetero] reply snapshot failed: %s\n", e.what());
+    pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), snap.slot), pinned_.end());
+    model_->slot_free(snap.slot);
+    return;
+  }
+  snap.len = len;
+  ++reply_forks_;
+  if (chain) s.chain_snap = snap;
+  else s.snaps.push_back(snap);
+}
+
+void Engine::drop_snapshots(Seq& s) {
+  s.snaps.push_back(s.chain_snap);
+  for (const Seq::Snap& v : s.snaps)
+    if (v.slot >= 0) {
+      pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), v.slot), pinned_.end());
+      model_->slot_free(v.slot);
+    }
+  s.snaps.clear();
+  s.chain_snap = {};
+}
+
+// The reply's states that hold a prefix of prompt + reply exactly: the work
+// slot (unless a decode chain ran past the end token: its rows after it are
+// in the slot) and the snapshots. The longest becomes the reply checkpoint,
+// a later turn of the conversation continues it (an agent's tool loop: the
+// reply, the tool's result, the next reply); the shorter snapshots stay under
+// it, for a turn whose prompt renders the end of the reply differently (a
+// tool call re-rendered from its parsed arguments, other token boundaries).
+// Older ones are inserted first: the longest is the most recent (LRU).
+bool Engine::save_reply(Seq& s) {
+  const int P = int(s.req.prompt.size()), R = int(s.reply.size());
+  struct Cand {
+    int slot, len;
+  };
+  std::vector<Cand> cs;
+  for (const Seq::Snap& v : s.snaps) cs.push_back({v.slot, v.len});
+  if (s.chain_snap.slot >= 0) cs.push_back({s.chain_snap.slot, s.chain_snap.len});
+  cs.push_back({s.work, model_->slot_len(s.work)});
+  s.snaps.clear();
+  s.chain_snap = {};
+  std::stable_sort(cs.begin(), cs.end(), [](const Cand& a, const Cand& b) { return a.len < b.len; });
+  std::vector<std::string> digests;
+  for (const PreparedImage& im : s.req.images) digests.push_back(im.digest);
+  bool kept = false;
+  for (size_t i = 0; i < cs.size(); ++i) {
+    const Cand& c = cs[i];
+    const bool work = c.slot == s.work;
+    // A shorter copy of the same length as the next one is redundant (the
+    // work slot, last among equals, is kept).
+    bool use = c.len > P && c.len <= P + R && !(i + 1 < cs.size() && cs[i + 1].len == c.len);
+    CacheEntry e;
+    std::string key;
+    if (use) {
+      e.ns = "chat";
+      e.tokens.reserve(size_t(c.len));
+      e.tokens.assign(s.req.prompt.begin(), s.req.prompt.end());
+      e.tokens.insert(e.tokens.end(), s.reply.begin(), s.reply.begin() + (c.len - P));
+      e.digests = digests;
+      e.slot = c.slot;
+      e.mtp = s.mtp && model_->slot_mtp(c.slot);
+      e.parent = s.chain_key;
+      key = chat_key(e.digests, e.tokens, e.mtp);
+      // (the same tokens cached already, or with the MTP state, which serves both)
+      use = !cache_.count(key) && !(!e.mtp && cache_.count(chat_key(e.digests, e.tokens, true)));
+    }
+    if (!work) pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), c.slot), pinned_.end());
+    if (!use) {
+      if (!work) model_->slot_free(c.slot);
+      continue;
+    }
+    cache_put(key, std::move(e));
+    ++reply_saved_;
+    kept = kept || work;
+  }
+  return kept;
 }
 
 // Evicts the least recently used checkpoint that nobody needs now; its slot
@@ -1128,7 +1348,7 @@ int Engine::answer_reserve(int remaining) const {
 
 // ---------------------------------------------------------------- decisions
 json::Value Engine::decide(const json::Value& body) {
-  if (clef_) return clef_decide(body);
+  if (clef_ || (kev_ && kev_->is_videojev())) return clef_decide(body);
   if (d1_) return d1_decide(body);
   if (kev_)
     throw RequestError(422, "this is a Kev decision model: it answers the SystemOne body (state, questions) at /v1/systemone");
@@ -1174,6 +1394,7 @@ json::Value Engine::decide(const json::Value& body) {
                                   " tokens)");
   }
   for (const std::string& url : r.images) job->images.push_back(prepare_image(url, px > 0 ? px : 0));
+  number_images(job->images);
   if (!job->images.empty()) {
     const size_t before = plan.prefix.size();
     plan.prefix = expand_images(plan.prefix, job->images);
@@ -1364,6 +1585,7 @@ json::Value Engine::systemone(const json::Value& body) {
                                   std::to_string(max_length));
   }
   for (const std::string& url : urls) job->images.push_back(prepare_image(url, px > 0 ? px : 0, min_px));
+  number_images(job->images);
   std::vector<int> itoks;
   for (const PreparedImage& im : job->images) itoks.push_back(im.tokens(I.vision_merge));
   // max_state_tokens as the release slices: state_ids[:n] (0 = no state, negative = drop from the end).
@@ -2678,11 +2900,6 @@ void Engine::step() {
       t.set("score", std::move(sc));
     }
     s.out->timings = t;
-    if (s.work >= 0) {
-      model_->slot_free(s.work);
-      pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), s.work), pinned_.end());
-      s.work = -1;
-    }
     if (s.ckpt >= 0) {
       pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), s.ckpt), pinned_.end());
       if (!s.saved_ckpt) {
@@ -2716,6 +2933,15 @@ void Engine::step() {
     // same photo arrives a moment later and finds them still cached.
     if (opt_.keep_live)
       for (const std::string& k : s.keep) cache_find(k);
+    // A finished reply's state is a checkpoint for the conversation's next
+    // turn (most recent of all); otherwise its slots are freed.
+    if (s.work >= 0) {
+      pinned_.erase(std::remove(pinned_.begin(), pinned_.end(), s.work), pinned_.end());
+      const bool kept = s.reply_ck && (reason == "stop" || reason == "length") && save_reply(s);
+      if (!kept) model_->slot_free(s.work);
+      s.work = -1;
+    }
+    drop_snapshots(s);
     gen_tokens_ += uint64_t(s.generated);
     s.out->finish(reason, err);
   };
@@ -2875,6 +3101,8 @@ void Engine::step() {
       for (auto& [k, e] : cache_)
         if (on_path(s->req, e) && (!want_mtp || e.mtp)) s->keep.push_back(k);
       s->chain_key = best ? best->key : std::string();
+      // (a prompt that is not cached for later turns is not continued by one either)
+      s->reply_ck = opt_.reply_checkpoint && keep_prompt && split >= 0 && s->req.forced.empty();
       s->cached = cached;
       s->done = cached;
       s->mtp = want_mtp;
@@ -3113,6 +3341,11 @@ void Engine::step() {
            s->generated >= opt_.chain_after;
       K = std::max(K, std::min(opt_.chain_steps, s->req.max_tokens - s->generated));
     }
+    // The state before the chain: its steps past an end token would leave
+    // the work slot ahead of the reply (taken first: a fork shares the
+    // slot's partial block, which the chain's first step then copies).
+    if (ok && K > 1)
+      for (Seq* s : decoding) reply_snapshot(*s, true);
     if (ok && K > 1) {
       // KV for all K steps before the chain starts. Its passes are
       // planned while the earlier ones run and take blocks as they go: one that
@@ -3208,6 +3441,7 @@ void Engine::step() {
           }
         }
         s->out->push(emit.data(), emit.size());
+        if (s->reply_ck) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
         s->pending.assign(1, last);
         if (!reason.empty()) s->pending.clear();
         if (!reason.empty() || s->out->cancelled()) {
@@ -3216,6 +3450,8 @@ void Engine::step() {
           if (it != active_.end()) active_.erase(it);
         }
       }
+      for (auto& q : active_)
+        if (q->phase == Seq::Decode) reply_snapshot(*q, false);
       return;
     }
   }
@@ -3755,6 +3991,9 @@ void Engine::step() {
       // the newest decoding sequences stop with an error, then the newest
       // prompts, then the last decision job fails. Only trees that take KV
       // wait (a decision without its prefix checkpoint takes none).
+      // Running replies' snapshots go first (each holds the partial block its
+      // work slot copied since).
+      for (auto& q : active_) drop_snapshots(*q);
       std::vector<char> drop(trees.size(), 0);  // 1: waits for a later pass, 2: fails
       auto seq_of = [&](size_t i) { return owners[i].first == 's' ? static_cast<Seq*>(owners[i].second) : nullptr; };
       auto newest = [&](auto pred) -> long {
@@ -4333,6 +4572,7 @@ void Engine::step() {
     // The records of the emitted tokens travel with them.
     if (produced_lp[i].size() > emit.size()) produced_lp[i].resize(emit.size());
     s->out->push(emit.data(), emit.size(), s->req.logprobs >= 0 ? &produced_lp[i] : nullptr);
+    if (s->reply_ck) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
     if (s->commit_k > 0 && !produced[i].empty()) {
       // The accepted drafts become rows of the slot (commit below); only
       // the new token is pending, so the next pass has room for a full chain.
@@ -4369,6 +4609,9 @@ void Engine::step() {
       }
     }
   }
+  // Reply snapshots, once the pass's accepted drafts are rows of their slots.
+  for (auto& q : active_)
+    if (q->phase == Seq::Decode) reply_snapshot(*q, false);
 }
 
 json::Value Engine::stats() const {
@@ -4387,6 +4630,8 @@ json::Value Engine::stats() const {
   o.set("kv_deferred_chunks", int64_t(kv_deferred_.load()));
   o.set("decision_row_reservations", int64_t(decision_reservations_.load()));
   o.set("kv_skipped_checkpoints", int64_t(kv_skipped_.load()));
+  o.set("reply_checkpoints", int64_t(reply_saved_.load()));
+  o.set("reply_snapshots", int64_t(reply_forks_.load()));
   std::string x;
   {
     std::lock_guard<std::mutex> lk(xsnap_mu_);

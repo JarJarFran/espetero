@@ -18,12 +18,13 @@ uses only Apple's system frameworks.
 | libjpeg-turbo 3.1.0 (Independent JPEG Group's libjpeg) | `src/vision/jpeg.cpp` | IJG License; Arm Neon colour formulas: zlib License |
 | Pillow 12 (`src/libImaging/Resample.c`) | `src/vision/resize.cpp` | MIT-CMU |
 | Jinja2 3.1 (lexer, parser, `idtracking`, filters) | `src/tmpl/` (`parser.cpp`, `scope.cpp`, `builtins.cpp`) | BSD-3-Clause |
-| ggml (block dequantization formulas) | `src/model/impl/gguf.h` | MIT |
+| ggml (block dequantization formulas, IQ2_S / IQ3_S grids) | `src/model/impl/gguf.h`, `src/model/impl/gguf_iq_grids.h` | MIT |
 | JEVfire (`jevfire/core.py`, `jevfire/models.py`) | `src/engine/decisions.cpp` | MIT |
 | Cloudflare Clef, Clef-Omni (`joint_schema_model.py`) | `src/engine/clef.h`, `src/engine/clef.cpp`, `src/engine/engine.cpp` (Clef-Omni's media limits), `tests/ref/clef_omni_ref.py` | Apache-2.0 |
 | Hugging Face transformers (Qwen2-VL `smart_resize`, Gemma 4 `get_aspect_ratio_preserving_size`) | `src/vision/processor.cpp` | Apache-2.0 |
 | Hugging Face transformers (Qwen3-Omni thinker semantics: `models/qwen3_omni_moe`) | `src/model/impl/qwen3_omni.h`, `src/model/impl/qwen3_omni_load.h`, `kernels/82_qwen3_omni.metal`, the DeepStack mergers in `src/model/impl/vision.h` and `src/model/impl/load.h`, `tools/clef_convert.py`, `tests/ref/clef_omni_ref.py` | Apache-2.0 |
 | Hugging Face transformers (LFM2, LFM2-VL and SigLIP2 model semantics; the LFM2-VL processor's geometry and token runs) | `src/model/impl/lfm2.h`, `src/model/impl/lfm2_load.h`, `src/model/impl/config.h` (`config_from_lfm2`, `vision_from_lfm2`), `src/model/impl/vision.h` (SigLIP2 position table), `kernels/90_lfm2.metal`, `src/vision/lfm2.cpp`, `tests/ref/lfm2_ref.py` | Apache-2.0 |
+| Hugging Face transformers (MiniCPM-OCR and Qwen3.5 model semantics; the MiniCPM-OCR processor's geometry and token runs) | `src/model/impl/minicpm_load.h`, `src/model/impl/config.h` (`vision_from_minicpm`), `src/model/impl/vision.h` (nearest-bucket position table), `src/vision/minicpm.cpp` | Apache-2.0 |
 | LiquidAI d1 (`prompt.py`, `api.py`: the System One prompt, option codes, readout and answer format) | `src/engine/d1.h`, `src/engine/d1.cpp`, `tests/ref/lfm2_ref.py` | LFM Open License v1.0 |
 | Unicode Character Database 15.1 | `src/tok/unicode_data.h`, `src/tmpl/unicode_data.inc` | Unicode-3.0 |
 | mlx-lm 0.32 (Gemma 4 model semantics: `models/gemma4_text.py`, `models/rope_utils.py`) | `src/model/impl/gemma.h`, `src/model/impl/gemma_load.h`, `src/model/impl/config.h` (`config_from_gemma`), `kernels/80_gemma.metal` | MIT |
@@ -200,7 +201,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## ggml
 
 `src/model/impl/gguf.h` converts GGUF quantized blocks (Q4_0, Q4_1, Q5_0,
-Q5_1, Q8_0, Q2_K to Q6_K, IQ4_NL, IQ4_XS) with the formulas of ggml's
+Q5_1, Q8_0, Q2_K to Q6_K, IQ4_NL, IQ4_XS, IQ3_S, IQ2_S; the IQ2_S and IQ3_S
+codebook grids are copied into `src/model/impl/gguf_iq_grids.h`) with the formulas of ggml's
 `dequantize_row_*` functions (including `get_scale_min_k4` and the `IQ4_NL`
 value table).
 

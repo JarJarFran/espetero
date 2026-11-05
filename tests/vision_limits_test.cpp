@@ -355,6 +355,47 @@ void test_gemma() {
   check(ids == want, "gemma image expansion (<|image> + 4 soft tokens + <image|>)");
 }
 
+
+// MiniCPM-OCR's processor: grids and view sizes of transformers'
+// get_sliced_grid, find_best_resize and get_refine_size (values computed with
+// transformers 5.21), the token run and the views' first image tokens.
+void test_minicpm() {
+  struct Case {
+    int h, w, rows, cols, sh, sw, slh, slw;
+  };
+  const Case cases[] = {{120, 1010, 0, 0, 168, 1288, 0, 0},   {1851, 1504, 3, 3, 504, 392, 504, 392},
+                        {1850, 1500, 3, 3, 504, 392, 504, 392}, {28, 28, 0, 0, 448, 448, 0, 0},
+                        {10, 3000, 0, 0, 28, 7504, 0, 0},     {448, 448, 0, 0, 448, 448, 0, 0},
+                        {449, 449, 2, 1, 448, 448, 308, 644},  {800, 600, 2, 2, 504, 392, 504, 392},
+                        {600, 1600, 1, 4, 280, 728, 560, 364}, {3000, 200, 4, 1, 1736, 112, 868, 224},
+                        {2339, 1654, 3, 3, 532, 364, 532, 364}, {1080, 1920, 2, 4, 336, 588, 476, 420},
+                        {5000, 5000, 3, 3, 448, 448, 448, 448}};
+  MinicpmSpec s;
+  s.image_id = 1, s.im_start_id = 2, s.im_end_id = 3, s.sl_start_id = 4, s.sl_end_id = 5, s.newline_id = 6;
+  for (const Case& c : cases) {
+    const MinicpmLayout L = minicpm_layout(c.h, c.w, s);
+    check(L.rows == c.rows && L.cols == c.cols && L.source_h == c.sh && L.source_w == c.sw && L.slice_h == c.slh &&
+              L.slice_w == c.slw,
+          "minicpm_layout " + size_str(c.w, c.h) + ": grid " + std::to_string(L.rows) + "x" + std::to_string(L.cols) +
+              ", overview " + size_str(L.source_w, L.source_h) + ", slices " + size_str(L.slice_w, L.slice_h));
+  }
+  // A 2 x 2 grid of 504 x 392 slices: <image> 252 </image> <slice> 252 </slice> <slice> 252 </slice> \n ...
+  RGBImage img;
+  img.width = 600;
+  img.height = 800;
+  img.rgb.assign(size_t(600) * 800 * 3, 128);
+  const MinicpmPrepared p = minicpm_preprocess(img, s);
+  const size_t n = size_t(36) * 28 / 4;
+  check(p.views.size() == 5 && p.run.size() == 2 + n + 4 * (2 + n) + 1, "minicpm views and run length");
+  check(p.run[0] == 2 && p.run[n + 1] == 3 && p.run[n + 2] == 4 && p.run[2 * n + 3] == 5 && p.run[2 * n + 4] == 4 &&
+            p.run[3 * n + 6] == 6 && p.run.back() == 5,
+        "minicpm run markers");
+  bool firsts = true;
+  for (const auto& v : p.views) firsts = firsts && p.run[size_t(v.token)] == 1 && p.run[size_t(v.token) - 1] != 1 && v.gh == 36 && v.gw == 28;
+  check(firsts && p.views[1].token == int(n) + 3 && p.views[3].token == int(3 * n) + 8, "minicpm views' first tokens");
+  check(p.pixels.size() == 5 * size_t(36) * 28 * 588 && p.pixels[0] == (128.0f / 255.0f - 0.5f) / 0.5f, "minicpm patch rows");
+}
+
 }  // namespace
 
 int main() {
@@ -367,6 +408,8 @@ int main() {
   test_real_files();
   std::printf("gemma 4 processor\n");
   test_gemma();
+  std::printf("minicpm-ocr processor\n");
+  test_minicpm();
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

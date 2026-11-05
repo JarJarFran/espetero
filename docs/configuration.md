@@ -24,7 +24,7 @@ which are the model's own recommendation:
 | Memory check | a model that cannot fit this Mac's GPU memory is refused before it is downloaded and before it is loaded, with what it needs, a `--context` that fits and smaller files of the same model (`--skip-memory-check` to try anyway) | a 16 GB Mac does not download 30 GB of a 27B 8-bit to fail at load; see below |
 | Sampling defaults | requests that leave out `temperature`, `top_p`, `top_k` or `min_p` get the model's `generation_config.json` values (GGUF: `general.sampling.*`; Qwen3.8-27B: 1.0, 0.95, 20), the rest OpenAI's; set values always win, greedy requests unchanged; `--no-generation-config` for OpenAI's (1, 1, off, 0) | the settings the model's authors recommend, applied as vLLM and llama.cpp apply them; `top_k` 1–32 also puts sampled requests on the GPU sampling path. Details below |
 | Model by repo id | `--model ORG/NAME` or `ORG/NAME:QUANT` (GGUF) runs the Hugging Face cache's snapshot, downloaded into that cache by Espetero itself when missing, resumable and verified (`--offline`: never) | no separate download step, no Python; one copy shared with `hf`, transformers and mlx-lm; see below |
-| Prompt caching | system-prompt, instruction and image checkpoints; a shared prefix is computed once even when many requests arrive together | repeated system prompts, instructions placed before a photo (shared by a set of photos) and several questions about one photo cost one prefill; with `--prefix-dir` (on in `--preset flow`) a restarted server loads them from disk instead of computing them again (a shared prompt of tens of thousands of tokens loads in a fraction of a second instead of minutes on Flash-Next); checkpoints that running requests restored from or saved are evicted last, so the next question about the same image still finds it (`--no-keep-live` for plain LRU) |
+| Prompt caching | system-prompt, instruction and image checkpoints; a shared prefix is computed once even when many requests arrive together | repeated system prompts, instructions placed before a photo (shared by a set of photos) and several questions about one photo cost one prefill; with `--prefix-dir` (on in `--preset flow`) a restarted server loads them from disk instead of computing them again (a shared prompt of tens of thousands of tokens loads in a fraction of a second instead of minutes on Flash-Next); checkpoints that running requests restored from or saved are evicted last, so the next question about the same image still finds it (`--no-keep-live` for plain LRU); a finished chat reply's state stays cached as a checkpoint of the prompt and the reply, so an agent's next turn (the reply, the tool's result, the next reply) reads only what is new: on Qwen3.8-27B an 8-turn tool loop prefilled 1,128 tokens after its first turn instead of 2,227 (first tokens 12.3 s instead of 22.2 s in all), replies unchanged; forks of the reply's state every 256 tokens (`--reply-snapshot N`, the latest 2 kept) serve a turn that renders the end of the reply differently (`--no-reply-checkpoint`: none) |
 | Models larger than memory (Qwen3.8-Flash-Next) | the n-gram table read from the SSD by rows; the most recently used experts kept in GPU memory that macOS never compresses or swaps (automatic: what the GPU working set and the memory available before loading leave after the model, the slots + KV and 2.5 GB of scratch: and at most 18 GB under the RAM counting what is wired or compressed before loading: ~31 GB on a 64 GB Mac, every expert on 128 GB; `--expert-cache-gb X` to set it, `-1` for none; `--memory-gb` for slots + KV, 3 GB by default for this model), the rest read from the SSD when a token routes to them; the next layer's likely experts read ahead; expert records (one read per missing expert instead of nine) used when built: `--expert-store-build` writes them once (~68 GB, ~40 s) to ~/Library/Caches/espetero/xstore.noindex/&lt;model&gt; (outside Time Machine and Spotlight), `--expert-store DIR\|none` to choose; MTP drafts (3 per pass) from a Qwen3.8-Flash-Next-MTP-Drafter directory found beside the model (8-bit at load, ~2.7 GB; `--mtp PATH\|none`) | answers identical to a model held in memory (drafts are verified); reads do not wear the SSD; on a 64 GB M1 Max it decodes 12.9 tok/s (17.8 with MTP) and describes a photo in ~20 s |
 
 ### Models and request defaults
@@ -124,14 +124,15 @@ same Hugging Face cache:
 Only models Espetero runs are loaded: an MLX `config.json` whose `model_type`
 (or `text_config.model_type`) is of the Qwen3.5 family (`qwen3_5`,
 `qwen3_5_moe`, `qwen3_5_mtp`, and `_text` variants), Qwen3.8-Flash-Next
-(`qwen4_exp`), Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`) or LFM2 (`lfm2`, `lfm2_vl`:
-an MLX conversion or the Hugging Face release itself), a GGUF whose
+(`qwen4_exp`), Gemma 4 (`gemma4`, `gemma4_text`, `gemma4_unified`), LFM2 (`lfm2`, `lfm2_vl`:
+an MLX conversion or the Hugging Face release itself) or MiniCPM-OCR (`minicpm_ocr`, the
+Hugging Face release), a GGUF whose
 `general.architecture` is `qwen35`, `qwen35moe` or `gemma4`. Any other model
 stops `serve`, `chat`, `batch` and `info` at start with one message naming its
 type:
 
 ```
-error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.2; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models) and Cloudflare Clef classifiers
+error: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit: model_type 'llama4' is not supported by Espetero 0.1.4; it runs the Qwen3.5 family (qwen3_5, qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL (lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), DeepSeek-V4.1 (deepseek_v41), GLM-5.3-Flash (glm5_next), MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers
 ```
 
 Gemma 4 runs its 31B dense and 26B-A4B mixture-of-experts models with their
@@ -193,6 +194,9 @@ unchanged, and fields the model does not set keep OpenAI's defaults
 (temperature 1, top_p 1, top_k off, min_p 0); `do_sample` is ignored, as in
 vLLM. A `top_k` of 1 to 32 also puts sampled requests on the GPU sampling
 path (drafts drawn as the target draws its tokens).
+`no_repeat_ngram_size` N (vLLM's and transformers' field; 0, the default:
+off) gives -inf to every token that would repeat an N-gram of the reply,
+the loop guard OCR pipelines such as MiniCPM-OCR's SDK send (N = 100).
 `--no-generation-config` gives every request OpenAI's defaults again.
 `--print-config` and `GET /v1/config` show the defaults in effect and where
 they come from (`effective.sampling-defaults`). `espetero chat` uses
@@ -204,6 +208,26 @@ else 0.7, 0.95 and 20.
 All presets serve the same OpenAI-compatible API (`/v1/chat/completions`,
 `/v1/completions`, `/v1/embeddings`, images in messages, `/v1/batches`) plus
 `/v1/decisions`.
+`--harness NAME` prints, when the server starts, the client setup for an agent
+harness, with the address the server listens on. The default is `deepseek`
+(deepseek-harness: `DEEPSEEK_BASE_URL=http://host:port/v1`, or its
+`llm-deepseek` `baseURL`, which gets `/chat/completions` and `/files` added;
+`/chat/completions`, `/models` and `/files` answer without `/v1` too);
+`claude-code` (`ANTHROPIC_BASE_URL`), `codex` (`wire_api = "responses"`) and
+`opencode` (`baseURL` with `/v1`) are the other choices, and `none` prints
+nothing. It only prints: the harness's own config is still written by hand.
+Chat requests take DeepSeek's fields: `thinking` `{"type": "enabled" |
+"disabled"}`, `reasoning_effort` (`low`, `medium`, `high` = `max` = `xhigh`
+for templates that take one), and content parts that name an upload
+(`{"type": "file", "file_id"}`, or OpenAI's `{"type": "file", "file":
+{"file_id"}}`: an image, or a text file as its text). Uploads take
+`expires_after[seconds]` (their `expires_at`; gone after it), and `GET
+/v1/files` takes `purpose`, `limit`, `after` and `order` and answers with
+`has_more`, `first_id` and `last_id`. The Messages side covers image blocks
+that name an uploaded file (`source` `{"type": "file", "file_id"}`),
+`tool_addition` / `tool_removal` blocks in system turns with `defer_loading`
+tools, and Files requests that carry `anthropic-beta: files-api-…` answer in
+Anthropic's shapes (without that header `/v1/files` keeps the OpenAI shape).
 Other clients' APIs run the same chat job (same prompt, same tokens):
 OpenAI's `/v1/responses` (`previous_response_id` continues one of the newest
 256 stored responses; `GET` / `DELETE /v1/responses/{id}`), Anthropic's
@@ -217,7 +241,7 @@ follows each API: Anthropic requests think only with `"thinking": {"type":
 `minimal`, and their effort reaches templates that take one (Flash-Next:
 `low`, `medium`, `high` = `xhigh`). Not supported (an error, never
 ignored): a non-empty `logit_bias` (422), built-in or server tools, images
-by file id, images inside tool results. `tool_choice` `none` renders the prompt without the
+inside tool results. `tool_choice` `none` renders the prompt without the
 tools, so no call is parsed. An Anthropic reply that one of its
 `stop_sequences` ended has `stop_reason` `stop_sequence` and that string in
 `stop_sequence`.
@@ -531,8 +555,8 @@ Claude Code, Codex CLI (with the two settings below) and opencode run
 against Espetero: each fixed a small Python package with failing unit tests (8 of 8 passing, the
 tests untouched) on Qwen3.6-35B-A3B 6-bit served with `--context 65536`.
 Give the server a context that holds the agent's system prompt and tools
-plus the work; the prompt checkpoints keep the system prompt and the history
-an agent re-sends every turn from being computed again.
+plus the work; the prompt and reply checkpoints keep the system prompt, the history
+and the previous reply an agent re-sends every turn from being computed again.
 
 - **Claude Code** (Anthropic Messages): any model name works, the server
   serves its one model.
@@ -980,6 +1004,39 @@ reference's (`tests/ref/kev_fixtures.json`: 20 requests, 9 with images)
 and the answers' rounding, confidences and `output_tokens`. Known
 difference: integers beyond the int64 range in a JSON state are rendered
 as floats.
+
+### MiniCPM-OCR
+
+OpenBMB's MiniCPM-OCR 1.0 (`openbmb/MiniCPM-OCR-1.0`, 1.3B: a SigLIP tower and
+a Qwen3.5 decoder of 24 layers) runs from the Hugging Face release itself
+(bf16, served as fp16; no conversion):
+
+```
+espetero serve --model openbmb/MiniCPM-OCR-1.0
+```
+
+Its decoder takes the Qwen3.5 path (the release's `model.language_model.*`
+tensors read under their MLX names, the RMSNorm weights shifted by one as
+mlx-lm's conversion writes them); there is no MTP head, so drafts come from
+prompt lookup only. Images go through the release's processor
+(`preprocessor_config.json`, `downsample_mode` `"4x"`): an image of more than
+448 x 448 pixels is cut into a grid of 2 to 9 slices (the grid closest to its
+aspect ratio), each view (an overview of about 448 x 448 pixels, then the
+slices row by row; smaller images are enlarged to that size) becomes
+(h / 14) x (w / 14) / 4 image tokens (SigLIP patches of 14 pixels, the
+position table read at each patch's nearest bucket, 2 x 2 merged), and the
+placeholder becomes `<image_id>N</image_id><image>` + the overview's tokens
++ `</image>`, then `<slice>` + tokens + `</slice>` per slice with a `\n`
+between grid rows (N: the image's index in the prompt). A scanned A4 page is
+3 x 3 slices, 2,520 image tokens; a text line of 1010 x 120 pixels 276. The
+chat image budget (`image_detail`) does not apply. The model card's prompts
+name the task: `Text Recognition:`, `Table Recognition:`, `Formula
+Recognition:`, `Seal Recognition:`, `Chart to Table:`. Greedy replies equal
+transformers' (5.21) on a page, a text line and two images in one prompt
+until the first near-tie, where Espetero's logits agree with an fp32
+reference to about 0.002. The processor's `small_image_upsize` `"adaptive"`
+mode (OpenCV glyph statistics) and `"16x"` checkpoints (the window-attention
+merger) are refused.
 
 ### LFM2-VL and d1 decision models
 

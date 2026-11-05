@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <algorithm>
 #include <string>
@@ -139,9 +140,15 @@ bool event(http::Response& res, const std::string& name, const json::Value& data
 
 // ---------------------------------------------------------------- Anthropic Messages
 
-// An image block's source as the chat route's URL: a data URL for "base64",
-// the URL itself for "url" (fetched with --image-urls).
-std::string image_url_of(const json::Value& block) {
+// Bytes and media type of a Files API upload, named by an image block's
+// source {"type": "file", "file_id"}.
+using FileReader = std::function<std::pair<std::string, std::string>(const std::string& id)>;
+
+
+// An image block's source as the chat route's URL: a data URL for "base64"
+// and "file" (the uploaded bytes), the URL itself for "url" (fetched with
+// --image-urls).
+std::string image_url_of(const json::Value& block, const FileReader& files) {
   const json::Value* src = block.get("source");
   if (!src || !src->is_object()) invalid("image: source required");
   const std::string type = src->get_string("type", "");
@@ -150,11 +157,66 @@ std::string image_url_of(const json::Value& block) {
     if (url.empty()) invalid("image: source.url required");
     return url;
   }
-  if (type != "base64") invalid("image: source type base64 or url (file sources are not supported)");
+  if (type == "file") {
+    const std::string id = src->get_string("file_id", "");
+    if (id.empty()) invalid("image: source.file_id required");
+    if (!files) invalid("image: file sources need the Files API");
+    const auto [media_type, bytes] = files(id);
+    return "data:" + media_type + ";base64," + base64_encode(bytes);
+  }
+  if (type != "base64") invalid("image: source type base64, url or file");
   return "data:" + src->get_string("media_type", "image/jpeg") + ";base64," + src->get_string("data", "");
 }
 
-json::Value anthropic_to_chat(const json::Value& b) {
+// Developer updates may carry tool_addition and tool_removal blocks
+// (DeepSeek's Messages protocol): they set the tools, not the text, so the
+// turn keeps only its other blocks.
+json::Value without_tool_updates(const json::Value& m) {
+  const json::Value* content = m.get("content");
+  if (!content || !content->is_array()) return m;
+  json::Value kept = arr();
+  for (const json::Value& blk : content->as_array()) {
+    const std::string type = blk.get_string("type", "");
+    if (type != "tool_addition" && type != "tool_removal") kept.push_back(blk);
+  }
+  if (kept.size() == content->size()) return m;
+  json::Value out = m;
+  out.set("content", std::move(kept));
+  return out;
+}
+
+// The declared tools the prompt offers once the conversation has run: a
+// tool with defer_loading starts unavailable, tool_addition makes it
+// available and tool_removal withdraws it, in conversation order. The prompt
+// is rendered whole, so the state after the last update is what the model
+// sees.
+std::vector<json::Value> active_tools(const json::Value& b) {
+  std::vector<json::Value> declared;
+  if (const json::Value* t = b.get("tools"); t && t->is_array()) declared = t->as_array();
+  std::map<std::string, bool> offered;  // tool name -> offered now
+  for (const json::Value& t : declared) offered[t.get_string("name", "")] = !t.get_bool("defer_loading", false);
+  if (const json::Value* ms = b.get("messages"); ms && ms->is_array()) {
+    for (const json::Value& m : ms->as_array()) {
+      const json::Value* content = m.get("content");
+      if (!content || !content->is_array()) continue;
+      for (const json::Value& blk : content->as_array()) {
+        const std::string type = blk.get_string("type", "");
+        if (type != "tool_addition" && type != "tool_removal") continue;
+        const json::Value* tool = blk.get("tool");
+        const std::string name = tool ? tool->get_string("name", "") : "";
+        auto it = offered.find(name);
+        if (it == offered.end()) invalid(type + ": tool '" + name + "' is not declared in tools");
+        it->second = type == "tool_addition";
+      }
+    }
+  }
+  std::vector<json::Value> out;
+  for (const json::Value& t : declared)
+    if (offered[t.get_string("name", "")]) out.push_back(t);
+  return out;
+}
+
+json::Value anthropic_to_chat(const json::Value& b, const FileReader& files) {
   json::Value msgs = arr();
   if (const json::Value* sys = b.get("system"); sys && !sys->is_null()) {
     json::Value m = obj();
@@ -164,7 +226,11 @@ json::Value anthropic_to_chat(const json::Value& b) {
   }
   const json::Value* ms = b.get("messages");
   if (!ms || !ms->is_array() || ms->size() == 0) invalid("messages: a nonempty list is required");
-  for (const json::Value& m : ms->as_array()) {
+  for (const json::Value& raw : ms->as_array()) {
+    const json::Value m = without_tool_updates(raw);
+    // A turn that held only tool changes is no turn.
+    const json::Value *rc = raw.get("content"), *mc = m.get("content");
+    if (rc && rc->is_array() && rc->size() > 0 && mc && mc->is_array() && mc->size() == 0) continue;
     std::string role = m.get_string("role", "");
     // Claude Code puts system reminders between turns as {"role": "system"}
     // messages. Chat templates take one system message, first: before any turn
@@ -207,7 +273,7 @@ json::Value anthropic_to_chat(const json::Value& b) {
         if (const json::Value* cc = blk.get("cache_control"); cc && cc->is_object()) t.set("cache_control", *cc);
         parts.push_back(std::move(t));
       } else if (type == "image") {
-        parts.push_back(image_part(image_url_of(blk), ""));
+        parts.push_back(image_part(image_url_of(blk, files), ""));
       } else if (type == "thinking") {
         reasoning += blk.get_string("thinking", "");
       } else if (type == "redacted_thinking") {
@@ -313,23 +379,22 @@ json::Value anthropic_to_chat(const json::Value& b) {
       invalid("tool_choice: type auto, any, tool or none");
     }
   }
-  if (const json::Value* tools = b.get("tools"); tools && tools->is_array() && tools->size()) {
-    if (choice != "none") {
-      json::Value ts = arr();
-      for (const json::Value& t : tools->as_array()) {
-        const std::string type = t.get_string("type", "custom");
-        if (type != "custom") invalid("tools: only custom tools (server tool '" + type + "' is not supported)");
-        json::Value fn = obj();
-        fn.set("name", t.get_string("name", ""));
-        if (const json::Value* d = t.get("description")) fn.set("description", *d);
-        if (const json::Value* s = t.get("input_schema")) fn.set("parameters", *s);
-        json::Value w = obj();
-        w.set("type", "function");
-        w.set("function", std::move(fn));
-        ts.push_back(std::move(w));
-      }
-      out.set("tools", std::move(ts));
+  const std::vector<json::Value> tools = active_tools(b);
+  if (tools.size() && choice != "none") {
+    json::Value ts = arr();
+    for (const json::Value& t : tools) {
+      const std::string type = t.get_string("type", "custom");
+      if (type != "custom") invalid("tools: only custom tools (server tool '" + type + "' is not supported)");
+      json::Value fn = obj();
+      fn.set("name", t.get_string("name", ""));
+      if (const json::Value* d = t.get("description")) fn.set("description", *d);
+      if (const json::Value* s = t.get("input_schema")) fn.set("parameters", *s);
+      json::Value w = obj();
+      w.set("type", "function");
+      w.set("function", std::move(fn));
+      ts.push_back(std::move(w));
     }
+    out.set("tools", std::move(ts));
   }
   return out;
 }
@@ -1180,14 +1245,36 @@ void refuse_clef(const Engine& engine) {
 
 }  // namespace
 
-void install_compat_routes(http::Server& server, Engine& engine) {
+std::string base64_encode(const std::string& in) {
+  static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve((in.size() + 2) / 3 * 4);
+  for (size_t i = 0; i < in.size(); i += 3) {
+    const bool more1 = i + 1 < in.size(), more2 = i + 2 < in.size();
+    const uint32_t n = (uint32_t(uint8_t(in[i])) << 16) | (more1 ? uint32_t(uint8_t(in[i + 1])) << 8 : 0) |
+                       (more2 ? uint32_t(uint8_t(in[i + 2])) : 0);
+    out += kAlphabet[(n >> 18) & 63];
+    out += kAlphabet[(n >> 12) & 63];
+    out += more1 ? kAlphabet[(n >> 6) & 63] : '=';
+    out += more2 ? kAlphabet[n & 63] : '=';
+  }
+  return out;
+}
+
+void install_compat_routes(http::Server& server, Engine& engine, BatchService* batches) {
+  // Image sources {"type": "file"} name uploads of the Files API (no store: refused).
+  const FileReader files = [batches](const std::string& id) -> std::pair<std::string, std::string> {
+    if (!batches) throw RequestError(400, "image: file sources need the Files API (no file store)");
+    const json::Value info = batches->file_info(id);
+    return {info.get_string("mime_type", "image/jpeg"), batches->file_content(id)};
+  };
   // ---- Anthropic Messages
-  server.route("POST", "/v1/messages", [&engine](const http::Request& req, http::Response& res) {
+  server.route("POST", "/v1/messages", [&engine, files](const http::Request& req, http::Response& res) {
     try {
       refuse_clef(engine);
       const json::Value body = parse_body(req);
       if (!body.get("max_tokens")) invalid("max_tokens: required");
-      ChatJob job = prepare_chat(engine, anthropic_to_chat(body));
+      ChatJob job = prepare_chat(engine, anthropic_to_chat(body, files));
       if (job.stream) {
         anthropic_stream(engine, job, res, thinking_shown(body));
         return;
@@ -1209,13 +1296,13 @@ void install_compat_routes(http::Server& server, Engine& engine) {
       else res.send_json(500, anthropic_error(500, e.what()));
     }
   }, http::Body::Json);
-  server.route("POST", "/v1/messages/count_tokens", [&engine](const http::Request& req, http::Response& res) {
+  server.route("POST", "/v1/messages/count_tokens", [&engine, files](const http::Request& req, http::Response& res) {
     try {
       refuse_clef(engine);
       json::Value body = parse_body(req);
       body.set("max_tokens", 1);  // counting only: no output budget against the context
       body.set("stream", false);
-      ChatJob job = prepare_chat(engine, anthropic_to_chat(body), false);
+      ChatJob job = prepare_chat(engine, anthropic_to_chat(body, files), false);
       json::Value o = obj();
       o.set("input_tokens", int64_t(job.gen.prompt.size()));
       res.send_json(200, o);

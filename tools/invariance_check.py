@@ -21,6 +21,9 @@ Checks, in order (server state matters, so run them on fresh servers):
                     starts from the system checkpoint) vs B: the second alone
   image-ckpt        A: two questions about one image (the second starts from
                     the image checkpoint) vs B: the second alone
+  tool-loop         A: two turns of a tool-calling conversation (each turn
+                    continues the previous reply's checkpoint), then the
+                    third turn scored vs B: it alone (A's cached tokens shown)
   concurrent        A: four requests in flight together vs B: one at a time
   generation        greedy replies of A vs B (reported, first divergence
                     explained by the logprob gap there)
@@ -61,10 +64,45 @@ def post(url, body, timeout=1800):
         return json.load(r)
 
 
-def score(url, messages, text=CONTINUATION):
+def score(url, messages, text=CONTINUATION, tools=None, cached=None):
     body = {"messages": messages, "max_tokens": 8, "temperature": 0, "enable_thinking": False,
             "score": {"continuation": text, "top_k": 2}}
-    return post(url, body)["timings"]["score"]
+    if tools:
+        body["tools"] = tools
+    o = post(url, body)
+    if cached is not None:
+        cached.append((o.get("usage") or {}).get("prompt_tokens_details", {}).get("cached_tokens", 0))
+        cached.append((o.get("usage") or {}).get("prompt_tokens", 0))
+    return o["timings"]["score"]
+
+
+TOOLS = [{"type": "function", "function": {
+    "name": "read_file", "description": "Read a file of the repository.",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+TOOL_RESULT = ("def parse_date(text):\n    y, m, d = text.split('-')\n    return date(int(y), int(m), int(d))\n\n"
+               "def parse_range(text):\n    a, _, b = text.partition('/')\n    return parse_date(a), parse_date(b)\n")
+
+
+def tool_turn(url, messages):
+    """A greedy reply with tools, and the messages after it (its tool results, or a follow-up)."""
+    body = {"messages": messages, "tools": TOOLS, "tool_choice": "required", "max_tokens": 200, "temperature": 0,
+            "enable_thinking": False}
+    try:
+        o = post(url, body)
+    except urllib.error.HTTPError as e:  # a template without forced tool calls
+        if e.code != 422:
+            raise
+        del body["tool_choice"]
+        o = post(url, body)
+    m = o["choices"][0]["message"]
+    am = {"role": "assistant", "content": m.get("content") or ""}
+    out = messages + [am]
+    if m.get("tool_calls"):
+        am["tool_calls"] = m["tool_calls"]
+        out += [{"role": "tool", "tool_call_id": c.get("id", ""), "content": TOOL_RESULT} for c in m["tool_calls"]]
+    else:
+        out.append({"role": "user", "content": "Read src/dates/range.py too."})
+    return out
 
 
 def chat(url, messages, max_tokens):
@@ -136,6 +174,13 @@ def main():
         compare("image-ckpt", score(A, q2), score(B, q2))
     except urllib.error.HTTPError as e:
         print(f"image-ckpt             skipped (HTTP {e.code}: no vision tower?)")
+    # tool loop: A's third turn continues the second turn's reply checkpoint
+    t = [{"role": "system", "content": "You are a coding agent. Read files with the tool before answering."},
+         {"role": "user", "content": "Read src/dates/parse.py and tell me whether parse_date accepts times."}]
+    t = tool_turn(A, tool_turn(A, t))
+    got = []
+    compare("tool-loop", score(A, t, tools=TOOLS, cached=got), score(B, t, tools=TOOLS))
+    print(f"{'':22s}      A's third turn: {got[0]} of {got[1]} prompt tokens cached", flush=True)
     # concurrent (A) vs one at a time (B), fresh prompts for both servers
     msgs = [[{"role": "user", "content": p + " (v2)"}] for p in PROMPTS]
     seq = [score(B, mm) for mm in msgs]

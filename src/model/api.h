@@ -76,7 +76,8 @@ struct ModelInfo {
   int vision_patch = 0, vision_merge = 0, vision_patch_dim = 0, vision_temporal = 0;
   // "qwen": Qwen-VL patches and runs (<|image_pad|>, merge x merge cells per token);
   // "deepseek": DeepSeek-VL2 style (ImageRef: grid_h x grid_w patches of 3 x patch x patch,
-  // the run [start] + (row of ceil(w / merge) tokens + newline) x ceil(h / merge) + [end]).
+  // the run [start] + (row of ceil(w / merge) tokens + newline) x ceil(h / merge) + [end]);
+  // "minicpm": MiniCPM-OCR's slices (views of a PreparedImage, SigLIP patch rows, plain positions).
   std::string vision_layout = "qwen";
   int image_token_id = -1;  // the placeholder the chat template writes for an image (-1: the layout's default)
   int vision_max_tokens = 0, vision_min_pixels = 0;  // deepseek: the run's token budget, the pixel floor
