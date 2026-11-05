@@ -129,6 +129,7 @@ class MetalModel final : public NativeModel {
       char buf[24];
       std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
       build_id_ = buf;
+      m.build_id = build_id_;
     }
     // Memory the system can give before this model's allocations without
     // compressing or swapping anything: free pages, the file cache and
@@ -146,7 +147,7 @@ class MetalModel final : public NativeModel {
       }
     }
     load_qwen35(m, path, o.vision, o.mmproj, o.mtp);
-    m.weight_bytes = m.arena->total();
+    m.weight_bytes = m.arena->total() + (m.tiles ? m.tiles->bytes : 0);
     mark("weights");
 
     const Config& c = m.cfg;
@@ -226,7 +227,7 @@ class MetalModel final : public NativeModel {
       // reads), when the Mac keeps 12 GB beside it and the GPU's memory.
       if (m.ple.present) {
         const NgramTable& T = m.ple.table;
-        const double table = double(T.rows) * double(T.width / 2 + (T.width / T.group) * 4);
+        const double table = double(T.rows) * double(T.width * T.bits / 8 + (T.width / T.group) * 4);
         uint64_t ram = 0;
         size_t len = sizeof ram;
         sysctlbyname("hw.memsize", &ram, &len, nullptr, 0);
@@ -329,7 +330,8 @@ class MetalModel final : public NativeModel {
     if (const char* v = std::getenv("ESPETERO_ROUTE_NOTILES")) m.route_notiles = *v == '1';
     if (const char* v = std::getenv("ESPETERO_ROUTE_SEQEXP")) m.route_seqexp = *v == '1';
     if (const char* v = std::getenv("ESPETERO_MOE_FMA")) m.moe_fma = *v == '1';
-    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_TUNE")) m.moe_down_comb_tune = *v == '1';
+    if (const char* v = std::getenv("ESPETERO_MOE_DOWN_COMB")) m.moe_down_comb = *v == '1', m.moe_down_comb_tune = false;
     if (const char* v = std::getenv("ESPETERO_MOE_COMB_KS")) m.moe_comb_ks = std::atoi(v);
     if (const char* v = std::getenv("ESPETERO_MOE_FIN")) m.moe_fin = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("ESPETERO_MOE_FMA_MIX")) m.moe_fma_mix = *v == '1';
@@ -410,6 +412,8 @@ class MetalModel final : public NativeModel {
     mark("GEMM tiles (autotune)");
     prewarm();
     mark("pipelines (prewarm)");
+    tune_moe_down(m);
+    mark("MoE down path (tune)");
 
     // ---- info
     ModelInfo& I = info_;
@@ -438,7 +442,8 @@ class MetalModel final : public NativeModel {
     I.vision = m.vis.c.present;
     I.mtp = m.mtp.present;
     I.leaves = true;  // Qwen4-Exp verifies draft leaves too
-    I.hidden_states = !m.cfg.q4;  // run_forest refuses out_hidden for qwen4_exp
+    I.hidden_states = !m.cfg.q4;  // the engine's hidden-state features stay off for qwen4_exp
+    I.hidden_rows = true;         // out_hidden: for qwen4_exp the final mixer's output, the LM head input
     {  // Verify-commit (ESPETERO_COMMIT=0: accepted drafts re-run as roots, as before)
       const char* v = std::getenv("ESPETERO_COMMIT");
       I.commit = (v == nullptr || std::atoi(v) != 0) && !m.cfg.gemma && !m.cfg.q3moe && !m.cfg.lfm2;  // Qwen4-Exp too; not Gemma 4, Qwen3-Omni, LFM2
@@ -446,7 +451,7 @@ class MetalModel final : public NativeModel {
     I.end_ids = m.cfg.eos_ids;  // Gemma 4: <eos>, <turn|>, <|tool_response>
     if (m.cfg.q3moe) I.family = "qwen3_omni_moe";
     if (m.cfg.gemma) {
-      I.family = "gemma4";
+      I.family = m.cfg.spark ? "spark2_5" : "gemma4";
       I.kv_heads = c.Hkv_g;  // the paged pool's (global layers'); the sliding layers' rings are slot state
     }
     if (m.cfg.lfm2) I.family = "lfm2";
@@ -472,6 +477,7 @@ class MetalModel final : public NativeModel {
       d.set("sliding_window", c.window);
       d.set("ring_gb", m.kvs.buf ? double([m.kvs.buf length]) / 1e9 : 0.0);
     }
+    if (m.n_q3) d.set("matrices_3bit", m.n_q3);
     d.set("matrices_4bit", m.n_q4);
     d.set("matrices_5bit", m.n_q5);
     d.set("matrices_6bit", m.n_q6);
@@ -498,6 +504,9 @@ class MetalModel final : public NativeModel {
     I.gpu_family = devprof_.family;
     I.devprof_measured = devprof_.measured;
     I.load_ms = ms_since(t0);
+    if (const char* lt = std::getenv("ESPETERO_LOAD_TRACE"); lt && *lt == '1')
+      std::fprintf(stderr, "[load] %.0f ms: host_mat %.0f ms, GPU waits %.0f ms, tune %.0f ms\n", I.load_ms,
+                   load_trace().host_ms, load_trace().wait_ms, I.tune_ms);
   }
 
   const ModelInfo& info() const override { return info_; }
@@ -740,6 +749,18 @@ class MetalModel final : public NativeModel {
     @autoreleasepool {
       const FailMarks counters(m_);
       run_forest(m_, meta_, trees, stats);
+      if (m_.tap_pass) {  // calibration taps: the pass is done, its copies are in tap_buf
+        const uint8_t* base = static_cast<const uint8_t*>([m_.tap_buf contents]);
+        for (const auto& r : m_.tap_recs) {
+          if (r.has_w)
+            m_.tap_sink->tap_route_weights(r.layer, reinterpret_cast<const float*>(base + r.w_off), r.n * r.k);
+          m_.tap_sink->tap(r.layer, r.kind, reinterpret_cast<const uint16_t*>(base + r.off), r.n, r.width,
+                           r.k ? reinterpret_cast<const int32_t*>(base + r.ids_off) : nullptr,
+                           r.k ? reinterpret_cast<const int32_t*>(base + r.pos_off) : nullptr, r.k);
+        }
+        m_.tap_recs.clear();
+        m_.tap_pass = false;
+      }
       // Readout table for logits(): tree -> first readout.
       readout_base_.assign(trees.size(), 0);
       int n = 0;
@@ -925,7 +946,8 @@ class MetalModel final : public NativeModel {
     else if (name == "gemm_var") m_.tune.gemm_var = m_.gemm_var_kernels ? std::max(0, std::min(3, value)) : 0;  // kernels compiled with ESPETERO_GEMM_VAR
     else if (name == "so_max") m_.tune.so_max_floats = value;
     else if (name == "gemv_ks") m_.tune.gemv_ks = value == 16 ? 16 : 8;
-    else if (name == "moe_down_comb") m_.moe_down_comb = value != 0;
+    else if (name == "moe_down_comb") m_.moe_down_comb = value != 0, m_.moe_down_comb_tune = false;
+    else if (name == "moe_down_tune") m_.moe_down_comb_tune = value != 0;  // takes effect at the next load only
     else if (name == "expert_cache_gb") m_.expert_cache_gb = m_.xpool.empty() ? double(value) : m_.expert_cache_gb;
     else if (name == "mtp_coarse") m_.mtp.coarse_c = m_.mtp.coarse.out() > 0 ? std::max(0, std::min(256, value)) : 0;
     else if (name == "mtp_head4") m_.mtp.use_head4 = value != 0;
@@ -1002,6 +1024,11 @@ class MetalModel final : public NativeModel {
     }
   }
 
+  void set_activation_sink(ActivationSink* sink) override {
+    if (sink && ((m_.cfg.gemma && m_.cfg.E) || m_.cfg.q3moe || m_.cfg.lfm2))
+      fail("calibration taps: Qwen3.5-family (with Qwen4-Exp) and dense Gemma 4 models only");
+    m_.tap_sink = sink;
+  }
   void set_profile(bool on) override {
     m_.profile = on;
     m_.prof.clear();

@@ -16,6 +16,9 @@
 //          routed on rmsnorm(h) * router.scale / sqrt(D)) are each normed (_1, _2), added and normed
 //          again (post_feedforward_layernorm) before the residual add and the scalar.
 //
+// Calibration taps (dense checkpoints): the q/k/v input, o_proj input, MLP
+// input and down input of every layer, as in the Qwen3.5 path.
+//
 // Semantics of mlx-lm's models/gemma4_text.py (MIT, THIRD_PARTY_NOTICES.md).
 // Sliding layers keep K/V in per-slot rings (Model::kvs); global layers use
 // the paged pool. The logits are soft-capped by run_forest after the LM head.
@@ -47,6 +50,14 @@ struct G4MoeOutParamsHost {
 struct G4RouteParamsHost {
   int32_t E, k, build, pad;
 };
+struct SpPrepParamsHost {
+  int32_t H, Hkv, ld, k_off, v_off, q_ld, kv_ld;
+  float scale;
+  int32_t rope_off, rope_ld;
+};
+struct SpGateParamsHost {
+  int32_t q_ld, D, hd, pad;
+};
 
 // The attention work of one layer kind over the pass's trees.
 struct G4Plan {
@@ -54,27 +65,30 @@ struct G4Plan {
   std::vector<G4TileRec> tiles;
   std::vector<AttnCombineRec> combine;
   int parts = 0;
+  int rows = 8;  // query rows per tile (above 8: unsplit tiles, g4_attention256_r<rows / 8>)
 };
 
-// Tiles of 8 query rows per tree. Sliding layers (window > 0) read only the
-// cached keys and batch rows the tile's earliest row can still see (cached
+// Tiles of 8 query rows per tree (`rows` when no tile is split). Sliding
+// layers (window > 0) read only the cached keys and batch rows the tile's
+// earliest row can still see (cached
 // key j and root row j sit at positions j and P + j; leaf rows are never
 // earlier than their index says, so skipping by index is safe). Few-tile
 // passes split the cached range (flash decoding), as plan_tiles does.
-inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const int32_t* pos) {
+inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const int32_t* pos, int rows = 8) {
   A.tiles.clear();
   A.combine.clear();
   A.parts = 0;
   int n_tiles = 0;
   for (const auto& t : A.trees) n_tiles += (t.M + 7) / 8;
   const int budget = std::max(1, 256 / std::max(1, groups * n_tiles));
+  A.rows = budget == 1 ? rows : 8;
   for (int ti = 0; ti < int(A.trees.size()); ++ti) {
     const AttnTreeRec& t = A.trees[size_t(ti)];
-    for (int r = 0; r < t.M; r += 8) {
+    for (int r = 0; r < t.M; r += A.rows) {
       int k0 = 0, b0 = 0;
       if (window > 0) {
         int minpos = INT32_MAX;
-        for (int i = r; i < std::min(t.M, r + 8); ++i) minpos = std::min(minpos, pos[4 * (t.base + i)]);
+        for (int i = r; i < std::min(t.M, r + A.rows); ++i) minpos = std::min(minpos, pos[4 * (t.base + i)]);
         k0 = std::clamp(minpos - window + 1, 0, t.P);
         b0 = std::max(0, minpos - window + 1 - t.P);
       }
@@ -107,9 +121,11 @@ inline void g4_plan_tiles(G4Plan& A, int groups, int split, int window, const in
 struct G4Geom {
   int hd, hkv, G, Gk, split;
   std::string kernel, combine;
+  int rt_rows = 8;  // rows per tile of unsplit prompt-pass tiles
 };
 inline G4Geom g4_geom(const Config& c, bool sliding) {
   G4Geom g;
+  if (c.spark) sliding = true;  // Spark: both layer kinds have the sliding layers' 256-dim geometry
   g.hd = sliding ? c.HD : c.HDg;
   g.hkv = sliding ? c.Hkv : c.Hkv_g;
   g.G = c.H / g.hkv;
@@ -118,6 +134,12 @@ inline G4Geom g4_geom(const Config& c, bool sliding) {
     g.split = 1;
     g.kernel = "g4_attention256_g" + std::to_string(g.G);
     g.combine = "g4_attention_combine256";
+    // Spark prompt passes: 16-row tiles (ESPETERO_G4_RT=0: 8).
+    static const bool rt = [] {
+      const char* e = std::getenv("ESPETERO_G4_RT");
+      return !(e && *e == '0');
+    }();
+    if (c.spark && g.G == 4 && rt) g.rt_rows = 16;
   } else {
     g.Gk = 2;
     g.split = g.G / 2;
@@ -191,6 +213,13 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     const char* e = std::getenv("ESPETERO_ATTN_SPLIT");
     return size_t(e && *e ? std::atoi(e) : 16) << 20;
   }();
+  // Spark: a group holds at least this many threadgroups (up to 4x the
+  // row-key budget): at 256K the budget is 8 tiles of 8 rows, 32
+  // threadgroups, which ran at 60% of the speed of 64 (ESPETERO_ATTN_MIN_TGS).
+  static const size_t min_tgs = [] {
+    const char* e = std::getenv("ESPETERO_ATTN_MIN_TGS");
+    return size_t(e && *e ? std::atoi(e) : 64);
+  }();
   auto attention = [&](bool sliding, int layer_k) {
     const G4Plan& A = sliding ? *P.plan_s : *P.plan_g;
     if (A.tiles.empty()) return;
@@ -206,18 +235,22 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
                               sliding ? m.ring_blocks : 0, bidi, uint64_t(K.layer_base(layer_k))};
     std::vector<size_t> cut{0};
     if (split_rk > 0 && !dec && !P.chained && !m.chain_active && M >= 64) {
+      const size_t min_tiles = c.spark ? (min_tgs + size_t(groups) - 1) / size_t(groups) : 0;
       size_t acc = 0;
       for (size_t i = 0; i < A.tiles.size(); ++i) {
         const G4TileRec& tr = A.tiles[i];
-        const size_t w = size_t(8) * (size_t(tr.k1 - tr.k0) + size_t(A.trees[size_t(tr.tree)].M));
-        if (acc > 0 && acc + w > split_rk) cut.push_back(i), acc = 0;
+        const size_t w = size_t(A.rows) * (size_t(tr.k1 - tr.k0) + size_t(A.trees[size_t(tr.tree)].M));
+        if (acc > 0 && acc + w > split_rk && (i - cut.back() >= min_tiles || acc + w > 4 * split_rk))
+          cut.push_back(i), acc = 0;
         acc += w;
       }
     }
     cut.push_back(A.tiles.size());
     for (size_t gi = 0; gi + 1 < cut.size(); ++gi) {
       if (gi > 0) E.flush();
-      E.pipe(dec ? "g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G) : g.kernel);
+      const int rg = A.rows / 8;  // row groups per tile
+      E.pipe(dec ? "g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G)
+                 : rg > 1 ? "g4_attention256_r" + std::to_string(rg) + "_g" + std::to_string(g.G) : g.kernel);
       E.set(0, s.Q);
       E.set(1, s.Kb);
       E.set(2, s.Vb);
@@ -237,7 +270,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       E.wr(s.O);
       if (A.parts) E.wr(P.parts.b, P.parts.off, P.parts.off + P.parts_bytes);
       E.groups(MTLSizeMake(size_t(groups), cut[gi + 1] - cut[gi], 1),
-               MTLSizeMake(size_t(dec ? 32 * (g.hd / 128) * 2 : 32 * (g.hd / 128) * g.Gk), 1, 1));
+               MTLSizeMake(size_t(dec ? 32 * (g.hd / 128) * 2 : 32 * (g.hd / 128) * g.Gk * rg), 1, 1));
     }
     if (!A.combine.empty()) {
       E.pipe(g.combine);
@@ -270,12 +303,14 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
   };
   // GeGLU MLP of `rows` rows: X (fp16) -> act (fp16 [rows, I]) -> T (fp32 [rows, D], stored).
   auto mlp = [&](const Layer& L, id<MTLBuffer> X, id<MTLBuffer> act, id<MTLBuffer> T, int rows) {
+    const int li = layer_index(m, L);
+    tap_rows(m, E, li, 2, X, rows, c.D);  // ActivationSink::kMlpIn
     if (L.gate_up.out() > 0) {
       gemm(E, m.tune, L.gate_up, X, 0, c.D, act, 0, L.I, rows, 2);
     } else {
       gemm(E, m.tune, L.gate, X, 0, c.D, s.g32, 0, L.I, rows, 0);
       gemm(E, m.tune, L.up, X, 0, c.D, s.u32, 0, L.I, rows, 0);
-      E.pipe("geglu_f32");
+      E.pipe(c.spark ? "geglu_erf_f32" : "geglu_f32");
       E.set(0, s.g32);
       E.set(1, s.u32);
       E.set(2, act);
@@ -285,6 +320,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       E.wr(act);
       E.threads(MTLSizeMake(size_t(L.I / 4), size_t(rows), 1), MTLSizeMake(64, 1, 1));
     }
+    tap_rows(m, E, li, 3, act, rows, L.I);  // ActivationSink::kDownIn
     gemm(E, m.tune, L.down, act, 0, L.I, T, 0, c.D, rows, 0);
   };
   // The experts of an MoE layer: router logits -> top-k -> tile table ->
@@ -383,6 +419,18 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     grouped(L.experts_down, z.act, c.Ie, 0, z.ys, c.D, c.D, 0);
   };
 
+  const int sp_nf = c.rot / 2 + c.rot_g / 2;
+  if (c.spark) {  // the RoPE (cos, sin) of every row, once per pass for all 36 layers
+    const int32_t nr[2] = {c.rot / 2, sp_nf};
+    E.pipe("sp_rope_table");
+    E.set(0, P.pos);
+    E.set(1, m.inv_freq);
+    E.set(2, m.inv_freq_g);
+    E.set(3, s.sp_rope);
+    E.bytes(4, nr);
+    E.wr(s.sp_rope);
+    E.threads(MTLSizeMake(size_t(sp_nf), size_t(M), 1), MTLSizeMake(size_t(std::min(sp_nf, 256)), 1, 1));
+  }
   rmsnorm(s.h, m.layers[0].in_norm, s.xn, M);
   for (int li = 0; li < c.L; ++li) {
     const Layer& L = m.layers[size_t(li)];
@@ -391,8 +439,26 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     const int qd = c.H * g.hd, kvd = g.hkv * g.hd, ld = c.g4_ld(sw);
     const bool has_v = sw || !c.k_eq_v;
     const int k = L.index_in_kind;
+    tap_rows(m, E, li, 0, s.xn, M, c.D);  // ActivationSink::kAttnIn
     gemm_runs(E, m.tune, L.in_proj, s.xn, 0, c.D, s.proj, 0, ld, M, 0);
-    {
+    if (c.spark) {
+      const int rot = sw ? c.rot : c.rot_g;
+      const SpPrepParamsHost pp{c.H, g.hkv, ld, qd, qd + kvd, qd, kvd, float(1.0 / std::sqrt(double(g.hd))),
+                                sw ? 0 : c.rot / 2, sp_nf};
+      E.pipe("sp_attn_prep" + std::to_string(rot));
+      E.set(0, s.proj);
+      E.set(1, s.sp_rope);
+      E.rd(s.sp_rope);
+      E.set(3, s.Q);
+      E.set(4, s.Kb);
+      E.set(5, s.Vb);
+      E.bytes(6, pp);
+      E.rd(s.proj);
+      E.wr(s.Q);
+      E.wr(s.Kb);
+      E.wr(s.Vb);
+      E.groups(MTLSizeMake(size_t(c.H + 2 * g.hkv + 3) / 4, size_t(M), 1), MTLSizeMake(128, 1, 1));
+    } else {
       const G4PrepParamsHost pp{c.H, g.hkv, ld, qd, has_v ? qd + kvd : qd, qd, kvd, c.eps};
       E.pipe(sw ? "g4_attn_prep256" : "g4_attn_prep512");
       E.set(0, s.proj);
@@ -412,6 +478,18 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     }
     attention(sw, k);
     kv_save(sw, k);
+    if (c.spark) {  // O *= sigmoid(x g_proj^T) per query head (x: the layer input s.xn)
+      const SpGateParamsHost gp{qd, c.D, g.hd, 0};
+      E.pipe("sp_head_gate");
+      E.set(0, s.O);
+      E.set(1, s.xn);
+      E.set(2, L.head_gate);
+      E.bytes(3, gp);
+      E.rd(s.xn);
+      E.rd(s.O);
+      E.wr(s.O);
+      E.groups(MTLSizeMake(size_t(c.H), size_t(M), 1), MTLSizeMake(256, 1, 1));
+    }
     // The last layer of a pruned pass continues with the rows read out only.
     const bool last = li == c.L - 1 && P.prune;
     int rows = M;
@@ -422,8 +500,22 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       gather(s.h, s.hc, c.D, true);
       rows = N, Ob = s.mixc, Hb = s.hc, Xb = s.xc, Ab = s.actc;
     }
+    tap_rows(m, E, li, 1, Ob, rows, qd);  // ActivationSink::kMixOut
     gemm(E, m.tune, L.out, Ob, 0, qd, s.proj, 0, c.D, rows, 0);
-    {
+    if (c.spark) {  // h += o, x = rmsnorm(h) * post_attention_layernorm
+      const G4NormParamsHost np{c.D, c.eps, 1.0f, 1};
+      E.pipe("sp_add_norm");
+      E.set(0, s.proj);
+      E.set(1, Hb);
+      E.set(2, L.post_norm);
+      E.set(3, Xb);
+      E.bytes(4, np);
+      E.rd(s.proj);
+      E.rd(Hb);
+      E.wr(Hb);
+      E.wr(Xb);
+      E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
+    } else {
       const G4NormParamsHost np{c.D, c.eps, 1.0f, L.moe ? 3 : 1};
       E.pipe("g4_post_attn");
       E.set(0, s.proj);
@@ -448,8 +540,21 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     }
     mlp(L, Xb, Ab, s.proj, rows);
     const bool next = li + 1 < c.L && !last;
-    const Buf& w_next = next ? m.layers[size_t(li + 1)].in_norm : L.post_ffn;
-    if (L.moe) {
+    const Buf& w_next = next ? m.layers[size_t(li + 1)].in_norm : (c.spark ? L.post_norm : L.post_ffn);
+    if (c.spark) {  // h += mlp, x = rmsnorm(h) * the next layer's input_layernorm
+      const G4NormParamsHost np{c.D, c.eps, 1.0f, next ? 1 : 0};
+      E.pipe("sp_add_norm");
+      E.set(0, s.proj);
+      E.set(1, Hb);
+      E.set(2, w_next);
+      E.set(3, s.xn);
+      E.bytes(4, np);
+      E.rd(s.proj);
+      E.rd(Hb);
+      E.wr(Hb);
+      if (next) E.wr(s.xn);
+      E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
+    } else if (L.moe) {
       experts(L, s.g_xn2, s.g_xr, rows);
       MoeScratch& z = m.mz;
       const G4MoeOutParamsHost op{c.D, c.k, c.eps, L.scalar, next ? 1 : 0};
@@ -500,8 +605,15 @@ inline void g4_pipelines(const Model& m, std::vector<std::pair<std::string, int>
   for (const char* k : {"g4_scale_rows", "softcap_rows", "g4_attn_prep256", "g4_attn_prep512", "g4_post_attn", "g4_post_ffn",
                         "g4_attention_combine256", "g4_attention_combine512", "kv_save", "kv_copy_blocks", "geglu_f32"})
     out.push_back({k, 0});
+  if (c.spark) {
+    for (const char* k : {"sp_rope_table", "sp_head_gate", "sp_add_norm", "geglu_erf_f32"}) out.push_back({k, 0});
+    out.push_back({"sp_attn_prep" + std::to_string(c.rot), 0});
+    out.push_back({"sp_attn_prep" + std::to_string(c.rot_g), 0});
+  }
   out.push_back({g4_geom(c, true).kernel, 0});
   out.push_back({g4_geom(c, false).kernel, 0});
+  if (g4_geom(c, true).rt_rows > 8)
+    out.push_back({"g4_attention256_r" + std::to_string(g4_geom(c, true).rt_rows / 8) + "_g" + std::to_string(g4_geom(c, true).G), 0});
   for (bool sliding : {true, false}) {
     const G4Geom g = g4_geom(c, sliding);
     if (g.G <= 8) out.push_back({"g4_attention_dec" + std::to_string(g.hd) + "_g" + std::to_string(g.G), 0});

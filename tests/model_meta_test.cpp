@@ -136,7 +136,7 @@ static void test_family() {
                             "qwen3_5_moe: Qwen3.5, Qwen3.6, Qwen3.8, and finetunes such as Ornith 1.5), "
                             "Qwen3.8-Flash-Next (qwen4_exp), Gemma 4 (gemma4: 31B, 26B-A4B; gemma4_unified: 12B), LFM2 / LFM2-VL "
                             "(lfm2, lfm2_vl: LFM2.5-VL and d1 decision models), DeepSeek-V4.1 (deepseek_v41), GLM-5.3-Flash (glm5_next), "
-                    "MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers"));
+                    "Spark-X2.5 / X2.6 (spark2_5), MiniCPM-OCR (minicpm_ocr) and Cloudflare Clef classifiers"));
   // Other Gemma generations are not Gemma 4.
   CHECK(contains(error_of(dir_with("no_gemma3", "{\"model_type\": \"gemma3\"}")), "model_type 'gemma3' is not supported"));
   for (const char* t : {"qwen3", "qwen3_vl", "qwen3_moe", "llama", "qwen2_5_vl"})

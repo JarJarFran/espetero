@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Francisco José García Barbero
 
-"""Gemma 4 parity of the native engine against mlx-lm.
+"""Gemma 4 (and Spark) parity of the native engine against mlx-lm.
 
   # 1. reference (mlx-lm 0.32): prompts -> greedy generations and teacher-forced rows
   uv run --offline --no-project --with mlx-lm==0.32.0 python tests/ref/gemma4_ref.py ref \\
@@ -101,12 +101,15 @@ def cmd_ref(a):
             margins.append(t[0] - t[1])
         full = given if given else ids + gen[: a.forced]  # reuse: the same teacher-forced ids
         x = mx.array([full])
-        h = lm.model(x)
-        h = h[:, len(ids) - 1:, :]
-        logits = lm.model.embed_tokens.as_linear(h) if lm.tie_word_embeddings else lm.lm_head(h)
-        if lm.final_logit_softcapping is not None:
-            c = lm.final_logit_softcapping
-            logits = mx.tanh(logits / c) * c
+        if hasattr(lm, "final_logit_softcapping"):  # Gemma 4
+            h = lm.model(x)
+            h = h[:, len(ids) - 1:, :]
+            logits = lm.model.embed_tokens.as_linear(h) if lm.tie_word_embeddings else lm.lm_head(h)
+            if lm.final_logit_softcapping is not None:
+                c = lm.final_logit_softcapping
+                logits = mx.tanh(logits / c) * c
+        else:  # any other mlx-lm model (Spark): its own logits
+            logits = lm(x)[:, len(ids) - 1:, :]
         rows = rows_of(logits[0], 64)
         cases.append({"ids": full, "prompt_len": len(ids), "gen": a.gen})
         refs.append({"rows": rows, "gen": gen, "gen_margin": margins, "prompt_len": len(ids)})

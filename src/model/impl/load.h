@@ -11,8 +11,10 @@
 
 #include <dirent.h>
 
+#include "hf_source.h"
 #include "tensors.h"
 #include "model.h"
+#include "tiles.h"
 
 namespace espetero::native {
 
@@ -25,6 +27,10 @@ struct HostMat {
 };
 
 inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std::string& name, int out, int in) {
+  struct HostTimer {  // ESPETERO_LOAD_TRACE=1
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    ~HostTimer() { load_trace().host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); }
+  } host_timer;
   const TensorView t = src.tensor(name);
   HostMat h;
   h.out = out;
@@ -36,13 +42,40 @@ inline HostMat host_mat(Model& m, Arena& tmp, const WeightSource& src, const std
   } else {
     h.q = qw_from_view(tmp, t, out, in);
     m.source_types[t.kind == TensorView::GGUFQuant ? ggml_type_info(t.gguf_type)->name
-                                                    : "mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
+                   : t.kind == TensorView::EQQuant ? "eq" + std::to_string(t.bits) + (t.codebook ? "cb" : "")
+                                                   : "mlx" + std::to_string(t.bits) + "g" + std::to_string(t.group)] += 1;
   }
   return h;
 }
 
 // Dequantize a host QW to fp16 (identical to the GPU's half-precision fma).
 inline Buf dequant_f16(Arena& ar, const QW& q_in) {
+  if (eqc_mode(q_in.scale_mode)) {  // EQ codebooks: half(half(super * sub) * cb[code]), as the GPU's GEMMs
+    const QW& q = q_in;
+    Buf out = ar.alloc(size_t(q.out) * q.in * 2);
+    __fp16* dst = (__fp16*)ptr(out);
+    const uint32_t* codes = (const uint32_t*)ptr(q.w);
+    const int8_t* ss = (const int8_t*)ptr(q.s);
+    const int in = q.in, spr = in / 16, bpr = eq_supers(in);
+    const size_t zrow = q.z_row_bytes() / 2;
+    parallel_for(size_t(q.out), [&](size_t r) {
+      const uint16_t* z = (const uint16_t*)ptr(q.z) + r * zrow;
+      for (int c = 0; c < in; ++c) {
+        uint32_t code;
+        if (q.src_bits == 4) {
+          code = (codes[(r * size_t(in) + c) / 8] >> (4 * (c % 8))) & 0xF;
+        } else {  // EQ3: MLX's little-endian 3-bit stream
+          const uint8_t* rb = (const uint8_t*)codes + r * (size_t(in) * 3 / 8);
+          const size_t bit = size_t(c) * 3;
+          code = ((uint32_t(rb[bit / 8]) | (bit % 8 > 5 ? uint32_t(rb[bit / 8 + 1]) << 8 : 0u)) >> (bit % 8)) & 7u;
+        }
+        const int step = c / 64, t = (c % 8) / 2;
+        const float sc = f16_to_f32(f32_to_f16_bits(f16_to_f32(z[c / 256]) * float(ss[r * spr + step * 4 + t])));
+        dst[r * size_t(in) + c] = __fp16(sc * f16_to_f32(z[bpr + code]));
+      }
+    });
+    return out;
+  }
   const QW q0 = to_affine(ar, q_in);
   const QW q = to_half_scales(ar, q0.src_bits == 4 || q0.src_bits == 8 ? q0 : widen8(ar, q0));
   Buf out = ar.alloc(size_t(q.out) * q.in * 2);
@@ -169,7 +202,8 @@ inline HW densify(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, QW q) {
   d.out = q.out;
   d.in = d.kp = q.in;
   const int Np = (q.out + 31) / 32 * 32;
-  d.wr = m.arena->alloc(size_t(Np) * q.in * 2);
+  d.wr_n = size_t(Np) * q.in * 2;
+  d.wr = m.arena->alloc(d.wr_n);
   const int KG = q.in / 64;
   [e setComputePipelineState:m.kernel("dequant_hr" + std::to_string(q.bits), q.fc())];
   [e setBuffer:q.wr.b offset:q.wr.off atIndex:0];
@@ -183,7 +217,10 @@ inline HW densify(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, QW q) {
   return d;
 }
 
-inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat h, bool dense = false) {
+// key: the matrix's load site, for the tile image being written (tiles.h);
+// EQ3 codes are accepted for routed expert stacks only.
+inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat h, bool dense = false,
+                  const std::string& key = std::string()) {
   Mat out;
   if (h.dense) {
     out.dense = true;
@@ -195,10 +232,15 @@ inline Mat finish(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, HostMat 
     ++m.n_dense;
   } else {
     out.q = h.q;
+    // EQ3 has MoE kernels only (moe_gemv3 / moe_gemv8r3 / moe_down_comb3).
+    auto ends = [&](const char* s) { return key.size() >= std::strlen(s) && key.compare(key.size() - std::strlen(s), std::string::npos, s) == 0; };
+    if (out.q.bits == 3 && !ends("experts_gu") && !ends("experts_down"))
+      fail((key.empty() ? std::string("a matrix") : key) + ": EQ3 codes are for routed expert stacks only (convert it with EQ4 or wider)");
     repack(m, e, out.q, tmp);
     out.q.w = out.q.s = out.q.z = Buf{};  // host staging stays with `tmp`
-    ++(out.q.bits == 4 ? m.n_q4 : out.q.bits == 5 ? m.n_q5 : out.q.bits == 6 ? m.n_q6 : m.n_q8);
+    ++(out.q.bits == 4 ? m.n_q4 : out.q.bits == 5 ? m.n_q5 : out.q.bits == 6 ? m.n_q6 : out.q.bits == 3 ? m.n_q3 : m.n_q8);
   }
+  if (m.tiles) m.tiles->record(key, out);
   return out;
 }
 
@@ -269,6 +311,7 @@ inline void load_embedding(Model& m, Arena& tmp, const WeightSource& src, const 
     std::memcpy(ptr(E.codes), ptr(h), size_t(c.V) * c.D * 2);
     return;
   }
+  if (t.kind == TensorView::EQQuant) fail(name + ": EQ embeddings are not supported (espetero quantize keeps them MLX affine)");
   QW q = to_affine(tmp, qw_from_view(tmp, t, c.V, c.D));  // rows are gathered: affine
   if (q.src_bits != 4 && q.src_bits != 8) q = widen8(tmp, q);
   q = to_half_scales(tmp, q);
@@ -362,6 +405,16 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const
 // switch_mlp tensors [E, out, in], read as [E * out, in]).
 inline void load_experts(Model& m, const WeightSource& src, const std::string& p, Layer& L) {
   const Config& c = m.cfg;
+  if (tiles_reading(m)) {
+    L.router = tile_mat(m, p + "router");
+    L.shared_gate = tile_mat(m, p + "shared_gate");
+    if (m.tiles->has(p + "router_sg")) L.router_sg = m.tiles->mats.at(p + "router_sg");  // (not a counted matrix)
+    m.n_dense_mtp += (L.router.dense ? 1 : 0) + (L.shared_gate.dense ? 1 : 0);
+    L.experts_gu = tile_mat(m, p + "experts_gu").q;
+    L.experts_down = tile_mat(m, p + "experts_down").q;
+    L.moe = true;
+    return;
+  }
   Arena tmp(m.dev);
   HostMat router = host_mat(m, tmp, src, p + "mlp.gate.weight", c.E, c.D);
   HostMat sgate = host_mat(m, tmp, src, p + "mlp.shared_expert_gate.weight", 1, c.D);
@@ -377,29 +430,70 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   HostMat eg = host_mat(m, tmp, src, p + "mlp.switch_mlp.gate_proj.weight", c.E * c.Ie, c.D);
   HostMat eu = host_mat(m, tmp, src, p + "mlp.switch_mlp.up_proj.weight", c.E * c.Ie, c.D);
   HostMat ed = host_mat(m, tmp, src, p + "mlp.switch_mlp.down_proj.weight", c.E * c.D, c.Ie);
-  if (eg.dense || eu.dense || ed.dense) fail("dense expert weights are not supported");
+  // Dense (bf16) experts, as a Hugging Face checkpoint holds them (the
+  // calibration forward of espetero quantize): the grouped expert kernels
+  // read quantized layouts only, so they run as 8-bit group-64 copies
+  // (per-group min/max, ~0.2 % of each group's range).
+  // ESPETERO_EXPERTS_F16=1 keeps them exact instead (fp16, the bf16 values up to
+  // fp16's range): repack_f16's fragment order, read by moe_gemv8r16 (the 8-row
+  // MMA path only: no FMA tiles, no fused down + combine, no shared-expert tile).
+  static const bool experts_f16 = [] {
+    const char* v = std::getenv("ESPETERO_EXPERTS_F16");
+    return v && *v == '1';
+  }();
+  if (experts_f16 && eg.dense && eu.dense && ed.dense) {
+    const HostMat egu = interleave_gate_up(tmp, eg, eu);
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    L.router = finish(m, e, tmp, router, false, p + "router");
+    L.shared_gate = finish(m, e, tmp, sgate, false, p + "shared_gate");
+    m.n_dense_mtp += (L.router.dense ? 1 : 0) + (L.shared_gate.dense ? 1 : 0);
+    auto f16_experts = [&](const HostMat& h) {
+      const HW d = repack_dense(m, e, h.f16, h.out, h.in);
+      QW q;
+      q.out = h.out;
+      q.in = h.in;
+      q.bits = q.src_bits = 16;
+      q.wr = q.sb = d.wr;
+      q.wr_n = d.wr_n;
+      return q;
+    };
+    L.experts_gu = f16_experts(egu);
+    L.experts_down = f16_experts(ed);
+    [e endEncoding];
+    commit_wait(cb);
+    m.moe_fma = false;
+    m.moe_down_comb = false;
+    m.route_in_gemv = false;
+    L.moe = true;
+    return;
+  }
+  if (eg.dense) eg = requant<8>(tmp, eg);
+  if (eu.dense) eu = requant<8>(tmp, eu);
+  if (ed.dense) ed = requant<8>(tmp, ed);
   // Interleaving by 8 rows keeps every expert's 2 * Ie rows together (Ie % 64 == 0).
   const HostMat egu = interleave_gate_up(tmp, eg, eu);
   id<MTLCommandBuffer> cb = [m.queue commandBuffer];
   id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-  L.router = finish(m, e, tmp, router);
-  L.shared_gate = finish(m, e, tmp, sgate);
+  L.router = finish(m, e, tmp, router, false, p + "router");
+  L.shared_gate = finish(m, e, tmp, sgate, false, p + "shared_gate");
   // The multi-row route's single GEMM: the router's rows, then the shared
   // gate's (same codes and scales, so every output is the separate GEMMs').
   const QW& rq = router.q;
   const QW& gq = sgate.q;
   if (!router.dense && !sgate.dense && rq.bits == gq.bits && rq.src_bits == gq.src_bits && rq.group == gq.group &&
-      rq.half_scales == gq.half_scales && rq.scale_mode == gq.scale_mode) {
+      rq.half_scales == gq.half_scales && rq.scale_mode == gq.scale_mode && !eqc_mode(rq.scale_mode)) {  // (EQ codebooks: 8-row groups)
     L.router_sg.q = concat_rows(tmp, {rq, gq});
     repack(m, e, L.router_sg.q, tmp);
     L.router_sg.q.w = L.router_sg.q.s = L.router_sg.q.z = Buf{};
+    if (m.tiles) m.tiles->record(p + "router_sg", L.router_sg);
   }
   // Routers and shared gates read the normalized rows through the route
   // kernels (or plain GEMMs without norm links): a dense one does not block
   // the fused RMSNorm of the decoder GEMVs.
   m.n_dense_mtp += (L.router.dense ? 1 : 0) + (L.shared_gate.dense ? 1 : 0);
-  L.experts_gu = finish(m, e, tmp, egu).q;
-  L.experts_down = finish(m, e, tmp, ed).q;
+  L.experts_gu = finish(m, e, tmp, egu, false, p + "experts_gu").q;
+  L.experts_down = finish(m, e, tmp, ed, false, p + "experts_down").q;
   [e endEncoding];
   commit_wait(cb);
   L.moe = true;
@@ -424,11 +518,16 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   const bool moe = has_mlp && c.E > 0 && src.has(p + "mlp.switch_mlp.gate_proj.weight");
   const std::string mp = moe ? p + "mlp.shared_expert." : p + "mlp.";
   int I = 0;
-  HostMat gate, up, down;
   if (has_mlp) {
     I = moe ? c.I_shared : c.I;
     if (!I) I = int(src.tensor(mp + "gate_proj.weight").rows());
     L.I = I;
+  }
+  // A tile image has this layer's matrices finished: only the small tensors
+  // (norms, convolution taps, gates' parameters) are read below.
+  const bool img = tiles_reading(m);
+  HostMat gate, up, down;
+  if (has_mlp && !img) {
     gate = host_mat(m, tmp, src, mp + "gate_proj.weight", I, c.D);
     up = host_mat(m, tmp, src, mp + "up_proj.weight", I, c.D);
     down = host_mat(m, tmp, src, mp + "down_proj.weight", c.D, I);
@@ -437,23 +536,44 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   HostMat out;
   if (L.linear) {
     const std::string a = p + "linear_attn.";
-    parts = {host_mat(m, tmp, src, a + "in_proj_qkv.weight", c.C(), c.D),
-             host_mat(m, tmp, src, a + "in_proj_z.weight", c.Vd(), c.D),
-             host_mat(m, tmp, src, a + "in_proj_a.weight", c.Hv, c.D),
-             host_mat(m, tmp, src, a + "in_proj_b.weight", c.Hv, c.D)};
-    out = host_mat(m, tmp, src, a + "out_proj.weight", c.D, c.Vd());
+    if (!img) {
+      parts = {host_mat(m, tmp, src, a + "in_proj_qkv.weight", c.C(), c.D),
+               host_mat(m, tmp, src, a + "in_proj_z.weight", c.Vd(), c.D),
+               host_mat(m, tmp, src, a + "in_proj_a.weight", c.Hv, c.D),
+               host_mat(m, tmp, src, a + "in_proj_b.weight", c.Hv, c.D)};
+      out = host_mat(m, tmp, src, a + "out_proj.weight", c.D, c.Vd());
+    }
     L.conv_w = vec(m, src, a + "conv1d.weight", size_t(c.C()) * c.conv_k);
     L.a_log = vec(m, src, a + "A_log", c.Hv);
     L.dt_bias = vec(m, src, a + "dt_bias", c.Hv);
     L.gnorm = vec(m, src, a + "norm.weight", c.Dv);
   } else {
     const std::string a = p + "self_attn.";
-    parts = {host_mat(m, tmp, src, a + "q_proj.weight", c.H * c.HD * 2, c.D),
-             host_mat(m, tmp, src, a + "k_proj.weight", c.kv_dim(), c.D),
-             host_mat(m, tmp, src, a + "v_proj.weight", c.kv_dim(), c.D)};
-    out = host_mat(m, tmp, src, a + "o_proj.weight", c.D, c.H * c.HD);
+    if (!img) {
+      parts = {host_mat(m, tmp, src, a + "q_proj.weight", c.H * c.HD * 2, c.D),
+               host_mat(m, tmp, src, a + "k_proj.weight", c.kv_dim(), c.D),
+               host_mat(m, tmp, src, a + "v_proj.weight", c.kv_dim(), c.D)};
+      out = host_mat(m, tmp, src, a + "o_proj.weight", c.D, c.H * c.HD);
+    }
     L.q_norm = vec(m, src, a + "q_norm.weight", c.HD, norm_add);
     L.k_norm = vec(m, src, a + "k_norm.weight", c.HD, norm_add);
+  }
+  if (img) {
+    if (has_mlp) {
+      if (m.tiles->has(p + "gate_up")) {
+        L.gate_up = tile_mat(m, p + "gate_up");
+      } else {
+        L.gate = tile_mat(m, p + "gate");
+        L.up = tile_mat(m, p + "up");
+        m.split_mlp = true;
+      }
+      L.down = tile_mat(m, p + "down");
+    }
+    L.out = tile_mat(m, p + "out");
+    for (int i = 0; m.tiles->has(p + "in_proj." + std::to_string(i)); ++i)
+      L.in_proj.push_back(tile_mat(m, p + "in_proj." + std::to_string(i)));
+    if (moe) load_experts(m, src, p, L);
+    return L;
   }
   if (requant_bits == 8) {
     if (has_mlp) {
@@ -478,16 +598,17 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   auto dn = [&](const char* k) { return m.dense_mats.count(k) > 0; };
   if (has_mlp) {
     if (same_layout) {
-      L.gate_up = finish(m, e, tmp, gu, dn("gate_up"));
+      L.gate_up = finish(m, e, tmp, gu, dn("gate_up"), p + "gate_up");
     } else {
-      L.gate = finish(m, e, tmp, gate, dn("gate_up"));
-      L.up = finish(m, e, tmp, up, dn("gate_up"));
+      L.gate = finish(m, e, tmp, gate, dn("gate_up"), p + "gate");
+      L.up = finish(m, e, tmp, up, dn("gate_up"), p + "up");
       m.split_mlp = true;
     }
-    L.down = finish(m, e, tmp, down, dn("down"));
+    L.down = finish(m, e, tmp, down, dn("down"), p + "down");
   }
-  L.out = finish(m, e, tmp, out, dn("out"));
-  for (const HostMat& r : runs) L.in_proj.push_back(finish(m, e, tmp, r, dn("in_proj")));
+  L.out = finish(m, e, tmp, out, dn("out"), p + "out");
+  for (size_t i = 0; i < runs.size(); ++i)
+    L.in_proj.push_back(finish(m, e, tmp, runs[i], dn("in_proj"), p + "in_proj." + std::to_string(i)));
   [e endEncoding];
   commit_wait(cb);
   if (moe) load_experts(m, src, p, L);
@@ -508,19 +629,29 @@ inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = fa
     load_embedding(m, tmp, src, pre + "embed_tokens.weight");
     const std::string head = c.tie ? pre + "embed_tokens.weight"
                                    : (src.has("language_model.lm_head.weight") ? "language_model.lm_head.weight" : "lm_head.weight");
-    if (c.tie || src.has(head)) {
+    if (tiles_reading(m)) {
+      if (draft_head && m.mtp.head4) {
+        m.mtp.head = tile_mat(m, "mtp.head4");
+        --m.n_q4;
+      }
+      if (draft_head && m.mtp.coarse_c > 0 && m.tiles->has("mtp.coarse")) {
+        m.mtp.coarse = tile_mat(m, "mtp.coarse");
+        --m.n_q8;
+      }
+      m.lm_head = tile_mat(m, "lm_head");
+    } else if (c.tie || src.has(head)) {
       id<MTLCommandBuffer> cb = [m.queue commandBuffer];
       id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
       const HostMat h = host_mat(m, tmp, src, head, c.V, c.D);
       if (draft_head && m.mtp.head4) {
-        m.mtp.head = finish(m, e, tmp, requant4(tmp, h));
+        m.mtp.head = finish(m, e, tmp, requant4(tmp, h), false, "mtp.head4");
         --m.n_q4;  // not a decoder matrix
       }
       if (draft_head && m.mtp.coarse_c > 0 && !h.dense) {
-        m.mtp.coarse = finish(m, e, tmp, requant<2>(tmp, h));
+        m.mtp.coarse = finish(m, e, tmp, requant<2>(tmp, h), false, "mtp.coarse");
         --m.n_q8;  // not a decoder matrix (finish counts widths without a counter as 8-bit)
       }
-      m.lm_head = finish(m, e, tmp, h);
+      m.lm_head = finish(m, e, tmp, h, false, "lm_head");
       [e endEncoding];
       commit_wait(cb);
     }
@@ -546,13 +677,15 @@ inline void load_mtp(Model& m, const WeightSource& src) {
   T.enorm = vec(m, src, p + "pre_fc_norm_embedding.weight", c.D);
   T.hnorm = vec(m, src, p + "pre_fc_norm_hidden.weight", c.D);
   T.norm = vec(m, src, p + "norm.weight", c.D);
-  {
+  if (tiles_reading(m)) {
+    T.fc = tile_mat(m, "mtp.fc");
+  } else {
     Arena tmp(m.dev);
     HostMat fc = host_mat(m, tmp, src, p + "fc.weight", c.D, 2 * c.D);
     if (T.q8 && fc.dense) fc = requant<8>(tmp, fc);
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    T.fc = finish(m, e, tmp, fc);
+    T.fc = finish(m, e, tmp, fc, false, "mtp.fc");
     [e endEncoding];
     commit_wait(cb);
   }
@@ -614,6 +747,7 @@ namespace espetero::native {
 inline void load_q4(Model& m, const SafetensorsSource& src, bool want_vision, bool draft_head = false);
 inline void load_q4_mtp(Model& m, const std::string& dir);
 inline void load_q4_mtp_own(Model& m, const SafetensorsSource& src);
+inline void load_q4_mtp_eq(Model& m, const SafetensorsSource& src);
 inline void load_q4_mtp_gguf(Model& m, const std::string& file);
 inline void load_q4_gguf(Model& m, const GGUFSource& src);
 
@@ -727,14 +861,27 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
   }
   SafetensorsSource src(path);
   if (const std::string other = family::mlx_check(path, src.config()); !other.empty()) fail(other);
+  if (is_spark_type(src.config().get_string("model_type", ""))) {  // Spark-X2.5 / X2.6: HF, MLX or EQ (model.* names)
+    if (!mtp.empty() && mtp != "none") fail("--mtp: Spark has no drafting head (prompt lookup drafts only)");
+    m.format = src.config().get("quantization") ? "mlx" : "hf";
+    m.cfg = config_from_spark(src.config());
+    load_spark(m, src);
+    return;
+  }
   {  // Gemma 4 (no drafting head), with its vision tower when the checkpoint has one
     const json::Value& cfg = src.config();
     const json::Value* tc = cfg.get("text_config");
     if (is_gemma4_type(cfg.get_string("model_type", "")) ||
         (tc && tc->is_object() && is_gemma4_type(tc->get_string("model_type", "")))) {
       if (!mtp.empty() && mtp != "none") fail("--mtp: Gemma 4 has no drafting head (prompt lookup drafts only)");
-      m.format = "mlx";
       m.cfg = config_from_gemma(cfg);
+      if (HFSource::is_hf_dir(src)) {  // BF16 as transformers writes it (espetero quantize's calibration)
+        HFSource hf(path);
+        m.format = "hf";
+        load_gemma(m, hf);
+        return;
+      }
+      m.format = "mlx";
       load_gemma(m, src);
       if (want_vision && src.has("vision_tower.patch_embedder.input_proj.weight")) {
         const VisionConfig vc = vision_from_gemma(cfg, m.cfg.D);
@@ -766,6 +913,18 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
       return;
     }
   }
+  if (HFSource::is_hf_dir(src)) {
+    // A Hugging Face checkpoint as transformers writes it (BF16): text only,
+    // without its MTP head (espetero quantize's calibration forward; dense
+    // matrices served as fp16, experts as 8-bit copies or, with
+    // ESPETERO_EXPERTS_F16=1, fp16).
+    HFSource hf(path);
+    m.format = "hf";
+    m.cfg = config_from_mlx(hf.config());
+    if (m.cfg.q4) fail(path + ": Hugging Face checkpoints of this family are not supported (convert it first)");
+    load_decoder(m, hf, false);
+    return;
+  }
   if (is_minicpm_type(src.config().get_string("model_type", ""))) {  // MiniCPM-OCR (minicpm_load.h): no drafting head
     if (!mtp.empty() && mtp != "none") fail("--mtp: MiniCPM-OCR has no MTP head (prompt lookup drafts only)");
     m.format = "mlx";
@@ -782,20 +941,27 @@ inline void load_qwen35(Model& m, const std::string& path, bool want_vision, std
     // Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16; --mtp own, the file's own
     // mtp.* head (the oQ4e file carries one, 4-bit); by default a drafter
     // directory beside the model whose config says qwen4_exp_mtp, else the
-    // file's own head when it has one.
-    const std::string dir = mtp == "own" ? "" : mtp.empty() ? find_q4_drafter(path) : mtp;
-    const bool own = mtp == "own" || (mtp.empty() && dir.empty() && src.has("mtp.fc_embedding.weight"));
+    // file's own head when it has one. An EQ checkpoint (espetero quantize)
+    // drafts with its own mtp.* head by default.
+    const bool eq_own = mtp.empty() && src.config().get("eq_format") && src.has("mtp.fc_embedding.weight");
+    const std::string dir = mtp == "own" || eq_own ? "" : mtp.empty() ? find_q4_drafter(path) : mtp;
+    const bool own = mtp == "own" || eq_own || (mtp.empty() && dir.empty() && src.has("mtp.fc_embedding.weight"));
     const bool drafting = own || (!dir.empty() && dir != "none");
     load_q4(m, src, want_vision, drafting && (m.mtp.head4 || m.mtp.coarse_c > 0));
-    if (own) load_q4_mtp_own(m, src);
+    if (eq_own) load_q4_mtp_eq(m, src);
+    else if (own) load_q4_mtp_own(m, src);
     else if (drafting) load_q4_mtp(m, dir);
     return;
   }
   const bool own = mtp.empty() && src.has("language_model.mtp.fc.weight");
   const bool other = mtp != "none" && !mtp.empty();
+  // The checkpoint's tile image (tiles.h): read when it matches, written
+  // with ESPETERO_TILES=write. An external MTP head stays a normal load.
+  if (!other) m.tiles = open_tiles(m, path);
   load_decoder(m, src, (m.mtp.head4 || m.mtp.coarse_c > 0) && (own || other));
   if (own) load_mtp(m, src);
   else if (other) external_mtp(mtp);
+  save_tiles(m);
   if (want_vision && (src.has("vision_tower.patch_embed.proj.weight") || src.has("backbone.visual.patch_embed.proj.weight"))) {
     const VisionConfig vc = vision_from_mlx(src.config());
     if (vc.present)

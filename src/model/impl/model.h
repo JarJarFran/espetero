@@ -28,6 +28,10 @@
 #include <unordered_map>
 
 #include "config.h"
+
+namespace espetero {
+class ActivationSink;
+}
 #include "gemm.h"
 
 namespace espetero::native {
@@ -61,11 +65,21 @@ struct Layer {
   // gates of one layout only; empty otherwise).
   Mat router_sg;
   QW experts_gu, experts_down;
+  // EQV experts (vector-quantized, Qwen4-Exp route B): these instead of experts_gu / experts_down.
+  bool vq = false;
+  VQW vq_gu, vq_down;
+  // Two expert formats in one layer (espetero quantize --expert-split): experts [0, xsplit) are the
+  // stacks above (experts_gu / experts_down, or vq_gu / vq_down), [xsplit, E) these EQV stacks
+  // (mlp.switch_mlp_b.*). moe_sort gives each stack its own tile table. 0: one stack.
+  int xsplit = 0;
+  VQW xb_gu, xb_down;
+  int E = 0;  // this layer's routed experts when fewer than the config's (pruned per layer), else 0
   // Gated DeltaNet: in_proj = [qkv; z; a; b]; full attention: [q|gate; k; v].
   std::vector<Mat> in_proj;
   Mat out;
   Buf conv_w, a_log, dt_bias, gnorm;
   Buf q_norm, k_norm;
+  Buf head_gate;  // Spark: g_proj, fp16 [H][D] row-major (sp_head_gate computes its dots)
   int index_in_kind = 0;  // index among full or linear layers
   // Qwen4-Exp: the two hyper-connection blocks (token mixer, MoE) and the
   // sparse-attention indexer ([q 4 x 128 | k 128] rows, zero-centred norms + 1).
@@ -91,13 +105,15 @@ struct Layer {
 // when mapping fails); the table is not copied into memory, but a background
 // reader can warm the file cache with it (ensure_ngram_preload).
 struct NgramTable {
-  struct Shard { int file = -1; uint64_t w = 0, s = 0, b = 0; };
+  // file: of the codes; fs / fb: of the scales / biases (the same file in oQ4e,
+  // possibly the next one in espetero quantize output, whose shards split by size).
+  struct Shard { int file = -1, fs = -1, fb = -1; uint64_t w = 0, s = 0, b = 0; };
   std::vector<std::string> files;
   std::vector<int> fds;
   std::vector<const uint8_t*> maps;  // per file: its whole mapping, or nullptr (never unmapped)
   std::vector<Shard> shards;
   int64_t shard_rows = 0, rows = 0;
-  int width = 160, group = 32;
+  int width = 160, group = 32, bits = 4;  // MLX affine 4-bit (oQ4e) or 8-bit (espetero quantize --ple-bits 8)
   float scale = 1.0f;
   // 0: MLX 4-bit affine shards (codes, bf16 scales, bf16 biases); 1: one GGUF
   // IQ4_NL tensor (rows of width / 32 blocks: fp16 d + 16 bytes of codebook
@@ -413,6 +429,7 @@ struct StatePool {
 struct MoeScratch {
   int rows = 0;
   id<MTLBuffer> logits, ids, w, counts, fill, offsets, tiles, ntiles, rowmap, slotpos;
+  id<MTLBuffer> tiles_b, ntiles_b;  // the second expert stack's tile table and indirect arguments (Layer::xsplit)
   id<MTLBuffer> act, ys, shared, sgate;
   id<MTLBuffer> cparts, cctr;  // combine: per-row partial sums of squares and arrival counters
   id<MTLBuffer> rparts, rctr;  // parallel route: per-row slice partial logits and arrival counters
@@ -424,6 +441,7 @@ struct Scratch {
   id<MTLBuffer> g_xn2, g_xr;           // Gemma 4 MoE layers: the experts' and the router's normalized rows (fp16 [rows, D])
   id<MTLBuffer> tokens, h, xn, proj, qo, gb, y, yn;
   id<MTLBuffer> Q, Kb, Vb, O, act;
+  id<MTLBuffer> sp_rope;  // Spark: (cos, sin) of every row's RoPE angles, both layer kinds ([rows][rot / 2 + rot_g / 2])
   id<MTLBuffer> hc, xc, mixc, actc;  // last-layer rows actually scored
   id<MTLBuffer> g32, u32;            // split gate/up outputs (fp32 [rows, I])
   id<MTLBuffer> hn, logits, lse, argmax, cand_out;
@@ -432,6 +450,8 @@ struct Scratch {
   int hid_rows = 0;
   int tk_k = 0;  // K of the last pass's top-k (0: none)
 };
+
+struct TileImage;  // tiles.h
 
 struct Model : Runtime {
   Config cfg;
@@ -582,6 +602,20 @@ struct Model : Runtime {
   bool moe_fma = true;       // MoE: 1-2-row expert tiles use the FMA GEMV instead of the 8-row MMA one
   int moe_fma_rows = 2;      // MoE: largest pass (rows) whose expert tiles use the FMA GEMV (1-2; 3-4 measured slower)
   bool moe_down_comb = true; // single-row MoE: down projection and combine in one kernel
+  bool moe_down_comb_tune = false;  // ... or chosen at load per device and model (tune_moe_down): ESPETERO_MOE_DOWN_TUNE=1
+  // Calibration taps (NativeModel::set_activation_sink): the decoder
+  // matrices' inputs copied into tap_buf during a pass (tap_rows, forest.h),
+  // handed to the sink once the pass is done.
+  struct TapRec {
+    int layer = 0, kind = 0, n = 0, width = 0, k = 0;
+    size_t off = 0, ids_off = 0, pos_off = 0, w_off = 0;
+    bool has_w = false;  // kExpertIn: w_off holds the pairs' routing weights
+  };
+  espetero::ActivationSink* tap_sink = nullptr;
+  bool tap_pass = false;  // this pass copies
+  id<MTLBuffer> tap_buf = nil;
+  size_t tap_cap = 0, tap_used = 0;
+  std::vector<TapRec> tap_recs;
   int moe_comb_ks = 1;       // ... K slices per slot (1 or 2; 1 measured faster)
   // Fase 3 (bit-identical variants of the single-row MoE kernels):
   // moe_fin: moe_down_comb's fused-norm finalizer 0 the last arriver reading the 64 block
@@ -676,11 +710,13 @@ struct Model : Runtime {
   int attn_split = 512;      // cached keys per split-K tile (0: never split)
   int attn_min_chunk = 32;   // ... and at least this many per tile (a short context then runs unsplit, no combine). "attn_min_chunk"
   bool qsa = true;           // Qwen4-Exp: sparse attention past 2051 visible tokens (false: dense, the approximation before)
-  int n_q4 = 0, n_q5 = 0, n_q6 = 0, n_q8 = 0, n_dense = 0;
+  int n_q3 = 0, n_q4 = 0, n_q5 = 0, n_q6 = 0, n_q8 = 0, n_dense = 0;
   int n_dense_mtp = 0;       // dense matrices that never take a fused-norm link (the MTP layer's, MoE routers and shared gates)
   bool split_mlp = false;
   std::map<std::string, int> source_types;
   size_t weight_bytes = 0;
+  std::string build_id;               // this build (kernels + host code): tile images are valid for it only
+  std::shared_ptr<TileImage> tiles;   // the checkpoint's tile image (tiles.h), while it loads and maps it
 
   // ---------------------------------------------------------------- KV
   int kv_free() const { return int(kv.free_list.size()); }

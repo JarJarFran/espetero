@@ -128,6 +128,8 @@ template [[host_name("g4_attn_prep512")]] kernel void g4_attn_prep<512>(
 // With p.bidi an image's soft-token rows also see the image's later rows
 // (desc.w: the end of the row's image, 0 outside images): Gemma 4's
 // bidirectional attention within an image, AND-ed with the window.
+// RG > 1: RG groups of 8 rows per tile (unsplit tiles only), whose
+// simdgroups share each K / V block (Spark prompt passes).
 // ---------------------------------------------------------------------------
 struct G4AttnParams {
   int H;      // query heads
@@ -152,7 +154,7 @@ struct G4Tile {
   int pad;
 };
 
-template <int HD, int G, int SPLIT>
+template <int HD, int G, int SPLIT, int RG = 1>
 kernel void g4_attention(
     device const half* Q [[buffer(0)]],
     device const half* Kb [[buffer(1)]],
@@ -171,32 +173,33 @@ kernel void g4_attention(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr int NSG = HD / 128;           // simdgroups per query head
-  constexpr int NT = 32 * NSG * G;
+  constexpr int NT = 32 * NSG * G * RG;
   constexpr int BK = HD == 256 ? 16 : 8;  // keys per block: 2 x BK x (HD + 8) halves of threadgroup memory
   constexpr int KF = BK / 8;
   constexpr int LD = HD + 8;
   constexpr int C8 = HD / 8;              // uint4 columns of a key row
   threadgroup half Kt[BK * LD];
   threadgroup half Vt[BK * LD];
-  threadgroup float xs[NSG * G][8][BK];
+  threadgroup float xs[NSG * G * RG][8][BK];
 
   const int kvg = int(tgid.x);
   const int kvr = kvg / SPLIT;  // cached KV head
   const G4Tile tile = tiles[tgid.y];
   const AttnTree tree = trees[tile.tree];
-  const int hg = int(sg) / NSG;
+  const int rg = int(sg) / (NSG * G);  // row group
+  const int hg = int(sg) % (NSG * G) / NSG;
   const int dh = int(sg) % NSG;
   const int h = kvg * G + hg;
   const short qid = lane / 4;
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
   const int end = tree.base + tree.M;
-  const int row = tile.r0 + fm;
+  const int row = tile.r0 + rg * 8 + fm;
   const bool row_ok = row < end;
   const int rr = row - tree.base;
   const int4 d = desc[min(row, end - 1)];
   const int qpos = pos[min(row, end - 1)].x;
-  const int r_last = min(tile.r0 + 7, end - 1) - tree.base;
+  const int r_last = min(tile.r0 + 8 * RG - 1, end - 1) - tree.base;
 
   simdgroup_matrix<half, 8, 8> qf[16];
   {
@@ -275,7 +278,7 @@ kernel void g4_attention(
       UNROLL for (int e = 0; e < 2; ++e) {
         const int kc = kf * 8 + fn + e;
         float v = 0.0f;
-        UNROLL for (int o = 0; o < NSG; ++o) v += xs[hg * NSG + o][fm][kc];  // same order in every simdgroup
+        UNROLL for (int o = 0; o < NSG; ++o) v += xs[(rg * G + hg) * NSG + o][fm][kc];  // same order in every simdgroup
         const int j = j0 + kc;
         bool vis = row_ok && j < j_end;
         if (!in_slot) vis = vis && ((j < d.z) || (j >= d.x && (j <= rr || (p.bidi && j < d.w))));
@@ -338,8 +341,8 @@ kernel void g4_attention(
         half2(half(of[df].thread_elements()[0] * inv_l), half(of[df].thread_elements()[1] * inv_l));
 }
 
-#define INSTANTIATE_G4A(NAME, HD, G, SPLIT)                                                            \
-  template [[host_name(NAME)]] kernel void g4_attention<HD, G, SPLIT>(                                 \
+#define INSTANTIATE_G4A(NAME, HD, G, SPLIT, ...)                                                       \
+  template [[host_name(NAME)]] kernel void g4_attention<HD, G, SPLIT, ##__VA_ARGS__>(                  \
       device const half*, device const half*, device const half*, device const half*, device const int*, \
       device const int4*, device const int4*, device half*, constant G4AttnParams&, device const G4Tile*, \
       device const AttnTree*, device float*, uint2, uint, uint, uint);
@@ -353,6 +356,8 @@ INSTANTIATE_G4A("g4_attention512_s1", 512, 2, 1)
 INSTANTIATE_G4A("g4_attention512_s2", 512, 2, 2)
 INSTANTIATE_G4A("g4_attention512_s4", 512, 2, 4)
 INSTANTIATE_G4A("g4_attention512_s8", 512, 2, 8)
+// Spark prompt passes: 16-row tiles (512 threads).
+INSTANTIATE_G4A("g4_attention256_r2_g4", 256, 4, 1, 2)
 
 // Decode attention of a Gemma 4 layer for passes whose trees are single rows:
 // attn_decode_gqa (40_attention) with HD / 128 simdgroups per key slice

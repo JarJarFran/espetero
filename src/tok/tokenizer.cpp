@@ -296,15 +296,22 @@ std::unique_ptr<Tokenizer::Impl> build(BuildInput&& in) {
       v->erase(std::unique(v->begin(), v->end()), v->end());
     }
   } else {
-    // Byte tokens: every byte must have a single-character token.
+    // Byte tokens: every byte must have a single-character token, except the
+    // bytes that never occur in UTF-8 (C0, C1, F5-FF: DeepSeek-V3-style
+    // vocabularies such as Spark's leave them out); invalid input bytes
+    // without a token encode as '?'.
     const ByteLevelMap& bl = byte_level();
     for (int b = 0; b < 256; ++b) {
       std::string s;
       append_utf8(s, bl.byte_to_cp[b]);
       const int32_t id = t.vocab_find(s);
-      if (id < 0) throw std::runtime_error("tokenizer: vocabulary lacks the byte-level token for byte " + std::to_string(b));
+      const bool never_utf8 = b == 0xC0 || b == 0xC1 || b >= 0xF5;
+      if (id < 0 && !never_utf8)
+        throw std::runtime_error("tokenizer: vocabulary lacks the byte-level token for byte " + std::to_string(b));
       t.byte_id[b] = id;
     }
+    for (int b = 0; b < 256; ++b)
+      if (t.byte_id[b] < 0) t.byte_id[b] = t.byte_id[int('?')];
   }
 
   // Merges: resolve texts to ids; the merged token is the concatenation.

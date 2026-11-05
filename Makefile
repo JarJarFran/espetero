@@ -51,6 +51,15 @@ $(BUILD)/batch_kld: tests/batch_kld.mm $(BUILD)/model.o $(BUILD)/json.o
 $(BUILD)/bench_native: tests/bench_native.mm $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
 
+# Final-normed hidden states over a KLD harness reference's windows
+# (kld_harness.py eval --fmt espetero:...).
+$(BUILD)/kld_dump: tests/kld_dump.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
+# A checkpoint's tile image (src/model/impl/tiles.h).
+$(BUILD)/espetero_tiles: tests/tiles.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 # ---- modules (plain C++ unless noted)
 TOK_SRC    := $(wildcard src/tok/*.cpp)
 TMPL_SRC   := $(wildcard src/tmpl/*.cpp)
@@ -59,10 +68,12 @@ VISION_SRC := $(wildcard src/vision/*.cpp)
 VISION_MM  := $(wildcard src/vision/*.mm)
 ENGINE_SRC := $(wildcard src/engine/*.cpp)
 SERVER_SRC := $(wildcard src/server/*.cpp)
+QUANT_SRC  := $(wildcard src/quant/*.cpp)
+QUANT_MM   := $(wildcard src/quant/*.mm)
 SERVER_MM  := $(wildcard src/server/*.mm)
 
-OBJS := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC) $(HTTP_SRC) $(VISION_SRC) $(ENGINE_SRC) $(SERVER_SRC)) \
-        $(patsubst src/%.mm,$(BUILD)/obj/%.o,$(VISION_MM) $(SERVER_MM))
+OBJS := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(TOK_SRC) $(TMPL_SRC) $(HTTP_SRC) $(VISION_SRC) $(ENGINE_SRC) $(QUANT_SRC) $(SERVER_SRC)) \
+        $(patsubst src/%.mm,$(BUILD)/obj/%.o,$(VISION_MM) $(SERVER_MM) $(QUANT_MM))
 
 $(BUILD)/obj/%.o: src/%.cpp
 	@mkdir -p $(dir $@)

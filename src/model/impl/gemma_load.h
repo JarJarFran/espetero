@@ -39,10 +39,11 @@ inline HostMat select_rows(Arena& tmp, const HostMat& h, int blocks, int stride,
   return o;
 }
 
-// A gate/up matrix of a GeGLU MLP: the gated epilogues apply the tanh GELU.
-inline void set_gelu_gate(Mat& w) {
-  if (w.dense) w.d.act = 1;
-  else w.q.act = 1;
+// A gate/up matrix of a GeGLU MLP: the gated epilogues apply the tanh GELU
+// (act 1, Gemma 4) or the exact GELU (act 2, Spark).
+inline void set_gelu_gate(Mat& w, int act = 1) {
+  if (w.dense) w.d.act = act;
+  else w.q.act = act;
 }
 
 // One decoder layer (prefix `p`, e.g. "language_model.model.layers.3.").
@@ -286,6 +287,87 @@ inline void load_gemma_unified_vision(Model& m, const WeightSource& src, VisionC
   // transformers' Gemma4UnifiedModel builds its masks (and llama.cpp
   // decodes gemma4uv images); ESPETERO_G4_BIDI still overrides it.
   m.g4_bidi = 2;
+}
+
+// Spark-X2.5 / X2.6 (spark2_5): one decoder layer (prefix `p`, e.g.
+// "model.layers.3."): the fused q_k_v_proj, g_proj (H gate rows, kept fp16
+// for sp_head_gate: a GEMM dispatch of 16 rows cost more than its dots),
+// out_proj, the GeGLU MLP and two RMSNorms.
+inline Layer load_sp_layer(Model& m, const WeightSource& src, const std::string& p, int li, int index_in_kind) {
+  const Config& c = m.cfg;
+  Layer L;
+  L.linear = false;
+  L.swa = c.swa[size_t(li)];
+  L.index_in_kind = index_in_kind;
+  L.in_norm = vec(m, src, p + "input_layernorm.weight", c.D);
+  L.post_norm = vec(m, src, p + "post_attention_layernorm.weight", c.D);
+  Arena tmp(m.dev);
+  const std::string a = p + "self_attn.";
+  const std::vector<HostMat> parts = {host_mat(m, tmp, src, a + "q_k_v_proj.weight", c.H * c.HD + 2 * c.kv_dim(), c.D)};
+  {
+    const TensorView g = src.tensor(a + "g_proj.weight");
+    if (g.kind != TensorView::Dense) fail(a + "g_proj.weight: expected unquantized gates (mlx-lm and EQ keep them)");
+    Buf h = f16_from_view(tmp, g, c.H, c.D);
+    L.head_gate = m.arena->copy(ptr(h), size_t(c.H) * size_t(c.D) * 2);
+  }
+  HostMat out = host_mat(m, tmp, src, a + "out_proj.weight", c.D, c.H * c.HD);
+  L.I = c.I;
+  HostMat gate = host_mat(m, tmp, src, p + "mlp.gate_proj.weight", c.I, c.D);
+  HostMat up = host_mat(m, tmp, src, p + "mlp.up_proj.weight", c.I, c.D);
+  HostMat down = host_mat(m, tmp, src, p + "mlp.down_proj.weight", c.D, c.I);
+  const bool same_layout = gate.dense || up.dense ||
+                           (gate.q.bits == up.q.bits && gate.q.src_bits == up.q.src_bits &&
+                            gate.q.scale_mode == up.q.scale_mode && gate.q.group == up.q.group &&
+                            gate.q.half_scales == up.q.half_scales);
+  const HostMat gu = same_layout ? interleave_gate_up(tmp, gate, up) : HostMat{};
+  const std::vector<HostMat> runs = fuse(tmp, parts);
+  id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+  id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+  auto dn = [&](const char* k) { return m.dense_mats.count(k) > 0; };
+  if (same_layout) {
+    L.gate_up = finish(m, e, tmp, gu, dn("gate_up"));
+    set_gelu_gate(L.gate_up, 2);
+  } else {
+    L.gate = finish(m, e, tmp, gate, dn("gate_up"));
+    L.up = finish(m, e, tmp, up, dn("gate_up"));
+    m.split_mlp = true;
+  }
+  L.down = finish(m, e, tmp, down, dn("down"));
+  L.out = finish(m, e, tmp, out, dn("out"));
+  for (const HostMat& r : runs) L.in_proj.push_back(finish(m, e, tmp, r, dn("in_proj")));
+  [e endEncoding];
+  commit_wait(cb);
+  return L;
+}
+
+// Spark checkpoints: Hugging Face (BF16, the names mlx-lm keeps), MLX
+// conversions (mlx-lm's spark2_5) and EQ checkpoints, all named model.*.
+// RoPE (nn.RoPE, traditional false): pairs (d, d + rot / 2) of the first
+// rot dims at theta^(-2d / rot), per layer kind.
+inline void load_spark(Model& m, const WeightSource& src) {
+  Config& c = m.cfg;
+  c.validate();
+  if (!src.has("model.embedding.weight")) fail("expected a Spark checkpoint (model.embedding.weight)");
+  {
+    Arena tmp(m.dev);
+    load_embedding(m, tmp, src, "model.embedding.weight");
+    id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    m.lm_head = finish(m, e, tmp, host_mat(m, tmp, src, c.tie ? "model.embedding.weight" : "lm_head.weight", c.V, c.D));
+    [e endEncoding];
+    commit_wait(cb);
+  }
+  m.final_norm = vec(m, src, "model.norm.weight", c.D);
+  int nf = 0, ns = 0;
+  for (int i = 0; i < c.L; ++i)
+    m.layers.push_back(load_sp_layer(m, src, "model.layers." + std::to_string(i) + ".", i, c.swa[size_t(i)] ? ns++ : nf++));
+  auto table = [&](int rot, double theta) {
+    std::vector<float> f(size_t(rot / 2));
+    for (int i = 0; i < rot / 2; ++i) f[size_t(i)] = float(1.0 / std::pow(theta, double(2 * i) / double(rot)));
+    return m.arena->copy(f.data(), f.size() * 4);
+  };
+  m.inv_freq = table(c.rot, c.theta);
+  m.inv_freq_g = table(c.rot_g, c.theta_g);
 }
 
 inline void load_gemma(Model& m, const WeightSource& src) {

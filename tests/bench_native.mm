@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
   std::vector<int> lab_v;
   int max_ctx = 8192;            // --max-ctx N: tokens per sequence (the KV pool holds 4 GB, or 2 contexts of N)
   int long_seqs = 1;             // --long-seqs N: N sequences of the --long contexts decoded together
+  double kv_gb = 0;              // --kv-gb G: the KV pool size (default: room for long_seqs + 1 contexts at 72 KB a token)
   std::vector<int> vrows;        // --verify-rows 1,2,4,6: MTP verify passes of R rows (1 root + R - 1 chain leaves) and their commits
   int vr_iters = 16;             // --vr-iters N: timed rounds of --verify-rows (every R once per round)
   const char* mtp_path = nullptr;  // --mtp PATH|none: the MTP head (LoadOptions::mtp)
@@ -86,6 +87,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--long-ab") && i + 2 < argc) lab = argv[++i], lab_v = parse_list(argv[++i]);
     else if (!std::strcmp(argv[i], "--max-ctx") && i + 1 < argc) max_ctx = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--long-seqs") && i + 1 < argc) long_seqs = std::max(1, std::atoi(argv[++i]));
+    else if (!std::strcmp(argv[i], "--kv-gb") && i + 1 < argc) kv_gb = std::atof(argv[++i]);
     else if (!std::strcmp(argv[i], "--verify-rows") && i + 1 < argc) vrows = parse_list(argv[++i]);
     else if (!std::strcmp(argv[i], "--vr-iters") && i + 1 < argc) vr_iters = std::max(3, std::atoi(argv[++i]));
     else if (!std::strcmp(argv[i], "--mtp") && i + 1 < argc) mtp_path = argv[++i];
@@ -99,7 +101,7 @@ int main(int argc, char** argv) {
   if (xcache_gb != -1) o.expert_cache_gb = xcache_gb;  // --xcache: the expert cache is sized at load
   o.max_ctx = max_ctx;
   if (mtp_path) o.mtp = mtp_path;
-  o.kv_gb = std::max(4.0, (long_seqs + 1.0) * max_ctx * 72e3 / 1e9);
+  o.kv_gb = kv_gb > 0 ? kv_gb : std::max(4.0, (long_seqs + 1.0) * max_ctx * 72e3 / 1e9);
   auto m = NativeModel::load(argv[1], o);
   const ModelInfo& I = m->info();
   std::printf("# %s  %s  layers %d  vocab %d  mtp %d  load %.0f ms (tune %.0f)  boundary %.2f us (family %d%s)\n", argv[1],
@@ -768,10 +770,12 @@ int main(int argc, char** argv) {
     };
     for (int P : longs) {
       std::vector<int> slots;
+      double prefill_ms = 0;
       for (int q = 0; q < long_seqs; ++q) {
         const int s = m->slot_alloc();
         slots.push_back(s);
         auto r = toks(P);
+        const auto tp = Clock::now();
         for (int at = 0; at < P;) {
           const int n = std::min({2048, I.max_rows, P - at});
           TreeSpec t;
@@ -782,7 +786,10 @@ int main(int argc, char** argv) {
           m->run({t});
           at += n;
         }
+        if (q == 0) prefill_ms = ms_since(tp);
       }
+      std::printf("P %6d: prefill %.0f ms (%.1f tok/s, passes of %d rows)\n", P, prefill_ms, 1000.0 * P / prefill_ms,
+                  std::min(2048, I.max_rows));
       std::vector<int32_t> tok(slots.size(), 11), arg(slots.size(), 0);
       auto step = [&](double* wall) {
         std::vector<TreeSpec> ts;

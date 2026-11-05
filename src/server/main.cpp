@@ -36,6 +36,7 @@
 #include "../engine/chat.h"
 #include "../engine/engine.h"
 #include "../http/http.h"
+#include "../quant/quantize.h"
 #include "../tok/tokenizer.h"
 #include "../vision/vision.h"
 #include "api.h"
@@ -1134,6 +1135,14 @@ int cmd_service(const Args& a) {
 
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
+  if (argc > 1 && std::strcmp(argv[1], "quantize") == 0) {  // its own options (src/quant/quantize.cpp)
+    try {
+      return quant::cmd_quantize(argc - 2, argv + 2);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   Args cli = parse(argc, argv);
   if (cli.has("version") || cli.cmd == "--version" || cli.cmd == "version") {
     std::printf("%s %s\n", kProduct, kVersion);

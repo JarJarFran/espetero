@@ -67,7 +67,8 @@ struct ModelInfo {
   bool leaves = true;  // multi-branch passes (draft leaves, decision trees)
   bool prompt_lookup = true;  // the engine may verify prompt-lookup drafts as leaves
   bool commit = false;  // verify-commit: TreeSpec::commit_chain + NativeModel::commit
-  bool hidden_states = true;  // TreeSpec::out_hidden readouts (not Qwen4-Exp yet)
+  bool hidden_states = true;  // the engine's hidden-state readouts (embeddings, heads; not Qwen4-Exp yet)
+  bool hidden_rows = true;     // TreeSpec::out_hidden of every row (Qwen4-Exp too: the final mixer's output)
   bool chunk_prefill = true;  // prompts may go in chunks while others decode (false: a pass reads its experts once)
   int draft_default = 0;  // MTP drafts per pass when --draft is not given (0: the engine's default, 5)
   std::string family = "qwen3_5";  // "qwen3_5" (also qwen3_5_moe, qwen4_exp), "gemma4" or "lfm2" (also lfm2_vl)
@@ -216,6 +217,34 @@ struct CommitRequest {
   int n = 0;
 };
 
+// Calibration (espetero quantize): the inputs of the decoder's matrices as
+// the engine computed them (fp16), handed over after each pass. One call per
+// (layer, kind) of the Qwen3.5-family layers:
+//   kAttnIn    [rows][D]   input of in_proj (linear attention) or q/k/v
+//   kMixOut    [rows][W]   input of out_proj / o_proj
+//   kMlpIn     [rows][D]   input of the MLP: gate/up, or router, shared expert,
+//                          shared gate and experts' gate/up
+//   kDownIn    [rows][I]   input of a dense MLP's or the shared expert's down_proj
+//   kExpertIn  [pairs][Ie] input of the experts' down_proj, rows in sorted
+//                          order: pair p = row * k + j routes to expert ids[p]
+//                          and its row is pos[p]
+// Taps are on for passes with more than 8 rows and plain (unfused) kernels,
+// as prefill passes of a dense checkpoint run.
+class ActivationSink {
+ public:
+  enum Kind { kAttnIn = 0, kMixOut = 1, kMlpIn = 2, kDownIn = 3, kExpertIn = 4,
+              // Qwen4-Exp: the hyper-connection blocks' normed streams and low-rank
+              // activations (attention block 5 / 6, MLP block 7 / 8; layer = the layer
+              // count for the final mixer, kinds 5 / 6) and the n-gram rows (9)
+              kHcAttnN = 5, kHcAttnLow = 6, kHcMlpN = 7, kHcMlpLow = 8, kPleIn = 9 };
+  virtual ~ActivationSink() = default;
+  virtual void tap(int layer, int kind, const uint16_t* rows, int n, int width, const int32_t* ids,
+                   const int32_t* pos, int k) = 0;
+  // Before a layer's kExpertIn tap: the routing weight of each pair p = row * k + j (the
+  // normalized top-k probabilities the MoE combine applies), float [pairs].
+  virtual void tap_route_weights(int layer, const float* w, int pairs) { (void)layer, (void)w, (void)pairs; }
+};
+
 class NativeModel {
  public:
   static std::unique_ptr<NativeModel> load(const std::string& path, const LoadOptions& options);
@@ -289,6 +318,9 @@ class NativeModel {
   // Development: internal micro-benchmarks by name ("gap": dispatch-gap
   // characterization); returns JSON.
   virtual std::string bench_json(const std::string& what) = 0;
+  // Calibration: deliver the matrix inputs of every later pass to `sink`
+  // (nullptr: off). Qwen3.5-family and dense Gemma 4 models only; throws otherwise.
+  virtual void set_activation_sink(ActivationSink* sink) = 0;
 };
 
 }  // namespace espetero

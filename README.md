@@ -72,6 +72,34 @@ Same protocol as above (greedy, thinking off, 16 parallel slots, 40K context, no
 ³ The mlx-community file has no MTP head; `--mtp` borrows the one unsloth ships for the GGUF. Flash-Next drafts with the oQ4e file's own 4-bit MTP head.
 ⁴ DeepSeek-V4.1 (measured with 0.1.2's code on 2026-10-21) runs with 6 sequence slots (its state is a slot of its own), so *8 users* queue: 6 at a time. Its first token includes the experts a new prompt reads from the SSD.
 
+## EQ formats
+
+Espetero has a quantization format of its own, **EQ** ([docs/eq.md](docs/eq.md)): 3-, 4-, 5-, 6- and 8-bit codes with an int8 scale per 16 inputs and an fp16 scale per 256, the 16 inputs of a scale chosen so that each GPU lane needs one scale per step, and optional 16- or 8-entry codebooks. `espetero quantize` converts a Hugging Face BF16 checkpoint without Python ([docs/quantize.md](docs/quantize.md)):
+
+```bash
+build/espetero quantize --model ~/models/Qwen3.6-35B-A3B --preset eq4dhb --out ~/models/Qwen3.6-35B-A3B-EQ4DHB   # from the BF16 checkpoint
+build/espetero serve --model ~/models/Qwen3.6-35B-A3B-EQ4DHB
+```
+
+Against the GGUF and MLX files of about the same size, every file run by the same Espetero build. KLD is the mean per-token KL divergence to the BF16 model with fp32 activations over 123K tokens of WikiText-2 and code (lower is better); the change is the paired difference over the 62 reference windows with its 95 % bootstrap interval. Bits per weight are read from the file headers, over all parameters, without the MTP head. Decode: batch 1, a 128-token context, wall-clock tokens/s.
+
+| Model | EQ file | Bits/weight | KLD | Rival | Bits/weight | KLD | KLD change | Decode M4 Max | Decode M1 Max |
+|:--|:--|--:|--:|:--|--:|--:|--:|--:|--:|
+| Qwen3.6-35B-A3B (MoE) | EQ3DHB | 4.35 | **0.0204** | IQ4_XS (imatrix) | 4.32 | 0.0279 | −27 % [−29, −24] | **116** vs 110 | **79** vs 68 |
+| | EQ4DHB | 5.19 | **0.0086** | unsloth UD-Q4_K_XL | 5.16 | 0.0100 | −14 % [−17, −11] | **116** vs 91 | **80** vs 62 |
+| | EQ6H | 6.71 | **0.0038** | unsloth UD-Q6_K | 6.76 | 0.0043 | −11 % [−15, −8] | **109** vs 87 | **75** vs 59 |
+| Qwen3.8-27B | `eqd6-27b`³ | 6.42 | **0.0011** | unsloth UD-Q6_K | 6.43 | 0.0014 | −19 % [−28, −7] | **21** vs 20 | **11** vs 10 |
+| Qwen3.5-9B | `eqd4m` | 5.03 | **0.0100** | Q4_K_M | 5.07 | 0.0141 | −29 % [−33, −25] | | **47** vs 43 |
+| | `eqd4l` | 5.30 | **0.0078** | unsloth UD-Q4_K_XL | 5.32 | 0.0122 | −36 % [−42, −29] | | **49** vs 35 |
+| | `eqd5` | 6.00 | **0.0043** | unsloth UD-Q5_K_XL | 6.02 | 0.0053 | −18 % [−33, −1] | | **45** vs 35 |
+| | `eqd6` | 6.65 | **0.0019** | Q6_K | 6.65 | 0.0026 | −27 % [−46, −6] | | **43** vs 34 |
+| Spark-X2.6-4B | c3 | 5.21 | **0.0255** | MLX 4-bit | 4.50 | 0.2376 | −89 % [−91, −88] | | 83 vs **99** |
+| | c4 | 5.67 | **0.0173** | official Q4_K_M¹ | 6.19 | 0.0707 | −76 % [−78, −73] | | |
+| Qwen3.8-Flash-Next (MoE)² | `fnx4h` | 5.10 | **0.031** | oQ4e-mtp | 4.58 | 0.117 | −74 % [−77, −71] | 51 vs **58** | |
+| | mix408 (64 GB Macs) | 3.31 | **0.095** | oQ4e-mtp | 4.58 | 0.117 | −19 % [−27, −9] | 44 | |
+
+EQ3DHB and EQ4DHB are 0.03 bits per weight larger than their rivals; the others are as large or smaller. EQ6H is calibrated with router-weighted expert statistics over a broader text ([docs/quantize.md](docs/quantize.md)). ¹ Espetero does not run Spark GGUF files: that row is the file dequantized into the fp32 reference. ² 96K tokens of WikiText-2, code and chat at a 4K context, decode at a 4K context; bits per weight without the n-gram table that is read from the SSD. ³ Mixed calibration (prose, Wikipedia, C/C++ and chat) and `--enc-opts schur6,refit` ([docs/quantize.md](docs/quantize.md#encoder-options)); decode measured on the same layout converted without them (the bytes read per token are the same). EQ's lead is quality per bit among the formats that decode at memory bandwidth on M1–M4: unsloth's UD files, llama.cpp's K-quants, MLX (including DWQ: the 4-bit DWQ of the 35B has 72 % more KLD than EQ4X at about the same size) and AutoRound GGUF files. EXL3 has lower KLD per bit on Qwen3.8-27B above ~5.5 bits and on Flash-Next (measured in fp32 emulation), but its Metal port decodes slower: on the M1 Max EQ's 27B file decodes 35 % faster than EXL3 at 6.5 bits. At short contexts Spark's MLX 4-bit file decodes faster than c3 in the same engine (c3 reads 16 % more bytes). EQ does not yet beat unsloth's files on Qwen3.8-27B at 4 and 5 bits; those presets are not listed.
+
 ## Quick start
 
 ```bash
@@ -125,7 +153,7 @@ The port opens at once; `GET /health` answers 503 `{"status": "loading"}` until 
 ```bash
 make && sudo make install      # /usr/local/bin/espetero (PREFIX=... and DESTDIR=... change where)
 sudo make uninstall
-make dist                      # build/espetero-0.1.4-macos-arm64.tar.gz: the binary, README, licenses and notices
+make dist                      # build/espetero-0.2.0-macos-arm64.tar.gz: the binary, README, licenses and notices
 ```
 
 Homebrew: `brew install JarJarFran/espetero/espetero` builds Espetero from the release's source ([packaging/homebrew/espetero.rb](packaging/homebrew/espetero.rb)).

@@ -268,7 +268,32 @@ bool parse_normalizer(const Value& v) {
 }
 
 // pre_tokenizer: Sequence[Split(Regex, Isolated), ByteLevel(add_prefix_space=false, use_regex=false)].
+// Spark-X2.5 / X2.6 (DeepSeek-V3 style): Sequence[Split(\p{N}{1,3}), Split(CJK runs),
+// Split(its pattern), Digits(individual), ByteLevel] (pretok.h, SplitPattern::kSpark).
+bool is_spark_pre_tokenizer(const Value& v) {
+  static const char* kRe[3] = {
+      R"re(\p{N}{1,3})re", "[\xE4\xB8\x80-\xE9\xBE\xA5\xE3\x81\x80-\xE3\x82\x9F\xE3\x82\xA0-\xE3\x83\xBF]+",
+      // (tokenizer.json holds a literal CR and LF in its two character classes)
+      R"re([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^)re" "\r\n" R"re(\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+|[)re"
+      "\r\n" R"re(]|\s+(?!\S)|\s+)re"};
+  const Value* list = v.get("pretokenizers");
+  if (v.get_string("type", "") != "Sequence" || !list || !list->is_array() || list->size() != 5) return false;
+  for (int i = 0; i < 3; ++i) {
+    const Value& s = (*list)[size_t(i)];
+    const Value* pat = s.get("pattern");
+    const Value* re = pat ? pat->get("Regex") : nullptr;
+    if (s.get_string("type", "") != "Split" || !re || !re->is_string() || re->as_string() != kRe[i] ||
+        s.get_string("behavior", "") != "Isolated" || s.get_bool("invert", false))
+      return false;
+  }
+  const Value& d = (*list)[3];
+  const Value& bl = (*list)[4];
+  return d.get_string("type", "") == "Digits" && d.get_bool("individual_digits", false) &&
+         bl.get_string("type", "") == "ByteLevel" && !bl.get_bool("add_prefix_space", false) && !bl.get_bool("use_regex", true);
+}
+
 tok::SplitPattern parse_pre_tokenizer(const Value& v) {
+  if (is_spark_pre_tokenizer(v)) return tok::SplitPattern::kSpark;
   const Value* list = v.get("pretokenizers");
   // DeepSeek-V3 / V4: Split(\p{N}{1,3}), Split(CJK runs), Split(regex), ByteLevel (tok::deepseek_split).
   if (v.get_string("type", "") == "Sequence" && list && list->is_array() && list->size() == 4) {

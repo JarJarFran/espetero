@@ -5,7 +5,7 @@
 // token ids, in every pass shape the engine runs (Gemma 4 parity against
 // mlx-lm; any model works):
 //
-//   build/logits_dump <model> <cases.json> <out.json> [--top 64] [--kv-gb 4] [--max-ctx 8192]
+//   build/logits_dump <model> <cases.json> <out.json> [--top 64] [--kv-gb 4] [--max-ctx 8192] [--mtp none|PATH]
 //
 // cases.json: {"cases": [{"ids": [...], "prompt_len": P, "gen": G}, ...]}; a
 // case may carry images (Gemma 4: "images": [{"file": path, "row": r}], r the
@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--max-ctx") && i + 1 < argc) o.max_ctx = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--slots") && i + 1 < argc) o.slots = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--image-pixels") && i + 1 < argc) image_pixels = std::atoll(argv[++i]);
+    else if (!std::strcmp(argv[i], "--mtp") && i + 1 < argc) o.mtp = argv[++i];
   }
   std::ifstream f(argv[2]);
   std::stringstream ss;

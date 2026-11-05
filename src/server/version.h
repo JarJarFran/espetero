@@ -7,6 +7,6 @@
 namespace espetero {
 
 inline constexpr const char* kProduct = "espetero";
-inline constexpr const char* kVersion = "0.1.4";
+inline constexpr const char* kVersion = "0.2.0";
 
 }  // namespace espetero

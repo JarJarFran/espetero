@@ -356,7 +356,7 @@ inline void gemm_q(Enc& E, Tuner& T, const QW& w, id<MTLBuffer> A, size_t aoff, 
   // 6-bit matrix's tuned tile.
   QW w8;
   size_t widen_bytes = 0;
-  if (M > 8 && w.bits == 6 && T.widen6_m > 0 && M >= T.widen6_m) {
+  if (M > 8 && w.bits == 6 && w.scale_mode != 6 && T.widen6_m > 0 && M >= T.widen6_m) {  // (not EQ6: EQ's 8 bits are EQ8)
     const int Np = (w.out + 31) / 32 * 32;
     widen_bytes = size_t(Np) * size_t(w.in);
     T.ensure_widen(E.rt, widen_bytes);
@@ -438,11 +438,12 @@ inline HTile hgemm_tile(int M, int N) {
 }
 
 // Dense fp16 GEMM: 0 store fp32, 1 add fp32, 2 gelu_tanh fp16, 3 gelu_erf
-// fp16, 4 SwiGLU fp16, 5 GeGLU fp16; the bias is applied when the matrix has one.
+// fp16, 4 SwiGLU fp16, 5 GeGLU fp16, 6 exact-GELU GeGLU fp16; the bias is
+// applied when the matrix has one.
 inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, id<MTLBuffer> Y, size_t yoff,
                    int ldy, int M, int epi) {
   if (M <= 0) return;
-  static const char* suffix[6] = {"store", "add", "gelu_tanh", "gelu_erf", "swiglu", "geglu"};
+  static const char* suffix[7] = {"store", "add", "gelu_tanh", "gelu_erf", "swiglu", "geglu", "geglu_erf"};
   const HTile t = hgemm_tile(M, w.out);
   struct {
     int M, N, K, lda, ldy, has_bias;
@@ -457,7 +458,7 @@ inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, i
   E.set(4, Y, yoff);
   E.bytes(5, p);
   const size_t elt = (epi == 0 || epi == 1) ? 4 : 2;
-  const int ncols = (epi == 4 || epi == 5) ? w.out / 2 : w.out;
+  const int ncols = (epi == 4 || epi == 5 || epi == 6) ? w.out / 2 : w.out;
   E.rd(A, aoff, aoff + (size_t(M - 1) * size_t(lda) + size_t(w.kp)) * 2);
   E.wr(Y, yoff, yoff + (size_t(M - 1) * size_t(ldy) + size_t(ncols)) * elt);
   E.groups(MTLSizeMake(size_t(M + t.bm - 1) / size_t(t.bm), size_t(w.out + t.bn - 1) / size_t(t.bn), 1),
@@ -471,7 +472,7 @@ inline void gemm(Enc& E, Tuner& T, const Mat& m, id<MTLBuffer> A, size_t aoff, i
   if (m.dense) {
     if (nin || nout) fail("fused norm on a dense matrix");
     if (so) *so = SplitOut{};
-    gemm_h(E, m.d, A, aoff, lda, Y, yoff, ldy, M, epi == 2 ? (m.d.act == 1 ? 5 : 4) : epi);
+    gemm_h(E, m.d, A, aoff, lda, Y, yoff, ldy, M, epi == 2 ? (m.d.act == 1 ? 5 : m.d.act == 2 ? 6 : 4) : epi);
   } else {
     gemm_q(E, T, m.q, A, aoff, lda, Y, yoff, ldy, M, epi, n_cols, nin, nout, so);
   }
@@ -521,7 +522,8 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
   if (m.out() <= 0) return;
   if (m.dense) {
     for (const char* t : {"8x8", "16x4", "32x4"})
-      for (const char* e : {"store", "add", m.d.act == 1 ? "geglu" : "swiglu"}) out.push_back({std::string("hgemm_") + t + "_" + e, 0});
+      for (const char* e : {"store", "add", m.d.act == 1 ? "geglu" : m.d.act == 2 ? "geglu_erf" : "swiglu"})
+        out.push_back({std::string("hgemm_") + t + "_" + e, 0});
     return;
   }
   const QW& w = m.q;
@@ -563,6 +565,9 @@ inline std::string tune_key(const QW* w) {
   if (w->bits != 4) k += "q" + std::to_string(w->bits);
   if (w->group != 64) k += "g" + std::to_string(w->group);
   if (w->scale_mode == 1) k += "q6k";
+  else if (w->scale_mode == 6) k += "eq";
+  else if (w->scale_mode == 7) k += "eqc";
+  else if (w->scale_mode == 8) k += "eqc3";
   else if (w->scale_mode) k += "m" + std::to_string(w->scale_mode);
   return k;
 }

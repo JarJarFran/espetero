@@ -30,6 +30,9 @@ struct MoeSortParams {
   int shared;       // 1: append tiles of expert E (the shared expert) over every row
   int remap;        // 1: ids are expert ids and map[id] is the pool slot the GEMVs read (Qwen4-Exp expert cache)
   int bm;           // rows per tile: 8 (0 too), 16 or 32 (the moe_gemm16 / moe_gemm32 kernels)
+  int split;        // > 0: experts [split, E) are a second stack (another format): their tiles go to tiles_b
+                    // (ids rebased to 0) with their own indirect arguments, the first stack's stay in tiles
+                    // (8-row tiles only)
 };
 
 // The sort proper, run by one threadgroup (moe_sort, or the last-arriving
@@ -41,7 +44,8 @@ static inline void moe_sort_body(device const int* ids, device int* offsets, dev
                                  device int* rowmap, device int* slotpos, constant MoeSortParams& p, device const int* map,
                                  uint tid, uint ntg, uint sg, uint lane, threadgroup atomic_int* tcnt,
                                  threadgroup atomic_int* tfill, threadgroup int* toff, threadgroup int* ttile,
-                                 threadgroup int* scan_c, threadgroup int* scan_t) {
+                                 threadgroup int* scan_c, threadgroup int* scan_t, device int4* tiles_b,
+                                 device uint* indirect_b) {
   auto id_at = [&](int i) -> int {
     return ATOMIC_IDS ? atomic_load_explicit((device atomic_int*)ids + i, memory_order_relaxed) : ids[i];
   };
@@ -100,19 +104,33 @@ static inline void moe_sort_body(device const int* ids, device int* offsets, dev
     // The shared expert: tiles over the M token rows, placed after the pairs.
     const int t = ttile[p.E];
     const int ts = p.shared ? (p.M + bm - 1) / bm : 0;
-    indirect[0] = uint(t + ts);
+    const int ta = p.split > 0 ? ttile[p.split] : t + ts;  // (no shared tiles with a split)
+    indirect[0] = uint(ta);
     indirect[1] = uint(p.gu_blocks);
     indirect[2] = 1u;
-    indirect[3] = uint(t + ts);
+    indirect[3] = uint(ta);
     indirect[4] = uint(p.down_blocks);
     indirect[5] = 1u;
+    if (p.split > 0) {
+      indirect_b[0] = uint(t - ta);
+      indirect_b[1] = uint(p.gu_blocks);
+      indirect_b[2] = 1u;
+      indirect_b[3] = uint(t - ta);
+      indirect_b[4] = uint(p.down_blocks);
+      indirect_b[5] = 1u;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int e = tid; e < p.E; e += ntg) {
     offsets[e] = toff[e];
     const int c = atomic_load_explicit(&tcnt[e], memory_order_relaxed);
-    for (int j = 0; j * bm < c; ++j)
-      tiles[ttile[e] + j] = int4(e, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    if (p.split > 0 && e >= p.split) {
+      for (int j = 0; j * bm < c; ++j)
+        tiles_b[ttile[e] - ttile[p.split] + j] = int4(e - p.split, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    } else {
+      for (int j = 0; j * bm < c; ++j)
+        tiles[ttile[e] + j] = int4(e, toff[e] + j * bm, min(bm, c - j * bm), 0);
+    }
   }
   if (p.shared) {
     const int t0 = ttile[p.E];
@@ -136,6 +154,8 @@ kernel void moe_sort(
     device int* slotpos [[buffer(5)]],
     constant MoeSortParams& p [[buffer(6)]],
     device const int* map [[buffer(7)]],
+    device int4* tiles_b [[buffer(8)]],     // (p.split > 0 only)
+    device uint* indirect_b [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint ntg [[threads_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -146,7 +166,7 @@ kernel void moe_sort(
   threadgroup int ttile[1025];
   threadgroup int scan_c[32], scan_t[32];
   moe_sort_body<0>(ids, offsets, tiles, indirect, rowmap, slotpos, p, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
-                   scan_c, scan_t);
+                   scan_c, scan_t, tiles_b, indirect_b);
 }
 
 struct MoeRouteParams {
@@ -277,7 +297,7 @@ kernel void moe_topk(
   atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope::thread_scope_device);
   if (tid == 0) atomic_store_explicit(ctr, 0, memory_order_relaxed);
   moe_sort_body<1>(ids, offsets, tiles, indirect, rowmap, slotpos, sp, map, tid, ntg, sg, lane, tcnt, tfill, toff, ttile,
-                   scan_c, scan_t);
+                   scan_c, scan_t, tiles, indirect);  // (the folded sort: no split)
 }
 
 // A 32-column block of a quantized GEMV over the K steps [g_begin, g_end) for
@@ -314,7 +334,7 @@ static inline void gemv_block_partial(device const half* arow, device const uint
       hw[0] = h.x, hw[1] = h.y;
     }
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (nb * 32 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (nb * 32 + fn) / 2, fm, s2, b2);
     float xv[8];
     UNROLL for (int jj = 0; jj < 8; ++jj) xv[jj] = float(arow[g * 64 + jj * 8 + fm]);
     UNROLL for (int jj = 0; jj < 8; ++jj) {
@@ -333,7 +353,7 @@ static inline void gemv_block_partial(device const half* arow, device const uint
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const float2 wv = float2(dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]));
+        const float2 wv = float2(dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j]));
         acc[2 * j] = fma(xv[jj], wv.x, acc[2 * j]);
         acc[2 * j + 1] = fma(xv[jj], wv.y, acc[2 * j + 1]);
       }
@@ -1119,10 +1139,22 @@ kernel void moe_gemv8(
   const short qid = lane / 4;
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
-  constexpr int WPL = BITS == 8 ? 4 : 2;
-  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  constexpr int WPL = BITS == 8 ? 4 : (BITS == 3 ? 1 : 2);
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 || BITS == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4)
+  // the threadgroup's pair table (one expert block; see rgemv).
+  threadgroup half eqct_all[KS][64];
+  threadgroup half* eqct = eqct_all[sgid];
+  const bool cbp = eqc_pairs_on<BITS>();
+  threadgroup half2 eqcp[4 * 256];
+  if (cbp) {
+    eqc_pairs_load(SB, KGall, Np2, nb, eqcp, int(sgid) * 32 + int(lane), KS * 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (eqc_on<BITS>()) {
+    eqc_load(SB, KGall, Np2, nb, eqct, ushort(lane));
+  }
   const bool row_ok = fm < rows;
   const int arow_i = row_ok ? (p.gather ? rowmap[r0 + fm] : r0 + fm) : 0;
   device const half* arow = A + ulong(arow_i) * p.lda;
@@ -1138,7 +1170,7 @@ kernel void moe_gemv8(
     if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
     if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     half2 av[8];
     UNROLL for (int jj = 0; jj < 8; ++jj)
       av[jj] = row_ok ? *((device const half2*)(arow + g * 64 + jj * 8 + fn)) : half2(0.0h);
@@ -1148,7 +1180,9 @@ kernel void moe_gemv8(
       a.thread_elements()[1] = av[jj].y;
       UNROLL for (int j = 0; j < 4; ++j) {
         half2 q;
-        if (BITS == 4) {
+        if (BITS == 3) {  // EQ3 (EQ only)
+          q = kstep_code<BITS>(words, hw, jj, j);
+        } else if (BITS == 4) {
           const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
           q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
         } else if (BITS == 6 || BITS == 5) {
@@ -1161,7 +1195,8 @@ kernel void moe_gemv8(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = cbp ? eqcp[j * 256 + eqc_pair_index(words, jj, j)] * s2[gi * 4 + j]
+                             : dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j);
         simdgroup_matrix<half, 8, 8> b;
         b.thread_elements()[0] = wv.x;
         b.thread_elements()[1] = wv.y;
@@ -1201,6 +1236,9 @@ kernel void moe_gemv8(
 // moe_gemm_bm: the same tile with BM = 16 or 32 rows (moe_gemm16* / moe_gemm32*, option moe_bm) for
 // passes of more than 8 rows. Kept separate from moe_gemv8 so the default kernel stays main's code
 // (templating moe_gemv8 on BM changed the generated code of the 8-row tile: 2048-row prefill +2 %).
+// EQ experts take these tiles too, as every other layout does (rather than staying on 8 rows): each
+// weight is dequantized as in moe_gemv8 and every fragment accumulates in moe_gemv8's order, so a
+// row's sums are the 8-row kernel's.
 template <int BITS, int EPI, int BM>
 kernel void moe_gemm_bm(
     device const half* A [[buffer(0)]],
@@ -1256,10 +1294,22 @@ kernel void moe_gemm_bm(
   const short qid = lane / 4;
   const short fm = (qid & 4) + ((lane / 2) % 4);
   const short fn = (qid & 2) * 2 + (lane % 2) * 2;
-  constexpr int WPL = BITS == 8 ? 4 : 2;
-  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 ? 2 : 0);
+  constexpr int WPL = BITS == 8 ? 4 : (BITS == 3 ? 1 : 2);
+  constexpr int HPL = BITS == 6 ? 4 : (BITS == 5 || BITS == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
+  // Codebook EQ: each simdgroup's copy of its block's codebooks, or (EQ4)
+  // the threadgroup's pair table (one expert block; see rgemv).
+  threadgroup half eqct_all[KS][64];
+  threadgroup half* eqct = eqct_all[sgid];
+  const bool cbp = eqc_pairs_on<BITS>();
+  threadgroup half2 eqcp[4 * 256];
+  if (cbp) {
+    eqc_pairs_load(SB, KGall, Np2, nb, eqcp, int(sgid) * 32 + int(lane), KS * 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else if (eqc_on<BITS>()) {
+    eqc_load(SB, KGall, Np2, nb, eqct, ushort(lane));
+  }
   // This lane's row of each fragment: fm + 8 i (rows past the tile's read row 0, unused).
   bool row_ok[FM];
   device const half* arow[FM];
@@ -1281,7 +1331,7 @@ kernel void moe_gemm_bm(
     if (!ESPETERO_PF) load_kstep<BITS, WPL>(wp, hp, g, words, hw);
     if (ESPETERO_PF && g + 1 < g_end) load_kstep<BITS, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     half2 av[FM][8];
     UNROLL for (int i = 0; i < FM; ++i)
       UNROLL for (int jj = 0; jj < 8; ++jj)
@@ -1294,7 +1344,9 @@ kernel void moe_gemm_bm(
       }
       UNROLL for (int j = 0; j < 4; ++j) {
         half2 q;
-        if (BITS == 4) {
+        if (BITS == 3) {  // EQ3 (EQ only)
+          q = kstep_code<BITS>(words, hw, jj, j);
+        } else if (BITS == 4) {
           const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
           q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
         } else if (BITS == 6 || BITS == 5) {
@@ -1307,7 +1359,8 @@ kernel void moe_gemm_bm(
           q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
         }
         const int gi = (jj * 8) / kGroup;
-        const half2 wv = dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]);
+        const half2 wv = cbp ? eqcp[j * 256 + eqc_pair_index(words, jj, j)] * s2[gi * 4 + j]
+                             : dequant_pair<BITS>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j);
         simdgroup_matrix<half, 8, 8> b;
         b.thread_elements()[0] = wv.x;
         b.thread_elements()[1] = wv.y;
@@ -1383,6 +1436,7 @@ INSTANTIATE_MOE("moe_gemv8r4", 4)
 INSTANTIATE_MOE("moe_gemv8r5", 5)
 INSTANTIATE_MOE("moe_gemv8r6", 6)
 INSTANTIATE_MOE("moe_gemv8r8", 8)
+INSTANTIATE_MOE("moe_gemv8r3", 3)  // EQ3 experts (EQ only)
 // 16- and 32-row tiles (passes of more than 8 rows).
 INSTANTIATE_MOE_BM("moe_gemm16r4", 4, 16)
 INSTANTIATE_MOE_BM("moe_gemm16r5", 5, 16)
@@ -1392,6 +1446,100 @@ INSTANTIATE_MOE_BM("moe_gemm32r4", 4, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r5", 5, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r6", 6, 32)
 INSTANTIATE_MOE_BM("moe_gemm32r8", 8, 32)
+INSTANTIATE_MOE_BM("moe_gemm16r3", 3, 16)  // EQ3 experts (EQ only)
+INSTANTIATE_MOE_BM("moe_gemm32r3", 3, 32)
+
+// Grouped expert GEMM for fp16 experts (unquantized BF16/F16 checkpoints,
+// ESPETERO_EXPERTS_F16=1): moe_gemv8's tiles, grid and epilogues, with the
+// weights read from repack_f16's fragment order ([E * N / 32][K / 64][lane]
+// [jj] uint4 of 4 column pairs), exact up to the bf16 -> fp16 conversion.
+// The shared expert never runs as a tile here (its own GEMVs).
+template <int EPI>
+kernel void moe_gemv8h(
+    device const half* A [[buffer(0)]],
+    device const uint* Wr [[buffer(1)]],
+    device const half4* SB [[buffer(2)]],
+    device const uint* Wh [[buffer(3)]],
+    device void* Yv [[buffer(4)]],
+    constant MoeGemmParams& p [[buffer(5)]],
+    device const int4* tiles [[buffer(6)]],
+    device const uint* ntiles [[buffer(7)]],
+    device const int* rowmap [[buffer(8)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int KS = 8;
+  if (!p.direct && tgid.x >= ntiles[0]) return;
+  const int4 ti = tiles[tgid.x];
+  const int e = ti.x, r0 = ti.y, rows = ti.z;
+  const int nloc = int(tgid.y) * 32;
+  if (nloc >= p.Ne) return;
+  const int n0 = e * p.Ne + nloc;
+  const int nb = n0 / 32;
+  const int KGall = p.K / 64;
+  const int per = (KGall + KS - 1) / KS;
+  const int g_begin = int(sgid) * per;
+  const int g_end = min(KGall, g_begin + per);
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+  device const uint4* wp = (device const uint4*)(Wr) + (ulong(nb) * KGall * 32 + lane) * 8;
+  const bool row_ok = fm < rows;
+  const int arow_i = row_ok ? (p.gather ? rowmap[r0 + fm] : r0 + fm) : 0;
+  device const half* arow = A + ulong(arow_i) * p.lda;
+  simdgroup_matrix<float, 8, 8> acc[4];
+  UNROLL for (int j = 0; j < 4; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  for (int g = g_begin; g < g_end; ++g) {
+    device const uint4* wg = wp + ulong(g) * 32 * 8;
+    uint4 wv[8];
+    UNROLL for (int jj = 0; jj < 8; ++jj) wv[jj] = wg[jj];
+    half2 av[8];
+    UNROLL for (int jj = 0; jj < 8; ++jj)
+      av[jj] = row_ok ? *((device const half2*)(arow + g * 64 + jj * 8 + fn)) : half2(0.0h);
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      simdgroup_matrix<half, 8, 8> a;
+      a.thread_elements()[0] = av[jj].x;
+      a.thread_elements()[1] = av[jj].y;
+      UNROLL for (int j = 0; j < 4; ++j) {
+        const half2 w = as_type<half2>(wv[jj][j]);
+        simdgroup_matrix<half, 8, 8> b;
+        b.thread_elements()[0] = w.x;
+        b.thread_elements()[1] = w.y;
+        simdgroup_multiply_accumulate(acc[j], a, b, acc[j]);
+      }
+    }
+  }
+  threadgroup float part[KS][8][32];
+  UNROLL for (int j = 0; j < 4; ++j) {
+    part[sgid][fm][j * 8 + fn] = acc[j].thread_elements()[0];
+    part[sgid][fm][j * 8 + fn + 1] = acc[j].thread_elements()[1];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int row = int(sgid);
+  const int c = int(lane);
+  if (row >= rows) return;
+  float v = 0.0f;
+  UNROLL for (int k = 0; k < KS; ++k) v += part[k][row][c];
+  const ulong orow = ulong(r0 + row) * p.ldy;
+  if (EPI == EPI_SWIGLU) {
+    if ((c / 8) % 2 == 0 && nloc + c < p.Ne) {
+      float u = 0.0f;
+      UNROLL for (int k = 0; k < KS; ++k) u += part[k][row][c + 8];
+      const int out = ((nloc + (c / 8) * 8) / 16) * 8 + (c % 8);
+      ((device half*)Yv)[orow + out] = half(glu_gate(v) * u);
+    }
+  } else if (nloc + c < p.Ne) {
+    device float* y = (device float*)Yv + orow + nloc + c;
+    *y = (EPI == EPI_ADD) ? *y + v : v;
+  }
+}
+#define INSTANTIATE_MOE_H(NAME, EPI)                                                       \
+  template [[host_name(NAME)]] kernel void moe_gemv8h<EPI>(                               \
+      device const half*, device const uint*, device const half4*, device const uint*,   \
+      device void*, constant MoeGemmParams&, device const int4*, device const uint*,     \
+      device const int*, uint3, uint, uint);
+INSTANTIATE_MOE_H("moe_gemv8r16_store", 0)
+INSTANTIATE_MOE_H("moe_gemv8r16_swiglu", 2)
 
 // h[row] += sum over slots (fixed order) of w * y_sorted[slotpos] +
 // sigmoid(gate[row]) * shared[row]. Grid (rows, column slices): each
@@ -1414,13 +1562,18 @@ INSTANTIATE_MOE_BM("moe_gemm32r8", 8, 32)
 // FMAs (two steps' loads in flight per simdgroup); the per-lane sums are the
 // same in the same order. 0 by default (ESPETERO_PF: the compile-time switch
 // for every kernel); the `_pf` instantiations set 1 (option moe_pf).
-template <int BITSX, int MM, int KS, int PF = ESPETERO_PF>
+// Codebook EQ: the simdgroup's codebook copy eqct (eqc_load), or with CBP
+// the caller's pair table tp (eqc_pairs_load, codebook EQ4).
+template <int BITSX, int MM, int KS, int PF = ESPETERO_PF, int CBP = 0>
 static inline void moe_kloop(device const uint* Wr, device const half4* SB, device const uint* Wh, int nb, int KGall,
                              int g_begin, int g_end, int Np2, int n0, int rows, device const half* arow0,
-                             device const half* arow1, ushort lane, short fm, short fn, thread float* acc) {
+                             device const half* arow1, ushort lane, short fm, short fn, thread float* acc,
+                             threadgroup half* eqct, threadgroup const half2* tp = nullptr) {
   constexpr int MAXG = 4;
-  constexpr int WPL = BITSX == 8 ? 4 : 2;
-  constexpr int HPL = BITSX == 6 ? 4 : (BITSX == 5 ? 2 : 0);
+  const bool cbp = CBP && eqc_pairs_on<BITSX>();
+  if (!cbp && eqc_on<BITSX>()) eqc_load(SB, KGall, Np2, nb, eqct, lane);
+  constexpr int WPL = BITSX == 8 ? 4 : (BITSX == 3 ? 1 : 2);
+  constexpr int HPL = BITSX == 6 ? 4 : (BITSX == 5 || BITSX == 3 ? 2 : 0);
   device const uint4* wp = (device const uint4*)(Wr) + ulong(nb) * KGall * (32 * WPL) + lane * WPL;
   device const uint* hp = Wh + (ulong(nb) * KGall * 32 + lane) * (HPL ? HPL : 1);
   device const half* arow[2] = {arow0, arow1};
@@ -1431,31 +1584,41 @@ static inline void moe_kloop(device const uint* Wr, device const half4* SB, devi
     if (!PF) load_kstep<BITSX, WPL>(wp, hp, g, words, hw);
     if (PF && g + 1 < g_end) load_kstep<BITSX, WPL>(wp, hp, g + 1, wnext, hnext);
     half2 s2[MAXG * 4], b2[MAXG * 4];
-    kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, s2, b2);
+    float2 s4[4];  // EQ: one scale per column and lane for the K step (eq_kstep)
+    if (kEQS) eq_lane_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s4);
+    else kstep_scales(SB, ulong(g), KGall, Np2, (n0 + fn) / 2, fm, s2, b2);
     float xv[MM][8];
     UNROLL for (int m = 0; m < MM; ++m)
       UNROLL for (int jj = 0; jj < 8; ++jj)
         xv[m][jj] = m < rows ? float(arow[m][g * 64 + jj * 8 + fm]) : 0.0f;
-    UNROLL for (int jj = 0; jj < 8; ++jj) {
-      UNROLL for (int j = 0; j < 4; ++j) {
-        half2 q;
-        if (BITSX == 4) {
-          const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
-          q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
-        } else if (BITSX == 6 || BITSX == 5) {
-          const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
-          const uint h = BITSX == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
-                                    : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
-          q = as_type<half2>(x | (h << 4) | 0x64006400u);
-        } else {
-          const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
-          q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
-        }
-        const int gi = (jj * 8) / kGroup;
-        const float2 wv = float2(dequant_pair(q, s2[gi * 4 + j], b2[gi * 4 + j]));
-        UNROLL for (int m = 0; m < MM; ++m) {
-          acc[m * 8 + 2 * j] = fma(xv[m][jj], wv.x, acc[m * 8 + 2 * j]);
-          acc[m * 8 + 2 * j + 1] = fma(xv[m][jj], wv.y, acc[m * 8 + 2 * j + 1]);
+    if (cbp) {
+      eq_kstep_cbp<MM>(words, s4, &xv[0][0], acc, tp);
+    } else if (kEQS) {
+      eq_kstep<BITSX, MM>(words, hw, s4, &xv[0][0], acc, eqct);
+    } else {
+      UNROLL for (int jj = 0; jj < 8; ++jj) {
+        UNROLL for (int j = 0; j < 4; ++j) {
+          half2 q;
+          if (BITSX == 3) {  // (EQ3 is EQ only: kEQS takes eq_kstep above)
+            q = kstep_code<BITSX>(words, hw, jj, j);
+          } else if (BITSX == 4) {
+            const uint x = words[j * 2 + jj / 4] >> (4 * (jj % 4));
+            q = as_type<half2>((x & 0x000F000Fu) | 0x64006400u);
+          } else if (BITSX == 6 || BITSX == 5) {
+            const uint x = (words[j * 2 + jj / 4] >> (4 * (jj % 4))) & 0x000F000Fu;
+            const uint h = BITSX == 6 ? (hw[j] >> (2 * jj)) & 0x00030003u
+                                      : (hw[j / 2] >> (jj + 8 * (j % 2))) & 0x00010001u;
+            q = as_type<half2>(x | (h << 4) | 0x64006400u);
+          } else {
+            const uint x = words[j * 4 + jj / 2] >> (8 * (jj % 2));
+            q = as_type<half2>((x & 0x00FF00FFu) | 0x64006400u);
+          }
+          const int gi = (jj * 8) / kGroup;
+          const float2 wv = float2(dequant_pair<BITSX>(q, s2[gi * 4 + j], b2[gi * 4 + j], eqct, j));
+          UNROLL for (int m = 0; m < MM; ++m) {
+            acc[m * 8 + 2 * j] = fma(xv[m][jj], wv.x, acc[m * 8 + 2 * j]);
+            acc[m * 8 + 2 * j + 1] = fma(xv[m][jj], wv.y, acc[m * 8 + 2 * j + 1]);
+          }
         }
       }
     }
@@ -1556,6 +1719,11 @@ kernel void moe_gemv(
     arow[m] = A + ulong(ri) * p.lda;
   }
   threadgroup float part[KS][MM][32];
+  threadgroup half eqct_all[KS][64];
+  // Codebook EQ4: the threadgroup's pair table of its block (one expert per
+  // threadgroup; see rgemv).
+  const bool cbp = sh ? eqc_pairs_on<BITS2>() : eqc_pairs_on<BITS>();
+  threadgroup half2 eqcp[4 * 256];
   // Column blocks of this threadgroup, in sequence (p.nbpt >= 1).
   for (int blk = 0; blk < p.nbpt; ++blk) {
   const int nloc = (int(bix) * p.nbpt + blk) * 32;
@@ -1566,10 +1734,15 @@ kernel void moe_gemv(
   float acc[MM][8];
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
+  if (cbp) {
+    // A later block's table: the barrier above follows every lookup of the previous one.
+    eqc_pairs_load(sh ? SB2 : SB, KGall, Np2, nb, eqcp, int(sgid) * 32 + int(lane), KS * 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   if (sh)
-    moe_kloop<BITS2, MM, KS, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
+    moe_kloop<BITS2, MM, KS, PF, 1>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0], eqct_all[sgid], eqcp);
   else
-    moe_kloop<BITS, MM, KS, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0]);
+    moe_kloop<BITS, MM, KS, PF, 1>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, rows, arow[0], arow[MM - 1], ushort(lane), fm, fn, &acc[0][0], eqct_all[sgid], eqcp);
   // Sum the 8 lanes that hold different k rows (fm: lane bits 1, 2 and 4).
   UNROLL for (int m = 0; m < MM; ++m)
     UNROLL for (int c = 0; c < 8; ++c) {
@@ -1649,6 +1822,7 @@ INSTANTIATE_MOE_GEMV("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV("moe_gemv6_", 6)
 INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
+INSTANTIATE_MOE_GEMV("moe_gemv3_", 3)
 // Mixed: BITS-bit routed experts with an 8-bit shared expert as tile k
 // (name suffix _s8), 1-2 rows, the K-slice variants and the folded route.
 #define INSTANTIATE_MOE_GEMV_S8(PRE, BITS)                                                     \
@@ -1660,6 +1834,20 @@ INSTANTIATE_MOE_GEMV("moe_gemv8_", 8)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv4_", 4)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv5_", 5)
 INSTANTIATE_MOE_GEMV_S8("moe_gemv6_", 6)
+INSTANTIATE_MOE_GEMV_S8("moe_gemv3_", 3)
+// EQ (one layout for every width): a wider EQ shared expert, suffix _s4 / _s5 / _s6.
+#define INSTANTIATE_MOE_GEMV_SX(PRE, BITS, SB, S)                                              \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 8, 0, S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 8, 0, S)             \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 4, 0, "_k4" S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 4, 0, "_k4" S) \
+  INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 1, 2, 0, "_k2" S) INSTANTIATE_MOE_GEMV_MB(PRE, BITS, SB, 2, 2, 0, "_k2" S) \
+  INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 8, "_route" S) INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 4, "_route_k4" S) \
+  INSTANTIATE_MOE_GEMV_ROUTE_B(PRE, BITS, SB, 2, "_route_k2" S)
+INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 5, "_s5")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv4_", 4, 6, "_s6")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv5_", 5, 6, "_s6")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 4, "_s4")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 5, "_s5")
+INSTANTIATE_MOE_GEMV_SX("moe_gemv3_", 3, 6, "_s6")
 // Fase 3 (option moe_pf): the single-row kernels with two K steps' loads in
 // flight per simdgroup (moe_kloop PF 1): `_pf` after the K-slice suffix.
 #define INSTANTIATE_MOE_GEMV_PF1(PRE, BITS, BITS2, KS, DIAG, TAG)                                \
@@ -1700,6 +1888,14 @@ INSTANTIATE_MOE_GEMV_PF("moe_gemv8_", 8, 8, "")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 8, "_s8")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 8, "_s8")
 INSTANTIATE_MOE_GEMV_PF("moe_gemv6_", 6, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 5, "_s5")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv4_", 4, 6, "_s6")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv5_", 5, 6, "_s6")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 3, "")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 8, "_s8")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 4, "_s4")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 5, "_s5")
+INSTANTIATE_MOE_GEMV_PF("moe_gemv3_", 3, 6, "_s6")
 
 struct MoeCombineParams {
   int D;
@@ -1848,6 +2044,7 @@ kernel void moe_down_comb(
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float part[17 * KSX][32];
+  threadgroup half eqct_all[17 * KSX][64];  // codebook EQ: each simdgroup's block codebooks
   threadgroup int last_tg;
   const int slot = int(sgid) / KSX, ksl = int(sgid) % KSX;
   const bool sh = slot == p.k;
@@ -1882,9 +2079,9 @@ kernel void moe_down_comb(
   float acc[8];
   UNROLL for (int c = 0; c < 8; ++c) acc[c] = 0.0f;
   if (sh)
-    moe_kloop<BITS2, 1, KSX, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
+    moe_kloop<BITS2, 1, KSX, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, eqct_all[sgid]);
   else
-    moe_kloop<BITS, 1, KSX, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc);
+    moe_kloop<BITS, 1, KSX, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, eqct_all[sgid]);
   UNROLL for (int c = 0; c < 8; ++c) {
     float v = acc[c];
     v += simd_shuffle_xor(v, ushort(2));
@@ -1998,3 +2195,18 @@ INSTANTIATE_DOWN_COMB_B(8)
 INSTANTIATE_DOWN_COMB_S8(4)
 INSTANTIATE_DOWN_COMB_S8(5)
 INSTANTIATE_DOWN_COMB_S8(6)
+// EQ: a wider EQ4 / EQ5 / EQ6 shared expert beside narrower routed experts; EQ3 experts.
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s5", 4, 5, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s5", 4, 5, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k1_s6", 4, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb4_k2_s6", 4, 6, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb5_k1_s6", 5, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb5_k2_s6", 5, 6, 2)
+INSTANTIATE_DOWN_COMB_B(3)
+INSTANTIATE_DOWN_COMB_S8(3)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s4", 3, 4, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s4", 3, 4, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s5", 3, 5, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s5", 3, 5, 2)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k1_s6", 3, 6, 1)
+INSTANTIATE_DOWN_COMB("moe_down_comb3_k2_s6", 3, 6, 2)

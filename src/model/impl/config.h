@@ -69,6 +69,15 @@ struct Config {
   // with GQA attention (head dim HD, RoPE theta over every dim, per-head q/k
   // RMSNorms, no output gate), SwiGLU MLPs, no delta-rule heads (Hk = Hv = 0).
   bool lfm2 = false;
+  // Spark-X2.5 / X2.6 (`spark2_5`; gemma.h with spark set): the Gemma 4
+  // layer loop with plain pre-norm residuals (input / post-attention RMSNorm
+  // only), fused q_k_v_proj without q/k/v norms, attention scale 1/sqrt(HD),
+  // a sigmoid gate per query head (g_proj: H scalars per row, computed by the
+  // gate kernel from the layer input) on the attention output, exact-erf
+  // GeGLU MLPs, no embedding scale and no soft cap. Both layer kinds have head
+  // dim HD = HDg and Hkv = Hkv_g heads; sliding layers rotate all HD dims
+  // (theta), global ones the first rot_g in (d, d + rot_g / 2) pairs (theta_g).
+  bool spark = false;
 
   int W() const { return hc * D; }  // residual width per token
   int C() const { return lfm2 ? D : 2 * Hk * Dk + Hv * Dv; }  // conv channels
@@ -80,6 +89,7 @@ struct Config {
   // projection rows of a sliding / global layer ([q; k; v], no v when k_eq_v).
   int kv_dim_g() const { return Hkv_g * HDg; }
   int g4_ld(bool sliding) const {
+    if (spark) return H * HD + 2 * kv_dim();  // [q; k; v] (the head gates: sp_head_gate)
     return sliding ? H * HD + 2 * kv_dim() : H * HDg + (k_eq_v ? 1 : 2) * kv_dim_g();
   }
   int proj_ld() const {
@@ -118,6 +128,18 @@ struct Config {
       if (G != 1 && G != 2 && G != 4 && G != 8) fail("unsupported LFM2 GQA group " + std::to_string(G));
       if (conv_k != 3 || D % 64 || I % 64) fail("unsupported LFM2 geometry (conv of 3 taps, widths multiples of 64)");
       if (E) fail("LFM2 mixture-of-experts models are not supported");
+      return;
+    }
+    if (spark) {
+      // gemma.h's 256-dim attention kernels for both layer kinds; sp_attn_prep's rotary widths.
+      if (!D || !I || !L || !H || !Hkv || !V || !window) fail("incomplete Spark configuration");
+      if (HD != 256 || HDg != HD || Hkv_g != Hkv || k_eq_v) fail("unsupported Spark head size (256)");
+      if (H % Hkv) fail("unsupported Spark head grouping");
+      const int G = H / Hkv;
+      if (G != 1 && G != 2 && G != 4 && G != 8) fail("unsupported Spark GQA group " + std::to_string(G));
+      if (D % 64 || I % 64 || E) fail("unsupported Spark geometry");
+      for (int r : {rot, rot_g})
+        if (r != 16 && r != 32 && r != 64 && r != 128 && r != 256) fail("unsupported Spark rotary width " + std::to_string(r));
       return;
     }
     if (gemma) {
@@ -283,6 +305,64 @@ inline Config config_from_mlx(const json::Value& root0) {
     // the kernels compute x * rsqrt(mean + eps) and fold the 1/sqrt(Dk) query scale.
     c.qk_eps = 1e-6f / float(c.Dk);
   }
+  return c;
+}
+
+// Spark-X2.5 / X2.6: config.json of a spark2_5 checkpoint, read as mlx-lm
+// 0.32's spark2_5.ModelArgs reads it (exact GELU, sigmoid head-wise gates,
+// RoPE per layer type from rope_parameters).
+inline bool is_spark_type(const std::string& t) { return t == "spark2_5"; }
+
+inline Config config_from_spark(const json::Value& cfg) {
+  Config c;
+  c.gemma = c.spark = true;
+  c.D = int(cfg.get_int("hidden_size", 0));
+  c.I = int(cfg.get_int("intermediate_size", 0));
+  c.L = int(cfg.get_int("num_hidden_layers", 0));
+  c.H = int(cfg.get_int("num_attention_heads", 0));
+  c.Hkv = c.Hkv_g = int(cfg.get_int("num_key_value_heads", 0));
+  c.HD = c.HDg = int(cfg.get_int("head_dim", 256));
+  c.V = int(cfg.get_int("vocab_size", 0));
+  c.eps = float(cfg.get_double("rms_norm_eps", 1e-6));
+  c.window = int(cfg.get_int("sliding_window", 0));
+  c.Hk = c.Hv = 0;
+  c.tie = cfg.get_bool("tie_word_embeddings", true);
+  if (cfg.get_string("hidden_act", "gelu") != "gelu") fail("unsupported Spark activation " + cfg.get_string("hidden_act", ""));
+  if (!cfg.get_bool("headwise_attn_output_gate", true) || cfg.get_string("gate_attn_act_mode", "sigmoid") != "sigmoid")
+    fail("unsupported Spark attention gate (sigmoid head-wise gates only)");
+  if (cfg.get_bool("attention_bias", false) || cfg.get_bool("mlp_bias", false)) fail("Spark projections with biases are not supported");
+  const json::Value* rp = cfg.get("rope_parameters");
+  auto rope_of = [&](const char* key, double& theta, int& rot) {
+    const json::Value* r = rp && rp->is_object() ? rp->get(key) : nullptr;
+    if (!r || !r->is_object()) fail(std::string("Spark config: rope_parameters.") + key + " missing");
+    const std::string type = r->get_string("rope_type", "default");
+    if (type != "default") fail("unsupported Spark RoPE type " + type);
+    theta = r->get_double("rope_theta", 10000.0);
+    rot = int(double(c.HD) * r->get_double("partial_rotary_factor", 1.0));
+  };
+  rope_of("sliding_attention", c.theta, c.rot);
+  rope_of("full_attention", c.theta_g, c.rot_g);
+  const json::Value* types = cfg.get("layer_types");
+  c.linear.assign(size_t(c.L), false);
+  c.swa.clear();
+  c.n_full = c.n_swa = 0;
+  for (int i = 0; i < c.L; ++i) {
+    bool s = i % 4 != 3;  // spark2_5.ModelArgs: three sliding layers, then one full
+    if (types && types->is_array() && size_t(i) < types->size()) {
+      const std::string t = (*types)[size_t(i)].as_string();
+      if (t != "sliding_attention" && t != "full_attention") fail("unsupported Spark layer type " + t);
+      s = t == "sliding_attention";
+    }
+    c.swa.push_back(s);
+    s ? ++c.n_swa : ++c.n_full;
+  }
+  if (const json::Value* e = cfg.get("eos_token_id")) {
+    if (e->is_int()) c.eos_ids.push_back(int(e->as_int()));
+    else if (e->is_array())
+      for (const auto& x : e->as_array())
+        if (x.is_int()) c.eos_ids.push_back(int(x.as_int()));
+  }
+  c.eos_token_id = c.eos_ids.empty() ? -1 : c.eos_ids[0];
   return c;
 }
 
