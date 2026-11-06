@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-06)
 
 - **Spark-X2.5 / X2.6 from the Hugging Face cache or a repository id**: the memory check before a load or download read a `spark2_5` config.json as Qwen3.5 and refused it ("incomplete Qwen3.5 configuration"), so `espetero serve --model XHToken/Spark-X2.6-4B` never got to the engine. The check now reads Spark's geometry (Gemma 4's pools with 256-dim heads in both layer kinds) and its `model.*` tensor names.
 
