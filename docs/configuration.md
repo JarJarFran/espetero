@@ -1257,6 +1257,57 @@ layer's experts and start reading the missing ones a layer early
 `ESPETERO_MOE_CHECK=1` is a diagnostic: it reads the MoE tile table of long
 passes back and checks it against the routing.
 
+### Finding the first NaN (ESPETERO_CHECK_FINITE)
+
+A debugging aid for numerical divergences (a new kernel, a quantization, a
+model port): `ESPETERO_CHECK_FINITE=1` adds, after chosen dispatches, a small
+kernel that scans the region just written and records the first element
+that is NaN or Inf in a shared buffer. When the pass's GPU work is done the
+host reads the records in encoding order and reports the first offender:
+
+```
+check-finite: NaN in qwen3_5 (Qwen3.5-0.8B-4bit), layer 1 attn_out, row 3, col 5 (of 64x2048 f16), value nan, 1 offending, pass 1; 17 later checks also flagged (last: logits)
+```
+
+model (family and directory), layer, op, row and column within the checked
+region, its shape and type, the value, how many elements offended, and the
+pass number (counted from the load); later checks that the NaN spread to are
+counted, not listed. By default the pass then fails with that message as
+its error (the request ends with it, the slots keep their state from before
+the pass); `log` reports it on stderr and goes on.
+
+| Value | Meaning |
+|:--|:--|
+| unset, `0` | off: nothing is encoded, outputs bit-identical |
+| `1` | NaN and Inf; the pass fails |
+| `1e11` (any number > 1) | also every \|x\| >= that value (DeepSeek's DeepInfer checks 1e11) |
+| `log` | report and go on (combine: `log,1e11`) |
+
+Check sites (the registry, `E.check(op, layer, ...)` in the shared encoder;
+more can be added at any dispatch):
+
+| Op | What | Families |
+|:--|:--|:--|
+| `attn_out` | the attention output before the out projection (the DeltaNet mixer's for linear layers) | Qwen3.5 / 3.6 dense and MoE, Gemma 4, DeepSeek-V4.1 |
+| `attn_res` | the residual stream after the attention block | Qwen3.5 / 3.6, Gemma 4 |
+| `moe_experts` | the routed experts' outputs, before their weighted combine (not on the fused single-row down + combine path) | Qwen3.6-35B-A3B, Gemma 4 26B-A4B |
+| `moe_out` | the MoE block's output (shared + routed experts) | DeepSeek-V4.1 |
+| `layer_out` | the residual stream after the layer (DeepSeek: its 4 hyper-connection copies per row; Flash-Next: its residual streams) | all of the above, Qwen3.8-Flash-Next |
+| `logits` | the LM head's output (after Gemma's soft cap) | all of the above |
+
+DeepSeek-V4.1's DSpark draft passes report `draft_attn_out`, `draft_moe_out`,
+`draft_layer_out` and `draft_logits`. Not covered yet: GLM-5.3-Flash, LFM2,
+the Qwen3-Omni thinker, vision towers, MTP draft passes of the Qwen3.5 family.
+
+`ESPETERO_CHECK_FINITE_POISON=op:layer:row:col` (tests; with the check on)
+writes a NaN into that element of that site's region before its check, in
+every pass that has the row (`logits:-1:0:7` for the logits).
+`build/finite_test MODEL [layer] [ops]` checks both cases on a real model
+and measures the overhead. On an M1 Max with Qwen3.5-0.8B-4bit (24 layers,
+~100 checks per pass) the checks cost +15 % on a 512-row prompt pass
+(151 -> 174 ms) and +30 % per decode step (6.3 -> 8.1 ms), with the logits
+bit-identical to a run with the option off: a debugging aid, not for serving.
+
 ### Background service
 
 `espetero service` runs the server in the background as a LaunchAgent of

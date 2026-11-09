@@ -1133,6 +1133,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     if (xsplit) vq_grouped(L.xb_down, z.act, c.Ie, 0, z.ys, c.D, c.D, 0, z.tiles_b, z.ntiles_b, false);
   }
   if (!(m.moe_stages & 8)) return;
+  E.check("moe_experts", layer_index(m, L), z.ys, 0, rows * c.k, c.D, c.D, FDtype::F32);  // the experts' outputs, before the combine
   // Column slices of 512 (128 threads x float4): several threadgroups per row.
   const int slice = 512;
   const int nsl = std::min(64, (c.D + slice - 1) / slice);
@@ -2109,6 +2110,8 @@ namespace espetero::native {
 
 inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& specs, PassStats* stats) {
   const auto t_wall = Clock::now();
+  m.fcheck.begin_pass();
+  FiniteGuard fc_guard{m.fcheck};  // a failed pass drops its checks
   const bool chained = m.chain_active && m.chain_step > 0;  // earlier passes of the chain may still run
   if (!chained) {
     meta.arena.reset();
@@ -4013,10 +4016,12 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         g.D = Vd;
         g.eps = c.eps;
         g.w = L.gnorm;
+        E.check("attn_out", li, s.y, 0, M, Vd, Vd, FDtype::F32);  // (the DeltaNet output before its gated norm)
         gemm(E, m.tune, L.out, s.y, 0, Vd, s.h, 0, c.D, M, 1, 0, &g, out_link);
       } else if (gdn_fused) {
         // yn was written by the fused kernel
         tap_rows(m, E, li, 1, s.yn, M, Vd);  // ActivationSink::kMixOut
+        E.check("attn_out", li, s.yn, 0, M, Vd, Vd, FDtype::F16);
         if (last_layer) {
           if (N == 0) break;
           gather(s.yn, s.mixc, Vd, false);
@@ -4039,6 +4044,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       E.wr(s.yn);
       E.groups(MTLSizeMake(size_t(c.Hv + 3) / 4, size_t(M), 1), MTLSizeMake(128, 1, 1));
       tap_rows(m, E, li, 1, s.yn, M, Vd);  // ActivationSink::kMixOut
+      E.check("attn_out", li, s.yn, 0, M, Vd, Vd, FDtype::F16);
       if (last_layer) {
         if (N == 0) break;
         gather(s.yn, s.mixc, Vd, false);
@@ -4060,6 +4066,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       if (!kvfold) kv_save(meta.kv_saves, kv_saves.size(), k);
       if (qsa_idx) qsa_save(m, E, qs, meta.pos.buf, meta.kv_saves.buf, kv_saves.size(), k, false);
       tap_rows(m, E, li, 1, s.O, M, qdim);  // ActivationSink::kMixOut
+      E.check("attn_out", li, s.O, 0, M, qdim, qdim, FDtype::F16);
       if (last_layer) {
         if (N == 0) break;
         gather(s.O, s.mixc, qdim, false);
@@ -4070,6 +4077,12 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       } else {
         gemm(E, m.tune, L.out, s.O, 0, qdim, s.h, 0, c.D, M, 1, 0, nullptr, out_link, nrm_fold ? &hpend : nullptr);
       }
+    }
+    // ESPETERO_CHECK_FINITE: the residual after the attention block (pending split-K partials added first)
+    if (m.fcheck.opt.on && !c.q4) {
+      settle_h();
+      if (last_layer) E.check("attn_res", li, s.hc, 0, N, c.D, c.D, FDtype::F32);
+      else E.check("attn_res", li, s.h, 0, M, c.D, c.D, FDtype::F32);
     }
     if (c.q4) {
       q4_inject(M, &L.hcm);
@@ -4120,6 +4133,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       // The next layer's input read follows directly, except after the n-gram mix (q4_ple changes H first).
       const bool next_read = li + 1 < c.L && li + 1 != c.ple_layer;
       q4_inject(M, next_read ? &m.layers[size_t(li + 1)].hca : nullptr);
+      E.check("layer_out", li, m.q4s.H, 0, M, c.W(), c.W(), FDtype::F32);  // the residual streams
       // Debug (parity): ESPETERO_Q4_DUMP=dir writes the residual streams after
       // every layer (P<pass>_H<li>.f32, [M][W] fp32) and the pass's n-gram rows (P<pass>_e16.f16).
       static const char* q4dump = std::getenv("ESPETERO_Q4_DUMP");
@@ -4156,6 +4170,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
         mlp_in(L, s.xc, s.actc, N);
         gemm(E, m.tune, L.down, s.actc, 0, L.I, s.hc, 0, c.D, N, 1);
       }
+      E.check("layer_out", li, s.hc, 0, N, c.D, c.D, FDtype::F32);  // (the rows read out)
       break;
     }
     if (!fuse) rmsnorm_h(L.post_norm, s.xn, M);
@@ -4168,6 +4183,10 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       tap_rows(m, E, li, 3, s.act, M, L.I);  // ActivationSink::kDownIn
       // (the next layer's input norm adds the partials; the last layer's go through settle_h below)
       gemm(E, m.tune, L.down, s.act, 0, L.I, s.h, 0, c.D, M, 1, 0, nullptr, next_link, nrm_fold ? &hpend : nullptr);
+    }
+    if (m.fcheck.opt.on) {  // the residual after the layer
+      settle_h();
+      E.check("layer_out", li, s.h, 0, M, c.D, c.D, FDtype::F32);
     }
   }
   settle_h();
@@ -4222,6 +4241,7 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       E.wr(s.logits);
       E.threads(MTLSizeMake(n4, 1, 1), MTLSizeMake(256, 1, 1));
     }
+    E.check("logits", -1, s.logits, 0, N, c.V, c.V, FDtype::F32);
     if (total_cands > 0) {
       E.pipe("gather_cands");
       E.set(0, s.logits);
@@ -4681,6 +4701,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     commit_wait(cb);  // on failure the guard leaves the slots as they were
     E.check_submitted();  // split handshakes' resident tiles
   }
+  // ESPETERO_CHECK_FINITE: the first offender of the pass (a chain's: once the chain completes); fails the pass
+  // before its slots take the new state, unless log only.
+  if (!m.chain_active) m.fcheck.collect();
 
   // Long-prompt staging (whole layers of experts, ~3 GB) is not kept for the
   // decode steps that follow: they stage a few MB (64 MB chunks).

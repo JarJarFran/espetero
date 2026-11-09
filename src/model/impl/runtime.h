@@ -23,11 +23,13 @@
 #import <Metal/Metal.h>
 
 #include <atomic>
+#include <exception>
 #include <mutex>
 #include <sys/mman.h>
 #include <thread>
 
 #include "common.h"
+#include "finite_check.h"
 
 namespace espetero::native {
 
@@ -215,6 +217,85 @@ class Arena {
   std::vector<size_t> len_, fill_;
 };
 
+// ---- NaN / Inf / outlier detector (ESPETERO_CHECK_FINITE; finite_check.h).
+// One record per check, claimed in encoding order from a shared buffer; the
+// host collects them once the GPU work of the checks encoded so far is done
+// (collect(), at the end of a pass or of a decode chain). Off: no buffer.
+struct FiniteCheck {
+  FiniteOptions opt;
+  std::string model;   // "family (directory)" for the report
+  uint64_t pass = 0;   // the current pass (begin_pass)
+  id<MTLBuffer> recs = nil;
+  size_t cap = 0;
+  std::vector<FiniteSite> sites;  // the pending checks, record i = sites[i]
+  bool warned_full = false;
+
+  void init(id<MTLDevice> dev) {
+    opt = parse_finite_options(std::getenv("ESPETERO_CHECK_FINITE"), std::getenv("ESPETERO_CHECK_FINITE_POISON"));
+    if (!opt.error.empty()) fail(opt.error);
+    if (!opt.on) return;
+    cap = size_t(1) << 16;
+    recs = [dev newBufferWithLength:cap * sizeof(FiniteRec) options:kShared];
+    if (!recs) fail("ESPETERO_CHECK_FINITE: cannot allocate its records");
+    reset_records(cap);
+    static bool said = false;
+    if (!said)
+      std::fprintf(stderr, "[espetero] ESPETERO_CHECK_FINITE: on (%s, %s)%s%s\n",
+                   opt.thr < INFINITY ? ("|x| >= " + finite_value_str(finite_thr_bits(opt.thr))).c_str() : "NaN / Inf",
+                   opt.abort ? "a flagged pass fails" : "log only", opt.poison_op.empty() ? "" : "; poison at ",
+                   opt.poison_op.empty() ? "" : (opt.poison_op + ":" + std::to_string(opt.poison_layer)).c_str());
+    said = true;
+  }
+  void reset_records(size_t n) {
+    FiniteRec* r = static_cast<FiniteRec*>([recs contents]);
+    for (size_t i = 0; i < n; ++i) r[i] = FiniteRec{};
+  }
+  void begin_pass() {
+    if (opt.on) ++pass;
+  }
+  // The record of a new check (-1: outside a pass, or the buffer is full until the next collect()).
+  int claim(const FiniteSite& s) {
+    if (pass == 0) return -1;  // encoded outside a pass (load-time tuning): nothing collects it
+    if (sites.size() >= cap) {
+      if (!warned_full) std::fprintf(stderr, "[espetero] ESPETERO_CHECK_FINITE: %zu checks pending, later ones skipped\n", cap);
+      warned_full = true;
+      return -1;
+    }
+    sites.push_back(s);
+    sites.back().pass = pass;
+    return int(sites.size() - 1);
+  }
+  // Call once every check encoded so far has run: reports the first offender
+  // (fails the pass unless log only) and frees the records.
+  void collect() {
+    if (sites.empty()) return;
+    const FiniteRec* r = static_cast<const FiniteRec*>([recs contents]);
+    const FiniteScan sc = finite_scan(r, sites.size());
+    std::string msg;
+    if (sc.first >= 0)
+      msg = finite_message(model, sites[size_t(sc.first)], r[sc.first], sc.flagged, &sites[size_t(sc.last)]);
+    discard();
+    if (msg.empty()) return;
+    if (opt.abort) fail(msg);
+    std::fprintf(stderr, "[espetero] %s\n", msg.c_str());
+  }
+  // Forget the pending checks (a failed pass: their records may be partial).
+  void discard() {
+    reset_records(sites.size());
+    sites.clear();
+    warned_full = false;
+  }
+};
+
+// Drops the pending checks when the scope is left by an exception (a failed pass).
+struct FiniteGuard {
+  FiniteCheck& f;
+  int n = std::uncaught_exceptions();
+  ~FiniteGuard() {
+    if (std::uncaught_exceptions() > n) f.discard();
+  }
+};
+
 struct Runtime {
   id<MTLDevice> dev = nil;
   id<MTLCommandQueue> queue = nil;
@@ -236,6 +317,7 @@ struct Runtime {
   uint64_t chain_wait = 0, chain_signal = 0;
   std::map<std::string, std::pair<double, int>> prof;
   std::string prof_tag;  // profiling: prefix of the labels of the dispatches encoded now (e.g. "mtp:")
+  FiniteCheck fcheck;    // ESPETERO_CHECK_FINITE (off: nothing encoded)
 
   void init(const std::string& kernel_source) {
     dev = MTLCreateSystemDefaultDevice();
@@ -271,6 +353,7 @@ struct Runtime {
     // ESPETERO_WEIGHTS_LOCK=1: the weights in memory locked with mlock, so an idle GPU's weights are not compressed
     // (measured on Flash-Next: the first pass after 90 s of idle; a default would change every model's footprint).
     arena = std::make_unique<Arena>(dev, size_t(1) << 30, true, env_on("ESPETERO_WEIGHTS_LOCK") ? Arena::Mem::Locked : Arena::Mem::Shared);
+    fcheck.init(dev);
   }
 
   static std::string key_of(const std::string& name, int fc) { return fc ? name + "#" + std::to_string(fc) : name; }
@@ -404,6 +487,44 @@ class Enc {
     [e setComputePipelineState:rt.kernel(name, fc)];
     if (rt.profile) cur = name;
     if (trace_) cur_name_ = name;
+    if (rt.fcheck.opt.on) last_pipe_ = name, last_fc_ = fc;
+  }
+  // ESPETERO_CHECK_FINITE: scan a destination region just written (rows x
+  // cols of dtype dt, row stride ld elements, from byte off) for NaN / Inf /
+  // outliers, as check site (op, layer). Off: returns at once (nothing encoded).
+  void check(const char* op, int layer, id<MTLBuffer> b, size_t off, int rows, int cols, int ld, FDtype dt) {
+    FiniteCheck& f = rt.fcheck;
+    if (!f.opt.on || rows <= 0 || cols <= 0 || !b) return;
+    FiniteSite site;
+    site.op = op, site.layer = layer, site.rows = rows, site.cols = cols, site.dt = dt;
+    const int ri = f.claim(site);
+    if (ri < 0) return;
+    const size_t esz = dt == FDtype::F32 ? 4 : 2;
+    const size_t hi = off + (size_t(rows - 1) * size_t(ld) + size_t(cols)) * esz;
+    FiniteParams p{uint32_t(rows), uint32_t(cols), uint32_t(ld), uint32_t(dt), finite_thr_bits(f.opt.thr), 0};
+    const std::string saved = cur, lp = last_pipe_;
+    const int lfc = last_fc_;
+    if (finite_poison_at(f.opt, site, ld, &p.elem)) {
+      pipe("finite_poison");
+      set(28, b, off);
+      bytes(30, p);
+      rd(b, off, hi);
+      wr(b, off, hi);
+      threads(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    }
+    [e setComputePipelineState:rt.kernel("finite_check")];
+    if (rt.profile) cur = "finite_check";
+    set(28, b, off);
+    set(29, f.recs, size_t(ri) * sizeof(FiniteRec));
+    bytes(30, p);
+    rd(b, off, hi);
+    wr(f.recs, size_t(ri) * sizeof(FiniteRec), size_t(ri + 1) * sizeof(FiniteRec));
+    const size_t n = size_t(rows) * size_t(cols);
+    groups(MTLSizeMake(std::min<size_t>((n + 1023) / 1024, 512), 1, 1), MTLSizeMake(256, 1, 1));
+    // the encoder as it was: the same pipeline for code that dispatches again without pipe()
+    if (!lp.empty()) [e setComputePipelineState:rt.kernel(lp, lfc)];
+    last_pipe_ = lp, last_fc_ = lfc;
+    if (rt.profile) cur = saved;
   }
   void label(const std::string& s) {
     if (rt.profile) cur = s;
@@ -594,6 +715,8 @@ class Enc {
   std::vector<id<MTLCommandBuffer>> submitted_;
   bool trace_ = env_on("ESPETERO_TRACE_BARRIERS");
   std::string cur_name_;
+  std::string last_pipe_;  // ESPETERO_CHECK_FINITE: restored after a check
+  int last_fc_ = 0;
 };
 
 // Commit and block until the GPU is done. No spinning on the status: a

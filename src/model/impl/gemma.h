@@ -501,6 +501,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       rows = N, Ob = s.mixc, Hb = s.hc, Xb = s.xc, Ab = s.actc;
     }
     tap_rows(m, E, li, 1, Ob, rows, qd);  // ActivationSink::kMixOut
+    E.check("attn_out", li, Ob, 0, rows, qd, qd, FDtype::F16);
     gemm(E, m.tune, L.out, Ob, 0, qd, s.proj, 0, c.D, rows, 0);
     if (c.spark) {  // h += o, x = rmsnorm(h) * post_attention_layernorm
       const G4NormParamsHost np{c.D, c.eps, 1.0f, 1};
@@ -538,6 +539,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       }
       E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
     }
+    E.check("attn_res", li, Hb, 0, rows, c.D, c.D, FDtype::F32);
     mlp(L, Xb, Ab, s.proj, rows);
     const bool next = li + 1 < c.L && !last;
     const Buf& w_next = next ? m.layers[size_t(li + 1)].in_norm : (c.spark ? L.post_norm : L.post_ffn);
@@ -557,6 +559,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
     } else if (L.moe) {
       experts(L, s.g_xn2, s.g_xr, rows);
       MoeScratch& z = m.mz;
+      E.check("moe_experts", li, z.ys, 0, rows * c.k, c.D, c.D, FDtype::F32);  // the experts' outputs, before g4_moe_out
       const G4MoeOutParamsHost op{c.D, c.k, c.eps, L.scalar, next ? 1 : 0};
       E.pipe("g4_moe_out");
       E.set(0, s.proj);
@@ -595,6 +598,7 @@ inline void g4_encode_layers(Model& m, Enc& E, const G4PassIn& P) {
       if (next) E.wr(s.xn);
       E.groups(MTLSizeMake(size_t(rows), 1, 1), MTLSizeMake(256, 1, 1));
     }
+    E.check("layer_out", li, Hb, 0, rows, c.D, c.D, FDtype::F32);
     if (last) break;
   }
 }

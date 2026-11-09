@@ -194,6 +194,15 @@ $(BUILD)/ollama_test: tests/ollama_test.cpp $(BUILD)/obj/server/ollama.o $(BUILD
 $(BUILD)/webui_test: tests/webui_test.cpp $(BUILD)/obj/server/webui.o $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(HTTP_SRC)) $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
+# ESPETERO_CHECK_FINITE's host side (options, poison sites, report) without a GPU.
+$(BUILD)/finite_check_test: tests/finite_check_test.cpp src/model/impl/finite_check.h
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+# ESPETERO_CHECK_FINITE on a real checkpoint (GPU): a clean run reports nothing, a poisoned
+# site is caught at its op, the overhead. build/finite_test <model> [layer] [ops]
+$(BUILD)/finite_test: tests/finite_test.mm $(BUILD)/model.o $(BUILD)/json.o
+	$(CXX) $(CXXFLAGS) $(OBJCFLAGS) $^ $(FRAMEWORKS) -o $@
+
 # The configuration file and the LaunchAgent, in a temporary home.
 $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ -o $@
@@ -201,7 +210,7 @@ $(BUILD)/service_test: tests/service_test.cpp $(BUILD)/obj/server/service.o $(BU
 .PHONY: test
 test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http_test $(BUILD)/vision_limits_test $(BUILD)/hub_test $(BUILD)/model_meta_test $(BUILD)/api_test \
       $(BUILD)/ollama_test $(BUILD)/webui_test $(BUILD)/service_test $(BUILD)/grammar_test $(BUILD)/gemma_test $(BUILD)/glm_test $(BUILD)/kev_test \
-      $(BUILD)/tok_load_test
+      $(BUILD)/tok_load_test $(BUILD)/finite_check_test
 	python3 tests/ref/json_ref.py $(BUILD)/json_cases.json && $(BUILD)/json_test $(BUILD)/json_cases.json
 	$(BUILD)/sampling_test
 	$(BUILD)/tmpl_test tests/ref/tmpl_fixtures
@@ -218,6 +227,7 @@ test: $(BUILD)/json_test $(BUILD)/sampling_test $(BUILD)/tmpl_test $(BUILD)/http
 	$(BUILD)/glm_test
 	$(BUILD)/kev_test tests/ref/kev_fixtures.json
 	$(BUILD)/tok_load_test
+	$(BUILD)/finite_check_test
 
 # ---- install / package
 # make install [PREFIX=/usr/local] [DESTDIR=staging]: the espetero binary in

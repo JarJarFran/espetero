@@ -39,6 +39,12 @@ class Dsv4Model final : public NativeModel {
     c_ = read_cfg(root);
     rt_.init(kernels);
     rt_.serial = true;
+    {  // ESPETERO_CHECK_FINITE's reports
+      std::string base = path;
+      while (base.size() > 1 && base.back() == '/') base.pop_back();
+      if (const size_t k = base.find_last_of('/'); k != std::string::npos) base = base.substr(k + 1);
+      rt_.fcheck.model = "deepseek_v41 (" + base + ")";
+    }
     // Development: ESPETERO_DS4_LAYERS=n loads the first n layers only (no head; the
     // files of later layers may still be downloading), ESPETERO_DS4_NO_ENGRAM=1 skips Engram.
     if (const char* v = std::getenv("ESPETERO_DS4_LAYERS"); v && std::atoi(v) > 0) {
@@ -1204,6 +1210,30 @@ class Dsv4Model final : public NativeModel {
       [e setBytes:&v length:sizeof(T) atIndex:i];
     }
     void raw(int i, const void* p, size_t n) { [e setBytes:p length:n atIndex:i]; }
+    // ESPETERO_CHECK_FINITE (runtime.h's Enc::check): rows x cols of dtype dt, row stride ld, from byte off.
+    void check(const char* op, int layer, id<MTLBuffer> b, size_t off, int rows, int cols, int ld, FDtype dt) {
+      FiniteCheck& f = rt.fcheck;
+      if (!f.opt.on || rows <= 0 || cols <= 0 || !b) return;
+      FiniteSite site;
+      site.op = op, site.layer = layer, site.rows = rows, site.cols = cols, site.dt = dt;
+      const int ri = f.claim(site);
+      if (ri < 0) return;
+      FiniteParams p{uint32_t(rows), uint32_t(cols), uint32_t(ld), uint32_t(dt), finite_thr_bits(f.opt.thr), 0};
+      const char* saved = cur;
+      if (finite_poison_at(f.opt, site, ld, &p.elem)) {
+        pipe("finite_poison");
+        set(28, b, off);
+        bytes(30, p);
+        threads(1, 1, 1, 1);
+      }
+      pipe("finite_check");
+      set(28, b, off);
+      set(29, f.recs, size_t(ri) * sizeof(FiniteRec));
+      bytes(30, p);
+      const size_t n = size_t(rows) * size_t(cols);
+      groups(std::min<size_t>((n + 1023) / 1024, 512), 1, 1, 256);
+      if (*saved) pipe(saved);  // the encoder's pipeline as it was
+    }
     void groups(size_t x, size_t y, size_t z, size_t tx) {
       if (!x || !y || !z) return;
       bar();
@@ -2105,6 +2135,8 @@ class Dsv4Model final : public NativeModel {
   void forward(std::vector<Seg>& segs, bool draft = false) {
     const auto tf0 = Clock::now();
     ++xc_.pass;
+    rt_.fcheck.begin_pass();
+    FiniteGuard fc_guard{rt_.fcheck};  // a failed pass drops its checks
     struct Timer {
       double& acc;
       Clock::time_point t0;
@@ -2348,6 +2380,7 @@ class Dsv4Model final : public NativeModel {
           hc_fused(E, r0, M, nil, 0, nil, nullptr, nullptr, nullptr, nil, prev, &w.attn_norm, X_, 0);
         }
         attention_block(E, w, l, bk, segs, draft);
+        E.check(draft ? "draft_attn_out" : "attn_out", l, Y_, 0, M, D, D, FDtype::F32);  // (the block's rows)
         if (!dump_dir_.empty()) dump_rows(E, "a" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
         if (!hc_fuse()) {
           hc_post(E, mixA_, r0, M);
@@ -2367,8 +2400,10 @@ class Dsv4Model final : public NativeModel {
         for (size_t ci = 0; ci < fb.size(); ++ci) {
           const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts_encode(E, w, int(ci), r0, M, M * K, M * K, true, nil, 0, 0);
+          E.check(draft ? "draft_moe_out" : "moe_out", l, Y_, 0, M, D, D, FDtype::F32);
           hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
         }
+        E.check(draft ? "draft_layer_out" : "layer_out", l, H_, 0, T, 4 * D, 4 * D, FDtype::F32);  // the 4 hc copies per row
         drives.push_back(std::move(d));
         prev = mixF_[cur];
         cur ^= 1;
@@ -2431,6 +2466,7 @@ class Dsv4Model final : public NativeModel {
         for (size_t ci = 0; ci < fb.size(); ++ci) {
           const int r0 = fb[ci].r0, M = fb[ci].M;
           moe_experts(E, w, int(ci), r0, M, slot_of);
+          E.check(draft ? "draft_moe_out" : "moe_out", l, Y_, 0, M, D, D, FDtype::F32);
           if (!dump_dir_.empty()) dump_rows(E, "f" + std::to_string(l) + "_" + std::to_string(ci), Y_, size_t(M) * size_t(D));
           hc_end(E, l, r0, M, nil, 0, mixF_[cur], LW, same_rows, mix_done, pre_done);
         }
@@ -2472,11 +2508,14 @@ class Dsv4Model final : public NativeModel {
             moe_experts(E, w, int(ci), fb[ci].r0, fb[ci].M, slot_of, &in, false, YT_, size_t(fb[ci].r0) * yrow, par);
           used[par] = E.submit_chained();
         }
-        for (size_t ci = 0; ci < fb.size(); ++ci)
+        for (size_t ci = 0; ci < fb.size(); ++ci) {
+          E.check(draft ? "draft_moe_out" : "moe_out", l, YT_, size_t(fb[ci].r0) * yrow, fb[ci].M, D, D, FDtype::F32);
           hc_end(E, l, fb[ci].r0, fb[ci].M, YT_, size_t(fb[ci].r0) * yrow, mixF_[cur], LW, same_rows, mix_done, pre_done);
+        }
       }
       prev = mixF_[cur];
       cur ^= 1;
+      E.check(draft ? "draft_layer_out" : "layer_out", l, H_, 0, T, 4 * D, 4 * D, FDtype::F32);  // the 4 hc copies per row
       if (!dump_dir_.empty()) dump_rows(E, "h" + std::to_string(l), H_, size_t(T) * 4 * size_t(D));
     }
     prot_lo_ = -1, prot_hi_ = -2;
@@ -2489,6 +2528,7 @@ class Dsv4Model final : public NativeModel {
         R += g.nlog;
       }
     if (R && head_.b) gemv(E, 2, Buf(head_), Buf{}, XN_, 0, D, LOG_, 0, c.V, c.V, D, R);
+    if (R && head_.b) E.check(draft ? "draft_logits" : "logits", -1, LOG_, 0, R, c.V, c.V, FDtype::F32);
     if (drive) {
       // ---- the whole pass is committed; the host follows the GPU layer by layer: route, slots (reads), tables, signal
       E.submit_async();
@@ -2561,9 +2601,11 @@ class Dsv4Model final : public NativeModel {
       E.end();
       gpu_ms_ += E.gpu_ms;
       flushes_ += uint64_t(E.flushes);
+      rt_.fcheck.collect();
       return;
     }
     E.end();
+    rt_.fcheck.collect();  // ESPETERO_CHECK_FINITE: the pass's first offender, before the slots take its state
     gpu_ms_ += E.gpu_ms;
     wait_ms_ += E.wait_ms, wake_ms_ += E.wake_ms;
     flushes_ += uint64_t(E.flushes);

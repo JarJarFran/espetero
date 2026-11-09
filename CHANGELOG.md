@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **`ESPETERO_CHECK_FINITE`** (debugging): after chosen dispatches a small kernel scans the region just written for NaN, Inf and optionally |x| >= a threshold (`=1e11`), and the host reports the first offender of the pass (model, layer, op, row, column, value, pass id), then fails the pass with that error or only logs it (`=log`). Hooked once in the shared encoders (`Enc::check`, DeepSeek-V4.1's `Enc2::check`), with sites for the attention output, the residual after attention and after each layer, the MoE output and the logits of the Qwen3.5 family (dense, MoE, Flash-Next's residual streams), Gemma 4 and DeepSeek-V4.1. Off, nothing is encoded and outputs are bit-identical. `ESPETERO_CHECK_FINITE_POISON=op:layer:row:col` injects a NaN for tests; `tests/finite_check_test` (in `make test`) and `build/finite_test MODEL` (GPU). See [docs/configuration.md](docs/configuration.md#finding-the-first-nan-espetero_check_finite).
+
 ## 0.2.1 (2026-11-06)
 
 - **Spark-X2.5 / X2.6 from the Hugging Face cache or a repository id**: the memory check before a load or download read a `spark2_5` config.json as Qwen3.5 and refused it ("incomplete Qwen3.5 configuration"), so `espetero serve --model XHToken/Spark-X2.6-4B` never got to the engine. The check now reads Spark's geometry (Gemma 4's pools with 256-dim heads in both layer kinds) and its `model.*` tensor names.
