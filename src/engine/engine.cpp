@@ -287,6 +287,20 @@ struct Engine::Seq {
   };
   std::vector<Snap> snaps;
   Snap chain_snap;
+  // Preemption (EngineOptions::preempt): the request's place in arrival
+  // order (n > 1 choices share their leader's), and, while a parked
+  // sequence computes its way back, the tokens its work slot must hold
+  // again: the prompt and every token emitted so far (`reply` records them
+  // while preemption is on). Its prefill runs over `resume` instead of the
+  // prompt and its final chunk's readout is the next token, drawn at the
+  // position the interrupted decode step would have drawn it; sampling
+  // state (seed, penalties, n-gram history, grammar) is never reset.
+  uint64_t arrival = 0;
+  std::vector<int32_t> resume;
+  int preempts = 0, resume_rows = 0;
+  int passes_before = 0;    // passes of earlier admissions (`passes` counts this one's: 0 = first chunk ahead)
+  int cached_report = -1;   // usage cached_tokens: the first admission's (a resume's cache hits are its own state)
+  const std::vector<int32_t>& tokens() const { return resume.empty() ? req.prompt : resume; }
 };
 
 // ---------------------------------------------------------------- setup
@@ -1327,7 +1341,7 @@ int Engine::reserved_kv_tokens() const {
   const int bt = std::max(1, model_->info().block_tokens);
   int64_t r = 0;
   for (const auto& s : active_)
-    r += std::max<int64_t>(0, int64_t(s->req.prompt.size()) - s->done) + answer_reserve(s->req.max_tokens - s->generated) +
+    r += std::max<int64_t>(0, int64_t(s->tokens().size()) - s->done) + answer_reserve(s->req.max_tokens - s->generated) +
          2 * bt;  // a copied partial block, verify rows past the slot's length
   return int(std::min<int64_t>(r, INT32_MAX));
 }
@@ -2031,6 +2045,7 @@ std::shared_ptr<GenStream> Engine::generate(GenRequest request) {
     seq->seed = (uint64_t(rd()) << 32) ^ uint64_t(rd());
   }
   seq->out->prompt_tokens = int(seq->req.prompt.size());
+  seq->arrival = ++arrivals_;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (stop_) throw RequestError(503, "engine is shutting down");
@@ -2388,7 +2403,7 @@ void Engine::loop() {
   waiting_.clear();
   for (auto& s : active_) {
     s->out->completion_tokens = s->generated;
-    s->out->cached_tokens = s->cached;
+    s->out->cached_tokens = s->cached_report >= 0 ? s->cached_report : s->cached;
     s->out->finish("error", msg);
   }
   active_.clear();
@@ -2671,6 +2686,7 @@ void Engine::fork_group(Seq& L, std::vector<Seq*>& touched, std::vector<std::vec
     f->rng.seed(seeds[k]);
     f->t_start = L.t_start;
     f->t_wait = now;
+    f->arrival = L.arrival;
     if (f->out->cancelled()) {
       f->out->finish("cancelled");
       continue;
@@ -2809,14 +2825,18 @@ void Engine::step() {
   auto finish_seq = [&](Seq& s, const std::string& reason, const std::string& err = "") {
     if (reason == "error") std::fprintf(stderr, "[espetero] generation failed after %d tokens: %s\n", s.generated, err.c_str());
     s.out->completion_tokens = s.generated;
-    s.out->cached_tokens = s.cached;
+    s.out->cached_tokens = s.cached_report >= 0 ? s.cached_report : s.cached;
     json::Value t = json::Value::object();
     const double total = ms_since(s.t_start);
     t.set("prefill_ms", round3(s.t_first.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(s.t_first - s.t_start).count() : total));
     const double dec = s.t_decode.time_since_epoch().count() ? ms_since(s.t_decode) : 0;
     t.set("decode_ms", round3(dec));
     t.set("decode_tokens_per_s", dec > 0 && s.generated > 1 ? round3((s.generated - 1) / (dec / 1000)) : json::Value());
-    t.set("passes", s.passes);
+    t.set("passes", s.passes + s.passes_before);
+    if (s.preempts) {  // parked for KV and resumed: how often, and the rows its resumes computed again
+      t.set("preemptions", s.preempts);
+      t.set("resume_rows", s.resume_rows);
+    }
     if (s.drafted) t.set("draft_acceptance", round3(double(s.accepted) / double(s.drafted)));
     if (s.lookups) t.set("lookup_passes", s.lookups);
     if (s.lost_mtp) t.set("mtp_plain_stretches", s.lost_mtp);  // losses of the MTP head (each a back-off)
@@ -2954,10 +2974,13 @@ void Engine::step() {
     }
   }
 
-  // A chat checkpoint that is a strict prefix of the prompt, with the same images inside it.
-  auto on_path = [&](const GenRequest& r, const CacheEntry& e) {
-    if (e.ns != "chat" || e.tokens.size() >= r.prompt.size()) return false;
-    if (!std::equal(e.tokens.begin(), e.tokens.end(), r.prompt.begin())) return false;
+  // A chat checkpoint that is a strict prefix of the prompt (a resumed
+  // sequence's: its prompt and emitted tokens), with the same images inside it.
+  auto on_path = [&](const Seq& q, const CacheEntry& e) {
+    const GenRequest& r = q.req;
+    const std::vector<int32_t>& toks = q.tokens();
+    if (e.ns != "chat" || e.tokens.size() >= toks.size()) return false;
+    if (!std::equal(e.tokens.begin(), e.tokens.end(), toks.begin())) return false;
     size_t inside = 0;
     for (int row : r.image_rows)
       if (size_t(row) < e.tokens.size()) ++inside;
@@ -2968,7 +2991,7 @@ void Engine::step() {
   };
   // Longest cached chat checkpoint that is a strict prefix of the prompt,
   // longer than `longer_than` tokens, with the same images inside it.
-  auto best_chat_ckpt = [&](const GenRequest& r, bool want_mtp, size_t longer_than) -> CacheEntry* {
+  auto best_chat_ckpt = [&](const Seq& r, bool want_mtp, size_t longer_than) -> CacheEntry* {
     CacheEntry* best = nullptr;
     for (auto& [k, e] : cache_) {
       if (want_mtp && !e.mtp) continue;
@@ -2986,12 +3009,16 @@ void Engine::step() {
       auto s = waiting_.front();
       if (s->out->cancelled()) {
         waiting_.pop_front();
+        // (a parked sequence has emitted tokens: its usage counts them)
+        s->out->completion_tokens = s->generated;
+        if (s->cached_report >= 0) s->out->cached_tokens = s->cached_report;
+        gen_tokens_ += uint64_t(s->generated);
         s->out->finish("cancelled");
         continue;
       }
       // Longest cached chat checkpoint that is a strict prefix of the prompt.
       const bool want_mtp = I.mtp && opt_.draft_tokens > 0 && s->req.speculate;
-      CacheEntry* best = best_chat_ckpt(s->req, want_mtp, 0);
+      CacheEntry* best = best_chat_ckpt(*s, want_mtp, 0);
       // KV for the prompt's uncached part and the answer, with some headroom.
       // A cached prefix is shared, not copied: counting the whole prompt would
       // let only a few requests in at a time under a long shared prefix (tens
@@ -3013,10 +3040,12 @@ void Engine::step() {
       // handling can be run.
       const bool reserve = kv_reserve();
       const int bt = I.block_tokens > 0 ? I.block_tokens : 64;
-      const int uncached = int(s->req.prompt.size()) - (best ? int(best->tokens.size()) : 0);
-      if (!reserve && !active_.empty() && model_->free_kv_tokens() < uncached + std::min(s->req.max_tokens, 1024) + 64 + bt)
+      const std::vector<int32_t>& toks = s->tokens();  // a parked sequence: its prompt and emitted tokens
+      const int left = s->req.max_tokens - s->generated;
+      const int uncached = int(toks.size()) - (best ? int(best->tokens.size()) : 0);
+      if (!reserve && !active_.empty() && model_->free_kv_tokens() < uncached + std::min(left, 1024) + 64 + bt)
         break;
-      const int need = uncached + answer_reserve(s->req.max_tokens) + 2 * bt;
+      const int need = uncached + answer_reserve(left) + 2 * bt;
       if (reserve && !active_.empty()) {
         const int reserved = reserved_kv_tokens();
         std::vector<int> keep_best;
@@ -3037,7 +3066,7 @@ void Engine::step() {
       if (!prefix_root_.empty()) {
         // Stored prefixes are text: valid up to the first image (a photo
         // request also loads the instructions before its image).
-        const size_t limit = s->req.image_rows.empty() ? s->req.prompt.size() : size_t(s->req.image_rows[0]);
+        const size_t limit = s->req.image_rows.empty() ? toks.size() : size_t(s->req.image_rows[0]);
         // The restore may evict to make room: pin the memory hit meanwhile, or
         // `best` could point at an evicted entry.
         const int bslot = best ? best->slot : -1;
@@ -3047,7 +3076,7 @@ void Engine::step() {
         // request whose instructions are on disk, just past a long system prompt
         // already in memory, would load a second copy of both (hundreds of KV
         // blocks) to save a few hundred rows.
-        CacheEntry* disk = prefix_store_restore(s->req.prompt, best ? best->tokens.size() + 2047 : 0, limit, want_mtp);
+        CacheEntry* disk = prefix_store_restore(toks, best ? best->tokens.size() + 2047 : 0, limit, want_mtp);
         if (bslot >= 0) pinned_.erase(std::find(pinned_.begin(), pinned_.end(), bslot));
         if (disk) best = disk;
       }
@@ -3079,9 +3108,9 @@ void Engine::step() {
         if (sl >= 0) avoid.push_back(sl);
         return sl;
       };
-      if (sys_split > cached && sys_split < int(s->req.prompt.size())) sysckpt = optional_slot();
-      if (opt_.instr_checkpoint && pre_split > cached && pre_split < int(s->req.prompt.size())) prectk = optional_slot();
-      if (opt_.image_checkpoint && img_split > cached && img_split < int(s->req.prompt.size())) imgckpt = optional_slot();
+      if (sys_split > cached && sys_split < int(toks.size())) sysckpt = optional_slot();
+      if (opt_.instr_checkpoint && pre_split > cached && pre_split < int(toks.size())) prectk = optional_slot();
+      if (opt_.image_checkpoint && img_split > cached && img_split < int(toks.size())) imgckpt = optional_slot();
       const bool keep_prompt = s->req.cache_prompt < 0 ? opt_.prompt_checkpoint : s->req.cache_prompt > 0;
       if (keep_prompt && split > cached && split <= int(s->req.prompt.size())) ckpt = optional_slot();
       waiting_.pop_front();
@@ -3099,13 +3128,18 @@ void Engine::step() {
       // (only those it can continue: a request that drafts cannot use a
       // checkpoint without the MTP state, which then stays plain LRU.)
       for (auto& [k, e] : cache_)
-        if (on_path(s->req, e) && (!want_mtp || e.mtp)) s->keep.push_back(k);
+        if (on_path(*s, e) && (!want_mtp || e.mtp)) s->keep.push_back(k);
       s->chain_key = best ? best->key : std::string();
       // (a prompt that is not cached for later turns is not continued by one either)
       s->reply_ck = opt_.reply_checkpoint && keep_prompt && split >= 0 && s->req.forced.empty();
       s->cached = cached;
       s->done = cached;
       s->mtp = want_mtp;
+      if (s->preempts > 0) {
+        ++kv_resumed_;
+        s->resume_rows += int(toks.size()) - cached;
+        kv_resume_rows_ += uint64_t(int(toks.size()) - cached);
+      }
       if (best) best->used = ++clock_;
       pinned_.push_back(work);
       if (ckpt >= 0) pinned_.push_back(ckpt);
@@ -3113,8 +3147,10 @@ void Engine::step() {
       if (imgckpt >= 0) pinned_.push_back(imgckpt);
       if (prectk >= 0) pinned_.push_back(prectk);
       if (s->parent >= 0) pinned_.push_back(s->parent);  // until the first chunk runs
-      if (s->req.sampling.penalized()) s->pen.add_prompt(s->req.prompt.data(), s->req.prompt.size());
-      if (opt_.prompt_lookup) s->ngram.extend(s->req.prompt.data(), s->req.prompt.size());
+      if (s->preempts == 0) {  // (a resumed sequence keeps its penalties and n-gram history)
+        if (s->req.sampling.penalized()) s->pen.add_prompt(s->req.prompt.data(), s->req.prompt.size());
+        if (opt_.prompt_lookup) s->ngram.extend(s->req.prompt.data(), s->req.prompt.size());
+      }
       active_.push_back(s);
     }
     // Decision jobs (FIFO) within the pass budget.
@@ -3441,7 +3477,7 @@ void Engine::step() {
           }
         }
         s->out->push(emit.data(), emit.size());
-        if (s->reply_ck) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
+        if (s->reply_ck || opt_.preempt) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
         s->pending.assign(1, last);
         if (!reason.empty()) s->pending.clear();
         if (!reason.empty() || s->out->cancelled()) {
@@ -3744,7 +3780,7 @@ void Engine::step() {
       // Late parent upgrade: a longer checkpoint appeared after this
       // prompt was admitted (another request with the same system prompt and
       // image finished its prefill): continue from it instead.
-      if (CacheEntry* b = best_chat_ckpt(s->req, s->mtp, size_t(s->cached))) {
+      if (CacheEntry* b = best_chat_ckpt(*s, s->mtp, size_t(s->cached))) {
         if (s->parent >= 0) {
           auto it = std::find(pinned_.begin(), pinned_.end(), s->parent);
           if (it != pinned_.end()) pinned_.erase(it);
@@ -3766,7 +3802,8 @@ void Engine::step() {
       }
       if (opt_.single_flight && shares_computing(s)) continue;
     }
-    const int total = int(s->req.prompt.size());
+    const std::vector<int32_t>& toks = s->tokens();  // a resumed sequence: prompt + emitted tokens
+    const int total = int(toks.size());
     int budget = max_rows - rows;
     if (!decoding.empty() || !jobs.empty()) budget = std::min(budget, prefill_chunk_rows());
     if (budget <= 0 || readouts + 1 > max_readouts) break;
@@ -3801,7 +3838,7 @@ void Engine::step() {
     if (end <= s->done) continue;
     if (opt_.single_flight && first) add_computing(s);  // later prompts in this pass wait for its prefixes
     prefill_rows += end - s->done;
-    s->root.assign(s->req.prompt.begin() + s->done, s->req.prompt.begin() + end);
+    s->root.assign(toks.begin() + s->done, toks.begin() + end);
     s->final_chunk = end == total;
     s->chunk_end = end;
     TreeSpec t;
@@ -3839,7 +3876,8 @@ void Engine::step() {
       s->arg.assign(1, -1);
       t.out_argmax = s->arg.data();
       t.want_logits = !s->req.sampling.greedy() || !s->req.forced.empty();
-      set_gpu_sampling(t, opt_, s->req.sampling, s->seed, int64_t(s->req.prompt.size()));
+      // (a resumed sequence's next token: the position its decode step would have drawn it at)
+      set_gpu_sampling(t, opt_, s->req.sampling, s->seed, int64_t(s->req.prompt.size()) + int64_t(s->generated));
       set_logprob_readouts(t, s->req, s->lp_lse, 1);
       set_constrained_readouts(t, s->req);
     }
@@ -3862,6 +3900,129 @@ void Engine::step() {
     finish_seq(*s, "error", why);
     if (it != active_.end()) active_.erase(it);
   };
+  // Preemption (EngineOptions::preempt): instead of stopping a sequence
+  // when the running ones hold the KV cache, one is parked and resumed once
+  // KV frees up. Parking frees what only it holds: its optional checkpoint
+  // slots not saved yet, its reply snapshots and its pins; its work slot
+  // becomes a chat checkpoint of exactly what it holds (the prompt and the
+  // tokens emitted so far less the pending ones), evicted like any other
+  // (least recently used, so only when the pass still needs its blocks). The
+  // sequence goes back to the queue ahead of the requests that have not
+  // started in its priority class (parked ones in arrival order); admission
+  // takes it once its rest fits, and it prefills prompt + emitted tokens from
+  // the longest cached state of them (its parked checkpoint when still there,
+  // else the prompt's or none). The final chunk's readout is its next token,
+  // drawn at the position its decode step would have used, with its seed,
+  // penalties, n-gram history and grammar state untouched, so greedy and
+  // seeded replies continue as they would have; its stream stays open, no
+  // token is sent twice and usage counts every token once.
+  // Not for teacher-forced scoring, M-RoPE (Qwen-VL) prompts, a forked
+  // choice's prompt with images (its pixels are gone) or an n > 1 leader
+  // before it forks: those stop as before.
+  auto preemptable = [&](const Seq& q) {
+    if (!opt_.preempt || !q.req.forced.empty() || !q.req.positions.empty() || !q.req.group_out.empty()) return false;
+    for (const PreparedImage& im : q.req.images)
+      if (im.pixels.empty()) return false;
+    return true;
+  };
+  // The victim: batch priority before interactive, then the newest arrival;
+  // never the most senior running sequence (lowest priority value, oldest),
+  // which therefore always progresses: nothing starves, and a parked request
+  // resumes before later arrivals of its class start.
+  auto preempt_victim = [&]() -> Seq* {
+    if (active_.size() < 2) return nullptr;
+    auto senior_of = [](const Seq* a, const Seq* b) {
+      return a->req.priority != b->req.priority ? a->req.priority < b->req.priority : a->arrival < b->arrival;
+    };
+    Seq* senior = nullptr;
+    for (auto& p : active_)
+      if (!senior || senior_of(p.get(), senior)) senior = p.get();
+    Seq* v = nullptr;
+    for (auto& p : active_) {
+      Seq* q = p.get();
+      if (q == senior || !preemptable(*q)) continue;
+      if (!v || senior_of(v, q)) v = q;
+    }
+    return v;
+  };
+  auto preempt_seq = [&](Seq* s) {
+    decoding.erase(std::remove(decoding.begin(), decoding.end(), s), decoding.end());
+    prefilling.erase(std::remove(prefilling.begin(), prefilling.end(), s), prefilling.end());
+    held.erase(std::remove(held.begin(), held.end(), s), held.end());
+    auto unpin = [&](int sl) {
+      auto it = std::find(pinned_.begin(), pinned_.end(), sl);
+      if (it != pinned_.end()) pinned_.erase(it);
+    };
+    const int P = int(s->req.prompt.size());
+    drop_snapshots(*s);
+    for (int* f : {&s->ckpt, &s->sysckpt, &s->imgckpt, &s->prectk})  // (a saved one is -1 already)
+      if (*f >= 0) {
+        unpin(*f);
+        model_->slot_free(*f);
+        *f = -1;
+      }
+    if (s->parent >= 0) {
+      unpin(s->parent);
+      s->parent = -1;
+    }
+    std::vector<int32_t> toks = s->tokens();
+    if (s->phase == Seq::Decode) toks.insert(toks.end(), s->reply.begin(), s->reply.end());
+    int kept = 0;
+    if (s->work >= 0) {
+      unpin(s->work);
+      const int L = model_->slot_len(s->work);
+      const int expect = s->phase == Seq::Decode ? P + int(s->reply.size()) - int(s->pending.size()) : s->done;
+      if (L > 0 && L == expect && L < int(toks.size())) {
+        CacheEntry e;
+        e.ns = "chat";
+        e.tokens.assign(toks.begin(), toks.begin() + L);
+        for (size_t g = 0; g < s->req.image_rows.size(); ++g)
+          if (s->req.image_rows[g] < L) e.digests.push_back(s->req.images[g].digest);
+        e.slot = s->work;
+        // (MTP drafts this step ran the head past the slot's rows: its state then serves no draft)
+        e.mtp = s->mtp && model_->slot_mtp(s->work) && (s->drafts.empty() || s->from_lookup);
+        e.parent = s->chain_key;
+        const std::string key = chat_key(e.digests, e.tokens, e.mtp);
+        if (!cache_.count(key) && !(!e.mtp && cache_.count(chat_key(e.digests, e.tokens, true)))) {
+          cache_put(key, std::move(e));
+          kept = L;
+        }
+      }
+      if (!kept) model_->slot_free(s->work);
+      s->work = -1;
+    }
+    if (opt_.verbose || trace)
+      std::fprintf(stderr, "[espetero] KV cache full: sequence parked after %d tokens (%s, %d tokens held as a checkpoint)\n",
+                   s->generated, s->phase == Seq::Decode ? "decoding" : "prefilling", kept);
+    if (s->phase == Seq::Decode) s->resume = std::move(toks);
+    s->phase = Seq::Prefill;
+    s->pending.clear();
+    s->drafts.clear();
+    s->drafts2.clear();
+    s->sib = s->commit_k = s->lh_first = 0;
+    s->from_lookup = false;
+    if (s->cached_report < 0) s->cached_report = s->cached;
+    s->cached = s->done = 0;
+    s->saved_ckpt = s->saved_sys = s->saved_img = s->saved_pre = false;
+    s->keep.clear();
+    s->chain_key.clear();
+    s->passes_before += s->passes;
+    s->passes = s->retries = 0;
+    s->final_chunk = false;
+    s->tree = -1;
+    s->t_wait = Clock::now() - std::chrono::milliseconds(opt_.prefill_wait_ms);  // its chunks never wait for decoders
+    ++s->preempts;
+    ++kv_preempted_;
+    auto it = std::find_if(active_.begin(), active_.end(), [&](const auto& p) { return p.get() == s; });
+    std::shared_ptr<Seq> keep_alive = *it;
+    active_.erase(it);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto w = waiting_.begin();
+    while (w != waiting_.end() && ((*w)->req.priority < s->req.priority ||
+                                   ((*w)->req.priority == s->req.priority && (*w)->preempts > 0 && (*w)->arrival < s->arrival)))
+      ++w;
+    waiting_.insert(w, std::move(keep_alive));
+  };
   // The message says what would fit: a request alone gets the cache's
   // size and, for its prompt, the KV free for it (the free list, the
   // checkpoints it could evict and its own blocks); a stopped answer, the
@@ -3877,7 +4038,7 @@ void Engine::step() {
         const int64_t avail = int64_t(model_->free_kv_tokens()) + evictable_kv_tokens({}, true) +
                               (own.empty() ? 0 : model_->freed_kv_tokens(own));
         return "KV cache full: this request's prompt does not fit: it needs " +
-               std::to_string(int64_t(s.req.prompt.size()) - s.cached) + " tokens of KV cache beyond its cached "
+               std::to_string(int64_t(s.tokens().size()) - s.cached) + " tokens of KV cache beyond its cached "
                "prefix, and about " + std::to_string(avail) + " are free for it with nothing else running (the "
                "cache holds " + pool + "): send a shorter prompt, or raise --kv-gb or --memory-gb";
       }
@@ -4027,6 +4188,18 @@ void Engine::step() {
           pick = prompt;
         } else if (dec >= 0 && others) {
           pick = dec;
+        } else if (Seq* v = preempt_victim()) {
+          // Parked rather than stopped (it frees its blocks too, and its
+          // work slot's state stays cached while the pass can spare it).
+          for (size_t i = 0; i < trees.size(); ++i)
+            if (!drop[i] && seq_of(i) == v) {
+              drop[i] = 3;
+              need -= tneed[i];
+            }
+          const int w = v->work;
+          preempt_seq(v);
+          if (w >= 0) reads.erase(std::remove(reads.begin(), reads.end(), w), reads.end());
+          continue;
         } else {
           how = 2;  // a stopped sequence frees its blocks too
           pick = decoders ? newest(decode_tree) : newest(prompt_tree) >= 0 ? newest(prompt_tree) : dec;
@@ -4113,6 +4286,11 @@ void Engine::step() {
       {
         std::lock_guard<std::mutex> lk(mu_);
         decisions_.insert(decisions_.begin(), jobs.begin(), jobs.end());
+      }
+      if (Seq* v = preempt_victim()) {
+        std::fprintf(stderr, "[espetero] pass refused (%s): a sequence is parked\n", msg.c_str());
+        preempt_seq(v);
+        return;
       }
       ++kv_stopped_;
       std::fprintf(stderr, "[espetero] pass refused (%s): the newest sequence stops\n", msg.c_str());
@@ -4468,8 +4646,13 @@ void Engine::step() {
       s->t_wait = Clock::now();
       if (!s->final_chunk) continue;
       s->phase = Seq::Decode;
-      s->t_first = Clock::now();
-      s->t_decode = s->t_first;
+      if (!s->resume.empty()) {  // a resumed sequence decodes on (its first token's time stays)
+        s->resume.clear();
+        s->resume.shrink_to_fit();
+      } else if (s->preempts == 0 || !s->t_first.time_since_epoch().count()) {
+        s->t_first = Clock::now();
+        s->t_decode = s->t_first;
+      }
     } else {
       if (!s->drafts.empty() && !s->from_lookup && s->req.forced.empty()) {
         ++s->dep_k[std::min<size_t>(8, s->drafts.size())];
@@ -4572,7 +4755,7 @@ void Engine::step() {
     // The records of the emitted tokens travel with them.
     if (produced_lp[i].size() > emit.size()) produced_lp[i].resize(emit.size());
     s->out->push(emit.data(), emit.size(), s->req.logprobs >= 0 ? &produced_lp[i] : nullptr);
-    if (s->reply_ck) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
+    if (s->reply_ck || opt_.preempt) s->reply.insert(s->reply.end(), emit.begin(), emit.end());
     if (s->commit_k > 0 && !produced[i].empty()) {
       // The accepted drafts become rows of the slot (commit below); only
       // the new token is pending, so the next pass has room for a full chain.
@@ -4628,6 +4811,9 @@ json::Value Engine::stats() const {
   o.set("waiting_sequences", waiting_pub_.load());
   o.set("kv_stopped_sequences", int64_t(kv_stopped_.load()));
   o.set("kv_deferred_chunks", int64_t(kv_deferred_.load()));
+  o.set("kv_preempted_sequences", int64_t(kv_preempted_.load()));
+  o.set("kv_resumed_sequences", int64_t(kv_resumed_.load()));
+  o.set("kv_resume_rows", int64_t(kv_resume_rows_.load()));
   o.set("decision_row_reservations", int64_t(decision_reservations_.load()));
   o.set("kv_skipped_checkpoints", int64_t(kv_skipped_.load()));
   o.set("reply_checkpoints", int64_t(reply_saved_.load()));
