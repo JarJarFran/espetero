@@ -455,6 +455,12 @@ class MetalModel final : public NativeModel {
       I.kv_heads = c.Hkv_g;  // the paged pool's (global layers'); the sliding layers' rings are slot state
     }
     if (m.cfg.lfm2) I.family = "lfm2";
+    {  // ESPETERO_CHECK_FINITE's reports: "family (directory)"
+      std::string base = path;
+      while (base.size() > 1 && base.back() == '/') base.pop_back();
+      if (const size_t k = base.find_last_of('/'); k != std::string::npos) base = base.substr(k + 1);
+      m.fcheck.model = I.family + (c.E && !m.cfg.gemma && !m.cfg.q3moe ? "_moe" : "") + " (" + base + ")";
+    }
     // Qwen4-Exp: 3 drafts per pass (measured faster than 5 drafts or
     // --draft-auto when serving: every verify row brings its own experts
     // through the cache).
@@ -829,6 +835,7 @@ class MetalModel final : public NativeModel {
       } catch (...) {
         end_chain();
         m_.chain_cbs.clear();
+        m_.fcheck.discard();
         throw;
       }
       end_chain();
@@ -837,11 +844,13 @@ class MetalModel final : public NativeModel {
         if ([cb status] != MTLCommandBufferStatusCompleted) {
           NSError* err = [cb error];
           m_.chain_cbs.clear();
+          m_.fcheck.discard();
           fail(std::string("GPU command buffer failed in a decode chain: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
         }
         g += gpu_ms(cb);
       }
       m_.chain_cbs.clear();
+      m_.fcheck.collect();  // ESPETERO_CHECK_FINITE: the chain's passes
       std::memcpy(out, [m_.chain_tok contents], need);
       readout_base_.assign(first.size(), 0);
       if (stats) {
