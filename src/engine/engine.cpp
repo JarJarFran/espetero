@@ -300,6 +300,9 @@ struct Engine::Seq {
   int preempts = 0, resume_rows = 0;
   int passes_before = 0;    // passes of earlier admissions (`passes` counts this one's: 0 = first chunk ahead)
   int cached_report = -1;   // usage cached_tokens: the first admission's (a resume's cache hits are its own state)
+  std::vector<int> preempted_at;  // tokens generated when parked
+  Clock::time_point t_parked, t_resume;
+  double parked_ms = 0, resume_ms = 0;  // queued while parked; readmission to decoding again
   const std::vector<int32_t>& tokens() const { return resume.empty() ? req.prompt : resume; }
 };
 
@@ -2623,6 +2626,16 @@ static inline void ewma(double& v, int& n, double x) {
   ++n;
 }
 
+// Rows per pass of a resumed sequence's emitted tokens (preemption):
+// ESPETERO_RESUME_ROWS, default 8 (0: plain prefill chunks).
+static int resume_rows() {
+  static const int n = [] {
+    const char* v = std::getenv("ESPETERO_RESUME_ROWS");
+    return v && *v ? std::max(0, std::atoi(v)) : 8;
+  }();
+  return n;
+}
+
 // KV reservation at admission (and for forked choices); off with
 // ESPETERO_KV_RESERVE=0 (development: the plain free-blocks check, so the
 // pass-level shortage handling can be exercised).
@@ -2836,6 +2849,11 @@ void Engine::step() {
     if (s.preempts) {  // parked for KV and resumed: how often, and the rows its resumes computed again
       t.set("preemptions", s.preempts);
       t.set("resume_rows", s.resume_rows);
+      json::Value at = json::Value::array();
+      for (int g : s.preempted_at) at.push_back(int64_t(g));
+      t.set("preempted_at", std::move(at));
+      t.set("parked_ms", round3(s.parked_ms));
+      t.set("resume_ms", round3(s.resume_ms));
     }
     if (s.drafted) t.set("draft_acceptance", round3(double(s.accepted) / double(s.drafted)));
     if (s.lookups) t.set("lookup_passes", s.lookups);
@@ -3043,8 +3061,12 @@ void Engine::step() {
       const std::vector<int32_t>& toks = s->tokens();  // a parked sequence: its prompt and emitted tokens
       const int left = s->req.max_tokens - s->generated;
       const int uncached = int(toks.size()) - (best ? int(best->tokens.size()) : 0);
-      if (!reserve && !active_.empty() && model_->free_kv_tokens() < uncached + std::min(left, 1024) + 64 + bt)
+      if (!reserve && !active_.empty() && model_->free_kv_tokens() < uncached + std::min(left, 1024) + 64 + bt) {
+        if (trace)
+          std::fprintf(stderr, "[trace] admit: waits for KV (%d free, %d needed, %zu running)\n", model_->free_kv_tokens(),
+                       uncached + std::min(left, 1024) + 64 + bt, active_.size());
         break;
+      }
       const int need = uncached + answer_reserve(left) + 2 * bt;
       if (reserve && !active_.empty()) {
         const int reserved = reserved_kv_tokens();
@@ -3083,6 +3105,7 @@ void Engine::step() {
       std::vector<int> avoid;
       if (best) avoid.push_back(best->slot);
       const int work = acquire_slot(avoid);
+      if (work < 0 && trace) std::fprintf(stderr, "[trace] admit: no free slot (%zu running)\n", active_.size());
       if (work < 0) {
         if (active_.empty() && decisions_.empty()) {
           // Nothing running will free a slot: fail instead of waiting forever.
@@ -3136,6 +3159,8 @@ void Engine::step() {
       s->done = cached;
       s->mtp = want_mtp;
       if (s->preempts > 0) {
+        s->parked_ms += ms_since(s->t_parked);
+        s->t_resume = Clock::now();
         ++kv_resumed_;
         s->resume_rows += int(toks.size()) - cached;
         kv_resume_rows_ += uint64_t(int(toks.size()) - cached);
@@ -3808,6 +3833,16 @@ void Engine::step() {
     if (!decoding.empty() || !jobs.empty()) budget = std::min(budget, prefill_chunk_rows());
     if (budget <= 0 || readouts + 1 > max_readouts) break;
     int end = std::min(total, s->done + budget);
+    if (!s->resume.empty()) {
+      // A resumed sequence computes its prompt's rows as a prompt (in chunks
+      // ending at the prompt's end), and its emitted tokens' rows in passes of
+      // at most resume_rows() rows in all, as decode steps computed them: a
+      // long prefill chunk sums in another order (GEMM tiles, chunked linear
+      // attention), and greedy replies parted at near ties after it.
+      const int P = int(s->req.prompt.size());
+      if (s->done < P) end = std::min(end, P);
+      else if (resume_rows() > 0) end = std::min(end, s->done + std::max(1, resume_rows() - rows));
+    }
     // Chunks never split an image run: a chunk that would cut one ends before
     // it; a chunk that starts at it takes the whole run only if it fits in the
     // rows left in this pass (or the pass is still empty), otherwise the prompt
@@ -4012,6 +4047,8 @@ void Engine::step() {
     s->tree = -1;
     s->t_wait = Clock::now() - std::chrono::milliseconds(opt_.prefill_wait_ms);  // its chunks never wait for decoders
     ++s->preempts;
+    s->preempted_at.push_back(s->generated);
+    s->t_parked = Clock::now();
     ++kv_preempted_;
     auto it = std::find_if(active_.begin(), active_.end(), [&](const auto& p) { return p.get() == s; });
     std::shared_ptr<Seq> keep_alive = *it;
@@ -4646,6 +4683,7 @@ void Engine::step() {
       s->t_wait = Clock::now();
       if (!s->final_chunk) continue;
       s->phase = Seq::Decode;
+      if (s->preempts > 0) s->resume_ms += ms_since(s->t_resume);
       if (!s->resume.empty()) {  // a resumed sequence decodes on (its first token's time stays)
         s->resume.clear();
         s->resume.shrink_to_fit();

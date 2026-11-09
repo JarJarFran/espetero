@@ -3,19 +3,24 @@
 
 // Preemption when the KV cache runs out (GPU, a real checkpoint):
 //
-//   build/preempt_test <model dir> [max_tokens]
+//   build/preempt_test <model dir> [max_tokens (640)] [variant]
 //
-// Four requests that cannot all fit a small KV pool run at once (the
+// Four requests that need about twice a small KV pool run at once (the
 // admission reservation is off, ESPETERO_KV_RESERVE=0, so they are all
 // admitted and the pool runs out mid-generation). With preemption on, every
-// request must end with "length" and exactly the tokens it produces alone on
-// a server with room, in four variants: greedy; seeded sampling; seeded
-// sampling with repetition / frequency penalties and no_repeat_ngram_size;
-// greedy with one request under structured output (a JSON object, the
-// batch-priority one). The batch-priority request is the first parked; the
-// oldest interactive one never is. With --no-preempt the same load stops
-// requests with "KV cache full" (the old behaviour).
+// request must end as it does alone ("length", every token) and every parked
+// one with exactly the tokens it produces alone on a server with room, in four
+// variants: greedy; seeded sampling; seeded sampling with repetition /
+// frequency penalties and no_repeat_ngram_size; greedy with one request under
+// structured output (a JSON schema with at least 25 array items, the
+// batch-priority one). A difference in a request before it was ever parked is
+// reported, not failed: batching alone moves near ties (the control line shows
+// the same four with room). The batch-priority request is parked; the oldest
+// interactive one never is. With --no-preempt the same load stops requests
+// with "KV cache full" (the old behaviour).
+#include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,7 +52,8 @@ namespace {
 struct Result {
   std::vector<int32_t> tokens;
   std::string reason, error;
-  int completion = 0, preemptions = 0, resume_rows = 0;
+  int completion = 0, preemptions = 0, resume_rows = 0, first_parked = -1;
+  double resume_ms = 0, parked_ms = 0, first_ms = 0;
 };
 
 const char* kPreface =
@@ -65,6 +71,7 @@ std::unique_ptr<Engine> load(const std::string& dir, double kv_gb, bool preempt)
   o.model_path = dir;
   o.max_seqs = 4;
   o.preempt = preempt;
+  o.decode_first = false;  // prompts start at once beside decoding ones: the four overlap from the start
   o.load.slots = 24;
   o.load.max_ctx = 4096;
   o.load.kv_gb = kv_gb;
@@ -106,7 +113,7 @@ GenRequest request_of(const Engine& e, const Variant& v, int i, int max_tokens,
     r.constraint = json_obj;
     r.ignore_eos = false;  // the reply ends with the JSON value
     r.prompt = e.tokenizer().encode(std::string(kPreface) +
-                                        "As a JSON object, list forty towns of Spain with their province, population and a "
+                                        "As a JSON object, list thirty towns of Spain with their province, population and a "
                                         "sentence about each one.\n\n",
                                     false);
     r.split = int(r.prompt.size());
@@ -125,6 +132,10 @@ Result drain(const std::shared_ptr<GenStream>& s) {
   r.completion = s->completion_tokens;
   if (const json::Value* p = s->timings.get("preemptions")) r.preemptions = int(p->as_int());
   if (const json::Value* p = s->timings.get("resume_rows")) r.resume_rows = int(p->as_int());
+  if (const json::Value* p = s->timings.get("resume_ms")) r.resume_ms = p->as_double();
+  if (const json::Value* p = s->timings.get("parked_ms")) r.parked_ms = p->as_double();
+  if (const json::Value* p = s->timings.get("prefill_ms")) r.first_ms = p->as_double();
+  if (const json::Value* p = s->timings.get("preempted_at"); p && p->is_array() && p->size() > 0) r.first_parked = int((*p)[0].as_int());
   return r;
 }
 
@@ -134,9 +145,25 @@ std::vector<Result> run_alone(Engine& e, const Variant& v, int max_tokens, const
   return out;
 }
 
+int64_t stat(const Engine& e, const char* k) {
+  const json::Value s = e.stats();
+  const json::Value* v = s.get(k);
+  return v ? v->as_int() : 0;
+}
+
 std::vector<Result> run_together(Engine& e, const Variant& v, int max_tokens, const std::shared_ptr<const grammar::Constraint>& c,
                                  double* wall_ms) {
   const auto t0 = std::chrono::steady_clock::now();
+  // The most requests running at once and the least free KV while they run.
+  std::atomic<bool> done{false};
+  int64_t most = 0, least = INT64_MAX;
+  std::thread watch([&] {
+    while (!done.load()) {
+      most = std::max(most, stat(e, "active_sequences"));
+      least = std::min(least, stat(e, "free_kv_tokens"));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  });
   std::vector<std::shared_ptr<GenStream>> ss;
   for (int i = 0; i < 4; ++i) {
     ss.push_back(e.generate(request_of(e, v, i, max_tokens, c)));
@@ -144,8 +171,26 @@ std::vector<Result> run_together(Engine& e, const Variant& v, int max_tokens, co
   }
   std::vector<Result> out;
   for (auto& s : ss) out.push_back(drain(s));
+  done = true;
+  watch.join();
   *wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  (at most %lld running at once, at least %lld KV tokens free)\n", (long long)most, (long long)least);
   return out;
+}
+
+// A long JSON reply: an object with at least 25 towns (the grammar enforces
+// minItems, so the reply runs long enough for the pool to run out under it).
+std::shared_ptr<const grammar::Constraint> towns_constraint(Engine& e) {
+  const json::Value schema = json::parse(
+      R"({"type": "object", "properties": {"towns": {"type": "array", "minItems": 25, "items": {"type": "object",
+          "properties": {"name": {"type": "string"}, "province": {"type": "string"}, "population": {"type": "integer"},
+          "note": {"type": "string"}}, "required": ["name", "province", "population", "note"]}}},
+          "required": ["towns"]})");
+  auto c = std::make_shared<grammar::Constraint>();
+  c->compiled = std::make_shared<grammar::Compiled>(grammar::compile_schema(schema, grammar::SchemaOptions{}, nullptr),
+                                                    e.grammar_vocab(), e.end_ids, std::vector<int32_t>{},
+                                                    std::vector<std::string>{});
+  return c;
 }
 
 int first_diff(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
@@ -155,23 +200,18 @@ int first_diff(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
   return a.size() == b.size() ? -1 : int(n);
 }
 
-int64_t stat(const Engine& e, const char* k) {
-  const json::Value s = e.stats();
-  const json::Value* v = s.get(k);
-  return v ? v->as_int() : 0;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <model dir> [max_tokens]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s <model dir> [max_tokens] [variant]\n", argv[0]);
     return 2;
   }
   // Admit everything (the plain free-blocks check): the pool runs out mid-generation.
   setenv("ESPETERO_KV_RESERVE", "0", 1);
   const std::string dir = argv[1];
-  const int max_tokens = argc > 2 ? std::atoi(argv[2]) : 320;
+  const int max_tokens = argc > 2 ? std::atoi(argv[2]) : 640;
+  const std::string only = argc > 3 ? argv[3] : "";  // run only the variant of this name
   const Variant variants[4] = {
       {"greedy"},
       {"seeded", 0.8, 0.95},
@@ -188,29 +228,37 @@ int main(int argc, char** argv) {
       auto big = load(dir, 1.0, true);
       const ModelInfo& I = big->info();
       tok_bytes = double(I.kv_bytes) / double(int64_t(I.kv_blocks) * I.block_tokens);
-      auto obj = std::make_shared<grammar::Constraint>();
-      obj->compiled = std::make_shared<grammar::Compiled>(grammar::any_object_grammar(), big->grammar_vocab(), big->end_ids,
-                                                          std::vector<int32_t>{}, std::vector<std::string>{});
-      for (const Variant& v : variants) alone.push_back(run_alone(*big, v, max_tokens, obj));
+      auto obj = towns_constraint(*big);
+      for (const Variant& v : variants)
+        alone.push_back(only.empty() || only == v.name ? run_alone(*big, v, max_tokens, obj) : std::vector<Result>{});
       for (int i = 0; i < 4; ++i) P = std::max(P, int(prompt_of(*big, i).size()));
       // Control: the four together with room (no preemption): what batching alone changes.
       auto ctl = run_together(*big, variants[0], max_tokens, obj, &ref_wall);
       int same = 0;
-      for (int i = 0; i < 4; ++i) same += first_diff(ctl[i].tokens, alone[0][i].tokens) < 0;
+      for (int i = 0; i < 4 && !alone[0].empty(); ++i) same += first_diff(ctl[i].tokens, alone[0][i].tokens) < 0;
       std::printf("control (room for all, greedy): %d of 4 identical to alone, %.0f ms\n", same, ref_wall);
       CHECK(stat(*big, "kv_preempted_sequences") == 0);
     }
-    // About two requests' worth of KV for four.
-    const int pool = int(2.1 * double(P + max_tokens));
+    // The plain admission check takes a request while the free KV holds its
+    // prompt and up to 1,024 tokens of answer (with a block's slack each): a
+    // pool of one such need plus twelve blocks admits all four as they arrive
+    // (each holds up to four blocks once its prompt ran: its prompt, the
+    // prompt checkpoint's copy of the partial block, its first answer block),
+    // and they need about twice the pool by their last tokens.
+    const int pool = P + std::min(max_tokens, 1024) + 128 + 12 * 64;
     const double kv_gb = double(pool) * tok_bytes / 1e9;
-    std::printf("prompts up to %d tokens, %d max_tokens: a pool of ~%d tokens\n", P, max_tokens, pool);
+    std::printf("prompts up to %d tokens, %d max_tokens: a pool of ~%d tokens (the four need ~%d)\n", P, max_tokens, pool, 4 * (P + max_tokens));
     {
       auto small = load(dir, kv_gb, true);
-      auto obj = std::make_shared<grammar::Constraint>();
-      obj->compiled = std::make_shared<grammar::Compiled>(grammar::any_object_grammar(), small->grammar_vocab(), small->end_ids,
-                                                          std::vector<int32_t>{}, std::vector<std::string>{});
+      auto obj = towns_constraint(*small);
+      int diverged_unparked = 0;
       for (size_t vi = 0; vi < 4; ++vi) {
         const Variant& v = variants[vi];
+        if (!only.empty() && only != v.name) continue;
+        // The previous variant's prompt and reply checkpoints would hold the
+        // pool (the plain admission check waits for free blocks): start empty.
+        small->clear_cache();
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         const int64_t p0 = stat(*small, "kv_preempted_sequences"), r0 = stat(*small, "kv_resume_rows");
         double wall = 0;
         auto got = run_together(*small, v, max_tokens, obj, &wall);
@@ -221,19 +269,29 @@ int main(int argc, char** argv) {
           const Result& a = alone[vi][i];
           const Result& g = got[i];
           const int d = first_diff(g.tokens, a.tokens);
-          std::printf("  req %d: %s, %zu tokens (alone %zu, %s), parked %d times, %d rows again%s\n", i, g.reason.c_str(),
-                      g.tokens.size(), a.tokens.size(), a.reason.c_str(), g.preemptions, g.resume_rows,
+          std::printf("  req %d: %s, %zu tokens (alone %zu, %s), parked %d times (first after %d tokens), %d rows again in "
+                      "%.0f ms, %.0f ms parked, first token at %.0f ms%s\n",
+                      i, g.reason.c_str(), g.tokens.size(), a.tokens.size(), a.reason.c_str(), g.preemptions, g.first_parked,
+                      g.resume_rows, g.resume_ms, g.parked_ms, g.first_ms,
                       d < 0 ? "" : (" -- FIRST DIFFERENCE at token " + std::to_string(d)).c_str());
           if (!g.error.empty()) std::printf("    error: %s\n", g.error.c_str());
-          CHECK(d < 0);
+          // A difference before the request was ever parked comes from batching
+          // (the control above shows how often); after it, from the resume.
+          if (d >= 0 && (g.first_parked < 0 || d < g.first_parked)) {
+            ++diverged_unparked;
+            std::printf("    (before any preemption: batch composition, not the resume)\n");
+          } else {
+            CHECK(d < 0);
+          }
           CHECK(g.reason == a.reason);
           CHECK(g.completion == int(g.tokens.size()));
           if (!(v.structured && i == 0)) CHECK(g.reason == "length" && int(g.tokens.size()) == max_tokens);
         }
         CHECK(got[1].preemptions == 0);  // the oldest interactive request runs through
-        if (!v.structured) CHECK(got[0].preemptions > 0);  // the batch job is parked first
+        CHECK(got[0].preemptions > 0);  // the batch job is parked first
       }
       CHECK(stat(*small, "kv_stopped_sequences") == 0);
+      std::printf("differences before any preemption (batching): %d\n", diverged_unparked);
     }
     // The old behaviour: the newest requests stop with "KV cache full".
     {

@@ -1173,7 +1173,14 @@ stray web page or an abusive request could do with it:
   continues from that checkpoint (a one-token pass) or, when the checkpoint
   was evicted, computes its prompt and emitted tokens again from the
   longest cached prefix (`kv_resume_rows` counts those rows; per request,
-  `timings.preemptions` and `timings.resume_rows`). Its next token is drawn
+  `timings.preemptions`, `timings.resume_rows`, `timings.preempted_at`,
+  `timings.parked_ms`, `timings.resume_ms`). The emitted tokens are computed
+  again in passes of at most 8 rows in all (`ESPETERO_RESUME_ROWS`, 0: plain
+  prompt chunks), the shape their decode steps had: a long prefill chunk sums
+  in another order. On an M1 Max with Qwen3.5-2B (4-bit), a resume from the
+  parked checkpoint was one pass of 7–8 ms; computing 270–650 emitted tokens
+  again took 0.22–0.59 s (about 0.8 ms per token, 0.5 ms as plain prompt
+  chunks), against 5 ms per decoded token. Its next token is drawn
   at the position, with the seed, penalties, `no_repeat_ngram_size` history
   and structured-output state it would have had, so greedy and seeded
   replies are the ones it gives alone; its stream stays open, no token is

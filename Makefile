@@ -113,7 +113,7 @@ $(BUILD)/engine_test: tests/engine_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD
 # Preemption when the KV cache runs out, on a real checkpoint (GPU): four requests
 # oversubscribing a small pool end with exactly their tokens alone (greedy, seeded,
 # penalties, structured output); --no-preempt stops them as before.
-#   build/preempt_test <Qwen3.5-2B-4bit dir> [max_tokens]
+#   build/preempt_test <Qwen3.5-2B-4bit dir> [max_tokens] [variant]
 $(BUILD)/preempt_test: tests/preempt_test.cpp $(LIB_OBJS) $(BUILD)/model.o $(BUILD)/json.o
 	$(CXX) $(CXXFLAGS) $^ $(FRAMEWORKS) -framework Accelerate -o $@
 
