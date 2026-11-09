@@ -232,6 +232,8 @@ void usage_all() {
                "                        tool loop continues the reply's state instead of reading the reply again)\n"
                "  --reply-snapshot N    ... and a fork of the reply's state every N tokens, the latest 2 kept, for a turn\n"
                "                        that renders the end of the reply differently (default 256; 0 = none)\n"
+               "  --no-preempt          a full KV cache stops the newest running request (\"KV cache full\"); default: one\n"
+               "                        is parked (batch priority first, then the newest) and resumes once KV frees up\n"
                "  --no-decode-first     prompt chunks run beside decoding sequences at once (default: they wait up to\n"
                "                        --prefill-wait-ms, 2500 (200 in --preset general), and prompts beyond\n"
                "                        --prefill-batch-rows, 512, wait a pass)\n"
@@ -490,6 +492,7 @@ json::Value effective_json(const EngineOptions& o, const std::string& repo = "")
   e.set("prompt-checkpoint", o.prompt_checkpoint);
   e.set("reply-checkpoint", o.reply_checkpoint);
   e.set("reply-snapshot", int64_t(o.reply_snapshot));
+  e.set("preempt", o.preempt);
   e.set("exif-rotate", vision::exif_orientation_enabled());
   e.set("chain", int64_t(o.chain_steps));
   e.set("prefill-chunk", int64_t(o.prefill_chunk));
@@ -583,6 +586,7 @@ EngineOptions engine_options(const Args& a) {
   o.prompt_checkpoint = !a.has("no-prompt-checkpoint");
   o.reply_checkpoint = !a.has("no-reply-checkpoint");
   o.reply_snapshot = std::max(0, a.i("reply-snapshot", 256));
+  o.preempt = !a.has("no-preempt");
   o.prefill_wait_ms = a.i("prefill-wait-ms", 2500);
   o.prefill_batch_rows = a.i("prefill-batch-rows", 512);
   o.prefill_slice_ms = a.i("prefill-slice-ms", 1000);

@@ -1175,10 +1175,40 @@ stray web page or an abusive request could do with it:
   of its prompts (system message, instructions, image, prompt end; a prompt's
   first chunk writes its rows twice for one) and of its decisions (their
   prefixes): the request runs and only that checkpoint is not cached
-  (`kv_skipped_checkpoints` in `/v1/stats`). Then prompt chunks wait and the newest
-  requests stop with a "KV cache full" error, so the earlier ones finish
-  (`kv_stopped_sequences`); checkpoints are evicted only for what is still
-  short after that. The error of a request that cannot fit even alone says
+  (`kv_skipped_checkpoints` in `/v1/stats`). Then prompt chunks wait, and a
+  running request is **preempted**: parked and resumed once KV frees up
+  (`kv_preempted_sequences`, `kv_resumed_sequences`). The victim is a batch
+  job before an interactive request, then the newest arrival; the oldest
+  interactive request is never parked, so it always progresses. A parked
+  request frees what only it holds (its unsaved checkpoint slots, its reply
+  snapshots); its state stays cached as a checkpoint of its prompt and the
+  tokens it emitted, evicted least recently used like any other, so only
+  when the cache still needs its blocks. It goes back to the queue ahead of
+  the requests of its priority that have not started, and once it fits it
+  continues from that checkpoint (a one-token pass) or, when the checkpoint
+  was evicted, computes its prompt and emitted tokens again from the
+  longest cached prefix (`kv_resume_rows` counts those rows; per request,
+  `timings.preemptions`, `timings.resume_rows`, `timings.preempted_at`,
+  `timings.parked_ms`, `timings.resume_ms`). The emitted tokens are computed
+  again in passes of at most 8 rows in all (`ESPETERO_RESUME_ROWS`, 0: plain
+  prompt chunks), the shape their decode steps had: a long prefill chunk sums
+  in another order. On an M1 Max with Qwen3.5-2B (4-bit), a resume from the
+  parked checkpoint was one pass of 7–8 ms; computing 270–650 emitted tokens
+  again took 0.22–0.59 s (about 0.8 ms per token, 0.5 ms as plain prompt
+  chunks), against 5 ms per decoded token. Its next token is drawn
+  at the position, with the seed, penalties, `no_repeat_ngram_size` history
+  and structured-output state it would have had, so greedy and seeded
+  replies are the ones it gives in the same batch without the park (the
+  resumed state's logprobs stay within the drift any batching causes, a few
+  thousandths; like any batched request it can still differ from its run
+  alone at a near tie); its stream stays open, no token is
+  sent twice, and usage counts each token once. Teacher-forced scoring,
+  M-RoPE (Qwen-VL) image prompts and an `n` > 1 request before its choices
+  fork are not preempted: they stop as before. With `--no-preempt` the
+  newest requests stop with a "KV cache full" error instead, so the earlier
+  ones finish (`kv_stopped_sequences`); a request that cannot fit even alone
+  stops either way. Checkpoints are evicted only for what is still short
+  after that. The error of a request that cannot fit even alone says
   what would: the KV free for its prompt, or the answer length it reached. A
   decode step takes a KV block only when its row opens one, and is counted so
   that a request alone fills the cache to its last block.

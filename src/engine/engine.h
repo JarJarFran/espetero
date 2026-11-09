@@ -86,6 +86,9 @@ struct EngineOptions {
                                    // checkpoint of prompt + reply (an agent's next turn continues it instead of reading the reply again)
   int reply_snapshot = 256;        // ... a fork of the reply's state every this many tokens (0: none), the latest
   int reply_snapshots = 2;         // ... this many kept: the fallback when the next turn renders the reply's tail differently
+  bool preempt = true;             // KV cache full mid-generation: park a running sequence (batch priority first, then
+                                   // the newest) and resume it once KV frees up, from its parked state if still cached,
+                                   // else by computing prompt + emitted tokens again (--no-preempt: it stops, "KV cache full")
   bool decode_first = true;        // prompts wait (bounded) for decoding sequences; big prompts one per pass
   int prefill_wait_ms = 2500;      // ... longest wait of a prompt chunk while sequences decode
   int prefill_batch_rows = 512;    // ... prompt rows per pass beyond which no further prompt joins
@@ -621,6 +624,11 @@ class Engine {
   // Sequences stopped because the KV cache could not hold every running
   // sequence (the newest go first), and prompt chunks deferred for it.
   std::atomic<uint64_t> kv_stopped_{0}, kv_deferred_{0};
+  // Preemption (EngineOptions::preempt): sequences parked for KV, resumed,
+  // and the rows their resumes computed again (prompt + emitted tokens past
+  // the longest cached state).
+  std::atomic<uint64_t> kv_preempted_{0}, kv_resumed_{0}, kv_resume_rows_{0};
+  std::atomic<uint64_t> arrivals_{0};  // admission order of requests (preemption takes the newest first)
   // Passes whose newest sequences' drafts or decode steps waited so that
   // a decision job that had waited for rows could run.
   std::atomic<uint64_t> decision_reservations_{0};
