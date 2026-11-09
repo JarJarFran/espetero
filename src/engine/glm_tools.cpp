@@ -54,11 +54,12 @@ bool glm_tool_call_body(const std::string& body) {
   return n == body.size() || body.compare(n, 9, "<arg_key>") == 0 || body[n] == '\n';
 }
 
-std::string parse_glm_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls) {
+std::string parse_glm_tool_calls(const std::string& content, const json::Value& tools, json::Value& calls,
+                                 const std::vector<size_t>* at_ok) {
   calls = json::Value();
   static const std::string open = "<tool_call>", close = "</tool_call>";
   static const std::string kKey = "<arg_key>", kKeyEnd = "</arg_key>", kVal = "<arg_value>", kValEnd = "</arg_value>";
-  size_t at = content.find(open);
+  size_t at = find_marker(content, open, at_ok);
   if (at == std::string::npos) return content;
   std::string before = content.substr(0, at);
   while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
@@ -107,7 +108,7 @@ std::string parse_glm_tool_calls(const std::string& content, const json::Value& 
       out.push_back(std::move(call));
     }
     if (end == std::string::npos) break;
-    at = content.find(open, end + close.size());
+    at = find_marker(content, open, at_ok, end + close.size());
   }
   if (out.size()) calls = std::move(out);
   return calls.is_null() ? content : before;

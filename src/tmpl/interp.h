@@ -102,13 +102,17 @@ class Interp {
  public:
   // Variables are looked up in `fixed` first, then in each JSON object of
   // `layers` in order, then among the globals.
+  // `data_layers`: how many of `layers`, from the first, are the render's
+  // data (their values are Val::data()).
   Interp(const TemplateImpl& t, const std::vector<std::pair<std::string_view, Val>>& fixed,
-         const std::vector<const json::Value*>& layers, const RenderOptions& opts);
+         const std::vector<const json::Value*>& layers, const RenderOptions& opts, size_t data_layers = 0);
   ~Interp();
   Interp(const Interp&) = delete;
   Interp& operator=(const Interp&) = delete;
 
-  std::string run();
+  // The rendered text; `spans` (optional) receives its byte ranges that came
+  // from data.
+  std::string run(Spans* spans = nullptr);
 
   Val eval(const Expr* e, Activation* act);
   Val call(const Val& callee, Args& args);
@@ -142,6 +146,7 @@ class Interp {
   void eval_args(const CallArgs& a, Activation* act, Args& out);
   Val eval_filter(const FilterExpr* f, Activation* act, const Val* block_value);
   Val render_body_to_str(const Body& body, Activation* act, Flow* flow);
+  void put(const Val& v);  // str(v) to the output, with its data spans
 
   Val eval_add(const BinExpr* e, Activation* act);
   void emit_add(const BinExpr* e, Activation* act);
@@ -150,6 +155,7 @@ class Interp {
   const TemplateImpl& t_;
   std::vector<Val> ctx_vals_;
   std::string* out_ = nullptr;
+  Spans* spans_ = nullptr;  // the data spans of *out_
   std::vector<Obj*> gc_;
   int depth_ = 0;
 };

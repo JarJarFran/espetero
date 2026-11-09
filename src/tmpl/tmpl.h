@@ -24,6 +24,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "../util/json.h"
 
@@ -100,9 +102,18 @@ class Template {
 // always defined (None when null), and extra_kwargs override special tokens.
 // special_tokens is the tokenizer's special_tokens_map (bos_token, eos_token,
 // unk_token, ...); pass null/{} if the caller merges them into extra_kwargs.
+//
+// `data` (optional) receives the byte ranges [begin, end) of the result that
+// came from messages, tools and extra_kwargs, the request's own text (sorted,
+// disjoint): what a tokenizer must read as plain text, never as special
+// tokens (Tokenizer::encode's `plain`). Strings the template derives from
+// them keep their spans through concatenation, join, slicing, strip and
+// split; any other string operation (upper, replace, format, tojson, ...)
+// on data makes its whole result data. special_tokens are the template's.
 std::string apply_chat_template(const Template& tmpl, const json::Value& messages, const json::Value& tools,
                                 bool add_generation_prompt, const json::Value& extra_kwargs,
                                 const json::Value& special_tokens = json::Value(),
-                                const RenderOptions& opts = RenderOptions());
+                                const RenderOptions& opts = RenderOptions(),
+                                std::vector<std::pair<size_t, size_t>>* data = nullptr);
 
 }  // namespace espetero::tmpl

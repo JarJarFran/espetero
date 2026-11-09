@@ -368,7 +368,8 @@ int64_t need_int(const Val& v, const char* what) {
 // Python str() of a value, keeping Markup as Markup (markupsafe.soft_str).
 Val soft_str(const Val& v) {
   if (v.is_str()) return v;
-  return Val::str(to_str(v));
+  Val r = Val::str(to_str(v));
+  return has_data(v) ? as_data(std::move(r)) : r;
 }
 
 Val mk(const Val& like, std::string s) { return Val::str(std::move(s), like.markup()); }
@@ -765,7 +766,47 @@ std::string strip_tags(std::string_view s) {
 
 Val call_method(Interp& in, const MethodObj& m, Args& a) { return call_method(in, m.self, m.id, a); }
 
+namespace {
+
+bool args_have_data(const Args& a) {
+  for (const Val& x : a.pos)
+    if (has_data(x)) return true;
+  for (const auto& kv : a.kw)
+    if (has_data(kv.second)) return true;
+  return false;
+}
+
+Val call_method_impl(Interp& in, const Val& self, int id, Args& a);
+
+}  // namespace
+
+// A str method that builds a new string from data (upper, replace, format,
+// ...) returns data as a whole; the ones that return slices (strip, split,
+// partition, ...) and join keep the exact spans themselves.
 Val call_method(Interp& in, const Val& self, int id, Args& a) {
+  bool opaque = (id >= kStr.first && id < kStr.last) || (id >= kMarkup.first && id < kMarkup.last);
+  switch (id) {
+    case S_strip:
+    case S_lstrip:
+    case S_rstrip:
+    case S_split:
+    case S_rsplit:
+    case S_splitlines:
+    case S_partition:
+    case S_rpartition:
+    case S_removeprefix:
+    case S_removesuffix:
+    case S_join: opaque = false; break;
+    default: break;
+  }
+  const bool data = opaque && (has_data(self) || args_have_data(a));
+  Val r = call_method_impl(in, self, id, a);
+  return data ? as_data(std::move(r)) : r;
+}
+
+namespace {
+
+Val call_method_impl(Interp& in, const Val& self, int id, Args& a) {
   const char* name = method_name(uint16_t(id));
   auto args = [&](std::initializer_list<const char*> names, std::initializer_list<Val> defaults, Val* out) {
     size_t i = 0;
@@ -874,16 +915,22 @@ Val call_method(Interp& in, const Val& self, int id, Args& a) {
     case S_join: {
       args({"iterable"}, {M}, v);
       std::string out;
+      Spans sp;
       PyIter it(v[0]);
       Val x;
       size_t i = 0;
       while (it.next(x)) {
         if (!x.is_str())
           type_error("sequence item " + std::to_string(i) + ": expected str instance, " + tname(x) + " found");
-        if (i++) out += self.sv();
+        if (i++) {
+          add_spans(sp, self, out.size(), self.sv().size());
+          out += self.sv();
+        }
+        const size_t b = out.size();
         out += (self.markup() && !x.markup()) ? html_escape(x.sv()) : std::string(x.sv());
+        add_spans(sp, x, b, out.size() - b);
       }
-      return mk(self, std::move(out));
+      return str_spans(std::move(out), std::move(sp), self.markup());
     }
     case S_strip: args({"chars"}, {Val::none()}, v); return do_strip(self, v[0], true, true, "strip");
     case S_lstrip: args({"chars"}, {Val::none()}, v); return do_strip(self, v[0], true, false, "lstrip");
@@ -1042,6 +1089,8 @@ Val call_method(Interp& in, const Val& self, int id, Args& a) {
   }
   raise(ErrorKind::Unsupported, std::string("method '") + name + "' is not supported");
 }
+
+}  // namespace
 
 // ================================================================ globals
 Val lookup_global(std::string_view name) {
@@ -1729,7 +1778,35 @@ std::vector<Val> reversed_items(const Val& v) {
 
 }  // namespace
 
+static Val call_filter_impl(Interp& in, int id, const std::string& name, const Val& value, Args& a);
+
+// A filter that builds a new string from data (upper, replace, tojson,
+// indent, ...) returns data as a whole; the ones returning a value they were
+// given, trim (a slice), join and safe keep the exact spans themselves.
 Val call_filter(Interp& in, int id, const std::string& name, const Val& value, Args& a) {
+  bool opaque = true;
+  switch (id) {
+    case FI_attr:
+    case FI_d:
+    case FI_default:
+    case FI_first:
+    case FI_last:
+    case FI_min:
+    case FI_max:
+    case FI_random:
+    case FI_join:
+    case FI_safe:
+    case FI_string:
+    case FI_trim:
+    case FI_sum: opaque = false; break;
+    default: break;
+  }
+  const bool data = opaque && (has_data(value) || args_have_data(a));
+  Val r = call_filter_impl(in, id, name, value, a);
+  return data ? as_data(std::move(r)) : r;
+}
+
+static Val call_filter_impl(Interp& in, int id, const std::string& name, const Val& value, Args& a) {
   if (id < 0) raise(ErrorKind::Runtime, "No filter named " + py_repr_str(name) + " found.");
   Val v[5];
   auto args = [&](const char* fn, std::initializer_list<const char*> names, std::initializer_list<Val> defaults) {
@@ -1922,18 +1999,24 @@ Val call_filter(Interp& in, int id, const std::string& name, const Val& value, A
     case FI_join: {
       args("sync_do_join", {"d", "attribute"}, {Val::str_ref(""), Val::none()});
       const AttrGetter getter(v[1]);
-      const std::string sep = to_str(v[0]);
+      const Val sep = soft_str(v[0]);
       std::string out;
+      Spans sp;
       PyIter it(value);
       Val x;
       bool first = true;
       while (it.next(x)) {
-        if (!first) out += sep;
+        if (!first) {
+          add_spans(sp, sep, out.size(), sep.sv().size());
+          out += sep.sv();
+        }
         first = false;
         if (!v[1].is_none()) x = getter(in, x);
+        const size_t b = out.size();
         append_str(out, x);
+        add_spans(sp, x, b, out.size() - b);
       }
-      return Val::str(std::move(out));
+      return str_spans(std::move(out), std::move(sp));
     }
     case FI_list: args("do_list", {}, {}); return make_list(to_vector(value));
     case FI_lower: {
@@ -2056,10 +2139,18 @@ Val call_filter(Interp& in, int id, const std::string& name, const Val& value, A
       const double r = method == "ceil" ? std::ceil(value.f() * scale) : std::floor(value.f() * scale);
       return Val::real(r / scale);
     }
-    case FI_safe:
+    case FI_safe: {
       args("do_mark_safe", {}, {});
       if (is_markup(value)) return value;
-      return Val::str(to_str(value), true);
+      if (value.is_str()) {
+        Spans sp;
+        add_spans(sp, value, 0, value.sv().size());
+        return str_spans(std::string(value.sv()), std::move(sp), true);
+      }
+      Val r = soft_str(value);  // a new string
+      r.set_markup(true);
+      return r;
+    }
     case FI_slice: {
       args("sync_do_slice", {"slices", "fill_with"}, {M, Val::none()});
       std::vector<Val> seq = to_vector(value);

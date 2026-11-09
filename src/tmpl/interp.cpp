@@ -90,7 +90,7 @@ int64_t LoopObj::len() {
 
 // ---------------------------------------------------------------- Interp
 Interp::Interp(const TemplateImpl& t, const std::vector<std::pair<std::string_view, Val>>& fixed,
-               const std::vector<const json::Value*>& layers, const RenderOptions& o)
+               const std::vector<const json::Value*>& layers, const RenderOptions& o, size_t data_layers)
     : opts(o), t_(t) {
   ctx_vals_.reserve(t.ctx_names.size());
   for (const std::string& name : t.ctx_names) {
@@ -105,7 +105,7 @@ Interp::Interp(const TemplateImpl& t, const std::vector<std::pair<std::string_vi
     for (size_t i = 0; !found && i < layers.size(); ++i)
       if (layers[i] && layers[i]->is_object())
         if (const json::Value* j = layers[i]->get(name)) {
-          v = from_json(*j);
+          v = from_json(*j, i < data_layers);
           found = true;
         }
     if (!found) v = lookup_global(name);
@@ -135,17 +135,27 @@ Interp::~Interp() {
     if (--o->rc == 0) delete o;
 }
 
-std::string Interp::run() {
+std::string Interp::run(Spans* spans) {
   auto* root = Activation::make(size_t(t_.root_slots), nullptr);
   root->tracked = true;
   gc_.push_back(root);  // owned by gc_
   std::string out;
+  Spans sp;
   out_ = &out;
+  spans_ = &sp;
   if (t_.self_slot >= 0) root->slots[size_t(t_.self_slot)] = Val::builtin(BuiltinId::TemplateReference);
   run_init(t_.root_init, root);
   exec(t_.body, root);
   out_ = nullptr;
+  spans_ = nullptr;
+  if (spans) *spans = std::move(sp);
   return out;
+}
+
+void Interp::put(const Val& v) {
+  const size_t b = out_->size();
+  append_str(*out_, v);
+  add_spans(*spans_, v, b, out_->size() - b);
 }
 
 void Interp::run_init(const FrameInit& init, Activation* act) {
@@ -174,16 +184,21 @@ Flow Interp::exec(const Body& body, Activation* act) {
 
 Val Interp::render_body_to_str(const Body& body, Activation* act, Flow* flow) {
   std::string buf;
+  Spans sp;
   std::string* saved = out_;
+  Spans* saved_sp = spans_;
   out_ = &buf;
+  spans_ = &sp;
   try {
     *flow = exec(body, act);
   } catch (...) {
     out_ = saved;
+    spans_ = saved_sp;
     throw;
   }
   out_ = saved;
-  return Val::str(std::move(buf));
+  spans_ = saved_sp;
+  return str_spans(std::move(buf), std::move(sp));
 }
 
 Flow Interp::exec_stmt(const Stmt* s, Activation* act) {
@@ -199,7 +214,7 @@ Flow Interp::exec_stmt(const Stmt* s, Activation* act) {
           continue;
         }
         const Val v = eval(it.expr.get(), act);
-        append_str(*out_, v);
+        put(v);
       }
       return Flow::Normal;
     }
@@ -244,7 +259,7 @@ Flow Interp::exec_stmt(const Stmt* s, Activation* act) {
       eval_args(call_expr->a, act, args);
       args.kw.emplace_back(Val::str_ref("caller"), caller);
       const Val r = call(fn, args);
-      append_str(*out_, r);
+      put(r);
       return Flow::Normal;
     }
     case SK::FilterBlock: {
@@ -254,7 +269,7 @@ Flow Interp::exec_stmt(const Stmt* s, Activation* act) {
       const Val body = render_body_to_str(fb->body, act, &flow);
       if (flow != Flow::Normal) return flow;
       const Val r = eval_filter(static_cast<const FilterExpr*>(fb->filter.get()), act, &body);
-      append_str(*out_, r);
+      put(r);
       return Flow::Normal;
     }
     case SK::With: {
@@ -433,28 +448,31 @@ void Interp::emit_add(const BinExpr* e, Activation* act) {
   const int n = add_chain(e, chain, 32);
   Val first = eval(chain[0], act);
   if (!first.is_str() || first.markup()) {
-    append_str(*out_, add_rest(std::move(first), chain, 1, n, act));
+    put(add_rest(std::move(first), chain, 1, n, act));
     return;
   }
   std::string& out = *out_;
   const size_t start = out.size();
   out += first.sv();
+  add_spans(*spans_, first, start, first.sv().size());
   for (int i = 1; i < n; ++i) {
     Val r = eval(chain[i], act);
     if (r.is_str() && !r.markup()) {
+      add_spans(*spans_, r, out.size(), r.sv().size());
       out += r.sv();
       continue;
     }
-    Val acc = Val::str(out.substr(start));
+    Val acc = str_spans(out.substr(start), take_spans(*spans_, start));
     out.resize(start);
     acc = py_add(acc, r);
-    append_str(out, add_rest(std::move(acc), chain, i + 1, n, act));
+    put(add_rest(std::move(acc), chain, i + 1, n, act));
     return;
   }
 }
 
 Val Interp::add_rest(Val acc, const Expr* const* chain, int from, int n, Activation* act) {
   std::string buf;
+  Spans sp;
   bool buffering = false;
   for (int i = from; i < n; ++i) {
     Val r = eval(chain[i], act);
@@ -463,19 +481,22 @@ Val Interp::add_rest(Val acc, const Expr* const* chain, int from, int n, Activat
       if (!buffering) {
         buf.reserve(acc.sv().size() + r.sv().size() + 64);
         buf.assign(acc.sv());
+        add_spans(sp, acc, 0, buf.size());
         buffering = true;
       }
+      add_spans(sp, r, buf.size(), r.sv().size());
       buf += r.sv();
       continue;
     }
     if (buffering) {
-      acc = Val::str(std::move(buf));
+      acc = str_spans(std::move(buf), std::move(sp));
       buf.clear();
+      sp.clear();
       buffering = false;
     }
     acc = py_add(acc, r);
   }
-  if (buffering) acc = Val::str(std::move(buf));
+  if (buffering) acc = str_spans(std::move(buf), std::move(sp));
   return acc;
 }
 
@@ -589,11 +610,14 @@ Val Interp::eval(const Expr* e, Activation* act) {
     }
     case EK::Concat: {
       std::string s;
+      Spans sp;
       for (const auto& n : static_cast<const ConcatExpr*>(e)->nodes) {
         const Val v = eval(n.get(), act);
+        const size_t b = s.size();
         append_str(s, v);
+        add_spans(sp, v, b, s.size() - b);
       }
-      return Val::str(std::move(s));
+      return str_spans(std::move(s), std::move(sp));
     }
     case EK::CondExpr: {
       auto* c = static_cast<const CondExpr*>(e);

@@ -281,15 +281,21 @@ struct Tokenizer::Impl {
   int32_t vocab_find(std::string_view s) const;  // model vocabulary only
   int32_t find(std::string_view s) const;        // added tokens first, then the vocabulary
 
-  void encode(std::string_view text, std::vector<int32_t>& out, bool parse_special) const;
-  void encode_segment(std::string_view seg, std::vector<int32_t>& out, bool parse_special) const;
+  // `plain` (optional): Tokenizer::encode's plain ranges, relative to `text`; encode_segment's
+  // `base` is the segment's offset in that text.
+  void encode(std::string_view text, std::vector<int32_t>& out, bool parse_special,
+              const Tokenizer::Ranges* plain = nullptr) const;
+  void encode_segment(std::string_view seg, std::vector<int32_t>& out, bool parse_special,
+                      const Tokenizer::Ranges* plain = nullptr, size_t base = 0) const;
   void encode_pieces(std::string_view s, std::vector<int32_t>& out) const;
+  template <class OnPiece>
+  void for_each_piece(std::string_view s, OnPiece&& on_piece) const;  // the pre-tokenizer's pieces [b, e)
   void encode_word(std::string_view word, std::vector<int32_t>& out) const;
   void bpe(std::string_view word, std::vector<int32_t>& out) const;
   void bpe_spm(std::string_view word, std::vector<int32_t>& out) const;
   template <class OnText>
   void split_added(const tok::AddedMatcher& m, std::string_view s, bool parse_special, std::vector<int32_t>& out,
-                   OnText&& on_text) const;
+                   OnText&& on_text, const Tokenizer::Ranges* plain = nullptr, size_t base = 0) const;
 };
 
 namespace tok {

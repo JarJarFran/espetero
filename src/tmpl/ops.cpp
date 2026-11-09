@@ -101,13 +101,16 @@ Val py_add(const Val& a, const Val& b) {
     if (a.markup() || b.markup()) {  // Markup escapes the plain operand
       std::string s = a.markup() ? std::string(a.sv()) : html_escape(a.sv());
       s += b.markup() ? std::string(b.sv()) : html_escape(b.sv());
-      return Val::str(std::move(s), true);
+      return has_data(a) || has_data(b) ? as_data(Val::str(std::move(s), true)) : Val::str(std::move(s), true);
     }
     std::string s;
+    Spans sp;
     s.reserve(a.sv().size() + b.sv().size());
     s += a.sv();
+    add_spans(sp, a, 0, a.sv().size());
+    add_spans(sp, b, s.size(), b.sv().size());
     s += b.sv();
-    return Val::str(std::move(s));
+    return str_spans(std::move(s), std::move(sp));
   }
   if ((a.is_list() && b.is_list()) || (a.is_tuple() && b.is_tuple())) {
     std::vector<Val> items;
@@ -125,7 +128,16 @@ Val py_add(const Val& a, const Val& b) {
 
 Val percent_format(const Val& fmt, const Val& args);
 
+static Val py_arith_impl(EK op, const Val& a, const Val& b);
+
+// String results of `*` and `%` that used data are data as a whole.
 Val py_arith(EK op, const Val& a, const Val& b) {
+  Val r = py_arith_impl(op, a, b);
+  if (r.is_str() && (has_data(a) || has_data(b))) r = as_data(std::move(r));
+  return r;
+}
+
+static Val py_arith_impl(EK op, const Val& a, const Val& b) {
   check_defined(a, b);
   const bool nums = a.is_number() && b.is_number();
   const bool ints = nums && !a.is_float() && !b.is_float();
@@ -336,7 +348,8 @@ Val get_slice(const Val& obj, const Val& a, const Val& b, const Val& c) {
       }
       std::string out;
       for (int64_t k = 0, i = start; k < n; ++k, i += step) out.append(s.substr(cps[size_t(i)].first, cps[size_t(i)].second));
-      return Val::str(std::move(out), obj.markup());
+      Val r = Val::str(std::move(out), obj.markup());
+      return has_data(obj) ? as_data(std::move(r)) : r;
     }
     case Kind::List:
     case Kind::Tuple: {

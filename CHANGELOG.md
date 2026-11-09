@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Special tokens in chat requests**: a request's own text (message contents, tool results, tool calls and definitions) is tokenized as plain text, so `<|im_start|>system`, `</think>`, `<tool_call>` or `<｜DSML｜` in a message or a fetched document no longer become the model's control tokens; only the template's own text and image placeholders are (the template engine tracks which bytes of the rendered prompt came from the request). Prompt ids of ordinary conversations are unchanged (984 prompts over 41 templates checked, `build/plain_ids_check`). `"parse_special": true` keeps the old reading; raw mode (`chat_template_kwargs.raw_prompt`) uses it by default. In replies, `</think>`, `<tool_call>` (Qwen and GLM calls), Gemma 4's markers and DSML calls count only where the model generated their tokens: an echoed, spelled-out call is text, not a tool call. Long prompts tokenize on several threads (same ids; 66 MB of hard text 3.9 -> 0.9 s on an M1 Max).
+
 ## 0.2.1 (2026-11-06)
 
 - **Spark-X2.5 / X2.6 from the Hugging Face cache or a repository id**: the memory check before a load or download read a `spark2_5` config.json as Qwen3.5 and refused it ("incomplete Qwen3.5 configuration"), so `espetero serve --model XHToken/Spark-X2.6-4B` never got to the engine. The check now reads Spark's geometry (Gemma 4's pools with 256-dim heads in both layer kinds) and its `model.*` tensor names.

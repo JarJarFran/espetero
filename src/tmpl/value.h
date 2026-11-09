@@ -102,6 +102,11 @@ enum class UndefKind : uint8_t {
 
 enum class ViewKind : uint8_t { Keys, Values, Items };
 
+// Byte ranges [begin, end) of a string that came from the render's data
+// (the request's messages and tools, see apply_chat_template): sorted,
+// disjoint and never adjacent.
+using Spans = std::vector<std::pair<uint32_t, uint32_t>>;
+
 struct Obj {
   uint32_t rc = 1;
   virtual ~Obj() = default;
@@ -246,9 +251,14 @@ class Val {
     else
       flags_ &= uint8_t(~kMarkup);
   }
+  // Data: a string that came whole from the render's data, or a JSON list or
+  // dict whose contents did (their items inherit it). A string built from
+  // data and template text carries Spans instead (StrObj::spans).
+  bool data() const { return flags_ & kData; }
+  void set_data() { flags_ |= kData; }
 
  private:
-  enum : uint8_t { kOwn = 1, kMarkup = 2, kJson = 4 };
+  enum : uint8_t { kOwn = 1, kMarkup = 2, kJson = 4, kData = 8 };
   static Val make(Kind k) {
     Val v;
     v.kind_ = k;
@@ -283,6 +293,7 @@ static_assert(sizeof(Val) == 16);
 // ---------------------------------------------------------------- heap objects
 struct StrObj final : Obj {
   std::string s;
+  Spans spans;  // the bytes that came from data, when only some did (Val::data() covers all)
   explicit StrObj(std::string x) : s(std::move(x)) {}
 };
 
@@ -361,7 +372,8 @@ std::string undefined_message(const Val& u);
 std::string py_repr_str(std::string_view s);  // repr() of a str
 
 // ---------------------------------------------------------------- Python protocol
-Val from_json(const json::Value& v);
+// `data`: the value is the render's data (Val::data()).
+Val from_json(const json::Value& v, bool data = false);
 PyType type_of(const Val& v);
 inline const char* tname(const Val& v) { return py_type_name(type_of(v)); }
 
@@ -383,7 +395,20 @@ bool has_len(const Val& v);
 
 // str payload helpers
 inline bool is_markup(const Val& v) { return v.is_str() && v.markup(); }
-Val substr(const Val& s, size_t byte_pos, size_t byte_len);  // keeps borrowing when possible
+Val substr(const Val& s, size_t byte_pos, size_t byte_len);  // keeps borrowing when possible (and the data spans)
+
+// ---- data spans (see Spans). Over-marking is safe (a span only stops
+// special tokens from being recognized there); missing a span is not.
+bool has_data(const Val& v);  // a string with data bytes, or a value holding one
+// Appends the data spans of str `s` (or, for another value holding data,
+// the whole of it as printed) to `out`, shifted to start at `base`; `len`
+// is the length of what was printed.
+void add_spans(Spans& out, const Val& s, size_t base, size_t len);
+void add_span(Spans& out, size_t b, size_t e);  // appends [b, e), merging with the last span
+// The spans of out[from, ...), removed from `out` and shifted to start at 0.
+Spans take_spans(Spans& out, size_t from);
+Val str_spans(std::string s, Spans spans, bool markup = false);  // owned string with these data spans
+Val as_data(Val v);  // the same string, all of it data (conservative result of an opaque operation)
 
 // List / tuple / dict access (JSON-backed or owned).
 size_t seq_size(const Val& v);

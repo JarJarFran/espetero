@@ -127,10 +127,16 @@ struct GemmaArgs {
 };
 }  // namespace
 
-std::string parse_gemma_tool_calls(const std::string& content, json::Value& calls) {
+std::string parse_gemma_tool_calls(const std::string& content, json::Value& calls, const std::vector<size_t>* at_ok) {
   calls = json::Value();
   const std::string open = "<|tool_call>", close = "<tool_call|>";
-  size_t at = content.find(open);
+  auto find_open = [&](size_t from) {
+    if (!at_ok) return content.find(open, from);
+    for (size_t p : *at_ok)
+      if (p >= from && content.compare(p, open.size(), open) == 0) return p;
+    return std::string::npos;
+  };
+  size_t at = find_open(0);
   if (at == std::string::npos) return content;
   std::string before = content.substr(0, at);
   while (!before.empty() && (before.back() == '\n' || before.back() == ' ')) before.pop_back();
@@ -162,7 +168,7 @@ std::string parse_gemma_tool_calls(const std::string& content, json::Value& call
       }
     }
     if (end == std::string::npos) break;
-    at = content.find(open, end + close.size());
+    at = find_open(end + close.size());
   }
   if (out.size()) calls = std::move(out);
   return calls.is_null() ? content : before;

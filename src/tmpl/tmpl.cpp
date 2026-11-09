@@ -60,25 +60,30 @@ std::string Template::render(const json::Value& context, const RenderOptions& op
   return in.run();
 }
 
-std::string render_impl(const TemplateImpl& t, const std::vector<std::pair<std::string_view, Val>>& fixed,
-                        const std::vector<const json::Value*>& layers, const RenderOptions& opts) {
-  Interp in(t, fixed, layers, opts);
-  return in.run();
-}
+
 
 std::string apply_chat_template(const Template& tmpl, const json::Value& messages, const json::Value& tools,
                                 bool add_generation_prompt, const json::Value& extra_kwargs,
-                                const json::Value& special_tokens, const RenderOptions& opts) {
+                                const json::Value& special_tokens, const RenderOptions& opts,
+                                std::vector<std::pair<size_t, size_t>>* data) {
   // transformers: template.render(messages=..., tools=..., documents=None,
   // add_generation_prompt=..., **{**special_tokens_map, **kwargs}); nothing is
   // copied: the render borrows the caller's JSON.
+  // messages, tools and extra_kwargs (the first layer) are the data.
   const std::vector<std::pair<std::string_view, Val>> fixed = {
-      {"messages", from_json(messages)},
-      {"tools", from_json(tools)},
+      {"messages", from_json(messages, true)},
+      {"tools", from_json(tools, true)},
       {"documents", Val::none()},
       {"add_generation_prompt", Val::boolean(add_generation_prompt)},
   };
-  return render_impl(tmpl.impl(), fixed, {&extra_kwargs, &special_tokens}, opts);
+  Interp in(tmpl.impl(), fixed, {&extra_kwargs, &special_tokens}, opts, 1);
+  Spans sp;
+  std::string out = in.run(data ? &sp : nullptr);
+  if (data) {
+    data->clear();
+    for (const auto& [b, e] : sp) data->emplace_back(b, e);
+  }
+  return out;
 }
 
 }  // namespace espetero::tmpl
