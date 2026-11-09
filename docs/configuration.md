@@ -1299,6 +1299,10 @@ DeepSeek-V4.1's DSpark draft passes report `draft_attn_out`, `draft_moe_out`,
 `draft_layer_out` and `draft_logits`. Not covered yet: GLM-5.3-Flash, LFM2,
 the Qwen3-Omni thinker, vision towers, MTP draft passes of the Qwen3.5 family.
 
+DeepSeek-V4.1 routes on the host: once a NaN reaches a router, the pass cannot
+go on even with `log`, and it fails with the detector's first offender
+followed by `(then deepseek_v41: bad routing)`.
+
 `ESPETERO_CHECK_FINITE_POISON=op:layer:row:col` (tests; with the check on)
 writes a NaN into that element of that site's region before its check, in
 every pass that has the row (`logits:-1:0:7` for the logits).

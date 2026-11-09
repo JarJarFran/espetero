@@ -279,6 +279,14 @@ struct FiniteCheck {
     if (opt.abort) fail(msg);
     std::fprintf(stderr, "[espetero] %s\n", msg.c_str());
   }
+  // The first offender among the checks whose GPU work is done, for a host check that fails mid-pass
+  // (e.g. a router reading NaN): its error then names where the NaN came from. "" if none (or off).
+  std::string first_offender() const {
+    if (sites.empty()) return {};
+    const FiniteRec* r = static_cast<const FiniteRec*>([recs contents]);
+    const FiniteScan sc = finite_scan(r, sites.size());
+    return sc.first < 0 ? std::string() : finite_message(model, sites[size_t(sc.first)], r[sc.first], sc.flagged, &sites[size_t(sc.last)]);
+  }
   // Forget the pending checks (a failed pass: their records may be partial).
   void discard() {
     reset_records(sites.size());

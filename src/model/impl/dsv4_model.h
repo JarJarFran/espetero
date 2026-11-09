@@ -675,6 +675,12 @@ class Dsv4Model final : public NativeModel {
   };
 
   Runtime rt_;
+  // The host's routing check failed (an expert id out of range: NaN router scores). With
+  // ESPETERO_CHECK_FINITE on, the error names the first offender of the work done so far.
+  [[noreturn]] void fail_routing() const {
+    const std::string m = rt_.fcheck.first_offender();
+    fail(m.empty() ? std::string("deepseek_v41: bad routing") : m + " (then deepseek_v41: bad routing)");
+  }
   Cfg c_;
   Ckpt ck_;
   EngramConst eng_;
@@ -2428,7 +2434,7 @@ class Dsv4Model final : public NativeModel {
       std::vector<int> used(size_t(w.nE), 0);
       for (const Blk& bk : fb)
         for (int i = bk.r0 * K; i < (bk.r0 + bk.M) * K; ++i) {
-          if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
+          if (sel[i] < 0 || sel[i] >= w.nE) fail_routing();
           ++used[size_t(sel[i])];
         }
       std::vector<int> need, nrows;
@@ -2543,7 +2549,7 @@ class Dsv4Model final : public NativeModel {
           std::vector<int> used(size_t(w.nE), 0);
           for (const Blk& bk : d.fb)
             for (int i = bk.r0 * K; i < (bk.r0 + bk.M) * K; ++i) {
-              if (sel[i] < 0 || sel[i] >= w.nE) fail("deepseek_v41: bad routing");
+              if (sel[i] < 0 || sel[i] >= w.nE) fail_routing();
               ++used[size_t(sel[i])];
             }
           std::vector<int> need, nrows;

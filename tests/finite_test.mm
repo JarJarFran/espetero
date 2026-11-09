@@ -162,11 +162,16 @@ int main(int argc, char** argv) {
     const bool hit = !r.ok && r.error.find("check-finite: NaN in ") == 0 && r.error.find(", " + where) != std::string::npos;
     expect(hit, "poison " + spec + " -> " + (r.ok ? std::string("(no error)") : r.error));
   }
-  // 3. log only: reported on stderr, the pass goes on
+  // 3. log only: reported on stderr, the pass goes on (the last op: a NaN that reaches a
+  // router fails the pass anyway, its error naming the first offender)
   {
-    const std::string spec = ops[0] + ":" + std::to_string(ops[0].find("logits") != std::string::npos ? -1 : layer) + ":0:1";
+    const std::string& lop = ops.back();
+    const std::string spec = lop + ":" + std::to_string(lop.find("logits") != std::string::npos ? -1 : layer) + ":0:1";
     const Result r = run_case(path, "log", spec.c_str(), 64, 2, 1);
-    expect(r.ok, "log only with poison " + spec + " goes on" + (r.ok ? std::string() : ": " + r.error));
+    // A model whose host reads the routing (DeepSeek-V4.1) cannot go on once a NaN reaches a
+    // router: then the pass fails, its error the detector's first offender.
+    const bool stopped = !r.ok && r.error.find("check-finite: NaN in ") == 0 && r.error.find(" (then ") != std::string::npos;
+    expect(r.ok || stopped, "log only with poison " + spec + (r.ok ? " goes on" : stopped ? " logs, then a router stops the pass: " + r.error : ": " + r.error));
   }
   // 4. overhead (min of 3), and the logits with the checks on
   if (timing) {
