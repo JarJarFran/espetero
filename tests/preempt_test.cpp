@@ -15,12 +15,19 @@
 // structured output (a JSON schema with at least 25 array items, the
 // batch-priority one). A difference in a request before it was ever parked is
 // reported, not failed: batching alone moves near ties (the control line shows
-// the same four with room). The batch-priority request is parked; the oldest
+// the same four with room). Each token's raw logprob is compared with the run
+// alone too (logprobs turn decode chains off, in both runs alike): from a
+// request's first park on, they must stay within three times
+// the drift batching causes before any park (at least 0.05). A difference after
+// a resume within that drift is batching moving a near tie (for greedy requests
+// the two choices' logprobs must be that close as well); a resume that rebuilt
+// the wrong state moves logprobs far past it. The batch-priority request is parked; the oldest
 // interactive one never is. With --no-preempt the same load stops requests
 // with "KV cache full" (the old behaviour).
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +61,7 @@ struct Result {
   std::string reason, error;
   int completion = 0, preemptions = 0, resume_rows = 0, first_parked = -1;
   double resume_ms = 0, parked_ms = 0, first_ms = 0;
+  std::vector<TokenLogprob> lps;  // each token's raw logprob and top alternative
 };
 
 const char* kPreface =
@@ -109,6 +117,10 @@ GenRequest request_of(const Engine& e, const Variant& v, int i, int max_tokens,
   r.seed = 1000 + uint64_t(i);
   r.has_seed = true;
   r.priority = i == 0 ? 1 : 0;  // request 0: a batch job
+  // Each token's raw logprob, to tell a resume that computed the wrong state
+  // (its logprobs move away from the run alone) from batching moving a near
+  // tie (they stay within the drift of requests never parked).
+  r.logprobs = 1;
   if (v.structured && i == 0) {
     r.constraint = json_obj;
     r.ignore_eos = false;  // the reply ends with the JSON value
@@ -124,7 +136,7 @@ GenRequest request_of(const Engine& e, const Variant& v, int i, int max_tokens,
 Result drain(const std::shared_ptr<GenStream>& s) {
   Result r;
   std::vector<int32_t> chunk;
-  while (s->next(chunk)) {
+  while (s->next(chunk, -1, &r.lps)) {
   }
   r.tokens = std::move(chunk);
   r.reason = s->finish_reason;
@@ -193,6 +205,15 @@ std::shared_ptr<const grammar::Constraint> towns_constraint(Engine& e) {
   return c;
 }
 
+// The largest |logprob difference| of the same token at positions [from, to)
+// of two runs (both chose it).
+double drift(const Result& g, const Result& a, int from, int to) {
+  double m = 0;
+  for (int t = std::max(from, 0); t < to && t < int(g.lps.size()) && t < int(a.lps.size()); ++t)
+    if (g.tokens[t] == a.tokens[t]) m = std::max(m, double(std::abs(g.lps[t].logprob - a.lps[t].logprob)));
+  return m;
+}
+
 int first_diff(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
   const size_t n = std::min(a.size(), b.size());
   for (size_t i = 0; i < n; ++i)
@@ -251,7 +272,7 @@ int main(int argc, char** argv) {
     {
       auto small = load(dir, kv_gb, true);
       auto obj = towns_constraint(*small);
-      int diverged_unparked = 0;
+      int diverged_unparked = 0, diverged_parked = 0;
       for (size_t vi = 0; vi < 4; ++vi) {
         const Variant& v = variants[vi];
         if (!only.empty() && only != v.name) continue;
@@ -265,24 +286,57 @@ int main(int argc, char** argv) {
         const int64_t np = stat(*small, "kv_preempted_sequences") - p0, nr = stat(*small, "kv_resume_rows") - r0;
         std::printf("%s: %lld preemptions, %lld rows computed again, %.0f ms\n", v.name, (long long)np, (long long)nr, wall);
         CHECK(np > 0);
+        // Logprob drift from the run alone on the tokens both chose: before a
+        // request's first park (all of it if never parked) batching alone; from
+        // the park on, the resume too. A resume that computed the wrong state moves
+        // logprobs far past what batching does.
+        int d[4], end[4];
+        double pre[4], post[4], batch_drift = 0;
         for (int i = 0; i < 4; ++i) {
           const Result& a = alone[vi][i];
           const Result& g = got[i];
-          const int d = first_diff(g.tokens, a.tokens);
+          d[i] = first_diff(g.tokens, a.tokens);
+          end[i] = d[i] < 0 ? int(std::min(g.tokens.size(), a.tokens.size())) : d[i];
+          const int park = g.first_parked < 0 ? end[i] : std::min(g.first_parked, end[i]);
+          pre[i] = drift(g, a, 0, park);
+          post[i] = g.first_parked < 0 ? -1 : drift(g, a, g.first_parked, end[i]);
+          batch_drift = std::max(batch_drift, pre[i]);
+        }
+        const double bound = std::max(0.05, 3 * batch_drift);
+        std::printf("  logprob drift from alone before any park: %.4f (bound after a resume: %.4f)\n", batch_drift, bound);
+        for (int i = 0; i < 4; ++i) {
+          const Result& a = alone[vi][i];
+          const Result& g = got[i];
           std::printf("  req %d: %s, %zu tokens (alone %zu, %s), parked %d times (first after %d tokens), %d rows again in "
-                      "%.0f ms, %.0f ms parked, first token at %.0f ms%s\n",
+                      "%.0f ms, %.0f ms parked, first token at %.0f ms, drift %.4f / %.4f%s\n",
                       i, g.reason.c_str(), g.tokens.size(), a.tokens.size(), a.reason.c_str(), g.preemptions, g.first_parked,
-                      g.resume_rows, g.resume_ms, g.parked_ms, g.first_ms,
-                      d < 0 ? "" : (" -- FIRST DIFFERENCE at token " + std::to_string(d)).c_str());
+                      g.resume_rows, g.resume_ms, g.parked_ms, g.first_ms, pre[i], post[i],
+                      d[i] < 0 ? "" : (" -- FIRST DIFFERENCE at token " + std::to_string(d[i])).c_str());
           if (!g.error.empty()) std::printf("    error: %s\n", g.error.c_str());
-          // A difference before the request was ever parked comes from batching
-          // (the control above shows how often); after it, from the resume.
-          if (d >= 0 && (g.first_parked < 0 || d < g.first_parked)) {
+          // At the first difference: each run's choice and its raw logprob (a
+          // greedy pair within the drift is a near tie).
+          double gap = -1;
+          if (d[i] >= 0 && d[i] < int(a.lps.size()) && d[i] < int(g.lps.size())) {
+            const TokenLogprob& x = a.lps[d[i]];
+            const TokenLogprob& y = g.lps[d[i]];
+            gap = std::abs(x.logprob - y.logprob);
+            std::printf("    alone chose %d (logprob %.4f), together %d (%.4f)\n", x.token, x.logprob, y.token, y.logprob);
+          }
+          if (d[i] >= 0 && (g.first_parked < 0 || d[i] < g.first_parked)) {
+            // A difference before the request was ever parked comes from batching
+            // (the control above shows how often).
             ++diverged_unparked;
             std::printf("    (before any preemption: batch composition, not the resume)\n");
-          } else {
-            CHECK(d < 0);
+          } else if (d[i] >= 0) {
+            // After a park: the resume's state must match the run alone as
+            // closely as batching keeps any request; then the difference is a
+            // near tie batching moved.
+            ++diverged_parked;
+            if (v.temperature == 0) CHECK(gap >= 0 && gap <= bound);  // greedy: only a near tie may move
+            std::printf(post[i] <= bound ? "    (after a resume whose logprobs stay within batching's drift: batch composition)\n"
+                                         : "    (after a resume whose logprobs moved past batching's drift)\n");
           }
+          if (g.first_parked >= 0) CHECK(post[i] <= bound);
           CHECK(g.reason == a.reason);
           CHECK(g.completion == int(g.tokens.size()));
           if (!(v.structured && i == 0)) CHECK(g.reason == "length" && int(g.tokens.size()) == max_tokens);
@@ -291,7 +345,8 @@ int main(int argc, char** argv) {
         CHECK(got[0].preemptions > 0);  // the batch job is parked first
       }
       CHECK(stat(*small, "kv_stopped_sequences") == 0);
-      std::printf("differences before any preemption (batching): %d\n", diverged_unparked);
+      std::printf("differences before any preemption (batching): %d; after a resume within batching's drift: %d\n",
+                  diverged_unparked, diverged_parked);
     }
     // The old behaviour: the newest requests stop with "KV cache full".
     {

@@ -1183,7 +1183,10 @@ stray web page or an abusive request could do with it:
   chunks), against 5 ms per decoded token. Its next token is drawn
   at the position, with the seed, penalties, `no_repeat_ngram_size` history
   and structured-output state it would have had, so greedy and seeded
-  replies are the ones it gives alone; its stream stays open, no token is
+  replies are the ones it gives in the same batch without the park (the
+  resumed state's logprobs stay within the drift any batching causes, a few
+  thousandths; like any batched request it can still differ from its run
+  alone at a near tie); its stream stays open, no token is
   sent twice, and usage counts each token once. Teacher-forced scoring,
   M-RoPE (Qwen-VL) image prompts and an `n` > 1 request before its choices
   fork are not preempted: they stop as before. With `--no-preempt` the
