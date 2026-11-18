@@ -393,6 +393,7 @@ Common options:
 | `--speculation M` | `auto` (default), `on` (draft every step), `off` |
 | `--memory-gb X` | GPU memory for conversations |
 | `--host`, `--port`, `--api-key`, `--name` | server (the key can also come from the environment variable `ESPETERO_API_KEY`, which keeps it out of `ps`) |
+| `--max-body-mb N` | largest request body in MB (default 256; larger requests get 413) |
 
 `serve` opens its port before it downloads or loads the model: a
 port another program listens on, at any address of this Mac, stops it at
