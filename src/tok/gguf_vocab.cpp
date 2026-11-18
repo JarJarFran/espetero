@@ -69,17 +69,18 @@ class Reader {
       default: fail(path_ + ": expected an integer GGUF value");
     }
   }
-  void skip(uint32_t t) {
+  void skip(uint32_t t, int depth = 0) {
     if (t == kString) {
       str();
     } else if (t == kArray) {
+      if (depth >= 32) fail(path_ + ": GGUF arrays nested too deeply");  // recursion would exhaust the stack
       const uint32_t et = get<uint32_t>();
       const uint64_t n = get<uint64_t>();
       if (const size_t sz = scalar_size(et)) {
         if (n > uint64_t(e_ - p_) / sz) fail(path_ + ": truncated GGUF array");
         p_ += n * sz;
       } else {
-        for (uint64_t i = 0; i < n; ++i) skip(et);
+        for (uint64_t i = 0; i < n; ++i) skip(et, depth + 1);
       }
     } else if (const size_t sz = scalar_size(t)) {
       need(sz);

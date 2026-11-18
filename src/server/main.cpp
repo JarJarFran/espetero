@@ -134,7 +134,8 @@ void usage() {
                "  --speculation M       auto (default: MTP drafts while they pay), on (always), off\n"
                "  --memory-gb X         GPU memory for conversations (default: automatic)\n"
                "  --host H --port P     bind address (default 127.0.0.1:8080)   --api-key KEY   --name NAME\n"
-               "                        (the key can come from ESPETERO_API_KEY instead, out of the process list)\n\n"
+               "                        (the key can come from ESPETERO_API_KEY instead, out of the process list;\n"
+               "                        --max-body-mb N caps request bodies, default 256 MB)\n\n"
                "configuration:\n"
                "  --config FILE.json    any option below as {\"option\": value}; the command line wins (default:\n"
                "                        ~/.config/espetero/config.json when it exists; --config none: no file)\n"
@@ -266,6 +267,7 @@ void usage_all() {
                "                        ESPETERO_API_KEY sets it too, out of the process list. Without a key the server\n"
                "                        only answers requests addressed to localhost, 127.0.0.1, [::1] or --host, and\n"
                "                        refuses requests from web pages of other origins (DNS rebinding, cross-site requests)\n"
+               "  --max-body-mb N       largest request body in MB (default 256; larger requests get 413)\n"
                "  --harness NAME        print the client setup for an agent harness at start: deepseek (deepseek-harness,\n"
                "                        the default: Messages and Files), claude-code, codex, opencode, or none\n"
                "  --cors                allow cross-origin requests (web pages of any origin)\n"
@@ -883,6 +885,12 @@ void open_port(Listener& L, const Args& a) {
   http::Options& ho = L.opts;
   ho.host = a.get("host", "127.0.0.1");
   ho.port = a.i("port", 8080);
+  if (a.has("max-body-mb")) {
+    const double mb = a.d("max-body-mb", 0);
+    if (!(mb > 0)) config_error("--max-body-mb: a positive number of megabytes");
+    const double clamped = mb > 16384.0 ? 16384.0 : mb;  // 16 GiB at most, so size_t stays sane
+    ho.max_body = size_t(clamped * (1 << 20));
+  }
   ho.api_key = a.get("api-key");
   if (ho.api_key.empty())  // the environment keeps the key out of `ps`
     if (const char* k = std::getenv("ESPETERO_API_KEY")) ho.api_key = k;

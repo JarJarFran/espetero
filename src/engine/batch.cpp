@@ -47,10 +47,29 @@ int64_t now_s() {
 
 std::string random_id(const char* prefix) {
   static std::mutex mu;
-  static std::mt19937_64 rng{std::random_device{}()};
+  static std::mt19937_64 rng{std::random_device{}()};  // fallback only: /dev/urandom is the source
   static const char* h = "0123456789abcdef";
   std::lock_guard<std::mutex> lk(mu);
   std::string s = prefix;
+  unsigned char buf[12];
+  const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    size_t got = 0;
+    while (got < sizeof buf) {
+      const ssize_t n = ::read(fd, buf + got, sizeof buf - got);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      got += size_t(n);
+    }
+    ::close(fd);
+    if (got == sizeof buf) {
+      for (size_t i = 0; i < sizeof buf; ++i) {
+        s.push_back(h[buf[i] >> 4]);
+        s.push_back(h[buf[i] & 15]);
+      }
+      return s;
+    }
+  }
   for (int i = 0; i < 24; ++i) s.push_back(h[rng() & 15]);
   return s;
 }
