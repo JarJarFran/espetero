@@ -700,7 +700,8 @@ class MetalModel final : public NativeModel {
         h.r_blocks != (R.n_layers ? m_.ring_blocks : 0) || h.rblock_bytes != (R.n_layers ? R.block_halves() * 2 : 0) ||
         h.n_linear != int32_t(S.conv_base.size()) || h.conv_bytes != S.conv_floats * 4 || h.st_bytes != S.st_floats * 4 ||
         (h.mtp_bytes && h.mtp_bytes != S.mtp_floats * 4) || h.ple_bytes != (pf ? pf * 4 + 8 : 0) || h.n_blocks < 0 ||
-        h.len < 0 || int64_t(h.len) > int64_t(h.n_blocks) * K.bt)
+        h.len < 0 || int64_t(h.len) > int64_t(h.n_blocks) * K.bt || h.n_lh < 0 || h.n_lh > kMaxDraft)
+      // n_lh indexes the slot's MTP region (lh_off: (1 + n_lh) * D of (1 + kMaxDraft) * D).
       return -1;
     const size_t need = sizeof(h) + size_t(h.n_blocks) * size_t(h.n_layers) * h.block_bytes +
                         size_t(h.n_linear) * (h.conv_bytes + h.st_bytes) + h.mtp_bytes + h.ple_bytes +

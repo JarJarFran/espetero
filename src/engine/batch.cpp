@@ -588,20 +588,36 @@ json::Value BatchService::create(const json::Value& body) {
 }
 
 void BatchService::run(std::shared_ptr<Batch> b) {
-  const std::string id = b->meta.get_string("id", "");
-  const std::string endpoint = b->meta.get_string("endpoint", "");
+  // meta is written under mu_ (cancel, get, save): read it under mu_ too.
+  std::string id, endpoint, input;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    id = b->meta.get_string("id", "");
+    endpoint = b->meta.get_string("endpoint", "");
+    input = b->meta.get_string("input_file_id", "");
+  }
+  if (!valid_id(input)) {  // ids name files on disk: a persisted id is trusted no further than create() trusts it
+    std::lock_guard<std::mutex> lk(mu_);
+    fail(*b, "missing_input", "input file id is not valid");
+    return;
+  }
   std::string text;
-  const std::string input = b->meta.get_string("input_file_id", "");
   if (!read_all(path_of(input, ".jsonl"), text)) {
     std::lock_guard<std::mutex> lk(mu_);
     fail(*b, "missing_input", "input file not found");
     return;
   }
   std::vector<Line> lines = parse_lines(text, endpoint);
-  // Output files: continue existing ones (resume) or create them.
-  if (b->out_id.empty()) b->out_id = random_id("file-");
-  if (b->err_id.empty()) b->err_id = random_id("file-");
-  const std::string out_id = b->out_id, err_id = b->err_id;
+  // Output files: continue existing ones (resume) or create them. out_id /
+  // err_id are read by to_json() under mu_, so write them under mu_ too.
+  std::string out_id, err_id;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (b->out_id.empty()) b->out_id = random_id("file-");
+    if (b->err_id.empty()) b->err_id = random_id("file-");
+    out_id = b->out_id;
+    err_id = b->err_id;
+  }
   // Counts come from the result files themselves (the saved counts may lag).
   std::set<std::string> done_ids;
   int prev[2] = {0, 0};

@@ -113,7 +113,7 @@ double num(const json::Value& body, const char* key, double def, double lo, doub
 // Common sampling options of chat and completions requests. Omitted
 // temperature / top_p / top_k / min_p take the model's defaults (`d`, its
 // generation_config.json); greedy requests keep OpenAI's for the other three.
-void sampling_options(const json::Value& body, ChatJob& job, int default_max, const SamplingDefaults& d) {
+void sampling_options(const json::Value& body, ChatJob& job, int default_max, const SamplingDefaults& d, int vocab) {
   GenRequest& g = job.gen;
   g.sampling.temperature = num(body, "temperature", d.temperature.value_or(1.0), 0, 2);
   const bool sampled = g.sampling.temperature > 0;
@@ -157,7 +157,11 @@ void sampling_options(const json::Value& body, ChatJob& job, int default_max, co
   }
   if (const json::Value* s = body.get("stop_token_ids"); s && s->is_array())
     for (const auto& x : s->as_array())
-      if (x.is_int()) g.stop_ids.push_back(int32_t(x.as_int()));
+      if (x.is_int()) {
+        const int64_t id = x.as_int();
+        if (id < 0 || (vocab > 0 && id >= vocab)) invalid("stop_token_ids: token ids in [0, vocab)");
+        g.stop_ids.push_back(int32_t(id));
+      }
   g.ignore_eos = parse_bool(body.get("ignore_eos"), false);
   job.stream = parse_bool(body.get("stream"), false);
   if (const json::Value* so = body.get("stream_options"); so && so->is_object())
@@ -337,7 +341,7 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   ChatJob job;
   job.id = random_id("chatcmpl-");
   job.created = now_s();
-  sampling_options(body, job, 1024, engine.sampling_defaults());
+  sampling_options(body, job, 1024, engine.sampling_defaults(), engine.info().vocab);
   score_options(engine, body, job);
   head_options(engine, body, job, run);
   parse_response_format(body.get("response_format"));  // its shape, before the prompt is rendered
@@ -708,7 +712,7 @@ ChatJob prepare_completion(Engine& engine, const json::Value& body) {
   job.split_reasoning = false;
   job.id = random_id("cmpl-");
   job.created = now_s();
-  sampling_options(body, job, 16, engine.sampling_defaults());
+  sampling_options(body, job, 16, engine.sampling_defaults(), engine.info().vocab);
   score_options(engine, body, job);
   head_options(engine, body, job, true);
   job.echo = parse_bool(body.get("echo"), false);

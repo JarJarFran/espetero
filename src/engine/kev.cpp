@@ -217,7 +217,11 @@ std::vector<int32_t> user_tokens(const Tokenizer& tok, std::string_view s) {
 Record encode(const Tokenizer& tok, const Delimiters& d, const json::Value& state, const json::Value& questions,
               const std::vector<int>& image_tokens, int32_t vision_start, int32_t image_pad, int32_t vision_end) {
   // The request models (api.Noul / Choice / Score, SystemOneRequest): what pydantic refuses with a 422.
+  // Cap the count like /v1/decisions caps fields (64): each question allocates
+  // rows x hidden floats before any context check (kev_engine.cpp), so an
+  // unbounded list is an OOM amplifier.
   if (!questions.is_object() || questions.size() == 0) invalid("questions: an object with at least one question");
+  if (questions.size() > 256) invalid("questions: at most 256 questions");
   struct Spec {
     const json::Value* instructions;
     const json::Value* criteria;

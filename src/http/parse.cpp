@@ -184,6 +184,7 @@ Head parse_head(std::string_view head, Request& req, size_t max_fields) {
   bool have_length = false, have_te = false, conn_close = false, conn_keep_alive = false;
   std::string te;  // Transfer-Encoding codings of all fields, comma-joined
   size_t fields = 0;
+  size_t host_fields = 0;  // RFC 9112 3.2: exactly one Host header field in HTTP/1.1
   while (next_line(line) && !line.empty()) {
     if (++fields > max_fields) return fail(431, "too many header fields");
     if (line[0] == ' ' || line[0] == '\t') return fail(400, "obsolete line folding is not supported");
@@ -228,6 +229,10 @@ Head parse_head(std::string_view head, Request& req, size_t max_fields) {
       } else if (!value.empty()) {
         return fail(417, "only 'Expect: 100-continue' is supported");
       }
+    } else if (lname == "host") {
+      // A proxy in front may read the last Host while this server reads the
+      // first: two different values would desync them, so refuse the request.
+      if (++host_fields > 1) return fail(400, "multiple Host header fields");
     }
     req.headers.emplace_back(std::move(lname), std::string(value));
   }

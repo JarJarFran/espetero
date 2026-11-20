@@ -628,6 +628,7 @@ inline VisionConfig vision_from_minicpm(const json::Value& root) {
   v.heads = int(vc.get_int("num_attention_heads", 0));
   v.patch = int(vc.get_int("patch_size", 14));
   v.in_ch = int(vc.get_int("num_channels", 3));
+  if (v.patch <= 0) fail("vision patch_size must be positive");
   const int side = int(vc.get_int("image_size", 980)) / v.patch;
   v.n_pos = side * side;
   v.eps = float(vc.get_double("layer_norm_eps", 1e-6));

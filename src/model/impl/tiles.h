@@ -51,6 +51,7 @@ struct TileImage {
   void* base = nullptr;
   size_t size = 0;
   std::vector<id<MTLBuffer>> segs;
+  std::vector<size_t> seg_len;  // mapped length of each segment, to bounds-check buf() ranges
   std::map<std::string, Mat> mats;
   size_t bytes = 0;
   // writing: the finished matrices of this load, in order
@@ -160,9 +161,16 @@ inline std::shared_ptr<TileImage> open_tiles(const Model& m, const std::string& 
     t->base = nullptr;
     return nullptr;
   }
-  for (const json::Value& s : idx.get("segments")->as_array()) {
-    const size_t off = size_t(s[0].as_int()), len = size_t(s[1].as_int());
-    if (off % size_t(getpagesize()) || len % size_t(getpagesize()) || off + len > t->size)
+  const json::Value* segments = idx.get("segments");
+  if (!segments || !segments->is_array()) fail(t->json_path + ": no segments array");
+  for (const json::Value& s : segments->as_array()) {
+    if (!s.is_array() || s.size() < 2 || !s[0].is_int() || !s[1].is_int())
+      fail(t->json_path + ": bad segment entry");
+    const int64_t off64 = s[0].as_int(), len64 = s[1].as_int();
+    if (off64 < 0 || len64 <= 0) fail(t->json_path + ": bad segment offset/length");
+    const size_t off = size_t(off64), len = size_t(len64);
+    // Overflow-safe: off + len can wrap, so compare each against the rest.
+    if (off % size_t(getpagesize()) || len % size_t(getpagesize()) || off > t->size || len > t->size - off)
       fail(t->bin_path + ": segment not page-aligned or past the file");
     id<MTLBuffer> b = [m.dev newBufferWithBytesNoCopy:static_cast<uint8_t*>(t->base) + off
                                                length:len
@@ -171,17 +179,26 @@ inline std::shared_ptr<TileImage> open_tiles(const Model& m, const std::string& 
     if (!b) fail(t->bin_path + ": cannot map a segment as a GPU buffer");
     Residency::get().add(b);
     t->segs.push_back(b);
+    t->seg_len.push_back(len);
     t->bytes += len;
   }
   auto buf = [&](const json::Value* v, size_t& n) -> Buf {
     n = 0;
-    if (!v || !v->is_array()) return Buf{};
-    const size_t seg = size_t((*v)[0].as_int());
+    if (!v || !v->is_array() || v->size() < 3) return Buf{};
+    if (!(*v)[0].is_int() || !(*v)[1].is_int() || !(*v)[2].is_int()) return Buf{};
+    const int64_t seg64 = (*v)[0].as_int(), off64 = (*v)[1].as_int(), n64 = (*v)[2].as_int();
+    if (seg64 < 0 || off64 < 0 || n64 < 0) fail(t->json_path + ": bad buffer entry");
+    const size_t seg = size_t(seg64);
     if (seg >= t->segs.size()) fail(t->json_path + ": bad segment index");
-    n = size_t((*v)[2].as_int());
-    return Buf(t->segs[seg], size_t((*v)[1].as_int()));
+    const size_t off = size_t(off64), len = size_t(n64);
+    // The range must stay inside its segment (kernels read n bytes at off).
+    if (off > t->seg_len[seg] || len > t->seg_len[seg] - off) fail(t->json_path + ": buffer past its segment");
+    n = len;
+    return Buf(t->segs[seg], off);
   };
-  const json::Object& mats = idx.get("mats")->as_object();
+  const json::Value* mats_v = idx.get("mats");
+  if (!mats_v || !mats_v->is_object()) fail(t->json_path + ": no mats object");
+  const json::Object& mats = mats_v->as_object();
   for (size_t i = 0; i < mats.size(); ++i) {
     const json::Value& e = mats.vals[i];
     Mat out;
@@ -192,6 +209,8 @@ inline std::shared_ptr<TileImage> open_tiles(const Model& m, const std::string& 
       d.in = int(e.get_int("in", 0));
       d.kp = int(e.get_int("kp", 0));
       d.act = int(e.get_int("act", 0));
+      if (d.out < 0 || d.in < 0 || d.kp < 0 || d.act < 0)
+        fail(t->json_path + ": negative matrix dims for " + mats.keys[i]);
       d.has_bias = e.get_int("has_bias", 0) != 0;
       d.wr = buf(e.get("wr"), d.wr_n);
       d.bias = buf(e.get("bias"), d.bias_n);
@@ -205,6 +224,9 @@ inline std::shared_ptr<TileImage> open_tiles(const Model& m, const std::string& 
       q.half_scales = e.get_int("half_scales", 0) != 0;
       q.scale_mode = int(e.get_int("scale_mode", 0));
       q.act = int(e.get_int("act", 0));
+      // group/bits drive divisions in the kernels: a crafted image must not zero them.
+      if (q.out < 0 || q.in < 0 || q.group <= 0 || (q.bits != 3 && q.bits != 4) || q.src_bits <= 0)
+        fail(t->json_path + ": bad quantization fields for " + mats.keys[i]);
       q.wr = buf(e.get("wr"), q.wr_n);
       q.sb = buf(e.get("sb"), q.sb_n);
       q.wh = buf(e.get("wh"), q.wh_n);

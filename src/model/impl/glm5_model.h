@@ -716,8 +716,16 @@ class DevModel {
     return rt_.arena->copy(v.data(), v.size() * 4);
   }
   // A GGUF matrix (ggml dims [K, N]); F32 ones run through ds4_gemv_f32.
+  // A crafted shard can carry nd=0 or an unknown type: fail instead of
+  // indexing dims[0] on empty or dividing by a null type's block / zero K.
+  static void check_gguf_mat(const GGUFFile::Tensor& t, const std::string& n) {
+    if (t.dims.empty() || t.dims[0] <= 0) fail("glm5: GGUF " + n + ": matrix without rows (dims[0])");
+    if (t.type != GGML_F32 && !ggml_type_info(t.type))
+      fail("glm5: GGUF " + n + ": unsupported tensor type " + std::to_string(t.type));
+  }
   Mat gmat(const std::string& n) {
     const GGUFFile::Tensor& t = gtensor(n);
+    check_gguf_mat(t, n);
     Mat m;
     m.K = int(t.dims[0]);
     m.N = int(t.nbytes / (t.type == GGML_F32 ? size_t(m.K) * 4 : size_t(m.K / ggml_type_info(t.type)->block * ggml_type_info(t.type)->bytes)));
@@ -735,6 +743,7 @@ class DevModel {
     bool mixed = false;
     for (const auto& n : ns) {
       const GGUFFile::Tensor& t = gtensor(n);
+      if (t.dims.empty() || t0.dims.empty()) fail("glm5: GGUF " + n + ": tensor with empty dims");
       if (t.dims[0] != t0.dims[0]) fail("glm5: GGUF " + n + " cannot be stacked with " + ns[0]);
       mixed |= t.type != t0.type;
       bytes += t.nbytes;
@@ -753,6 +762,7 @@ class DevModel {
     for (const auto& n : ns) {
       const GGUFFile* f = nullptr;
       const GGUFFile::Tensor& t = gtensor(n, &f);
+      check_gguf_mat(t, n);
       std::memcpy(static_cast<uint8_t*>(ptr(b)) + o, f->data(t), t.nbytes);
       o += t.nbytes;
       N += int(t.nbytes / (t.type == GGML_F32 ? size_t(t.dims[0]) * 4 : size_t(t.dims[0] / ggml_type_info(t.type)->block * ggml_type_info(t.type)->bytes)));
@@ -826,6 +836,7 @@ class DevModel {
           const GGUFFile::Tensor& t = gtensor(b + nm + ".weight", &f);
           if (t.dims.size() != 3 || int(t.dims[2]) != c_.E) fail("glm5: GGUF " + b + nm + " is not [K, N, E]");
           gguf_suffix(t.type);
+          if (t.dims.size() < 2) fail("glm5: GGUF expert matrix with rank < 2");
           const uint64_t per = t.nbytes / uint64_t(c_.E);
           xl.m[mi++] = XMat{kGG, t.type, int(t.dims[1]), int(t.dims[0]), at, 0};
           const int fd = gfd(f);

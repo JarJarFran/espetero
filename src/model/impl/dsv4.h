@@ -221,11 +221,23 @@ struct Ckpt {
         TInfo ti;
         ti.file = int(i);
         ti.dtype = v.get_string("dtype", "");
-        for (const json::Value& s : v.get("shape")->as_array()) ti.shape.push_back(s.as_int());
-        const json::Value& off = *v.get("data_offsets");
-        ti.off = 8 + n + uint64_t(off[0].as_int());
-        ti.nbytes = uint64_t(off[1].as_int() - off[0].as_int());
-        if (ti.off + ti.nbytes > uint64_t(st.st_size)) {
+        const json::Value* shp = v.get("shape");
+        const json::Value* off = v.get("data_offsets");
+        if (!shp || !shp->is_array() || !off || !off->is_array() || off->size() < 2 || !(*off)[0].is_int() ||
+            !(*off)[1].is_int()) {
+          err[i] = path + ": bad header entry for " + o.keys[k];
+          return;
+        }
+        for (const json::Value& s : shp->as_array()) ti.shape.push_back(s.as_int());
+        const int64_t o0 = (*off)[0].as_int(), o1 = (*off)[1].as_int();
+        if (o0 < 0 || o1 < o0) {
+          err[i] = path + ": bad data_offsets for " + o.keys[k];
+          return;
+        }
+        ti.off = 8 + n + uint64_t(o0);
+        ti.nbytes = uint64_t(o1 - o0);
+        // Overflow-safe: off + nbytes can wrap in uint64.
+        if (ti.off > uint64_t(st.st_size) || ti.nbytes > uint64_t(st.st_size) - ti.off) {
           err[i] = path + ": shorter than its header says (download incomplete?)";
           return;
         }

@@ -125,11 +125,21 @@ class SafetensorsSource : public WeightSource {
                " (this build reads version 2, lane sub-blocks): convert the checkpoint again with espetero quantize");
         auto ov = overrides_.find(base);
         const int bits = ov != overrides_.end() ? ov->second.first : default_bits_;
+        if (bits <= 0 || bits > 32) fail(base + ": EQ bits out of range");
         if (e.shape.size() != 2 && e.shape.size() != 3) fail(base + ": unexpected EQ rank");
         int64_t rows = 1;
         for (size_t i = 0; i + 1 < e.shape.size(); ++i) rows *= e.shape[i];
+        // Leading dims of the auxiliary tensors must match the weight's rows:
+        // qw_from_view copies rows * (in / group) elements from scales/biases.
+        auto leading = [](const std::vector<int64_t>& sh) {
+          int64_t r = 1;
+          for (size_t i = 0; i + 1 < sh.size(); ++i) r *= sh[i];
+          return r;
+        };
         const int64_t in = e.shape.back() * 32 / bits;
-        if (e.shape.back() * 32 % bits || in % 64 || s->second.shape.back() * 16 != in ||
+        if (e.shape.back() * 32 % bits || in % 64 || s->second.shape.size() != e.shape.size() ||
+            leading(s->second.shape) != rows || s->second.shape.back() * 16 != in ||
+            sup->second.shape.size() != e.shape.size() || leading(sup->second.shape) != rows ||
             sup->second.shape.back() != (in + 255) / 256 || sup->second.dtype != "F16")
           fail(base + ": EQ tensors do not match their width");
         t.kind = TensorView::EQQuant;
@@ -153,12 +163,21 @@ class SafetensorsSource : public WeightSource {
       auto ov = overrides_.find(base);
       const int bits = ov != overrides_.end() ? ov->second.first : default_bits_;
       const int group = ov != overrides_.end() ? ov->second.second : default_group_;
+      if (bits <= 0 || bits > 32) fail(base + ": quantization bits out of range");
+      if (group <= 0) fail(base + ": quantization group_size must be positive");
       // Rank 2, or rank 3 for stacked experts ([E, out, in] read as [E * out, in]).
       if (e.shape.size() != 2 && e.shape.size() != 3) fail(base + ": unexpected quantized rank");
       int64_t rows = 1;
       for (size_t i = 0; i + 1 < e.shape.size(); ++i) rows *= e.shape[i];
+      auto leading = [](const std::vector<int64_t>& sh) {
+        int64_t r = 1;
+        for (size_t i = 0; i + 1 < sh.size(); ++i) r *= sh[i];
+        return r;
+      };
       const int64_t in = e.shape.back() * 32 / bits;
-      if (e.shape.back() * 32 % bits || in % group || s->second.shape.back() * group != in)
+      if (e.shape.back() * 32 % bits || in % group || s->second.shape.size() != e.shape.size() ||
+          leading(s->second.shape) != rows || s->second.shape.back() * group != in ||
+          z->second.shape.size() != e.shape.size() || leading(z->second.shape) != rows)
         fail(base + ": quantized shape does not match its width and group");
       if (s->second.dtype != "BF16" && s->second.dtype != "F16")
         fail(base + ": unsupported scale dtype " + s->second.dtype);

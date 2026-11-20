@@ -547,6 +547,12 @@ inline void load_q4_ple(Model& m, const SafetensorsSource& src, const std::strin
     T.rows += rows;
   }
   if (T.shards.empty()) fail(sh + ": no shards");
+  if (T.shard_rows <= 0) fail(sh + ": empty n-gram shard");
+  if (T.vocab.empty() || T.offs.empty()) fail(sh + ": no hash heads");
+  for (int64_t v : T.vocab)
+    if (v <= 0) fail(sh + ": a hash head has vocab 0 (ngram_rows would divide by zero)");
+  for (int64_t o : T.offs)
+    if (o < 0) fail(sh + ": negative hash offset");
   int64_t total = 0;
   for (int64_t v : T.vocab) total += v;
   if (total > T.rows || T.offs.back() + T.vocab.back() > T.rows) fail(sh + ": hash heads exceed the table");
@@ -721,13 +727,18 @@ inline void load_q4_ple_gguf(Model& m, const GGUFSource& src, const std::string&
   T.scale = 1.0f;
   if (T.width != int(f.get_int(a + "embedding_length_per_layer_input", 0)) || T.width % 32 || T.width > 512)
     fail("qwen4exp: unexpected n-gram row width " + std::to_string(T.width));
+  if (t->dims.size() < 2 || t->dims[1] <= 0) fail("qwen4exp: n-gram table has no rows");
   T.rows = T.shard_rows = t->dims[1];
   const std::vector<int64_t> mult = f.get_ints(a + "ple.layer_multipliers");
   T.vocab = f.get_ints(a + "ple.head_vocab_sizes");
   T.offs = f.get_ints(a + "ple.head_offsets");
   const int heads = 2 * c.ngram_heads;
-  if (int(mult.size()) != c.ngram || int(T.vocab.size()) != heads || int(T.offs.size()) != heads)
+  if (int(mult.size()) != c.ngram || int(T.vocab.size()) != heads || int(T.offs.size()) != heads || heads <= 0)
     fail("qwen4exp: n-gram hash constants do not match the configuration");
+  for (int64_t v : T.vocab)
+    if (v <= 0) fail("qwen4exp: a hash head has vocab 0 (ngram_rows would divide by zero)");
+  for (int64_t o : T.offs)
+    if (o < 0) fail("qwen4exp: negative hash offset");
   std::copy(mult.begin(), mult.end(), T.mult);
   if (T.offs.back() + T.vocab.back() > T.rows) fail("qwen4exp: hash heads exceed the n-gram table");
   NgramTable::Shard S;

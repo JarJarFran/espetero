@@ -39,7 +39,11 @@ class HFSource : public WeightSource {
   explicit HFSource(const std::string& dir) : raw_(dir) {
     for (const std::string& n : raw_.names()) {
       if (n.rfind("model.visual.", 0) == 0 || n.rfind("vision_tower", 0) == 0) continue;
-      if (n.find("conv1d.weight") != std::string::npos && raw_.locate(n).shape.back() != 1) unsanitized_conv_ = true;
+      if (n.find("conv1d.weight") != std::string::npos) {
+        const auto& sh = raw_.locate(n).shape;
+        if (sh.empty()) fail(n + ": tensor with empty shape");
+        if (sh.back() != 1) unsanitized_conv_ = true;
+      }
       if (n.rfind("mtp.", 0) == 0) has_mtp_ = true;
     }
     const json::Value& cfg = raw_.config();
@@ -138,9 +142,13 @@ class HFSource : public WeightSource {
     if (it == map_.end()) fail("missing tensor " + name);
     const auto l = raw_.locate(it->second.src);
     std::vector<int64_t> sh = l.shape;
+    if (sh.empty()) fail(it->second.src + ": tensor with empty shape");
     switch (it->second.kind) {
       case Kind::GateHalf:
-      case Kind::UpHalf: sh[sh.size() - 2] /= 2; break;
+      case Kind::UpHalf:
+        if (sh.size() < 2) fail(it->second.src + ": gate/up half needs rank >= 2");
+        sh[sh.size() - 2] /= 2;
+        break;
       case Kind::Stack: sh.insert(sh.begin(), int64_t(stacks_.at(name).size())); break;
       default: break;
     }
@@ -180,6 +188,7 @@ class HFSource : public WeightSource {
           else reinterpret_cast<float*>(buf.data())[i] = v;
         }
       } else if (r.kind == Kind::GateHalf || r.kind == Kind::UpHalf) {
+        if (l.shape.size() < 3) fail(r.src + ": gate_up_proj rank < 3");
         const int64_t E = l.shape[0], R2 = l.shape[1], C = l.shape[2];
         const size_t half = size_t(R2 / 2) * size_t(C) * es;
         buf.resize(size_t(E) * half);

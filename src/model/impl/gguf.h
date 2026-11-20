@@ -325,8 +325,10 @@ class GGUFSource : public WeightSource {
       // concatenated [embedding, hidden] inputs; the head takes its halves.
       TensorView v = gguf_view(f_, *t, name);
       const GGMLTypeInfo* ti = ggml_type_info(t->type);
+      if (!ti) fail(g + ": unsupported tensor type " + std::to_string(t->type));
       const int64_t rows = v.rows(), half = v.cols() / 2;
-      if (v.shape.size() != 2 || v.cols() % 2 || half % ti->block) fail(g + ": cannot split into the MTP fc halves");
+      if (v.shape.size() != 2 || v.cols() % 2 || rows <= 0 || half <= 0 || half % ti->block)
+        fail(g + ": cannot split into the MTP fc halves");  // rows == 0 would divide by zero below
       const size_t row_bytes = v.nbytes / size_t(rows), half_bytes = row_bytes / 2;
       const size_t at = name == "mtp.fc_embedding.weight" ? 0 : half_bytes;
       auto& owned = owned_bytes_[name];

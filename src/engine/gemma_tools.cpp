@@ -31,6 +31,14 @@ struct GemmaArgs {
   const std::string& s;
   size_t i = 0;
   bool ok = true;
+  int depth = 0;  // value() <-> object() recurse: a crafted reply must not overflow the stack
+  static constexpr int kMaxDepth = 512;  // same cap as the JSON parser (util/json.cpp)
+  struct DepthGuard {  // counts nesting, not total calls: wide-but-shallow args stay fine
+    int& d;
+    bool ok;
+    explicit DepthGuard(int& d_) : d(d_), ok(++d_ <= kMaxDepth) {}
+    ~DepthGuard() { --d; }
+  };
   static constexpr const char* kQ = "<|\"|>";
   bool at_quote() const { return s.compare(i, 5, kQ) == 0; }
   void ws() {
@@ -45,6 +53,11 @@ struct GemmaArgs {
     return v;
   }
   json::Value value() {
+    DepthGuard g(depth);
+    if (!g.ok) {
+      ok = false;
+      return json::Value();
+    }
     ws();
     if (i >= s.size()) {
       ok = false;
@@ -88,6 +101,11 @@ struct GemmaArgs {
     return json::Value(tok);
   }
   json::Value object() {
+    DepthGuard g(depth);
+    if (!g.ok) {
+      ok = false;
+      return json::Value();
+    }
     json::Value o = json::Value::object();
     ++i;  // {
     ws();
@@ -155,7 +173,7 @@ std::string parse_gemma_tool_calls(const std::string& content, json::Value& call
       if (!name.empty() && n < body.size() && body[n] == '{') {
         GemmaArgs p{body, n};
         json::Value args = p.object();
-        if (args.is_object()) {
+        if (p.ok && args.is_object()) {  // p.ok false: malformed or over kMaxDepth deep: no call, plain text
           json::Value fn = json::Value::object();
           fn.set("name", name);
           fn.set("arguments", json::dump(args));
