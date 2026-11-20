@@ -59,9 +59,8 @@ std::string byte_level_decode(std::string_view text) {
 bool WordCache::get(std::string_view key, uint64_t h, std::vector<int32_t>& out) const {
   if (h == 0) h = 1;
   const Shard& sh = shards_[h >> 58];
-  std::lock_guard<ShardLock> g(sh.lock);
   if (sh.slots.empty()) return false;
-  for (size_t i = h & (kSlots - 1);; i = (i + 1) & (kSlots - 1)) {
+  for (size_t i = h & slots_mask_;; i = (i + 1) & slots_mask_) {
     const Entry& en = sh.slots[i];
     if (en.hash == 0) return false;
     if (en.hash == h && en.key_len == key.size() && std::memcmp(sh.keys.data() + en.key_off, key.data(), key.size()) == 0) {
@@ -75,16 +74,15 @@ void WordCache::put(std::string_view key, uint64_t h, const int32_t* ids, size_t
   if (key.size() > kMaxKeyLen || n > 0xFFFF) return;
   if (h == 0) h = 1;
   Shard& sh = shards_[h >> 58];
-  std::lock_guard<ShardLock> g(sh.lock);
-  if (sh.slots.empty() || sh.count >= kMaxEntries || sh.keys.size() + key.size() > kMaxKeyBytes) {
+  if (sh.slots.empty() || sh.count >= max_entries_ || sh.keys.size() + key.size() > max_key_bytes_) {
     // First use, or full: start over. Simple, bounded, and cheap to refill.
-    sh.slots.assign(kSlots, Entry{0, 0, 0, 0, 0});
+    sh.slots.assign(slots_mask_ + 1, Entry{0, 0, 0, 0, 0});
     sh.keys.clear();
     sh.ids.clear();
     sh.count = 0;
   }
-  size_t i = h & (kSlots - 1);
-  for (;; i = (i + 1) & (kSlots - 1)) {
+  size_t i = h & slots_mask_;
+  for (;; i = (i + 1) & slots_mask_) {
     const Entry& en = sh.slots[i];
     if (en.hash == 0) break;
     if (en.hash == h && en.key_len == key.size() && std::memcmp(sh.keys.data() + en.key_off, key.data(), key.size()) == 0)
@@ -574,8 +572,8 @@ void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& ou
     return;
   }
   // A long stretch: split into pieces here, then each thread BPEs a run of
-  // them (the word cache is shared and locked) and the runs are joined in
-  // order, so the ids are the serial ones.
+  // them (each thread memoizes in its own lock-free word cache) and the runs
+  // are joined in order, so the ids are the serial ones.
   std::vector<std::pair<uint32_t, uint32_t>> pieces;
   pieces.reserve(s.size() / 4);
   for_each_piece(s, [&](size_t b, size_t e) { pieces.emplace_back(uint32_t(b), uint32_t(e)); });
@@ -598,13 +596,42 @@ void Tokenizer::Impl::encode_pieces(std::string_view s, std::vector<int32_t>& ou
   for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
 }
 
+Tokenizer::Impl::~Impl() {
+  for (auto& p : thread_caches_) delete p.load();
+}
+
+// The calling thread's word cache. The two thread_locals are constant-initialized,
+// so the hot path (tls_impl == this && tls_cache) is a plain TLS read plus a branch:
+// no TLS guard, no lock. A thread that switches to another tokenizer claims a fresh
+// slot (ids are vocabulary-specific); the old slot stays owned by that tokenizer.
+// 256 slots x 128 entries x 8 KB keys per shard: <= ~0.9 MB per thread when full.
+tok::WordCache* Tokenizer::Impl::word_cache() const {
+  thread_local const Impl* tls_impl = nullptr;
+  thread_local tok::WordCache* tls_cache = nullptr;
+  if (tls_impl == this && tls_cache) return tls_cache;
+  for (size_t i = 0; i < kMaxThreadCaches; ++i) {
+    tok::WordCache* expected = nullptr;
+    auto* c = new tok::WordCache(256, 128, 8 * 1024);
+    if (thread_caches_[i].compare_exchange_strong(expected, c)) {
+      tls_impl = this;
+      tls_cache = c;
+      return c;
+    }
+    delete c;
+  }
+  tls_impl = this;
+  tls_cache = nullptr;  // more threads than slots: encode without a cache
+  return nullptr;
+}
+
 void Tokenizer::Impl::encode_word(std::string_view word, std::vector<int32_t>& out) const {
+  tok::WordCache* c = word_cache();
   if (spm) {
     const uint64_t h = tok::hash_bytes(word.data(), word.size());
-    if (cache.get(word, h, out)) return;
+    if (c && c->get(word, h, out)) return;
     const size_t before = out.size();
     bpe_spm(word, out);
-    cache.put(word, h, out.data() + before, out.size() - before);
+    if (c) c->put(word, h, out.data() + before, out.size() - before);
     return;
   }
   if (word.size() == 1) {  // a single byte cannot merge
@@ -612,7 +639,7 @@ void Tokenizer::Impl::encode_word(std::string_view word, std::vector<int32_t>& o
     return;
   }
   const uint64_t h = tok::hash_bytes(word.data(), word.size());
-  if (cache.get(word, h, out)) return;
+  if (c && c->get(word, h, out)) return;
   const size_t before = out.size();
   int32_t whole = -1;
   if (ignore_merges) {
@@ -624,7 +651,7 @@ void Tokenizer::Impl::encode_word(std::string_view word, std::vector<int32_t>& o
   }
   if (whole >= 0) out.push_back(whole);
   else bpe(word, out);
-  cache.put(word, h, out.data() + before, out.size() - before);
+  if (c) c->put(word, h, out.data() + before, out.size() - before);
 }
 
 // BPE exactly as the reference's Word::merge_all: a min-heap of candidate merges

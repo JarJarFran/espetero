@@ -5,11 +5,11 @@
 // load_hf.cpp and gguf_vocab.cpp). Not part of the public API.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -17,10 +17,6 @@
 
 #include "pretok.h"
 #include "tokenizer.h"
-
-#if defined(__APPLE__)
-#include <os/lock.h>
-#endif
 
 namespace espetero::tok {
 
@@ -79,24 +75,6 @@ const ByteLevelMap& byte_level();
 // otherwise the text's own UTF-8 is used unchanged.
 std::string byte_level_decode(std::string_view text);
 
-// Short lock for the cache shards (uncontended in practice).
-class ShardLock {
- public:
-#if defined(__APPLE__)
-  void lock() { os_unfair_lock_lock(&l_); }
-  void unlock() { os_unfair_lock_unlock(&l_); }
-
- private:
-  os_unfair_lock l_ = OS_UNFAIR_LOCK_INIT;
-#else
-  void lock() { m_.lock(); }
-  void unlock() { m_.unlock(); }
-
- private:
-  std::mutex m_;
-#endif
-};
-
 // (left id, right id) -> (rank, merged id), open addressing with linear probing.
 class MergeTable {
  public:
@@ -140,20 +118,23 @@ class MergeTable {
   size_t mask_ = 0;
 };
 
-// Thread-safe cache word bytes -> BPE ids. Sharded by hash so concurrent encoders
-// rarely touch the same lock; each shard is a flat table over two arenas and is
-// simply cleared when full (bounded memory, no per-entry allocation).
+// Cache word bytes -> BPE ids. Sharded by hash; each shard is a flat table over two
+// arenas and is simply cleared when full (bounded memory, no per-entry allocation).
+// Not thread-safe: the tokenizer keeps one cache per encoding thread (see
+// Tokenizer::Impl::word_cache), so the hot path takes no lock at all.
 class WordCache {
  public:
   // Longer words are not cached (they are rare, and each would take a big share of a shard).
   static constexpr size_t kMaxKeyLen = 1024;
 
-  WordCache() = default;
+  // slots must be a power of two. Defaults: 64 shards x 1024 words, ~7 MB when every shard is full.
+  explicit WordCache(size_t slots = kSlots, size_t max_entries = kMaxEntries,
+                     size_t max_key_bytes = kMaxKeyBytes)
+      : slots_mask_(slots - 1), max_entries_(max_entries), max_key_bytes_(max_key_bytes) {}
   bool get(std::string_view key, uint64_t h, std::vector<int32_t>& out) const;
   void put(std::string_view key, uint64_t h, const int32_t* ids, size_t n);
 
  private:
-  // 64 shards x 1024 words; at most ~7 MB when every shard is full.
   static constexpr size_t kShards = 64;
   static constexpr size_t kSlots = 2048;  // per shard, power of two, load factor <= 0.5
   static constexpr size_t kMaxEntries = kSlots / 2;
@@ -166,13 +147,15 @@ class WordCache {
     uint16_t n_ids;
   };
   struct alignas(64) Shard {
-    mutable ShardLock lock;
     std::vector<Entry> slots;  // allocated on first insert
     std::string keys;
     std::vector<int32_t> ids;
     size_t count = 0;
   };
   mutable Shard shards_[kShards];
+  size_t slots_mask_ = kSlots - 1;
+  size_t max_entries_ = kMaxEntries;
+  size_t max_key_bytes_ = kMaxKeyBytes;
 };
 
 // Transparent hash so string_view lookups need no temporary std::string.
@@ -264,7 +247,14 @@ struct Tokenizer::Impl {
   // segment as one word gives the same ids).
   std::vector<uint32_t> spm_before_sp, spm_before_nl, spm_after_nl;
   tok::SplitPattern pattern = tok::SplitPattern::kQwen35;
-  mutable tok::WordCache cache;
+  ~Impl();
+  // The calling thread's lock-free memo of word -> BPE ids (nullptr when every slot
+  // is taken, which needs more threads than kMaxThreadCaches: encode without cache).
+  // One cache per thread, so get/put take no lock; the hot path is two trivial
+  // thread_locals (constant-initialized, no TLS guard).
+  tok::WordCache* word_cache() const;
+  static constexpr size_t kMaxThreadCaches = 32;
+  mutable std::atomic<tok::WordCache*> thread_caches_[kMaxThreadCaches] = {};
 
   // ---- metadata
   int32_t eos = -1, bos = -1, pad = -1;

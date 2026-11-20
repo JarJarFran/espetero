@@ -11,7 +11,7 @@
 //
 // Loading throws std::runtime_error with a readable message on unsupported or
 // malformed input. After loading, every method is const and thread-safe (the
-// internal word cache is sharded and locked).
+// internal word cache is thread-local and lock-free).
 //
 // Deliberate differences from the reference, none of which affect valid input:
 //  * Input need not be valid UTF-8: each invalid byte is treated like a symbol

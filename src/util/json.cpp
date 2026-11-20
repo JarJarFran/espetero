@@ -6,6 +6,7 @@
 #include <xlocale.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <numeric>
@@ -26,6 +27,21 @@ Object& Object::operator=(const Object& o) {
 
 namespace {
 constexpr size_t kIndexAt = 12;  // linear search below this many keys
+
+// Byte class inside a JSON string, so the hot scan is one table load per byte
+// instead of several comparisons.
+enum : uint8_t { kStrNormal = 0, kStrQuote = 1, kStrEsc = 2, kStrCtrl = 3, kStrMulti = 4 };
+inline constexpr auto kStrByte = [] {
+  std::array<uint8_t, 256> t{};
+  for (int c = 0; c < 256; ++c) {
+    if (c == '"') t[size_t(c)] = kStrQuote;
+    else if (c == '\\') t[size_t(c)] = kStrEsc;
+    else if (c < 0x20) t[size_t(c)] = kStrCtrl;
+    else if (c < 0x80) t[size_t(c)] = kStrNormal;
+    else t[size_t(c)] = kStrMulti;
+  }
+  return t;
+}();
 }
 
 const Value* Object::find(std::string_view key) const {
@@ -259,13 +275,18 @@ struct Parser {
     const char* run = p;
     while (true) {
       if (p >= end) error("unterminated string");
-      const unsigned char c = static_cast<unsigned char>(*p);
-      if (c == '"') {
+      const uint8_t k = kStrByte[static_cast<unsigned char>(*p)];
+      if (k == kStrNormal) {
+        ++p;
+        continue;
+      }
+      if (k == kStrQuote) {
         out.append(run, size_t(p - run));
         ++p;
         return out;
       }
-      if (c == '\\') {
+      if (k == kStrEsc) {
+        const unsigned char c = static_cast<unsigned char>(*p);
         out.append(run, size_t(p - run));
         ++p;
         if (p >= end) error("unterminated escape");
@@ -306,12 +327,8 @@ struct Parser {
         run = p;
         continue;
       }
-      if (c < 0x20) error("control character in string");
-      if (c < 0x80) {
-        ++p;
-        continue;
-      }
-      // Validate a multi-byte sequence; replace invalid bytes.
+      if (k == kStrCtrl) error("control character in string");
+      // kStrMulti: validate a multi-byte sequence; replace invalid bytes.
       size_t i = size_t(p - begin);
       const std::string_view all(begin, size_t(end - begin));
       const size_t before = i;
@@ -360,9 +377,20 @@ struct Parser {
     }
     // strtod_l in the C locale (std::from_chars for double needs macOS 26). The
     // grammar above already limited [s, p) to a JSON number; overflow gives
-    // +-inf and underflow 0, as Python's float() does.
+    // +-inf and underflow 0, as Python's float() does. JSON numbers are short:
+    // copy into a stack buffer instead of allocating a std::string per float.
     static const locale_t c_locale = newlocale(LC_ALL_MASK, "C", nullptr);
-    const std::string text(s, p);
+    const size_t len = size_t(p - s);
+    if (len < 64) {
+      char buf[64];
+      std::memcpy(buf, s, len);
+      buf[len] = '\0';
+      char* stop = nullptr;
+      const double d = strtod_l(buf, &stop, c_locale);
+      if (stop != buf + len) error("bad number");
+      return Value(d);
+    }
+    const std::string text(s, p);  // absurdly long number: the slow path
     char* stop = nullptr;
     const double d = strtod_l(text.c_str(), &stop, c_locale);
     if (stop != text.c_str() + text.size()) error("bad number");
@@ -500,46 +528,57 @@ std::string format_double(double d) {
   char buf[64];
   auto r = std::to_chars(buf, buf + sizeof(buf), d, std::chars_format::scientific);
   std::string_view sci(buf, size_t(r.ptr - buf));
-  // sci: [-]d[.ddd]e[+-]xx
+  // sci: [-]d[.ddd]e[+-]xx — work on the view: no digits copy, no stoi allocation.
   bool neg = false;
   if (!sci.empty() && sci[0] == '-') {
     neg = true;
     sci.remove_prefix(1);
   }
   const size_t epos = sci.find('e');
-  std::string digits;
-  for (size_t i = 0; i < epos; ++i)
-    if (sci[i] != '.') digits.push_back(sci[i]);
-  const int exp10 = std::stoi(std::string(sci.substr(epos + 1)));
+  const size_t dot = sci.find('.');  // shortest repr may have no '.' at all ("1e+00")
+  const int n = int(dot == std::string_view::npos ? epos : epos - 1);  // significant digits
+  // Parse the exponent in place.
+  const std::string_view e = sci.substr(epos + 1);
+  const size_t e0 = !e.empty() && (e[0] == '+' || e[0] == '-') ? 1 : 0;
+  const bool eneg = e0 == 1 && e[0] == '-';
+  int exp10 = 0;
+  for (size_t i = e0; i < e.size(); ++i) exp10 = exp10 * 10 + (e[i] - '0');
+  if (eneg) exp10 = -exp10;
+  // digit k (0-based) of the mantissa: sci[k] without a '.', sci[0] then sci[k+1] with one.
+  auto digit = [&](int k) -> char {
+    return dot == std::string_view::npos ? sci[size_t(k)] : (k == 0 ? sci[0] : sci[size_t(k) + 1]);
+  };
   // Python float_repr_style 'short' with repr: fixed when -4 <= exp < 16.
-  std::string out = neg ? "-" : "";
-  const int n = int(digits.size());
+  std::string out;
+  if (neg) out += '-';
   if (exp10 >= -4 && exp10 < 16) {
     const int decpt = exp10 + 1;
     if (decpt <= 0) {
       out += "0.";
       out.append(size_t(-decpt), '0');
-      out += digits;
+      for (int k = 0; k < n; ++k) out.push_back(digit(k));
     } else if (decpt >= n) {
-      out += digits;
+      for (int k = 0; k < n; ++k) out.push_back(digit(k));
       out.append(size_t(decpt - n), '0');
       out += ".0";
     } else {
-      out += digits.substr(0, size_t(decpt));
+      for (int k = 0; k < decpt; ++k) out.push_back(digit(k));
       out += '.';
-      out += digits.substr(size_t(decpt));
+      for (int k = decpt; k < n; ++k) out.push_back(digit(k));
     }
   } else {
-    out += digits[0];
+    out.push_back(digit(0));
     if (n > 1) {
       out += '.';
-      out += digits.substr(1);
+      for (int k = 1; k < n; ++k) out.push_back(digit(k));
     }
     out += 'e';
     out += exp10 < 0 ? '-' : '+';
     const int ae = exp10 < 0 ? -exp10 : exp10;
     if (ae < 10) out += '0';
-    out += std::to_string(ae);
+    char eb[8];
+    auto er = std::to_chars(eb, eb + sizeof(eb), ae);
+    out.append(eb, size_t(er.ptr - eb));
   }
   return out;
 }
@@ -618,7 +657,12 @@ void dump_rec(std::string& out, const Value& v, const DumpOptions& o, int level)
   switch (v.type()) {
     case Type::Null: out += "null"; break;
     case Type::Bool: out += v.as_bool() ? "true" : "false"; break;
-    case Type::Int: out += std::to_string(v.as_int()); break;
+    case Type::Int: {
+      char b[24];  // int64 needs at most 20 chars: to_chars, no std::string allocation
+      auto r = std::to_chars(b, b + sizeof(b), v.as_int());
+      out.append(b, size_t(r.ptr - b));
+      break;
+    }
     case Type::Double: out += format_double(v.as_double()); break;
     case Type::String: append_quoted(out, v.as_string(), o.ensure_ascii); break;
     case Type::Array: {

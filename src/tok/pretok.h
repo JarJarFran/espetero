@@ -92,13 +92,25 @@ class PieceSplitter {
   bool symbol(uint8_t cls) const { return cls == ucd::kOther || (!marks_are_letters_ && cls == ucd::kMark); }
   static bool crlf(uint32_t cp) { return cp == '\r' || cp == '\n'; }
 
+  // ASCII letters are exactly [A-Za-z] in ucd::kAscii, so an ASCII byte can be
+  // tested with one ALU range check instead of a table load; only bytes >= 0x80
+  // (marks may count as letters) need at().
+  static bool ascii_letter(unsigned char b) { return unsigned((b | 0x20) - 'a') < 26u; }
+
   const unsigned char* letter_run(const unsigned char* p) const {
-    while (p < e_) {
-      const Ch c = at(p);
-      if (!letter(c.cls)) break;
-      p += c.len;
+    const unsigned char* q = p;
+    while (q < e_) {
+      const unsigned char b = *q;
+      if (b < 0x80) {
+        if (!ascii_letter(b)) break;
+        ++q;
+      } else {
+        const Ch c = at(q);
+        if (!letter(c.cls)) break;
+        q += c.len;
+      }
     }
-    return p;
+    return q;
   }
 
   static int fold_ascii(unsigned c) { return (c >= 'A' && c <= 'Z') ? int(c + 32) : int(c); }
@@ -201,8 +213,11 @@ class PieceSplitter {
     if (c.cp == '\'') {
       if (const int k = contraction(p)) return p + k;
     }
-    // 2. [^\r\n\p{L}\p{N}]? letter-run: try with the optional prefix first.
-    if (c.cls != ucd::kLetter && c.cls != ucd::kNumber && !crlf(c.cp) && after < e_ && letter(at(after).cls))
+    // 2. [^\r\n\p{L}\p{N}]? letter-run: try with the optional prefix first. For an
+    // ASCII prefix byte the letter test is a range check on the byte (letter_run
+    // re-tests it the same way), so the first letter is not decoded twice.
+    if (c.cls != ucd::kLetter && c.cls != ucd::kNumber && !crlf(c.cp) && after < e_ &&
+        (*after < 0x80 ? ascii_letter(*after) : letter(at(after).cls)))
       return letter_run(after);
     if (letter(c.cls)) return letter_run(after);
     // 3. digits
