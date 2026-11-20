@@ -379,15 +379,35 @@ std::string Request::query_param(std::string_view name) const {
 std::string url_decode(std::string_view s, bool plus_as_space) {
   std::string out;
   out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if (c == '%' && i + 2 < s.size() && detail::hex_value(s[i + 1]) >= 0 && detail::hex_value(s[i + 2]) >= 0) {
-      out.push_back(char(detail::hex_value(s[i + 1]) * 16 + detail::hex_value(s[i + 2])));
-      i += 2;
-    } else if (c == '+' && plus_as_space) {
+  const size_t n = s.size();
+  size_t i = 0;
+  while (i < n) {
+    // Bulk-copy the plain run up to the next '%' (or '+'): memchr scans at SIMD
+    // speed, so the common no-escape case is a memcpy, not a per-byte loop.
+    const void* hp = std::memchr(s.data() + i, '%', n - i);
+    const void* pp = plus_as_space ? std::memchr(s.data() + i, '+', n - i) : nullptr;
+    size_t hit = n;
+    char hc = 0;
+    if (hp) {
+      hit = size_t(static_cast<const char*>(hp) - s.data());
+      hc = '%';
+    }
+    if (pp && size_t(static_cast<const char*>(pp) - s.data()) < hit) {
+      hit = size_t(static_cast<const char*>(pp) - s.data());
+      hc = '+';
+    }
+    out.append(s.data() + i, hit - i);
+    if (hit == n) break;
+    i = hit;
+    if (hc == '+') {
       out.push_back(' ');
+      ++i;
+    } else if (i + 2 < n && detail::hex_value(s[i + 1]) >= 0 && detail::hex_value(s[i + 2]) >= 0) {
+      out.push_back(char(detail::hex_value(s[i + 1]) * 16 + detail::hex_value(s[i + 2])));
+      i += 3;
     } else {
-      out.push_back(c);
+      out.push_back('%');
+      ++i;
     }
   }
   return out;
