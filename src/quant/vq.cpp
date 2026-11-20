@@ -104,16 +104,39 @@ std::vector<float> kmeans(const std::vector<float>& X, const std::vector<float>&
   }
   std::vector<int32_t> a(static_cast<size_t>(N));
   uint64_t lcg = 0x9e3779b97f4a7c15ull;
+  const size_t n_chunks = N >= 32768 ? 8 : 1;
+  std::vector<std::vector<double>> pnum(n_chunks), pden(n_chunks);
+  for (size_t c = 0; c < n_chunks; ++c) {
+    pnum[c].resize(size_t(K) * 8);
+    pden[c].resize(size_t(K) * 8);
+  }
   for (int it = 0; it < iters; ++it) {
     assign(X.data(), T.data(), N, cb.data(), K, a.data());
-    std::vector<double> num(size_t(K) * 8, 0.0), den(size_t(K) * 8, 0.0);
-    for (int64_t i = 0; i < N; ++i) {
-      const size_t k = size_t(a[size_t(i)]);
-      for (int j = 0; j < 8; ++j) {
-        num[k * 8 + j] += double(T[size_t(i) * 8 + j]) * X[size_t(i) * 8 + j];
-        den[k * 8 + j] += T[size_t(i) * 8 + j];
+    parallel_for(n_chunks, [&](size_t c) {
+      const int64_t i0 = N * int64_t(c) / int64_t(n_chunks);
+      const int64_t i1 = N * int64_t(c + 1) / int64_t(n_chunks);
+      double* nu = pnum[c].data();
+      double* de = pden[c].data();
+      std::fill(nu, nu + size_t(K) * 8, 0.0);
+      std::fill(de, de + size_t(K) * 8, 0.0);
+      for (int64_t i = i0; i < i1; ++i) {
+        const size_t k = size_t(a[size_t(i)]) * 8;
+        const float* ti = T.data() + size_t(i) * 8;
+        const float* xi = X.data() + size_t(i) * 8;
+        for (int j = 0; j < 8; ++j) {
+          nu[k + j] += double(ti[j]) * xi[j];
+          de[k + j] += ti[j];
+        }
+      }
+    });
+    for (size_t c = 1; c < n_chunks; ++c) {
+      for (size_t idx = 0; idx < size_t(K) * 8; ++idx) {
+        pnum[0][idx] += pnum[c][idx];
+        pden[0][idx] += pden[c][idx];
       }
     }
+    const std::vector<double>& num = pnum[0];
+    const std::vector<double>& den = pden[0];
     for (int k = 0; k < K; ++k) {
       double s = 0;
       for (int j = 0; j < 8; ++j) s += den[size_t(k) * 8 + j];

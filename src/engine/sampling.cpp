@@ -13,18 +13,31 @@
 namespace espetero {
 
 void PenaltyState::apply(float* logits, const SamplingParams& p) const {
-  for (const auto& [tok, count] : seen_) {
-    float& x = logits[tok];
-    if (p.repetition_penalty != 1.0) x = x > 0 ? float(x / p.repetition_penalty) : float(x * p.repetition_penalty);
-    if (count > 0 && (p.presence_penalty != 0 || p.frequency_penalty != 0))
-      x -= float(p.presence_penalty + p.frequency_penalty * count);
+  const bool rep = p.repetition_penalty != 1.0;
+  const bool pf = p.presence_penalty != 0 || p.frequency_penalty != 0;
+  if (rep || pf) {
+    const float rp = float(p.repetition_penalty);
+    const float inv_rp = float(1.0 / p.repetition_penalty);
+    for (const Entry& e : seen_) {
+      if (e.tok < 0) continue;
+      float& x = logits[e.tok];
+      if (rep) x = x > 0 ? (x * inv_rp) : (x * rp);
+      if (e.count > 0 && pf) x -= float(p.presence_penalty + p.frequency_penalty * e.count);
+    }
   }
   const int n = p.no_repeat_ngram_size;
   if (n > 0 && out_.size() + 1 >= size_t(n)) {
     const size_t L = out_.size(), k = size_t(n - 1);  // the gram's prefix: out_[L - k, L)
-    for (size_t j = 0; j + k < L; ++j)
-      if (std::equal(out_.begin() + j, out_.begin() + j + k, out_.end() - k))
-        logits[out_[j + k]] = -std::numeric_limits<float>::infinity();
+    if (k == 0) {
+      for (int32_t tok : out_) logits[tok] = -std::numeric_limits<float>::infinity();
+    } else {
+      const int32_t last = out_[L - 1];
+      const int32_t* base = out_.data();
+      const int32_t* tail = base + L - k;
+      for (size_t j = 0; j + k < L; ++j)
+        if (base[j + k - 1] == last && (k == 1 || std::equal(base + j, base + j + k - 1, tail)))
+          logits[base[j + k]] = -std::numeric_limits<float>::infinity();
+    }
   }
 }
 
@@ -43,52 +56,111 @@ Distribution distribution(const float* logits, int vocab, const SamplingParams& 
     d.p = {1.0};
     return d;
   }
-  // x = logits / T; total = sum exp(x - max) over the whole vocabulary.
   thread_local std::vector<float> x, e;
+  thread_local std::vector<int32_t> idx;
   x.resize(size_t(vocab));
-  e.resize(size_t(vocab));
   const float inv_t = float(1.0 / sp.temperature);
   vDSP_vsmul(logits, 1, &inv_t, x.data(), 1, vDSP_Length(vocab));
   float m = 0;
   vDSP_maxv(x.data(), 1, &m, vDSP_Length(vocab));
-  const float neg_m = -m;
-  vDSP_vsadd(x.data(), 1, &neg_m, e.data(), 1, vDSP_Length(vocab));
-  int n = vocab;
-  vvexpf(e.data(), e.data(), &n);
-  double total = 0;
-  {
-    float t = 0;
-    vDSP_sve(e.data(), 1, &t, vDSP_Length(vocab));
-    total = t;
-  }
-  if (!std::isfinite(total)) {
-    // NaN (or infinite) logits break the ordering the sorts below rely
-    // on (undefined behavior); they count as -inf, never drawn (+inf as the
-    // largest float).
+  // Sanitize NaN/+inf if max is non-finite (or check during scan below).
+  auto sanitize = [&]() {
     for (float& v : x)
       if (std::isnan(v)) v = -std::numeric_limits<float>::infinity();
       else if (v == std::numeric_limits<float>::infinity()) v = std::numeric_limits<float>::max();
     vDSP_maxv(x.data(), 1, &m, vDSP_Length(vocab));
-    const float nm = -m;
-    vDSP_vsadd(x.data(), 1, &nm, e.data(), 1, vDSP_Length(vocab));
+  };
+  if (!std::isfinite(m)) sanitize();
+
+  const int k = sp.top_k > 0 ? std::min(sp.top_k, vocab) : vocab;
+  const bool need_head = k < vocab || sp.top_p < 1.0 || sp.min_p > 0;
+  // Full-vocab exp+sum is only needed when returning all tokens or when top_p
+  // without top_k/min_p must check whether the top-2048 mass reaches top_p.
+  const bool need_full_exp = !need_head || (k == vocab && sp.top_p < 1.0 && sp.min_p <= 0);
+  double total = 1.0;
+  if (need_full_exp) {
+    e.resize(size_t(vocab));
+    const float neg_m = -m;
+    vDSP_vsadd(x.data(), 1, &neg_m, e.data(), 1, vDSP_Length(vocab));
+    int n = vocab;
     vvexpf(e.data(), e.data(), &n);
     float t = 0;
     vDSP_sve(e.data(), 1, &t, vDSP_Length(vocab));
-    total = t > 0 ? t : 1;
+    total = t;
+    if (!std::isfinite(total)) {
+      sanitize();
+      const float nm = -m;
+      vDSP_vsadd(x.data(), 1, &nm, e.data(), 1, vDSP_Length(vocab));
+      vvexpf(e.data(), e.data(), &n);
+      vDSP_sve(e.data(), 1, &t, vDSP_Length(vocab));
+      total = t > 0 ? t : 1;
+    }
   }
-  const int k = sp.top_k > 0 ? std::min(sp.top_k, vocab) : vocab;
-  if (k < vocab || sp.top_p < 1.0 || sp.min_p > 0) {
+  if (need_head) {
     const int head = std::min(k, 2048);
-    std::vector<int32_t> idx(static_cast<size_t>(vocab));
-    std::iota(idx.begin(), idx.end(), 0);
-    auto by_logit = [&](int32_t a, int32_t b) { return x[size_t(a)] > x[size_t(b)] || (x[size_t(a)] == x[size_t(b)] && a < b); };
-    std::nth_element(idx.begin(), idx.begin() + head - 1, idx.end(), by_logit);
-    idx.resize(size_t(head));
+    auto by_logit = [&](int32_t a, int32_t b) {
+      return x[size_t(a)] > x[size_t(b)] || (x[size_t(a)] == x[size_t(b)] && a < b);
+    };
+    const float* xd = x.data();
+    idx.clear();
+    // Single-pass candidate filter: when min_p > 0, tokens below m + log(min_p)
+    // cannot survive min_p; otherwise keep a running top-`head` cutoff so >99%
+    // of the 248K vocabulary is skipped with one float comparison.
+    const bool use_minp_cut = sp.min_p > 0 && std::isfinite(m);
+    float cut = use_minp_cut ? (m + float(std::log(sp.min_p)) - 1e-4f) : -std::numeric_limits<float>::infinity();
+    const size_t cap = std::max<size_t>(size_t(head) * 2, 256);
+    bool has_nan = false;
+    for (int32_t i = 0; i < vocab; ++i) {
+      const float v = xd[i];
+      if (v >= cut) {
+        idx.push_back(i);
+        if (!use_minp_cut && idx.size() >= cap) {
+          std::nth_element(idx.begin(), idx.begin() + head - 1, idx.end(), by_logit);
+          idx.resize(size_t(head));
+          cut = xd[idx[size_t(head - 1)]];
+        }
+      } else if (std::isnan(v)) {
+        has_nan = true;
+      }
+    }
+    if (has_nan) {
+      sanitize();
+      if (!std::isfinite(m)) {
+        d.ids = {0};
+        d.p = {1.0};
+        return d;
+      }
+      idx.clear();
+      cut = sp.min_p > 0 ? (m + float(std::log(sp.min_p)) - 1e-4f) : -std::numeric_limits<float>::infinity();
+      for (int32_t i = 0; i < vocab; ++i) {
+        const float v = xd[i];
+        if (v >= cut) {
+          idx.push_back(i);
+          if (!(sp.min_p > 0) && idx.size() >= cap) {
+            std::nth_element(idx.begin(), idx.begin() + head - 1, idx.end(), by_logit);
+            idx.resize(size_t(head));
+            cut = xd[idx[size_t(head - 1)]];
+          }
+        }
+      }
+    }
+    if (idx.empty()) {
+      // Fallback if all logits were -inf.
+      idx.resize(size_t(std::min(head, vocab)));
+      std::iota(idx.begin(), idx.end(), 0);
+    } else if (int(idx.size()) > head) {
+      std::nth_element(idx.begin(), idx.begin() + head - 1, idx.end(), by_logit);
+      idx.resize(size_t(head));
+    }
     std::sort(idx.begin(), idx.end(), by_logit);
     std::vector<double> p(idx.size());
     double mass = 0;
-    for (size_t i = 0; i < idx.size(); ++i) mass += (p[i] = double(e[size_t(idx[i])]) / total);
-    if (k == vocab && sp.top_p < 1.0 && mass < sp.top_p && head < vocab) {
+    if (need_full_exp) {
+      for (size_t i = 0; i < idx.size(); ++i) mass += (p[i] = double(e[size_t(idx[i])]) / total);
+    } else {
+      for (size_t i = 0; i < idx.size(); ++i) mass += (p[i] = double(std::exp(x[size_t(idx[i])] - m)));
+    }
+    if (need_full_exp && k == vocab && sp.top_p < 1.0 && mass < sp.top_p && head < vocab) {
       // Rare: a flat distribution; sort everything.
       idx.resize(size_t(vocab));
       std::iota(idx.begin(), idx.end(), 0);
@@ -108,21 +180,21 @@ Distribution distribution(const float* logits, int vocab, const SamplingParams& 
       for (double v : p) sum += v;
       const double target = sp.top_p * sum;
       double acc = 0;
-      size_t cut = p.size();
+      size_t cut_i = p.size();
       for (size_t i = 0; i < p.size(); ++i) {
         acc += p[i];
         if (acc >= target) {  // numpy searchsorted(cumsum, target) + 1
-          cut = i + 1;
+          cut_i = i + 1;
           break;
         }
       }
-      idx.resize(cut);
-      p.resize(cut);
+      idx.resize(cut_i);
+      p.resize(cut_i);
     }
     double s = 0;
     for (double v : p) s += v;
     for (double& v : p) v /= s;
-    d.ids = std::move(idx);
+    d.ids.assign(idx.begin(), idx.end());
     d.p = std::move(p);
     return d;
   }
@@ -203,11 +275,14 @@ int32_t sample_at(const Distribution& d, uint64_t seed, int64_t pos) {
     return int32_t(j);
   }
   // Head: Gumbel-max, the first (lowest-rank) candidate on exact ties.
+  const uint64_t base = mix64(mix64(seed + 0x9E3779B97F4A7C15ull) ^ (uint64_t(pos) * 0xD1B54A32D192ED03ull));
   double best = -std::numeric_limits<double>::infinity();
   int32_t tok = d.ids[0];
   for (size_t i = 0; i < d.ids.size(); ++i) {
     if (!(d.p[i] > 0)) continue;
-    const double g = -std::log(-std::log(hashed_uniform(seed, pos, d.ids[i])));
+    const uint64_t hx = mix64(base ^ uint64_t(d.ids[i]));
+    const double u = double(hx >> 11) * 0x1.0p-53 + 0x1.0p-54;
+    const double g = -std::log(-std::log(u));
     const double sc = std::log(d.p[i]) + g;
     if (sc > best) best = sc, tok = d.ids[i];
   }

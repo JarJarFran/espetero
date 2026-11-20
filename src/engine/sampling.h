@@ -33,37 +33,103 @@ struct SamplingParams {
 class PenaltyState {
  public:
   void add_prompt(const int32_t* ids, size_t n) {
-    for (size_t i = 0; i < n; ++i) seen_[ids[i]] = seen_[ids[i]];
+    if (n == 0) return;
+    reserve_seen(seen_size_ + n);
+    for (size_t i = 0; i < n; ++i) find_or_insert(ids[i]);
   }
   void add_output(int32_t id) {
-    ++seen_[id];
+    ++seen_[find_or_insert(id)].count;
     out_.push_back(id);
   }
   // add_output that says whether the token was new, and its exact undo
   // (PenaltyScope).
   bool add_output_new(int32_t id) {
-    auto [it, fresh] = seen_.try_emplace(id, 0);
-    ++it->second;
+    bool fresh = false;
+    const size_t slot = find_or_insert(id, &fresh);
+    ++seen_[slot].count;
     out_.push_back(id);
     return fresh;
   }
   void undo_output(int32_t id, bool fresh) {
     if (!out_.empty() && out_.back() == id) out_.pop_back();
-    auto it = seen_.find(id);
-    if (it == seen_.end()) return;
-    if (fresh) seen_.erase(it);
-    else --it->second;
+    const size_t slot = find_slot(id);
+    if (slot == SIZE_MAX) return;
+    if (fresh) {
+      // Mark slot tombstoned (key = kTomb) so probing chains stay intact.
+      seen_[slot] = {kTomb, 0};
+      --seen_size_;
+    } else {
+      --seen_[slot].count;
+    }
   }
   // Apply to a copy of `logits` (only the touched entries change). With
   // no_repeat_ngram_size n, every token that followed an earlier occurrence
   // of the output's last n - 1 tokens gets -inf (transformers'
   // NoRepeatNGramLogitsProcessor over the output tokens).
   void apply(float* logits, const SamplingParams& p) const;
-  bool empty() const { return seen_.empty() && out_.empty(); }
+  bool empty() const { return seen_size_ == 0 && out_.empty(); }
 
  private:
-  std::unordered_map<int32_t, int32_t> seen_;  // token -> output count (0: prompt only)
-  std::vector<int32_t> out_;                   // the output tokens, in order
+  static constexpr int32_t kEmpty = -1;
+  static constexpr int32_t kTomb = -2;
+  struct Entry {
+    int32_t tok = kEmpty;
+    int32_t count = 0;
+  };
+  static inline size_t hash_id(int32_t id) { return size_t(uint32_t(id) * 2654435761u); }
+  void reserve_seen(size_t need) {
+    if (seen_.size() * 2 >= need * 3 + 8) return;
+    size_t cap = std::max<size_t>(32, seen_.size() * 2);
+    while (cap * 2 < need * 3 + 8) cap *= 2;
+    std::vector<Entry> next(cap);
+    const size_t mask = cap - 1;
+    for (const Entry& e : seen_) {
+      if (e.tok < 0) continue;
+      size_t i = hash_id(e.tok) & mask;
+      while (next[i].tok != kEmpty) i = (i + 1) & mask;
+      next[i] = e;
+    }
+    seen_ = std::move(next);
+    seen_used_ = seen_size_;
+  }
+  size_t find_or_insert(int32_t id, bool* fresh = nullptr) {
+    if ((seen_used_ + 1) * 3 >= seen_.size() * 2) reserve_seen(seen_size_ + 1);
+    const size_t mask = seen_.size() - 1;
+    size_t i = hash_id(id) & mask;
+    size_t first_tomb = SIZE_MAX;
+    for (;;) {
+      const int32_t t = seen_[i].tok;
+      if (t == id) {
+        if (fresh) *fresh = false;
+        return i;
+      }
+      if (t == kEmpty) {
+        const size_t dst = first_tomb != SIZE_MAX ? first_tomb : i;
+        if (dst == i) ++seen_used_;
+        seen_[dst] = {id, 0};
+        ++seen_size_;
+        if (fresh) *fresh = true;
+        return dst;
+      }
+      if (t == kTomb && first_tomb == SIZE_MAX) first_tomb = i;
+      i = (i + 1) & mask;
+    }
+  }
+  size_t find_slot(int32_t id) const {
+    if (seen_.empty()) return SIZE_MAX;
+    const size_t mask = seen_.size() - 1;
+    size_t i = hash_id(id) & mask;
+    for (;;) {
+      const int32_t t = seen_[i].tok;
+      if (t == id) return i;
+      if (t == kEmpty) return SIZE_MAX;
+      i = (i + 1) & mask;
+    }
+  }
+  std::vector<Entry> seen_;  // open-addressed: token -> output count (0: prompt only)
+  size_t seen_size_ = 0;
+  size_t seen_used_ = 0;     // occupied + tombstones
+  std::vector<int32_t> out_; // the output tokens, in order
 };
 
 // The tokens a verify pass produces, counted by the penalties of the

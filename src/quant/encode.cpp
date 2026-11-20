@@ -81,16 +81,28 @@ float sym_search(const float* x, const float* w, int bits, bool rtn, bool end_hi
   if (!(std::fabs(mval) > 0)) mval = 1e-12f;
   if (rtn) return -mval / float(nmax);
   const float lo = float(-nmax), hi = float(nmax - 1);
+  const float32x4_t vlo = vdupq_n_f32(lo), vhi = vdupq_n_f32(hi);
+  const float32x4_t vx0 = vld1q_f32(x + 0), vx1 = vld1q_f32(x + 4), vx2 = vld1q_f32(x + 8), vx3 = vld1q_f32(x + 12);
+  const float32x4_t vw0 = w ? vld1q_f32(w + 0) : vdupq_n_f32(1.0f);
+  const float32x4_t vw1 = w ? vld1q_f32(w + 4) : vdupq_n_f32(1.0f);
+  const float32x4_t vw2 = w ? vld1q_f32(w + 8) : vdupq_n_f32(1.0f);
+  const float32x4_t vw3 = w ? vld1q_f32(w + 12) : vdupq_n_f32(1.0f);
   float best_s = 0, best_q = 0;
   for (int i = -9; i <= 9; ++i) {
     const float iscale = end_hi ? float(double(nmax - 1) + 0.1 * i) / mval : float(-(double(nmax) + 0.1 * i)) / mval;
-    float sxl = 0, sl2 = 0;
-    for (int k = 0; k < 16; ++k) {
-      const float l = std::clamp(rint_even(iscale * x[k]), lo, hi);
-      const float wl = w ? w[k] * l : l;
-      sxl += wl * x[k];
-      sl2 += wl * l;
-    }
+    const float32x4_t vis = vdupq_n_f32(iscale);
+    auto lane4 = [&](float32x4_t vx, float32x4_t vw, float32x4_t& ax, float32x4_t& al) {
+      const float32x4_t l = vminq_f32(vmaxq_f32(vrndnq_f32(vmulq_f32(vis, vx)), vlo), vhi);
+      const float32x4_t wl = w ? vmulq_f32(vw, l) : l;
+      ax = vaddq_f32(ax, vmulq_f32(wl, vx));
+      al = vaddq_f32(al, vmulq_f32(wl, l));
+    };
+    float32x4_t ax = vdupq_n_f32(0.0f), al = vdupq_n_f32(0.0f);
+    lane4(vx0, vw0, ax, al);
+    lane4(vx1, vw1, ax, al);
+    lane4(vx2, vw2, ax, al);
+    lane4(vx3, vw3, ax, al);
+    const float sxl = vaddvq_f32(ax), sl2 = vaddvq_f32(al);
     const float sc = sl2 > 0 ? sxl / sl2 : -mval / float(nmax);
     const float q = sl2 > 0 ? sxl * sxl / sl2 : 0.0f;
     if (i == -9 || q > best_q) {
@@ -159,18 +171,27 @@ void affine_search(const float* v, const float* w, int g, int bits, int nstep, c
   }
   const float nmax = float((1 << bits) - 1);
   const float rng = std::max(hi - lo, 1e-12f);
+  float sw = 0, sx = 0;
+  for (int i = 0; i < g; ++i) {
+    const float wi = w ? w[i] : 1.0f;
+    sw += wi;
+    sx += wi * v[i];
+  }
+  float ls_stack[256];
+  std::vector<float> ls_heap;
+  float* ls = g <= 256 ? ls_stack : (ls_heap.resize(size_t(g)), ls_heap.data());
   float best_s = rng / nmax, best_b = lo, best_e = INFINITY;
   for (int st = 0; st <= nstep; ++st) {
     const float iscale = nstep == 0 ? nmax / rng : (-1.0f + 0.1f * float(st) + nmax) / rng;
-    float sw = 0, sl = 0, sl2 = 0, sxl = 0, sx = 0;
+    float sl = 0, sl2 = 0, sxl = 0;
     for (int i = 0; i < g; ++i) {
       const float l = std::clamp(rint_even(iscale * (v[i] - lo)), 0.0f, nmax);
+      ls[i] = l;
       const float wi = w ? w[i] : 1.0f;
-      sw += wi;
-      sl += wi * l;
-      sl2 += wi * l * l;
-      sxl += wi * l * v[i];
-      sx += wi * v[i];
+      const float wl = wi * l;
+      sl += wl;
+      sl2 += wl * l;
+      sxl += wl * v[i];
     }
     float sc = rng / nmax, bi = lo;
     if (nstep > 0) {
@@ -186,8 +207,7 @@ void affine_search(const float* v, const float* w, int g, int bits, int nstep, c
     }
     float e = 0;
     for (int i = 0; i < g; ++i) {
-      const float l = std::clamp(rint_even(iscale * (v[i] - lo)), 0.0f, nmax);
-      const float dd = sc * l + bi - v[i];
+      const float dd = sc * ls[i] + bi - v[i];
       e += (w ? w[i] : 1.0f) * dd * dd;
     }
     if (e < best_e) {

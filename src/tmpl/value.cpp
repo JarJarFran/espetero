@@ -985,17 +985,31 @@ void dump_rec(std::string& out, const Val& v, const JsonOpts& o, int level) {
         out += "{}";
         return;
       }
+      if (!o.sort_keys) {
+        out.push_back('{');
+        for (size_t i = 0; i < n; ++i) {
+          if (i) out += o.item_sep;
+          if (o.indent_set) newline_indent(out, o, level + 1);
+          const Val k = dict_key(v, i);
+          if (k.is_str()) json::append_quoted(out, k.sv(), o.ensure_ascii);
+          else json::append_quoted(out, json_key(k), o.ensure_ascii);
+          out += o.key_sep;
+          dump_rec(out, dict_value(v, i), o, level + 1);
+        }
+        if (o.indent_set) newline_indent(out, o, level);
+        out.push_back('}');
+        return;
+      }
       std::vector<std::pair<std::string, size_t>> keys;
       keys.reserve(n);
       for (size_t i = 0; i < n; ++i) keys.emplace_back(json_key(dict_key(v, i)), i);
-      if (o.sort_keys) {
-        // sorted(dct.items()) compares the original keys.
-        std::vector<Val> orig;
-        for (size_t i = 0; i < n; ++i) orig.push_back(dict_key(v, i));
-        std::stable_sort(keys.begin(), keys.end(), [&](const auto& x, const auto& y) {
-          return py_lt(orig[x.second], orig[y.second]);
-        });
-      }
+      // sorted(dct.items()) compares the original keys.
+      std::vector<Val> orig;
+      orig.reserve(n);
+      for (size_t i = 0; i < n; ++i) orig.push_back(dict_key(v, i));
+      std::stable_sort(keys.begin(), keys.end(), [&](const auto& x, const auto& y) {
+        return py_lt(orig[x.second], orig[y.second]);
+      });
       out.push_back('{');
       bool first = true;
       for (const auto& [key, i] : keys) {

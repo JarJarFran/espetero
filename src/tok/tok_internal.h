@@ -228,7 +228,8 @@ struct Tokenizer::Impl {
   int32_t n_vocab = 0;             // max id + 1
 
   // ---- model
-  int32_t byte_id[256] = {};  // byte-level: the token of each byte; spm: its byte-fallback token <0xHH>
+  int32_t byte_id[256] = {};   // byte-level: the token of each byte; spm: its byte-fallback token <0xHH>
+  int32_t ascii_id[128] = {};  // spm: direct LUT for single-byte ASCII vocabulary tokens (-1 if absent)
   tok::MergeTable merges;
   bool ignore_merges = false;
   bool nfc = true;

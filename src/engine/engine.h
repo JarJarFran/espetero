@@ -399,11 +399,14 @@ class Engine {
   // min_pixels > 0 overrides the processor's floor (min(65536, max)); Clef requests pass the release's own limits.
   // At most 4 images are decoded and preprocessed at once across request threads.
   PreparedImage prepare_image(const std::string& data_url, int64_t max_pixels = 0, int64_t min_pixels = 0) const;
+  PreparedImage prepare_image_bytes(std::string_view bytes, int64_t max_pixels = 0, int64_t min_pixels = 0,
+                                    int64_t max_pixels_lfm2 = 0) const;
   // The tokens prepare_image will give an image at this budget, from the file's
   // header alone (no pixel decoded): 422 for a bad data URL, an image over the
   // decode cap or an aspect ratio the processor rejects; -1 when the header
   // cannot be read (decoding then decides).
   int image_tokens(const std::string& data_url, int64_t max_pixels = 0, int64_t min_pixels = 0) const;
+  int image_tokens_bytes(std::string_view bytes, int64_t max_pixels = 0, int64_t min_pixels = 0) const;
   // Length of `ids` once each image placeholder becomes its run of `runs[i]`
   // tokens (an unknown run, -1, counts as its placeholder); 422 like
   // expand_images when placeholders and images differ in number.
@@ -457,6 +460,10 @@ class Engine {
   std::unique_ptr<d1::Release> d1_;
   std::unique_ptr<vision::Lfm2Spec> lfm2_spec_;  // LFM2-VL image processor
   std::unique_ptr<vision::MinicpmSpec> minicpm_spec_;  // MiniCPM-OCR image processor
+  mutable std::once_flag img_norm_once_;
+  mutable float img_mean_[3] = {0.5f, 0.5f, 0.5f};
+  mutable float img_std_[3] = {0.5f, 0.5f, 0.5f};
+  mutable bool img_norm_loaded_ = false;
   struct EmbedJob;  // embed.cpp
   std::deque<std::shared_ptr<EmbedJob>> embed_jobs_;
   std::vector<float> embed_hidden_;  // a pass's hidden rows

@@ -349,13 +349,14 @@ Prepared preprocess_deepseek(const RGBImage& image, int patch, int down, int max
     }
     nw = std::max(nw, 1), nh = std::max(nh, 1);
     const RGBImage r = (nw == image.width && nh == image.height) ? image : resize_bicubic(image, nw, nh);
-    for (int yy = 0; yy < nh; ++yy) {
-      const int ty = y + yy;
-      if (ty < 0 || ty >= H) continue;
-      for (int xx = 0; xx < nw; ++xx) {
-        const int tx = x + xx;
-        if (tx < 0 || tx >= W) continue;
-        std::memcpy(&canvas.rgb[(size_t(ty) * size_t(W) + size_t(tx)) * 3], &r.rgb[(size_t(yy) * size_t(nw) + size_t(xx)) * 3], 3);
+    const int x0 = std::max(0, -x), x1 = std::min(nw, W - x);
+    if (x0 < x1) {
+      const size_t copy_bytes = size_t(x1 - x0) * 3;
+      for (int yy = 0; yy < nh; ++yy) {
+        const int ty = y + yy;
+        if (ty < 0 || ty >= H) continue;
+        std::memcpy(&canvas.rgb[(size_t(ty) * size_t(W) + size_t(x + x0)) * 3],
+                    &r.rgb[(size_t(yy) * size_t(nw) + size_t(x0)) * 3], copy_bytes);
       }
     }
   }
@@ -363,24 +364,59 @@ Prepared preprocess_deepseek(const RGBImage& image, int patch, int down, int max
   const int gh = H / patch, gw = W / patch, K = 3 * patch * patch;
   out.grid_t = 1, out.grid_h = gh, out.grid_w = gw;
   out.pixels.resize(size_t(gh) * size_t(gw) * size_t(K));
-  auto bf16 = [](float f) {
+  float lut[256];
+  for (int v = 0; v < 256; ++v) {
+    const float x = float(v) / 255.0f;
+    float f = (x - 0.5f) / 0.5f;
     uint32_t u;
     std::memcpy(&u, &f, 4);
     u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
     std::memcpy(&f, &u, 4);
-    return f;
-  };
-  for (int py = 0; py < gh; ++py)
-    for (int px = 0; px < gw; ++px) {
-      float* o = out.pixels.data() + (size_t(py) * size_t(gw) + size_t(px)) * size_t(K);
-      for (int c = 0; c < 3; ++c)
-        for (int i = 0; i < patch; ++i)
-          for (int j = 0; j < patch; ++j) {
-            const uint8_t v = canvas.rgb[((size_t(py) * patch + size_t(i)) * size_t(W) + size_t(px) * patch + size_t(j)) * 3 + size_t(c)];
-            const float x = float(v) / 255.0f;
-            o[(size_t(c) * patch + size_t(i)) * patch + size_t(j)] = bf16((x - 0.5f) / 0.5f);
+    lut[v] = f;
+  }
+  struct Ctx {
+    const uint8_t* rgb;
+    const float* lut;
+    float* dst;
+    int W, gh, gw, patch, K;
+  } ctx{canvas.rgb.data(), lut, out.pixels.data(), W, gh, gw, patch, K};
+  auto run_rows = [](const Ctx& c, int py0, int py1) {
+    const size_t block = size_t(c.patch) * size_t(c.patch);
+    for (int py = py0; py < py1; ++py)
+      for (int px = 0; px < c.gw; ++px) {
+        float* o = c.dst + (size_t(py) * size_t(c.gw) + size_t(px)) * size_t(c.K);
+        float* o0 = o;
+        float* o1 = o + block;
+        float* o2 = o + 2 * block;
+        for (int i = 0; i < c.patch; ++i) {
+          const uint8_t* s = c.rgb + (size_t(py * c.patch + i) * size_t(c.W) + size_t(px * c.patch)) * 3;
+          float* d0 = o0 + size_t(i) * size_t(c.patch);
+          float* d1 = o1 + size_t(i) * size_t(c.patch);
+          float* d2 = o2 + size_t(i) * size_t(c.patch);
+          for (int j = 0; j < c.patch; ++j) {
+            d0[j] = c.lut[s[3 * j + 0]];
+            d1[j] = c.lut[s[3 * j + 1]];
+            d2[j] = c.lut[s[3 * j + 2]];
           }
-    }
+        }
+      }
+  };
+  const int chunks = gh >= 16 ? std::min(16, gh / 4) : 1;
+  if (chunks <= 1) {
+    run_rows(ctx, 0, gh);
+  } else {
+    struct Job {
+      Ctx* ctx;
+      decltype(run_rows)* fn;
+      int gh, chunks;
+    } job{&ctx, &run_rows, gh, chunks};
+    dispatch_apply_f(size_t(chunks), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job,
+                     [](void* p, size_t i) {
+                       auto* j = static_cast<Job*>(p);
+                       (*j->fn)(*j->ctx, int(int64_t(j->gh) * i / j->chunks),
+                                int(int64_t(j->gh) * (i + 1) / j->chunks));
+                     });
+  }
   out.digest = digest(out.pixels.data(), out.pixels.size(), out.grid());
   return out;
 }

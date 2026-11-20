@@ -584,12 +584,34 @@ void anthropic_stream(Engine& engine, ChatJob& job, http::Response& res, bool sh
 // Stored responses (store: true, the API's default): the response object and
 // the conversation it ends (chat messages without the instructions, which
 // are not carried over to a continuation), the newest kCount within kBytes.
+size_t estimate_json_bytes(const json::Value& v) {
+  switch (v.type()) {
+    case json::Type::Null: return 4;
+    case json::Type::Bool: return 5;
+    case json::Type::Int:
+    case json::Type::Double: return 16;
+    case json::Type::String: return v.as_string().size() + 2;
+    case json::Type::Array: {
+      size_t s = 2;
+      for (const json::Value& x : v.as_array()) s += estimate_json_bytes(x) + 1;
+      return s;
+    }
+    case json::Type::Object: {
+      const json::Object& o = v.as_object();
+      size_t s = 2;
+      for (size_t i = 0; i < o.size(); ++i) s += o.keys[i].size() + 4 + estimate_json_bytes(o.vals[i]);
+      return s;
+    }
+  }
+  return 4;
+}
+
 class ResponseStore {
  public:
   static constexpr size_t kCount = 256;
   static constexpr size_t kBytes = size_t(256) << 20;
   void put(const std::string& id, json::Value response, json::Value history) {
-    const size_t bytes = json::dump(response).size() + json::dump(history).size();
+    const size_t bytes = estimate_json_bytes(response) + estimate_json_bytes(history);
     std::lock_guard<std::mutex> lk(mu_);
     erase_locked(id);
     map_[id] = Entry{std::move(response), std::move(history), bytes};

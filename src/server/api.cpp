@@ -299,28 +299,61 @@ void install_routes(http::Server& server, Engine& engine, BatchService* batches,
       std::vector<char> first(n, 1);
       std::vector<json::Value> usages(n);
       std::vector<int64_t> text_offset(n, 0);
+      // Pre-rendered chunk prefix for zero-allocation SSE text/reasoning deltas.
+      std::string chunk_pfx;
+      if (job.chat) {
+        chunk_pfx.reserve(160);
+        chunk_pfx += "{\"id\":";
+        json::append_quoted(chunk_pfx, job.id);
+        chunk_pfx += ",\"object\":\"chat.completion.chunk\",\"created\":";
+        chunk_pfx += std::to_string(job.created);
+        chunk_pfx += ",\"model\":";
+        json::append_quoted(chunk_pfx, engine.model_name());
+        chunk_pfx += ",\"choices\":[{\"index\":";
+      }
+      std::string sse_buf;
       run_choices(engine, job, [&](int i, const ChatEvent& ev) {
         const size_t k = size_t(i);
         if (first[k] && job.chat) {
-          json::Value d = json::Value::object();
-          d.set("role", "assistant");
-          d.set("content", "");
-          if (!res.sse(json::dump(chat_chunk(engine, job, d, json::Value(), true, nullptr, nullptr, i)))) return false;
+          sse_buf.clear();
+          sse_buf.append(chunk_pfx);
+          sse_buf += std::to_string(i);
+          sse_buf += ",\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"logprobs\":null,\"finish_reason\":null}]}";
+          if (!res.sse(sse_buf)) return false;
         }
         first[k] = 0;
-        json::Value d = json::Value::object();
-        if (!ev.reasoning.empty()) d.set("reasoning_content", ev.reasoning);
-        if (!ev.content.empty()) d.set("content", ev.content);
-        if (!ev.tool_calls.is_null()) {
-          json::Value calls = ev.tool_calls;
-          for (size_t j = 0; j < calls.size(); ++j) calls[j].set("index", int64_t(j));
-          d.set("tool_calls", calls);
-        }
-        // The event's logprob records go with its text, else with the finish chunk.
         const std::vector<TokenLogprob>* lps = ev.logprobs.empty() ? nullptr : &ev.logprobs;
-        if (d.size()) {
-          if (!res.sse(json::dump(chat_chunk(engine, job, d, json::Value(), true, lps, &text_offset[k], i)))) return false;
-          lps = nullptr;
+        if (job.chat && !lps && ev.tool_calls.is_null() && (!ev.reasoning.empty() || !ev.content.empty())) {
+          sse_buf.clear();
+          sse_buf.append(chunk_pfx);
+          sse_buf += std::to_string(i);
+          sse_buf += ",\"delta\":{";
+          bool comma = false;
+          if (!ev.reasoning.empty()) {
+            sse_buf += "\"reasoning_content\":";
+            json::append_quoted(sse_buf, ev.reasoning);
+            comma = true;
+          }
+          if (!ev.content.empty()) {
+            if (comma) sse_buf.push_back(',');
+            sse_buf += "\"content\":";
+            json::append_quoted(sse_buf, ev.content);
+          }
+          sse_buf += "},\"logprobs\":null,\"finish_reason\":null}]}";
+          if (!res.sse(sse_buf)) return false;
+        } else {
+          json::Value d = json::Value::object();
+          if (!ev.reasoning.empty()) d.set("reasoning_content", ev.reasoning);
+          if (!ev.content.empty()) d.set("content", ev.content);
+          if (!ev.tool_calls.is_null()) {
+            json::Value calls = ev.tool_calls;
+            for (size_t j = 0; j < calls.size(); ++j) calls[j].set("index", int64_t(j));
+            d.set("tool_calls", calls);
+          }
+          if (d.size()) {
+            if (!res.sse(json::dump(chat_chunk(engine, job, d, json::Value(), true, lps, &text_offset[k], i)))) return false;
+            lps = nullptr;
+          }
         }
         if (ev.final) {
           usages[k] = ev.usage;

@@ -7,7 +7,8 @@ CXX      ?= clang++
 BUILD    ?= build
 # The oldest macOS the binary runs on (Metal Shading Language 3.2 needs macOS 15).
 MACOS_MIN ?= 15.0
-CXXFLAGS ?= -std=c++20 -O3 -mcpu=apple-m1 -mmacosx-version-min=$(MACOS_MIN) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+LTO      ?= -flto=thin
+CXXFLAGS ?= -std=c++20 -O3 $(LTO) -mcpu=apple-m1 -mmacosx-version-min=$(MACOS_MIN) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 OBJCFLAGS = -fobjc-arc
 # A plain `make` builds on every core: GNU Make 3.81 (the Command Line Tools'
 # make) runs one job at a time unless -j is on its command line, and the

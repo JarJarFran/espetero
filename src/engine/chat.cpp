@@ -18,6 +18,7 @@
 #include "../tmpl/tmpl.h"
 #include "../tok/tokenizer.h"
 #include "../vision/fetch.h"
+#include "../vision/vision.h"
 #include "requests.h"
 #include "structured.h"
 
@@ -577,17 +578,55 @@ ChatJob prepare_chat(Engine& engine, const json::Value& body, bool run) {
   GenRequest& g = job.gen;
   fetch_remote_images(engine, urls);
   if (!urls.empty()) {
+    // Decode each base64 data URL once (avoiding double base64 decode between
+    // header probing and pixel decoding), then decode/preprocess multi-image
+    // prompts in parallel.
+    std::vector<std::string> raw_images(urls.size());
+    for (size_t i = 0; i < urls.size(); ++i) {
+      std::string err;
+      if (!vision::decode_data_url(urls[i], raw_images[i], err)) throw RequestError(422, "image: " + err);
+    }
     // Each image's token run from its header: a prompt that cannot fit the
     // context window is refused (as generate() would) before any decoding.
     std::vector<int> runs;
-    for (size_t i = 0; i < urls.size(); ++i) runs.push_back(engine.image_tokens(urls[i], detail_pixels[i]));
+    runs.reserve(urls.size());
+    for (size_t i = 0; i < urls.size(); ++i) runs.push_back(engine.image_tokens_bytes(raw_images[i], detail_pixels[i]));
     const size_t n = engine.expanded_length(ids, runs);
     if (n >= size_t(engine.info().max_ctx))
       throw RequestError(422, "Prompt exceeds the model context window (" + std::to_string(engine.info().max_ctx) +
                                   " tokens): " + std::to_string(n) + " tokens with its images");
+    g.images.resize(urls.size());
+    if (urls.size() == 1) {
+      g.images[0] = engine.prepare_image_bytes(raw_images[0], detail_pixels[0]);
+    } else {
+      std::vector<std::exception_ptr> exs(urls.size());
+      const size_t nt = std::min<size_t>(urls.size(), 4);
+      std::atomic<size_t> next{0};
+      auto work = [&]() {
+        for (;;) {
+          const size_t i = next.fetch_add(1);
+          if (i >= urls.size()) break;
+          try {
+            g.images[i] = engine.prepare_image_bytes(raw_images[i], detail_pixels[i]);
+          } catch (...) {
+            exs[i] = std::current_exception();
+          }
+        }
+      };
+      std::vector<std::thread> th;
+      for (size_t k = 1; k < nt; ++k) {
+        try {
+          th.emplace_back(work);
+        } catch (const std::system_error&) {
+          break;
+        }
+      }
+      work();
+      for (auto& t : th) t.join();
+      for (const auto& ep : exs)
+        if (ep) std::rethrow_exception(ep);
+    }
   }
-  // Images (decoded in this thread; preprocessing is CPU work).
-  for (size_t i = 0; i < urls.size(); ++i) g.images.push_back(engine.prepare_image(urls[i], detail_pixels[i]));
   engine.number_images(g.images);
   if (!g.images.empty()) {
     if (!marks.empty()) {  // each image's placeholder becomes its run of image tokens: shift the marks after it
@@ -782,25 +821,42 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
   std::vector<size_t> tok_end;
   size_t lp_sent = 0;
   // `held`: bytes at the end of `raw` the view does not show yet.
-  ReplyText::View rv;  // the last view (its call openings, for the final parse)
-  auto view = [&](bool final_view, std::string& reasoning, std::string& content, size_t& safe, size_t& held) {
-    rv = reply.view(final_view);
+  size_t max_stop = 0;
+  for (const auto& s : job.stops) max_stop = std::max(max_stop, s.size());
+  size_t stop_checked = 0, stop_cut = std::string::npos;
+  size_t call_checked = 0, call_at = std::string::npos;
+  ReplyText::StreamView rv;  // the last view (its call openings, for the final parse)
+  auto view = [&](bool final_view, std::string_view& reasoning, std::string_view& content, size_t& safe, size_t& held) {
+    rv = reply.stream_view(final_view);
     reasoning = rv.reasoning;
     content = rv.content;
     held = rv.held;
-    size_t cut = std::string::npos;
-    for (const auto& s : job.stops) {
-      const size_t at = content.find(s);
-      if (at != std::string::npos && at < cut) cut = at, stop_seq = s;
+    if (stop_cut == std::string::npos && !job.stops.empty() && content.size() > stop_checked) {
+      const size_t from = stop_checked > max_stop ? stop_checked - max_stop + 1 : 0;
+      size_t cut = std::string::npos;
+      for (const auto& s : job.stops) {
+        const size_t at = content.find(s, from);
+        if (at != std::string::npos && at < cut) cut = at, stop_seq = s;
+      }
+      if (cut != std::string::npos) {
+        stop_cut = cut;
+        stop_hit = true;
+      } else {
+        stop_checked = content.size();
+      }
     }
-    if (cut != std::string::npos) {
-      content.resize(cut);
-      stop_hit = true;
-    }
+    if (stop_cut != std::string::npos && stop_cut < content.size()) content = content.substr(0, stop_cut);
     if (tools) {
-      const size_t at = reply.calls_start(rv, content);
-      if (at != std::string::npos) {
-        safe = std::min(safe, at);  // the rest is parsed at the end
+      if (call_at == std::string::npos && content.size() > call_checked) {
+        const size_t from = (!rv.calls_at && call_checked > job.tool_open.size())
+                                ? call_checked - job.tool_open.size() + 1
+                                : 0;
+        const size_t at = reply.calls_start(rv, content, from);
+        if (at != std::string::npos) call_at = at;
+        else call_checked = content.size();
+      }
+      if (call_at != std::string::npos && call_at <= content.size()) {
+        safe = std::min(safe, call_at);  // the rest is parsed at the end
         while (safe > 0 && (content[safe - 1] == '\n' || content[safe - 1] == ' ')) --safe;  // the gap before the calls
         return;
       }
@@ -871,12 +927,12 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
     }
     if (!job.force_after_think.empty() && !phase2) gen1.insert(gen1.end(), got.begin(), got.end());
     if (!got.empty()) {
-      std::string reasoning, content;
+      std::string_view reasoning, content;
       size_t safe = SIZE_MAX, held = 0;
       view(false, reasoning, content, safe, held);
       ChatEvent ev;
-      if (reasoning.size() > emitted_r) ev.reasoning = reasoning.substr(emitted_r);
-      if (safe != SIZE_MAX && safe > emitted_c) ev.content = content.substr(emitted_c, safe - emitted_c);
+      if (reasoning.size() > emitted_r) ev.reasoning.assign(reasoning.substr(emitted_r));
+      if (safe != SIZE_MAX && safe > emitted_c) ev.content.assign(content.substr(emitted_c, safe - emitted_c));
       if (!ev.reasoning.empty() || !ev.content.empty()) {
         emitted_r = std::max(emitted_r, reasoning.size());
         emitted_c += ev.content.size();
@@ -908,9 +964,10 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
     }
   }
   // Final view: everything, tool calls parsed.
-  std::string reasoning, content;
+  std::string_view reasoning_sv, content_sv;
   size_t safe = SIZE_MAX, held = 0;
-  view(true, reasoning, content, safe, held);
+  view(true, reasoning_sv, content_sv, safe, held);
+  std::string content(content_sv);
   ChatEvent last;
   last.final = true;
   if (tools) {
@@ -921,7 +978,7 @@ void run_chat_stream(Engine& engine, const ChatJob& job, std::shared_ptr<GenStre
       last.tool_calls = calls;
     }
   }
-  if (reasoning.size() > emitted_r) last.reasoning = reasoning.substr(emitted_r);
+  if (reasoning_sv.size() > emitted_r) last.reasoning.assign(reasoning_sv.substr(emitted_r));
   if (content.size() > emitted_c) last.content = content.substr(emitted_c);
   std::string reason = stream->finish_reason;
   if (stop_hit) reason = "stop";

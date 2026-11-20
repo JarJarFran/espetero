@@ -273,6 +273,10 @@ std::unique_ptr<Tokenizer::Impl> build(BuildInput&& in) {
       std::snprintf(name, sizeof(name), "<0x%02X>", b);
       t.byte_id[b] = t.vocab_find(name);
     }
+    for (int b = 0; b < 128; ++b) {
+      const char ch = char(b);
+      t.ascii_id[b] = t.vocab_find(std::string_view(&ch, 1));
+    }
     t.unk = in.unk_token.empty() ? -1 : t.vocab_find(in.unk_token);
     // The word / line boundaries no vocabulary token spans (see Impl::spm_before_sp).
     for (const auto& [tx, id] : in.vocab) {
@@ -654,10 +658,55 @@ void Tokenizer::Impl::encode_word(std::string_view word, std::vector<int32_t>& o
   if (c) c->put(word, h, out.data() + before, out.size() - before);
 }
 
-// BPE exactly as the reference's Word::merge_all: a min-heap of candidate merges
-// ordered by (rank, position); stale entries are skipped when the symbol was
-// consumed, is last, or no longer forms a pair that merges into the same token.
+// BPE exactly as the reference's Word::merge_all: ordered by (rank, position).
+// Short words (n <= 32, the common case) use a stack-allocated linear scan
+// with cached per-pair ranks (no heap overhead); longer words use a min-heap
+// storing (left_id, right_id) so stale entries are skipped in O(1) without
+// re-probing the merge hash table.
+static constexpr uint32_t kNoMerge = UINT32_MAX;
+
 void Tokenizer::Impl::bpe(std::string_view word, std::vector<int32_t>& out) const {
+  const size_t n = word.size();
+  if (n <= 32) {
+    int32_t id[32], prev[32], next[32];
+    uint32_t rnk[32], mrg[32];
+    for (size_t i = 0; i < n; ++i) {
+      id[i] = byte_id[static_cast<unsigned char>(word[i])];
+      prev[i] = int32_t(i) - 1;
+      next[i] = i + 1 < n ? int32_t(i + 1) : -1;
+      rnk[i] = kNoMerge;
+      mrg[i] = 0;
+    }
+    for (size_t i = 0; i + 1 < n; ++i)
+      if (!merges.get(uint32_t(id[i]), uint32_t(id[i + 1]), rnk[i], mrg[i])) rnk[i] = kNoMerge;
+    for (;;) {
+      uint32_t best_r = kNoMerge;
+      int32_t best_p = -1;
+      for (int32_t p = 0; p >= 0; p = next[p]) {
+        if (rnk[p] < best_r) {
+          best_r = rnk[p];
+          best_p = p;
+        }
+      }
+      if (best_p < 0) break;
+      const int32_t r = next[best_p];
+      id[best_p] = int32_t(mrg[best_p]);
+      next[best_p] = next[r];
+      if (next[r] >= 0) prev[next[r]] = best_p;
+      if (prev[best_p] >= 0) {
+        const int32_t l = prev[best_p];
+        if (!merges.get(uint32_t(id[l]), uint32_t(id[best_p]), rnk[l], mrg[l])) rnk[l] = kNoMerge;
+      }
+      if (next[best_p] >= 0) {
+        if (!merges.get(uint32_t(id[best_p]), uint32_t(id[next[best_p]]), rnk[best_p], mrg[best_p]))
+          rnk[best_p] = kNoMerge;
+      } else {
+        rnk[best_p] = kNoMerge;
+      }
+    }
+    for (int32_t p = 0; p >= 0; p = next[p]) out.push_back(id[p]);
+    return;
+  }
   struct Sym {
     int32_t id;
     int32_t prev;
@@ -668,12 +717,13 @@ void Tokenizer::Impl::bpe(std::string_view word, std::vector<int32_t>& out) cons
     uint32_t rank;
     uint32_t pos;
     uint32_t merged;
+    int32_t left_id;
+    int32_t right_id;
   };
   // Heap comparator: std heaps are max-heaps, so "less" means larger (rank, pos).
   const auto later = [](const Cand& x, const Cand& y) { return x.rank != y.rank ? x.rank > y.rank : x.pos > y.pos; };
   // Per-thread scratch for ordinary words; a huge word gets its own buffers so the
   // thread does not keep megabytes around afterwards.
-  const size_t n = word.size();
   thread_local std::vector<Sym> tl_syms;
   thread_local std::vector<Cand> tl_heap;
   std::vector<Sym> big_syms;
@@ -687,7 +737,7 @@ void Tokenizer::Impl::bpe(std::string_view word, std::vector<int32_t>& out) cons
   uint32_t rank, merged;
   for (size_t i = 0; i + 1 < n; ++i)
     if (merges.get(uint32_t(syms[i].id), uint32_t(syms[i + 1].id), rank, merged))
-      heap.push_back(Cand{rank, uint32_t(i), merged});
+      heap.push_back(Cand{rank, uint32_t(i), merged, syms[i].id, syms[i + 1].id});
   std::make_heap(heap.begin(), heap.end(), later);
   while (!heap.empty()) {
     std::pop_heap(heap.begin(), heap.end(), later);
@@ -696,19 +746,25 @@ void Tokenizer::Impl::bpe(std::string_view word, std::vector<int32_t>& out) cons
     Sym& cur = syms[top.pos];
     if (cur.len == 0 || cur.next < 0) continue;
     const Sym right = syms[size_t(cur.next)];
-    if (!merges.get(uint32_t(cur.id), uint32_t(right.id), rank, merged) || merged != top.merged) continue;
+    if (cur.id != top.left_id || right.id != top.right_id) continue;
     syms[size_t(cur.next)].len = 0;
     cur.id = int32_t(top.merged);
     cur.len += right.len;
     cur.next = right.next;
     if (right.next >= 0) syms[size_t(right.next)].prev = int32_t(top.pos);
-    if (cur.prev >= 0 && merges.get(uint32_t(syms[size_t(cur.prev)].id), uint32_t(cur.id), rank, merged)) {
-      heap.push_back(Cand{rank, uint32_t(cur.prev), merged});
-      std::push_heap(heap.begin(), heap.end(), later);
+    if (cur.prev >= 0) {
+      const int32_t lid = syms[size_t(cur.prev)].id;
+      if (merges.get(uint32_t(lid), uint32_t(cur.id), rank, merged)) {
+        heap.push_back(Cand{rank, uint32_t(cur.prev), merged, lid, cur.id});
+        std::push_heap(heap.begin(), heap.end(), later);
+      }
     }
-    if (cur.next >= 0 && merges.get(uint32_t(cur.id), uint32_t(syms[size_t(cur.next)].id), rank, merged)) {
-      heap.push_back(Cand{rank, top.pos, merged});
-      std::push_heap(heap.begin(), heap.end(), later);
+    if (cur.next >= 0) {
+      const int32_t rid = syms[size_t(cur.next)].id;
+      if (merges.get(uint32_t(cur.id), uint32_t(rid), rank, merged)) {
+        heap.push_back(Cand{rank, top.pos, merged, cur.id, rid});
+        std::push_heap(heap.begin(), heap.end(), later);
+      }
     }
   }
   for (size_t i = 0; i < n; ++i)
@@ -732,6 +788,8 @@ void Tokenizer::Impl::bpe_spm(std::string_view word, std::vector<int32_t>& out) 
     uint32_t rank;
     uint32_t pos;
     uint32_t merged;
+    int32_t left_id;
+    int32_t right_id;
   };
   const auto later = [](const Cand& x, const Cand& y) { return x.rank != y.rank ? x.rank > y.rank : x.pos > y.pos; };
   const size_t n = word.size();
@@ -752,11 +810,18 @@ void Tokenizer::Impl::bpe_spm(std::string_view word, std::vector<int32_t>& out) 
   const auto* e = p + n;
   bool in_unk = false;  // the last symbol is an unk that may absorb the next unknown character
   while (p < e) {
-    uint32_t cp;
-    int len = tok::decode_utf8(p, e, cp);
-    if (len <= 0) len = 1;
-    const std::string_view ch(reinterpret_cast<const char*>(p), size_t(len));
-    const int32_t id = vocab_find(ch);
+    int len;
+    int32_t id;
+    if (*p < 0x80) {
+      len = 1;
+      id = ascii_id[*p];
+    } else {
+      uint32_t cp;
+      len = tok::decode_utf8(p, e, cp);
+      if (len <= 0) len = 1;
+      const std::string_view ch(reinterpret_cast<const char*>(p), size_t(len));
+      id = vocab_find(ch);
+    }
     if (id >= 0) {
       push(id, len);
       in_unk = false;
@@ -775,10 +840,45 @@ void Tokenizer::Impl::bpe_spm(std::string_view word, std::vector<int32_t>& out) 
     p += len;
   }
   const size_t ns = syms.size();
+  if (ns <= 32) {
+    uint32_t rnk[32], mrg[32];
+    for (size_t i = 0; i < ns; ++i) rnk[i] = kNoMerge, mrg[i] = 0;
+    for (size_t i = 0; i + 1 < ns; ++i)
+      if (!merges.get(uint32_t(syms[i].id), uint32_t(syms[i + 1].id), rnk[i], mrg[i])) rnk[i] = kNoMerge;
+    for (;;) {
+      uint32_t best_r = kNoMerge;
+      int32_t best_p = -1;
+      for (int32_t cur = 0; cur >= 0; cur = syms[size_t(cur)].next) {
+        if (rnk[cur] < best_r) {
+          best_r = rnk[cur];
+          best_p = cur;
+        }
+      }
+      if (best_p < 0) break;
+      Sym& cur = syms[size_t(best_p)];
+      const int32_t r = cur.next;
+      cur.id = int32_t(mrg[best_p]);
+      cur.next = syms[size_t(r)].next;
+      if (cur.next >= 0) syms[size_t(cur.next)].prev = best_p;
+      if (cur.prev >= 0) {
+        const int32_t l = cur.prev;
+        if (!merges.get(uint32_t(syms[size_t(l)].id), uint32_t(cur.id), rnk[l], mrg[l])) rnk[l] = kNoMerge;
+      }
+      if (cur.next >= 0) {
+        if (!merges.get(uint32_t(cur.id), uint32_t(syms[size_t(cur.next)].id), rnk[best_p], mrg[best_p]))
+          rnk[best_p] = kNoMerge;
+      } else {
+        rnk[best_p] = kNoMerge;
+      }
+    }
+    if (ns > 0)
+      for (int32_t cur = 0; cur >= 0; cur = syms[size_t(cur)].next) out.push_back(syms[size_t(cur)].id);
+    return;
+  }
   uint32_t rank, merged;
   for (size_t i = 0; i + 1 < ns; ++i)
     if (merges.get(uint32_t(syms[i].id), uint32_t(syms[i + 1].id), rank, merged))
-      heap.push_back(Cand{rank, uint32_t(i), merged});
+      heap.push_back(Cand{rank, uint32_t(i), merged, syms[i].id, syms[i + 1].id});
   std::make_heap(heap.begin(), heap.end(), later);
   while (!heap.empty()) {
     std::pop_heap(heap.begin(), heap.end(), later);
@@ -787,19 +887,25 @@ void Tokenizer::Impl::bpe_spm(std::string_view word, std::vector<int32_t>& out) 
     Sym& cur = syms[top.pos];
     if (cur.len == 0 || cur.next < 0) continue;
     const Sym right = syms[size_t(cur.next)];
-    if (!merges.get(uint32_t(cur.id), uint32_t(right.id), rank, merged) || merged != top.merged) continue;
+    if (cur.id != top.left_id || right.id != top.right_id) continue;
     syms[size_t(cur.next)].len = 0;
     cur.id = int32_t(top.merged);
     cur.len += right.len;
     cur.next = right.next;
     if (right.next >= 0) syms[size_t(right.next)].prev = int32_t(top.pos);
-    if (cur.prev >= 0 && merges.get(uint32_t(syms[size_t(cur.prev)].id), uint32_t(cur.id), rank, merged)) {
-      heap.push_back(Cand{rank, uint32_t(cur.prev), merged});
-      std::push_heap(heap.begin(), heap.end(), later);
+    if (cur.prev >= 0) {
+      const int32_t lid = syms[size_t(cur.prev)].id;
+      if (merges.get(uint32_t(lid), uint32_t(cur.id), rank, merged)) {
+        heap.push_back(Cand{rank, uint32_t(cur.prev), merged, lid, cur.id});
+        std::push_heap(heap.begin(), heap.end(), later);
+      }
     }
-    if (cur.next >= 0 && merges.get(uint32_t(cur.id), uint32_t(syms[size_t(cur.next)].id), rank, merged)) {
-      heap.push_back(Cand{rank, top.pos, merged});
-      std::push_heap(heap.begin(), heap.end(), later);
+    if (cur.next >= 0) {
+      const int32_t rid = syms[size_t(cur.next)].id;
+      if (merges.get(uint32_t(cur.id), uint32_t(rid), rank, merged)) {
+        heap.push_back(Cand{rank, top.pos, merged, cur.id, rid});
+        std::push_heap(heap.begin(), heap.end(), later);
+      }
     }
   }
   for (size_t i = 0; i < ns; ++i)
@@ -833,6 +939,7 @@ void Tokenizer::encode_append(std::string_view text, std::vector<int32_t>& out, 
 
 std::string Tokenizer::decode(const int32_t* ids, size_t n, bool skip_special) const {
   std::string out;
+  out.reserve(n * 4);
   const Impl& t = *impl_;
   for (size_t i = 0; i < n; ++i) {
     const int32_t id = ids[i];

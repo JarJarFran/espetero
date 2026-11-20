@@ -578,6 +578,11 @@ Val do_replace(const Val& self, std::string_view old, std::string_view repl, int
 
 // Code point range [b, e) of the optional start/end arguments (slice rules).
 void sub_range(std::string_view s, const Val& start, const Val& end, size_t* bb, size_t* eb) {
+  if ((start.is_missing() || start.is_none()) && (end.is_missing() || end.is_none())) {
+    *bb = 0;
+    *eb = s.size();
+    return;
+  }
   const int64_t n = int64_t(uni::length(s));
   auto norm = [&](const Val& v, int64_t dflt) -> int64_t {
     if (v.is_missing() || v.is_none()) return dflt;
@@ -927,7 +932,8 @@ Val call_method_impl(Interp& in, const Val& self, int id, Args& a) {
           out += self.sv();
         }
         const size_t b = out.size();
-        out += (self.markup() && !x.markup()) ? html_escape(x.sv()) : std::string(x.sv());
+        if (self.markup() && !x.markup()) out += html_escape(x.sv());
+        else out.append(x.sv());
         add_spans(sp, x, b, out.size() - b);
       }
       return str_spans(std::move(out), std::move(sp), self.markup());
@@ -2090,9 +2096,13 @@ static Val call_filter_impl(Interp& in, int id, const std::string& name, const V
     case FI_selectattr: return make_iter(apply_select(in, value, a, true, id == FI_rejectattr), "select_or_reject");
     case FI_replace: {
       args("do_replace", {"old", "new", "count"}, {M, M, Val::none()});
-      const std::string old = to_str(v[0]), repl = to_str(v[1]);
+      std::string old_buf, repl_buf;
+      const std::string_view old = v[0].is_str() ? v[0].sv() : (old_buf = to_str(v[0]));
+      const std::string_view repl = v[1].is_str() ? v[1].sv() : (repl_buf = to_str(v[1]));
+      const int64_t cnt = v[2].is_none() ? -1 : need_int(v[2], nullptr);
+      if (value.is_str()) return do_replace(value, old, repl, cnt, false);
       const Val s = Val::str(to_str(value));
-      return do_replace(s, old, repl, v[2].is_none() ? -1 : need_int(v[2], nullptr), false);
+      return do_replace(s, old, repl, cnt, false);
     }
     case FI_reverse: {
       args("do_reverse", {}, {});

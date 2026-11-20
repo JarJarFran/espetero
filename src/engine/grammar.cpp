@@ -3,6 +3,8 @@
 
 #include "grammar.h"
 
+#include <Accelerate/Accelerate.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -834,8 +836,8 @@ Matcher::Matcher(std::shared_ptr<const Constraint> c)
 }
 
 bool Matcher::step_bytes(std::vector<int32_t>& tops, const std::string& bytes) {
-  std::vector<int32_t> next;
-  next.reserve(4);
+  thread_local std::vector<int32_t> next;
+  next.clear();
   for (unsigned char c : bytes) {
     next.clear();
     for (int32_t t : tops) a_.step(pool_, t, c, next);
@@ -923,7 +925,7 @@ bool Matcher::advance(int32_t t) {
   }
   st_ = std::move(s);
   cur_.reset();
-  compact();
+  if (pool_.size() > 512) compact();
   return true;
 }
 
@@ -1135,12 +1137,12 @@ int32_t masked_argmax(Matcher& m, const Readout& r, const SamplingParams& sp, co
 static int32_t masked_argmax_fast(Matcher& m, const Readout& r, const SamplingParams& sp, const PenaltyState* pen) {
   const bool penalized = sp.penalized() && pen && !pen->empty();
   const float* lg = r.logits;
-  std::vector<float> buf;
+  thread_local std::vector<float> buf;
   if (!penalized) {
     if (r.argmax >= 0 && m.allows(r.argmax)) return r.argmax;
-    const auto mk = m.mask();
+    // Check GPU top-32 candidates via quick allows() before walking the full vocab trie.
     for (int i = 0; i < r.n_cand; ++i)
-      if (mk->allows(r.cand[i])) return r.cand[i];
+      if (m.allows(r.cand[i])) return r.cand[i];
   } else if (lg) {
     buf.assign(lg, lg + r.vocab);
     pen->apply(buf.data(), sp);
@@ -1172,7 +1174,9 @@ Distribution subset_distribution(const std::vector<int32_t>& ids, const std::vec
     return d;
   }
   // As distribution(): x = logits / T, p = exp(x - max) / total; NaN as -inf, +inf as the largest float.
-  std::vector<float> x(n);
+  thread_local std::vector<float> x, ef;
+  thread_local std::vector<uint32_t> idx;
+  x.resize(n);
   const float inv_t = float(1.0 / sp.temperature);
   float m = -std::numeric_limits<float>::infinity();
   for (size_t i = 0; i < n; ++i) {
@@ -1180,36 +1184,76 @@ Distribution subset_distribution(const std::vector<int32_t>& ids, const std::vec
     if (std::isnan(v)) v = -std::numeric_limits<float>::infinity();
     else if (v == std::numeric_limits<float>::infinity()) v = std::numeric_limits<float>::max();
     x[i] = v;
-    m = std::max(m, v);
+    if (v > m) m = v;
   }
   if (!(m > -std::numeric_limits<float>::infinity())) {  // nothing finite: the first allowed token
     d.ids = {ids[0]};
     d.p = {1.0};
     return d;
   }
-  std::vector<double> e(n);
-  double total = 0;
-  for (size_t i = 0; i < n; ++i) total += e[i] = double(std::exp(x[i] - m));
   const int k = sp.top_k > 0 ? std::min(sp.top_k, vocab) : vocab;
+  const bool need_head = k < vocab || sp.top_p < 1.0 || sp.min_p > 0;
+  const bool need_full_exp = !need_head || (k == vocab && sp.top_p < 1.0 && sp.min_p <= 0);
+  double total = 1.0;
+  if (need_full_exp) {
+    ef.resize(n);
+    const float neg_m = -m;
+    vDSP_vsadd(x.data(), 1, &neg_m, ef.data(), 1, vDSP_Length(n));
+    int ni = int(n);
+    vvexpf(ef.data(), ef.data(), &ni);
+    total = 0;
+    for (size_t i = 0; i < n; ++i) total += double(ef[i]);
+  }
   std::vector<int32_t> out_ids;
   std::vector<double> p;
-  if (k < vocab || sp.top_p < 1.0 || sp.min_p > 0) {
-    std::vector<size_t> idx(n);
-    std::iota(idx.begin(), idx.end(), size_t(0));
-    auto by = [&](size_t a, size_t b) { return x[a] > x[b] || (x[a] == x[b] && ids[a] < ids[b]); };
+  if (need_head) {
+    auto by = [&](uint32_t a, uint32_t b) { return x[a] > x[b] || (x[a] == x[b] && ids[a] < ids[b]); };
     const size_t head = std::min<size_t>(size_t(std::min(k, 2048)), n);
-    std::nth_element(idx.begin(), idx.begin() + long(head) - 1, idx.end(), by);
-    std::sort(idx.begin(), idx.begin() + long(head), by);
-    double mass = 0;
-    for (size_t i = 0; i < head; ++i) mass += e[idx[i]] / total;
-    size_t keep = head;
-    if (k == vocab && sp.top_p < 1.0 && mass < sp.top_p && head < n) {  // a flat distribution: all of it
-      std::sort(idx.begin(), idx.end(), by);
-      keep = n;
+    idx.clear();
+    const bool use_minp_cut = sp.min_p > 0;
+    float cut = use_minp_cut ? (m + float(std::log(sp.min_p)) - 1e-4f) : -std::numeric_limits<float>::infinity();
+    const size_t cap = std::max<size_t>(head * 2, 256);
+    for (size_t i = 0; i < n; ++i) {
+      if (x[i] >= cut) {
+        idx.push_back(uint32_t(i));
+        if (!use_minp_cut && idx.size() >= cap) {
+          std::nth_element(idx.begin(), idx.begin() + long(head) - 1, idx.end(), by);
+          idx.resize(head);
+          cut = x[idx[head - 1]];
+        }
+      }
     }
-    for (size_t i = 0; i < keep; ++i) {
-      out_ids.push_back(ids[idx[i]]);
-      p.push_back(e[idx[i]] / total);
+    if (idx.empty()) {
+      idx.resize(head);
+      std::iota(idx.begin(), idx.end(), uint32_t(0));
+    } else if (idx.size() > head) {
+      std::nth_element(idx.begin(), idx.begin() + long(head) - 1, idx.end(), by);
+      idx.resize(head);
+    }
+    std::sort(idx.begin(), idx.end(), by);
+    double mass = 0;
+    size_t keep = idx.size();
+    if (need_full_exp) {
+      for (size_t i = 0; i < keep; ++i) mass += double(ef[idx[i]]) / total;
+      if (k == vocab && sp.top_p < 1.0 && mass < sp.top_p && keep < n) {  // a flat distribution: all of it
+        idx.resize(n);
+        std::iota(idx.begin(), idx.end(), uint32_t(0));
+        std::sort(idx.begin(), idx.end(), by);
+        keep = n;
+      }
+    }
+    out_ids.reserve(keep);
+    p.reserve(keep);
+    if (need_full_exp) {
+      for (size_t i = 0; i < keep; ++i) {
+        out_ids.push_back(ids[idx[i]]);
+        p.push_back(double(ef[idx[i]]) / total);
+      }
+    } else {
+      for (size_t i = 0; i < keep; ++i) {
+        out_ids.push_back(ids[idx[i]]);
+        p.push_back(double(std::exp(x[idx[i]] - m)));
+      }
     }
     if (sp.min_p > 0) {
       const double floor = sp.min_p * p[0];
@@ -1223,21 +1267,21 @@ Distribution subset_distribution(const std::vector<int32_t>& ids, const std::vec
       for (double v : p) sum += v;
       const double target = sp.top_p * sum;
       double acc = 0;
-      size_t cut = p.size();
+      size_t cut_i = p.size();
       for (size_t i = 0; i < p.size(); ++i) {
         acc += p[i];
         if (acc >= target) {
-          cut = i + 1;
+          cut_i = i + 1;
           break;
         }
       }
-      out_ids.resize(cut);
-      p.resize(cut);
+      out_ids.resize(cut_i);
+      p.resize(cut_i);
     }
   } else {
     out_ids = ids;
     p.resize(n);
-    for (size_t i = 0; i < n; ++i) p[i] = e[i] / total;
+    for (size_t i = 0; i < n; ++i) p[i] = double(ef[i]) / total;
   }
   double s = 0;
   for (size_t i = 0; i < p.size(); ++i) {
@@ -1266,31 +1310,41 @@ Distribution masked_distribution(Matcher& m, const Readout& r, const SamplingPar
     return d;
   }
   const bool penalized = sp.penalized() && pen && !pen->empty();
-  const auto mk = m.mask();
-  // The GPU candidates hold the masked head when, among them, at least
-  // top_k (or every allowed token) are allowed: they are the true top-n.
+  // Fast path: check GPU top-k candidates with quick allows() BEFORE building
+  // the full 248K vocabulary mask. If at least top_k candidates are allowed,
+  // they are the exact masked top-k head without walking the trie.
   if (!penalized && sp.top_k >= 1 && r.n_cand >= sp.top_k && r.cand) {
-    std::vector<int32_t> ids;
-    std::vector<float> x;
+    thread_local std::vector<int32_t> cids;
+    thread_local std::vector<float> cx;
+    cids.clear();
+    cx.clear();
     const float s = r.scaled ? 1.0f : float(1.0 / sp.temperature);
-    for (int i = 0; i < r.n_cand; ++i)
-      if (mk->allows(r.cand[i])) {
-        ids.push_back(r.cand[i]);
-        x.push_back(r.cand_x[i] * s);
+    for (int i = 0; i < r.n_cand; ++i) {
+      if (m.allows(r.cand[i])) {
+        cids.push_back(r.cand[i]);
+        cx.push_back(r.cand_x[i] * s);
+        if (int(cids.size()) >= sp.top_k)
+          return distribution_topk(cids.data(), cx.data(), int(cids.size()), cx[0], 1.0f, sp);
       }
-    if (!ids.empty() && int(ids.size()) >= std::min(sp.top_k, mk->count))
-      return distribution_topk(ids.data(), x.data(), int(ids.size()), x[0], 1.0f, sp);
+    }
+    if (!cids.empty()) {
+      const auto mk = m.mask();
+      if (int(cids.size()) >= mk->count)
+        return distribution_topk(cids.data(), cx.data(), int(cids.size()), cx[0], 1.0f, sp);
+    }
   }
+  const auto mk = m.mask();
   if (!r.logits) return Distribution{};
   const float* lg = r.logits;
-  std::vector<float> buf;
+  thread_local std::vector<float> buf, x;
+  thread_local std::vector<int32_t> ids;
   if (penalized) {
     buf.assign(lg, lg + r.vocab);
     pen->apply(buf.data(), sp);
     lg = buf.data();
   }
-  std::vector<int32_t> ids;
-  std::vector<float> x;
+  ids.clear();
+  x.clear();
   ids.reserve(size_t(mk->count));
   x.reserve(size_t(mk->count));
   mk->for_each([&](int32_t t) {

@@ -191,17 +191,30 @@ class ReplyText {
     std::vector<size_t> tool_at;  // offsets in `content` where the model generated the opening
     const std::vector<size_t>* calls_at() const { return anchored ? &tool_at : nullptr; }
   };
+  // Zero-copy view backed by ReplyText's incremental buffers (valid until the next add/view call).
+  struct StreamView {
+    std::string_view reasoning, content;
+    size_t held = 0;
+    const std::vector<size_t>* calls_at = nullptr;
+  };
   // `final_view`: all of it (else an incomplete UTF-8 tail waits).
   View view(bool final_view) const;
+  StreamView stream_view(bool final_view) const;
   // Where the calls start in `content` (the view's content, maybe cut by a
   // stop string), npos if nowhere.
   size_t calls_start(const View& v, const std::string& content) const;
+  size_t calls_start(const StreamView& v, std::string_view content, size_t from = 0) const;
   // The tool calls in `content` (parse_tool_calls or parse_gemma_tool_calls);
   // returns the text before them.
   std::string parse_calls(const View& v, const std::string& content, const json::Value& tools, json::Value& calls) const;
+  std::string parse_calls(const StreamView& v, const std::string& content, const json::Value& tools,
+                          json::Value& calls) const;
 
  private:
+  enum class Phase { Init, Reasoning, Content };
   void note(int32_t id, size_t at);
+  void reset_cache() const;
+  void advance(bool final_view) const;
   const Tokenizer& tok_;
   const ChatMarkers& mk_;
   std::string tool_open_;
@@ -209,6 +222,19 @@ class ReplyText {
   MarkerToken close_mark_, tool_mark_;
   std::string raw_;
   std::vector<size_t> close_raw_, tool_raw_;  // offsets in raw_ where the markers' tokens were generated
+  // Incremental sanitized UTF-8 + reasoning/content split cache (O(1) amortized per token).
+  mutable bool finalized_ = false;
+  mutable size_t raw_scanned_ = 0;
+  mutable std::string clean_;
+  mutable bool clean_same_ = true;
+  mutable size_t close_mapped_ = 0, tool_mapped_ = 0;
+  mutable std::vector<size_t> close_clean_, tool_clean_;
+  mutable Phase phase_ = Phase::Content;
+  mutable size_t shift_ = 0, r_start_ = 0, r_end_ = 0, c_start_ = 0;
+  mutable bool r_skip_nl_ = false, c_skip_nl_ = false;
+  mutable size_t close_scan_ = 0, close_idx_ = 0, tag_held_ = 0;
+  mutable size_t tool_idx_ = 0;
+  mutable std::vector<size_t> tool_at_;
 };
 
 // The special tokens a chat template sees, as transformers passes its

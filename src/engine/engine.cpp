@@ -3,6 +3,7 @@
 
 #include "engine.h"
 
+#include <Accelerate/Accelerate.h>
 #include <dirent.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -19,7 +20,9 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <unordered_set>
 
 #include "../tmpl/tmpl.h"
 #include "../tok/tokenizer.h"
@@ -67,6 +70,21 @@ std::string hex(const uint8_t* d, size_t n) {
 
 std::string tokens_key(const std::vector<int32_t>& t, size_t n) {
   return std::string(reinterpret_cast<const char*>(t.data()), n * sizeof(int32_t));
+}
+
+// Compact 24-byte key (128-bit splitmix/FNV hash + token count) so prefix cache
+// keys stay O(1) memory instead of copying 128-512 KB of raw token bytes.
+std::string tokens_hash(const std::vector<int32_t>& t, size_t n) {
+  uint64_t h1 = 1469598103934665603ull ^ uint64_t(n);
+  uint64_t h2 = 0x9e3779b97f4a7c15ull ^ (uint64_t(n) * 0xbf58476d1ce4e5b9ull);
+  for (size_t i = 0; i < n; ++i) {
+    const uint64_t v = uint32_t(t[i]);
+    h1 = (h1 ^ v) * 1099511628211ull;
+    h2 = (h2 + v + 0x9e3779b97f4a7c15ull) * 0x94d049bb133111ebull;
+    h2 ^= h2 >> 31;
+  }
+  uint64_t out[3] = {h1, h2, uint64_t(n)};
+  return std::string(reinterpret_cast<const char*>(out), sizeof(out));
 }
 
 template <class F>
@@ -834,6 +852,12 @@ int Engine::image_tokens(const std::string& data_url, int64_t max_pixels, int64_
   if (!has_vision()) throw RequestError(422, "This model has no vision tower; images are not supported");
   std::string bytes, err;
   if (!vision::decode_data_url(data_url, bytes, err)) throw RequestError(422, "image: " + err);
+  return image_tokens_bytes(bytes, max_pixels, min_pixels);
+}
+
+int Engine::image_tokens_bytes(std::string_view bytes, int64_t max_pixels, int64_t min_pixels) const {
+  if (!has_vision()) throw RequestError(422, "This model has no vision tower; images are not supported");
+  std::string err;
   int64_t w = 0, h = 0;
   if (!vision::probe_image(bytes, w, h, err)) return -1;
   if (w > vision::max_image_pixels() / h)
@@ -892,6 +916,13 @@ PreparedImage Engine::prepare_image_capped(const std::string& data_url, int64_t 
   if (!has_vision()) throw RequestError(422, "This model has no vision tower; images are not supported");
   std::string bytes, err;
   if (!vision::decode_data_url(data_url, bytes, err)) throw RequestError(422, "image: " + err);
+  return prepare_image_bytes(bytes, max_pixels, min_pixels, max_pixels_lfm2);
+}
+
+PreparedImage Engine::prepare_image_bytes(std::string_view bytes, int64_t max_pixels, int64_t min_pixels,
+                                          int64_t max_pixels_lfm2) const {
+  if (!has_vision()) throw RequestError(422, "This model has no vision tower; images are not supported");
+  std::string err;
   DecodeGate gate;
   vision::RGBImage rgb;
   if (!vision::decode_image(bytes, rgb, err)) throw RequestError(422, "image: " + err);
@@ -914,22 +945,30 @@ PreparedImage Engine::prepare_image_capped(const std::string& data_url, int64_t 
   if (lfm2_spec_) return prepare_lfm2_image(rgb, max_pixels_lfm2);
   if (minicpm_spec_) return prepare_minicpm_image(rgb);
   vision::Spec spec = image_spec(max_pixels, min_pixels);
-  // Normalization from the processor config when the checkpoint has one
-  // (Gemma 4 rescales only).
+  // Normalization from the processor config (cached once per Engine; Gemma 4 rescales only).
   if (is_dir(opt_.model_path) && !gemma_vision()) {
-    for (const char* name : {"/preprocessor_config.json", "/processor_config.json"}) {
-      const std::string txt = read_text(opt_.model_path + name);
-      if (txt.empty()) continue;
-      try {
-        json::Value pc = json::parse(txt);
-        if (const json::Value* ip = pc.get("image_processor"); ip && ip->is_object()) pc = *ip;
-        if (const json::Value* m = pc.get("image_mean"); m && m->is_array() && m->size() == 3)
-          for (int i = 0; i < 3; ++i) spec.mean[i] = float((*m)[size_t(i)].as_double());
-        if (const json::Value* s = pc.get("image_std"); s && s->is_array() && s->size() == 3)
-          for (int i = 0; i < 3; ++i) spec.std[i] = float((*s)[size_t(i)].as_double());
-        break;
-      } catch (...) {
+    std::call_once(img_norm_once_, [&]() {
+      for (const char* name : {"/preprocessor_config.json", "/processor_config.json"}) {
+        const std::string txt = read_text(opt_.model_path + name);
+        if (txt.empty()) continue;
+        try {
+          json::Value pc = json::parse(txt);
+          if (const json::Value* ip = pc.get("image_processor"); ip && ip->is_object()) pc = *ip;
+          if (const json::Value* m = pc.get("image_mean"); m && m->is_array() && m->size() == 3) {
+            for (int i = 0; i < 3; ++i) img_mean_[i] = float((*m)[size_t(i)].as_double());
+            img_norm_loaded_ = true;
+          }
+          if (const json::Value* s = pc.get("image_std"); s && s->is_array() && s->size() == 3) {
+            for (int i = 0; i < 3; ++i) img_std_[i] = float((*s)[size_t(i)].as_double());
+            img_norm_loaded_ = true;
+          }
+          break;
+        } catch (...) {
+        }
       }
+    });
+    if (img_norm_loaded_) {
+      for (int i = 0; i < 3; ++i) spec.mean[i] = img_mean_[i], spec.std[i] = img_std_[i];
     }
   }
   vision::Prepared p;
@@ -1089,7 +1128,7 @@ std::string Engine::decision_key(const std::string& salt, const std::vector<int3
   k.push_back('\0');
   k += digest;
   k.push_back('\0');
-  k += tokens_key(prefix, prefix.size());
+  k += tokens_hash(prefix, prefix.size());
   return k;
 }
 
@@ -1106,7 +1145,7 @@ std::string Engine::chat_key(const std::vector<std::string>& digests, const std:
   key.push_back(mtp ? 'M' : 'P');
   for (const auto& d : digests) key += d;
   key.push_back('\0');
-  key += tokens_key(tokens, tokens.size());
+  key += tokens_hash(tokens, tokens.size());
   return key;
 }
 
@@ -1281,14 +1320,11 @@ int Engine::evict_lru(const std::vector<int>& avoid, bool live_ok) {
   // Leaves go before the checkpoints others extend. A shared prefix (a
   // flow's long system prompt and instructions) costs its whole length to
   // compute again; an image checkpoint ~1K rows.
-  std::vector<const std::string*> parents;
+  std::unordered_set<std::string_view> parents;
+  parents.reserve(cache_.size());
   for (const auto& [k, e] : cache_)
-    if (!e.parent.empty() && cache_.count(e.parent)) parents.push_back(&e.parent);
-  auto is_parent = [&](const std::string& k) {
-    for (const std::string* p : parents)
-      if (*p == k) return true;
-    return false;
-  };
+    if (!e.parent.empty() && cache_.count(e.parent)) parents.insert(e.parent);
+  auto is_parent = [&](const std::string& k) { return parents.count(k) != 0; };
   auto victim = cache_.end();
   // 0: free leaves, 1: free checkpoints others extend, 2: those of running requests.
   int pass = 0;
@@ -2111,7 +2147,7 @@ static int64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-static std::string hex_digest(const std::string& bytes) {
+static std::string hex_digest(std::string_view bytes) {
   uint64_t h1 = 1469598103934665603ull, h2 = 0x9e3779b97f4a7c15ull;
   for (unsigned char c : bytes) {
     h1 = (h1 ^ c) * 1099511628211ull;
@@ -2278,7 +2314,9 @@ void Engine::prefix_store_put(const CacheEntry& e) {
       break;
     }
   const auto t0 = Clock::now();
-  const std::string base = prefix_root_ + "/" + hex_digest(tokens_key(e.tokens, e.tokens.size()));
+  const std::string base =
+      prefix_root_ + "/" +
+      hex_digest(std::string_view(reinterpret_cast<const char*>(e.tokens.data()), e.tokens.size() * sizeof(int32_t)));
   // Streamed from the slot's buffers to the file (no copy in memory); the
   // token list is written last, so an interrupted save leaves no entry. Both
   // files are created 0600 first (the writers keep an existing file's mode).
@@ -2509,7 +2547,8 @@ Distribution Engine::readout_dist(int tree, int readout, const SamplingParams& s
   const int V = model_->info().vocab;
   const float* lg = model_->logits(tree, readout);
   if (sp.penalized() && pen && !pen->empty()) {
-    std::vector<float> buf(lg, lg + V);
+    thread_local std::vector<float> buf;
+    buf.assign(lg, lg + V);
     pen->apply(buf.data(), sp);
     return distribution(buf.data(), V, sp);
   }
@@ -4467,13 +4506,19 @@ void Engine::step() {
       // forced token, then produce the forced tokens themselves.
       auto record = [&](int readout, int32_t target) {
         const float* lg = model_->logits(s->tree, readout);
-        int am = 0;
-        float mx = lg[0];
-        for (int v = 1; v < V; ++v)
-          if (lg[v] > mx) mx = lg[v], am = v;
-        double sum = 0;
-        for (int v = 0; v < V; ++v) sum += std::exp(double(lg[v]) - double(mx));
-        const double lse = double(mx) + std::log(sum);
+        float mx = 0;
+        vDSP_Length am_u = 0;
+        vDSP_maxvi(lg, 1, &mx, &am_u, vDSP_Length(V));
+        const int am = int(am_u);
+        thread_local std::vector<float> ef;
+        ef.resize(size_t(V));
+        const float neg_mx = -mx;
+        vDSP_vsadd(lg, 1, &neg_mx, ef.data(), 1, vDSP_Length(V));
+        int nv = V;
+        vvexpf(ef.data(), ef.data(), &nv);
+        float sumf = 0;
+        vDSP_sve(ef.data(), 1, &sumf, vDSP_Length(V));
+        const double lse = double(mx) + std::log(double(sumf));
         Seq::ScoreRec r;
         r.target = target;
         r.argmax = am;
@@ -4481,11 +4526,29 @@ void Engine::step() {
         if (s->scored.size() < s->req.score_ids.size())
           for (int32_t id : s->req.score_ids[s->scored.size()]) r.ids_lp.push_back(float(double(lg[id]) - lse));
         if (s->req.score_topk > 0) {
-          std::vector<int32_t> idx(static_cast<size_t>(V));
-          for (int v = 0; v < V; ++v) idx[size_t(v)] = v;
           const int kk = std::min(s->req.score_topk, V);
-          std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int32_t a, int32_t b) { return lg[a] > lg[b]; });
-          for (int j = 0; j < kk; ++j) r.top.push_back({idx[size_t(j)], float(double(lg[idx[size_t(j)]]) - lse)});
+          thread_local std::vector<int32_t> idx;
+          idx.clear();
+          auto by = [&](int32_t a, int32_t b) { return lg[a] > lg[b]; };
+          float cut = -std::numeric_limits<float>::infinity();
+          const size_t cap = std::max<size_t>(size_t(kk) * 2, 128);
+          for (int32_t v = 0; v < V; ++v) {
+            if (lg[v] >= cut) {
+              idx.push_back(v);
+              if (idx.size() >= cap) {
+                std::nth_element(idx.begin(), idx.begin() + kk - 1, idx.end(), by);
+                idx.resize(size_t(kk));
+                cut = lg[idx[size_t(kk - 1)]];
+              }
+            }
+          }
+          if (int(idx.size()) > kk) {
+            std::nth_element(idx.begin(), idx.begin() + kk - 1, idx.end(), by);
+            idx.resize(size_t(kk));
+          }
+          std::sort(idx.begin(), idx.end(), by);
+          r.top.reserve(idx.size());
+          for (int32_t id : idx) r.top.push_back({id, float(double(lg[id]) - lse)});
         }
         s->scored.push_back(std::move(r));
       };

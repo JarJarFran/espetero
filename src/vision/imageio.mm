@@ -256,6 +256,37 @@ bool convert(CGImageRef img, const Layout& L, const ImageIORules& rules, RGBImag
     rgbx8_to_rgb(base, L.bytes_per_row, w, h, dst);
     return true;
   }
+  if (model == kCGColorSpaceModelRGB && L.bits_per_component == 8 && !L.premultiplied &&
+      !L.swap_pixel32 && ncomp == 3 && c0 == 0) {
+    const size_t row_bytes = size_t(w) * 3;
+    if (L.bytes_per_row == row_bytes) {
+      std::memcpy(dst, base, row_bytes * size_t(h));
+    } else {
+      for (int y = 0; y < h; ++y) std::memcpy(dst + size_t(y) * row_bytes, base + size_t(y) * L.bytes_per_row, row_bytes);
+    }
+    return true;
+  }
+  if (model == kCGColorSpaceModelMonochrome && L.bits_per_component == 8 && !L.premultiplied && ncomp == 1) {
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* s = base + size_t(y) * L.bytes_per_row;
+      uint8_t* d = dst + size_t(y) * size_t(w) * 3;
+      int x = 0;
+#if defined(__ARM_NEON)
+      for (; x + 16 <= w; x += 16) {
+        const uint8x16_t v = vld1q_u8(s + x);
+        const uint8x16x3_t rgb = {{v, v, v}};
+        vst3q_u8(d + size_t(x) * 3, rgb);
+      }
+#endif
+      for (; x < w; ++x) {
+        const uint8_t v = s[x];
+        d[3 * x] = v;
+        d[3 * x + 1] = v;
+        d[3 * x + 2] = v;
+      }
+    }
+    return true;
+  }
 
   // Indexed: colour table lookup (the base space of PNG/GIF palettes is RGB).
   std::vector<uint8_t> table;

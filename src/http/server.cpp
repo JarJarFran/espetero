@@ -755,7 +755,6 @@ const Route* ServerState::find(std::string_view method, std::string_view path, s
   const Route* best = nullptr;
   const Route* get_for_head = nullptr;
   bool path_known = false;
-  std::vector<std::string_view> methods;
   auto better = [](const Route& a, const Route* b) {
     if (!b) return true;
     if (a.prefix != b->prefix) return !a.prefix;  // exact beats prefix
@@ -771,12 +770,19 @@ const Route* ServerState::find(std::string_view method, std::string_view path, s
       } else if (method == "HEAD" && r.method == "GET") {
         if (better(r, get_for_head)) get_for_head = &r;
       }
-      if (std::find(methods.begin(), methods.end(), r.method) == methods.end()) methods.push_back(r.method);
     }
   }
   if (best) return best;
   if (get_for_head) return get_for_head;
   if (allow && path_known) {
+    std::vector<std::string_view> methods;
+    for (const std::vector<Route>* table : {&routes, with_late ? &late : nullptr}) {
+      if (!table) continue;
+      for (const Route& r : *table) {
+        if (r.prefix ? !path.starts_with(r.path) : path != r.path) continue;
+        if (std::find(methods.begin(), methods.end(), r.method) == methods.end()) methods.push_back(r.method);
+      }
+    }
     if (std::find(methods.begin(), methods.end(), "GET") != methods.end() &&
         std::find(methods.begin(), methods.end(), "HEAD") == methods.end())
       methods.push_back("HEAD");
@@ -1021,9 +1027,18 @@ bool Response::write(std::string_view data) {
     return false;
   }
   if (data.empty()) return true;  // an empty chunk would end the stream
+  static constexpr char kHex[] = "0123456789abcdef";
   char size_line[24];
-  const int len = std::snprintf(size_line, sizeof size_line, "%zx\r\n", data.size());
-  iovec iov[3] = {{size_line, size_t(len)},
+  char* p = size_line + 18;
+  size_t sz = data.size();
+  do {
+    *--p = kHex[sz & 0xf];
+    sz >>= 4;
+  } while (sz);
+  size_line[18] = '\r';
+  size_line[19] = '\n';
+  const size_t len = size_t((size_line + 20) - p);
+  iovec iov[3] = {{p, len},
                   {const_cast<char*>(data.data()), data.size()},
                   {const_cast<char*>("\r\n"), 2}};
   if ((c_.http10 ? c_.send_all(&iov[1], 1) : c_.send_all(iov, 3)) != detail::Io::Ok) {

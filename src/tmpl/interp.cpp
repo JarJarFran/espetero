@@ -140,9 +140,10 @@ std::string Interp::run(Spans* spans) {
   root->tracked = true;
   gc_.push_back(root);  // owned by gc_
   std::string out;
+  out.reserve(512);
   Spans sp;
   out_ = &out;
-  spans_ = &sp;
+  spans_ = spans ? &sp : nullptr;
   if (t_.self_slot >= 0) root->slots[size_t(t_.self_slot)] = Val::builtin(BuiltinId::TemplateReference);
   run_init(t_.root_init, root);
   exec(t_.body, root);
@@ -155,7 +156,7 @@ std::string Interp::run(Spans* spans) {
 void Interp::put(const Val& v) {
   const size_t b = out_->size();
   append_str(*out_, v);
-  add_spans(*spans_, v, b, out_->size() - b);
+  if (spans_) add_spans(*spans_, v, b, out_->size() - b);
 }
 
 void Interp::run_init(const FrameInit& init, Activation* act) {
@@ -454,15 +455,15 @@ void Interp::emit_add(const BinExpr* e, Activation* act) {
   std::string& out = *out_;
   const size_t start = out.size();
   out += first.sv();
-  add_spans(*spans_, first, start, first.sv().size());
+  if (spans_) add_spans(*spans_, first, start, first.sv().size());
   for (int i = 1; i < n; ++i) {
     Val r = eval(chain[i], act);
     if (r.is_str() && !r.markup()) {
-      add_spans(*spans_, r, out.size(), r.sv().size());
+      if (spans_) add_spans(*spans_, r, out.size(), r.sv().size());
       out += r.sv();
       continue;
     }
-    Val acc = str_spans(out.substr(start), take_spans(*spans_, start));
+    Val acc = spans_ ? str_spans(out.substr(start), take_spans(*spans_, start)) : Val::str(out.substr(start));
     out.resize(start);
     acc = py_add(acc, r);
     put(add_rest(std::move(acc), chain, i + 1, n, act));

@@ -380,7 +380,8 @@ class Sink : public ActivationSink {
       if (ps.empty()) return;
       float* g = gu.diag.data() + e * D;
       float* d = dn.diag.data() + e * Ie;
-      std::vector<float> rows_dn(ps.size() * size_t(Ie)), rows_gu(gu.X.empty() ? 0 : ps.size() * size_t(D));
+      std::vector<float> rows_dn(dn.X.empty() ? 0 : ps.size() * size_t(Ie)),
+          rows_gu(gu.X.empty() ? 0 : ps.size() * size_t(D));
       double ws = 0;
       for (size_t i = 0; i < ps.size(); ++i) {
         const int p = ps[i];
@@ -390,7 +391,7 @@ class Sink : public ActivationSink {
           for (int c = 0; c < D; ++c) g[c] += x[c] * x[c];
           if (!rows_gu.empty()) std::memcpy(&rows_gu[i * D], x, sizeof(float) * D);
           for (int c = 0; c < Ie; ++c) d[c] += a[c] * a[c];
-          std::memcpy(&rows_dn[i * Ie], a, sizeof(float) * Ie);
+          if (!rows_dn.empty()) std::memcpy(&rows_dn[i * Ie], a, sizeof(float) * Ie);
           continue;
         }
         // Weighted: w x x^T (the rows scaled by sqrt(w) for the syrk)
@@ -400,7 +401,8 @@ class Sink : public ActivationSink {
         if (!rows_gu.empty())
           for (int c = 0; c < D; ++c) rows_gu[i * D + c] = s * x[c];
         for (int c = 0; c < Ie; ++c) d[c] += wt * a[c] * a[c];
-        for (int c = 0; c < Ie; ++c) rows_dn[i * Ie + c] = s * a[c];
+        if (!rows_dn.empty())
+          for (int c = 0; c < Ie; ++c) rows_dn[i * Ie + c] = s * a[c];
       }
       gu.cnt[e] += float(ps.size());
       dn.cnt[e] += float(ps.size());

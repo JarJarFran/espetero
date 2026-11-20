@@ -33,78 +33,6 @@ std::string call_id() {
   return s;
 }
 
-// (reasoning, content, closed) of generated text; `opened`: the prompt
-// already opened the reasoning block. `close_at` (sorted): the offsets in
-// `raw` where the model generated the closing marker's token (MarkerTokens);
-// null: anywhere the marker's text appears.
-struct Split {
-  std::string reasoning, content;
-  bool closed = true;
-  size_t held = 0;        // trailing bytes held back as a partial tag (their tokens' logprobs wait too)
-  size_t content_at = 0;  // where `content` starts in `raw`
-};
-Split split_reasoning(const std::string& raw, bool opened, const ChatMarkers& mk,
-                      const std::vector<size_t>* close_at = nullptr) {
-  const std::string& open = mk.think_open;
-  const std::string& close = mk.think_close;
-  Split out;
-  size_t shift = 0;
-  if (!opened) {
-    if (raw.compare(0, open.size(), open) != 0) {
-      // A partial "<think>" at the very start is held back.
-      if (!raw.empty() && open.compare(0, raw.size(), raw) == 0) {
-        out.closed = false;
-        out.held = raw.size();
-        return out;
-      }
-      out.content = raw;
-      return out;
-    }
-    shift = open.size();
-  }
-  std::string text = raw.substr(shift);
-  size_t end = std::string::npos;
-  if (!close_at) {
-    end = text.find(close);
-  } else {
-    for (size_t p : *close_at)
-      if (p >= shift && raw.compare(p, close.size(), close) == 0) {
-        end = p - shift;
-        break;
-      }
-  }
-  auto lead_nl = [](const std::string& s, size_t from) {
-    size_t n = 0;
-    while (from + n < s.size() && s[from + n] == '\n') ++n;
-    return n;
-  };
-  auto strip_nl = [](std::string s, bool left, bool right) {
-    if (left)
-      while (!s.empty() && s.front() == '\n') s.erase(s.begin());
-    if (right)
-      while (!s.empty() && s.back() == '\n') s.pop_back();
-    return s;
-  };
-  if (end == std::string::npos) {
-    // Hold back a partial closing tag.
-    for (size_t k = close.size() - 1; k > 0; --k)
-      if (text.size() >= k && text.compare(text.size() - k, k, close, 0, k) == 0) {
-        text.resize(text.size() - k);
-        out.held = k;
-        break;
-      }
-    out.reasoning = strip_nl(text, true, false);
-    out.closed = false;
-    out.content_at = raw.size();
-    return out;
-  }
-  out.reasoning = strip_nl(text.substr(0, end), true, true);
-  const size_t c0 = end + close.size();
-  out.content_at = shift + c0 + lead_nl(text, c0);
-  out.content = text.substr(c0 + lead_nl(text, c0));
-  return out;
-}
-
 }  // namespace
 
 // The first added token of the marker's own tokenization is its anchor.
@@ -132,7 +60,32 @@ ReplyText::ReplyText(const Tokenizer& tok, const ChatMarkers& mk, std::string to
       reasoning_open_(reasoning_open),
       split_(split),
       close_mark_(marker_token(tok, mk.think_close)),
-      tool_mark_(marker_token(tok, tool_open_)) {}
+      tool_mark_(marker_token(tok, tool_open_)) {
+  reset_cache();
+}
+
+void ReplyText::reset_cache() const {
+  finalized_ = false;
+  raw_scanned_ = 0;
+  clean_.clear();
+  clean_same_ = true;
+  close_mapped_ = 0;
+  tool_mapped_ = 0;
+  close_clean_.clear();
+  tool_clean_.clear();
+  phase_ = !split_ ? Phase::Content : (reasoning_open_ ? Phase::Reasoning : Phase::Init);
+  shift_ = 0;
+  r_start_ = 0;
+  r_end_ = 0;
+  c_start_ = 0;
+  r_skip_nl_ = split_ && reasoning_open_;
+  c_skip_nl_ = false;
+  close_scan_ = 0;
+  close_idx_ = 0;
+  tag_held_ = 0;
+  tool_idx_ = 0;
+  tool_at_.clear();
+}
 
 void ReplyText::note(int32_t id, size_t at) {
   if (id == close_mark_.anchor && at >= close_mark_.anchor_off) close_raw_.push_back(at - close_mark_.anchor_off);
@@ -140,11 +93,13 @@ void ReplyText::note(int32_t id, size_t at) {
 }
 
 void ReplyText::add(int32_t id) {
+  if (finalized_) reset_cache();
   note(id, raw_.size());
   raw_ += tok_.piece(id);
 }
 
 void ReplyText::add_text(const std::string& t) {
+  if (finalized_) reset_cache();
   size_t at = raw_.size();
   for (int32_t id : tok_.encode(t)) {
     note(id, at);
@@ -153,34 +108,166 @@ void ReplyText::add_text(const std::string& t) {
   raw_ += t;
 }
 
-ReplyText::View ReplyText::view(bool final_view) const {
-  View v;
-  const std::string_view shown = std::string_view(raw_).substr(0, final_view ? raw_.size() : json::utf8_complete_prefix(raw_));
-  const std::string text = sanitize_utf8(shown);
-  v.held = raw_.size() - shown.size();
-  // Offsets of raw_ in `text` (they differ only after invalid UTF-8).
-  const bool same = text.size() == shown.size();
-  auto map = [&](const std::vector<size_t>& from) {
-    std::vector<size_t> to;
-    for (size_t p : from)
-      if (p < shown.size()) to.push_back(same ? p : sanitize_utf8(shown.substr(0, p)).size());
-    return to;
-  };
-  size_t content_at = 0;
-  if (split_) {
-    const std::vector<size_t> close_at = map(close_raw_);
-    Split sp = split_reasoning(text, reasoning_open_, mk_, close_mark_.anchor >= 0 ? &close_at : nullptr);
-    v.reasoning = std::move(sp.reasoning);
-    v.content = std::move(sp.content);
-    content_at = sp.content_at;
-    v.held += sp.held;
-  } else {
-    v.content = text;
+void ReplyText::advance(bool final_view) const {
+  const size_t limit = final_view ? raw_.size() : json::utf8_complete_prefix(raw_);
+  if (final_view && limit > raw_scanned_) finalized_ = true;
+  if (limit > raw_scanned_) {
+    const std::string_view delta(raw_.data() + raw_scanned_, limit - raw_scanned_);
+    const size_t clean_before = clean_.size();
+    if (json::utf8_valid(delta)) {
+      clean_.append(delta);
+      const ptrdiff_t diff = ptrdiff_t(clean_before) - ptrdiff_t(raw_scanned_);
+      while (close_mapped_ < close_raw_.size() && close_raw_[close_mapped_] < limit)
+        close_clean_.push_back(size_t(ptrdiff_t(close_raw_[close_mapped_++]) + diff));
+      while (tool_mapped_ < tool_raw_.size() && tool_raw_[tool_mapped_] < limit)
+        tool_clean_.push_back(size_t(ptrdiff_t(tool_raw_[tool_mapped_++]) + diff));
+    } else {
+      size_t i = 0;
+      while (i < delta.size()) {
+        const size_t rpos = raw_scanned_ + i;
+        const size_t cpos = clean_.size();
+        while (close_mapped_ < close_raw_.size() && close_raw_[close_mapped_] <= rpos) {
+          close_clean_.push_back(cpos);
+          ++close_mapped_;
+        }
+        while (tool_mapped_ < tool_raw_.size() && tool_raw_[tool_mapped_] <= rpos) {
+          tool_clean_.push_back(cpos);
+          ++tool_mapped_;
+        }
+        json::utf8_append(clean_, json::utf8_next(delta, i));
+      }
+      while (close_mapped_ < close_raw_.size() && close_raw_[close_mapped_] < limit) {
+        close_clean_.push_back(clean_.size());
+        ++close_mapped_;
+      }
+      while (tool_mapped_ < tool_raw_.size() && tool_raw_[tool_mapped_] < limit) {
+        tool_clean_.push_back(clean_.size());
+        ++tool_mapped_;
+      }
+    }
+    raw_scanned_ = limit;
+    clean_same_ = (clean_.size() == raw_scanned_);
   }
-  if (tool_mark_.anchor >= 0) {
+
+  if (phase_ == Phase::Init) {
+    const std::string& open = mk_.think_open;
+    if (clean_.size() < open.size()) {
+      if (!clean_.empty() && open.compare(0, clean_.size(), clean_) == 0) {
+        tag_held_ = clean_.size();
+        return;
+      }
+      if (!clean_.empty()) {
+        phase_ = Phase::Content;
+        c_start_ = 0;
+        c_skip_nl_ = false;
+        tag_held_ = 0;
+      }
+    } else if (clean_.compare(0, open.size(), open) == 0) {
+      phase_ = Phase::Reasoning;
+      shift_ = open.size();
+      r_start_ = shift_;
+      r_end_ = shift_;
+      r_skip_nl_ = true;
+      close_scan_ = shift_;
+      tag_held_ = 0;
+    } else {
+      phase_ = Phase::Content;
+      c_start_ = 0;
+      c_skip_nl_ = false;
+      tag_held_ = 0;
+    }
+  }
+
+  if (phase_ == Phase::Reasoning) {
+    const std::string& close = mk_.think_close;
+    size_t end = std::string::npos;
+    if (close_mark_.anchor < 0) {
+      end = clean_.find(close, close_scan_);
+      if (end == std::string::npos) {
+        const size_t keep = close.size() > 1 ? close.size() - 1 : 0;
+        close_scan_ = clean_.size() > shift_ + keep ? clean_.size() - keep : shift_;
+      }
+    } else {
+      while (close_idx_ < close_clean_.size()) {
+        const size_t p = close_clean_[close_idx_];
+        if (p < shift_) {
+          ++close_idx_;
+          continue;
+        }
+        if (p + close.size() > clean_.size()) break;  // wait for the rest of the close marker
+        if (clean_.compare(p, close.size(), close) == 0) {
+          end = p;
+          break;
+        }
+        ++close_idx_;
+      }
+    }
+    if (end == std::string::npos) {
+      size_t held = 0;
+      const size_t rlen = clean_.size() - shift_;
+      for (size_t k = close.size() > 0 ? close.size() - 1 : 0; k > 0; --k)
+        if (rlen >= k && clean_.compare(clean_.size() - k, k, close, 0, k) == 0) {
+          held = k;
+          break;
+        }
+      tag_held_ = held;
+      const size_t vis_end = clean_.size() - held;
+      if (r_skip_nl_) {
+        while (r_start_ < vis_end && clean_[r_start_] == '\n') ++r_start_;
+        if (r_start_ < vis_end) r_skip_nl_ = false;
+      }
+      r_end_ = std::max(r_start_, vis_end);
+    } else {
+      tag_held_ = 0;
+      if (r_skip_nl_) {
+        while (r_start_ < end && clean_[r_start_] == '\n') ++r_start_;
+        r_skip_nl_ = false;
+      }
+      r_end_ = end;
+      while (r_end_ > r_start_ && clean_[r_end_ - 1] == '\n') --r_end_;
+      c_start_ = end + close.size();
+      c_skip_nl_ = true;
+      phase_ = Phase::Content;
+    }
+  }
+
+  if (phase_ == Phase::Content) {
+    if (c_skip_nl_) {
+      while (c_start_ < clean_.size() && clean_[c_start_] == '\n') ++c_start_;
+      if (c_start_ < clean_.size()) c_skip_nl_ = false;
+    }
+    if (tool_mark_.anchor >= 0 && !c_skip_nl_) {
+      while (tool_idx_ < tool_clean_.size()) {
+        const size_t p = tool_clean_[tool_idx_++];
+        if (p >= c_start_) tool_at_.push_back(p - c_start_);
+      }
+    }
+  }
+}
+
+ReplyText::StreamView ReplyText::stream_view(bool final_view) const {
+  advance(final_view);
+  StreamView v;
+  v.held = (raw_.size() - raw_scanned_) + tag_held_;
+  if (phase_ == Phase::Reasoning) {
+    v.reasoning = std::string_view(clean_).substr(r_start_, r_end_ - r_start_);
+  } else if (phase_ == Phase::Content) {
+    if (r_end_ > r_start_) v.reasoning = std::string_view(clean_).substr(r_start_, r_end_ - r_start_);
+    if (c_start_ < clean_.size()) v.content = std::string_view(clean_).substr(c_start_);
+  }
+  if (tool_mark_.anchor >= 0) v.calls_at = &tool_at_;
+  return v;
+}
+
+ReplyText::View ReplyText::view(bool final_view) const {
+  const StreamView sv = stream_view(final_view);
+  View v;
+  v.reasoning.assign(sv.reasoning);
+  v.content.assign(sv.content);
+  v.held = sv.held;
+  if (sv.calls_at) {
     v.anchored = true;
-    for (size_t p : map(tool_raw_))
-      if (p >= content_at) v.tool_at.push_back(p - content_at);
+    v.tool_at = *sv.calls_at;
   }
   return v;
 }
@@ -189,10 +276,24 @@ size_t ReplyText::calls_start(const View& v, const std::string& content) const {
   return find_marker(content, tool_open_, v.calls_at());
 }
 
+size_t ReplyText::calls_start(const StreamView& v, std::string_view content, size_t from) const {
+  if (!v.calls_at) return content.find(tool_open_, from);
+  for (size_t p : *v.calls_at)
+    if (p >= from && p + tool_open_.size() <= content.size() && content.compare(p, tool_open_.size(), tool_open_) == 0)
+      return p;
+  return std::string::npos;
+}
+
 std::string ReplyText::parse_calls(const View& v, const std::string& content, const json::Value& tools,
                                    json::Value& calls) const {
   return mk_.gemma ? parse_gemma_tool_calls(content, calls, v.calls_at())
                    : parse_tool_calls(content, tools, calls, v.calls_at());
+}
+
+std::string ReplyText::parse_calls(const StreamView& v, const std::string& content, const json::Value& tools,
+                                   json::Value& calls) const {
+  return mk_.gemma ? parse_gemma_tool_calls(content, calls, v.calls_at)
+                   : parse_tool_calls(content, tools, calls, v.calls_at);
 }
 
 // ---------------------------------------------------------------- tools

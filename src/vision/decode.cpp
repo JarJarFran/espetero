@@ -26,17 +26,41 @@ bool base64_decode(std::string_view in, std::string& out, std::string& err) {
     for (int i = 0; i < 64; i++) t[uint8_t(a[i])] = int8_t(i);
     return t;
   }();
-  out.clear();
-  out.reserve(in.size() / 4 * 3);
+  out.resize((in.size() / 4 + 1) * 3);
+  char* const base = out.data();
+  char* dst = base;
+  const char* const p = in.data();
+  const size_t n = in.size();
+  size_t i = 0;
   int quad = 0, pads = 0;
   uint32_t left = 0;
-  for (char ch : in) {
+  while (i < n) {
+    if (quad == 0) {
+      while (i + 4 <= n) {
+        const int8_t a = table[uint8_t(p[i])];
+        const int8_t b = table[uint8_t(p[i + 1])];
+        const int8_t c = table[uint8_t(p[i + 2])];
+        const int8_t d = table[uint8_t(p[i + 3])];
+        if ((a | b | c | d) < 0) break;
+        const uint32_t w = (uint32_t(a) << 18) | (uint32_t(b) << 12) | (uint32_t(c) << 6) | uint32_t(d);
+        dst[0] = char(w >> 16);
+        dst[1] = char(w >> 8);
+        dst[2] = char(w);
+        dst += 3;
+        i += 4;
+      }
+      if (i >= n) break;
+    }
+    const char ch = p[i++];
     if (uint8_t(ch) >= 0x80) {  // b64decode(str) first encodes to ASCII
       err = "string argument should contain only ASCII characters";
       return false;
     }
     if (ch == '=') {
-      if (quad >= 2 && quad + ++pads >= 4) return true;  // complete pad sequence
+      if (quad >= 2 && quad + ++pads >= 4) {
+        out.resize(size_t(dst - base));
+        return true;  // complete pad sequence
+      }
       continue;
     }
     const int v = table[uint8_t(ch)];
@@ -48,20 +72,21 @@ bool base64_decode(std::string_view in, std::string& out, std::string& err) {
         quad = 1;
         break;
       case 1:
-        out.push_back(char((left << 2) | (uint32_t(v) >> 4)));
+        *dst++ = char((left << 2) | (uint32_t(v) >> 4));
         left = uint32_t(v) & 0x0f;
         quad = 2;
         break;
       case 2:
-        out.push_back(char((left << 4) | (uint32_t(v) >> 2)));
+        *dst++ = char((left << 4) | (uint32_t(v) >> 2));
         left = uint32_t(v) & 0x03;
         quad = 3;
         break;
       default:
-        out.push_back(char((left << 6) | uint32_t(v)));
+        *dst++ = char((left << 6) | uint32_t(v));
         quad = 0;
     }
   }
+  out.resize(size_t(dst - base));
   if (quad != 0) {
     err = quad == 1 ? "invalid base64: number of data characters is 1 more than a multiple of 4"
                     : "invalid base64: incorrect padding";
