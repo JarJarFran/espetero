@@ -309,8 +309,31 @@ struct Runtime {
   id<MTLCommandQueue> queue = nil;
   id<MTLLibrary> lib = nil;
   std::unique_ptr<Arena> arena;
+  struct PsoKey {
+    std::string name;
+    int fc = 0;
+  };
+  struct PsoView {
+    std::string_view name;
+    int fc = 0;
+  };
+  struct PsoHash {
+    using is_transparent = void;
+    size_t operator()(const PsoKey& k) const noexcept { return hash(k.name, k.fc); }
+    size_t operator()(const PsoView& k) const noexcept { return hash(k.name, k.fc); }
+    static size_t hash(std::string_view n, int fc) noexcept {
+      size_t h = std::hash<std::string_view>{}(n);
+      return h ^ (std::hash<int>{}(fc) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
+    }
+  };
+  struct PsoEq {
+    using is_transparent = void;
+    bool operator()(const PsoKey& a, const PsoKey& b) const noexcept { return a.fc == b.fc && a.name == b.name; }
+    bool operator()(const PsoKey& a, const PsoView& b) const noexcept { return a.fc == b.fc && a.name == b.name; }
+    bool operator()(const PsoView& a, const PsoKey& b) const noexcept { return a.fc == b.fc && a.name == b.name; }
+  };
   std::mutex pso_mu;
-  std::unordered_map<std::string, id<MTLComputePipelineState>> pso;
+  std::unordered_map<PsoKey, id<MTLComputePipelineState>, PsoHash, PsoEq> pso;
   int dispatches = 0;
   int barriers = 0;
   bool profile = false;
@@ -366,8 +389,8 @@ struct Runtime {
 
   static std::string key_of(const std::string& name, int fc) { return fc ? name + "#" + std::to_string(fc) : name; }
 
-  id<MTLFunction> function(const std::string& name, int fc) {
-    NSString* fname = [NSString stringWithUTF8String:name.c_str()];
+  id<MTLFunction> function(std::string_view name, int fc) {
+    NSString* fname = [[NSString alloc] initWithBytes:name.data() length:name.size() encoding:NSUTF8StringEncoding];
     NSError* error = nil;
     id<MTLFunction> fn = nil;
     if (fc) {
@@ -383,13 +406,13 @@ struct Runtime {
     } else {
       fn = [lib newFunctionWithName:fname];
     }
-    if (!fn) fail("missing kernel " + name);
+    if (!fn) fail("missing kernel " + std::string(name));
     return fn;
   }
 
   // Pipeline for `name` specialized by `fc` (0: none). Thread-safe.
-  id<MTLComputePipelineState> kernel(const std::string& name, int fc = 0) {
-    const std::string key = key_of(name, fc);
+  id<MTLComputePipelineState> kernel(std::string_view name, int fc = 0) {
+    const PsoView key{name, fc};
     {
       std::lock_guard<std::mutex> lk(pso_mu);
       auto it = pso.find(key);
@@ -398,9 +421,9 @@ struct Runtime {
     id<MTLFunction> fn = function(name, fc);
     NSError* error = nil;
     id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:fn error:&error];
-    if (!p) fail("pipeline " + name + ": " + [[error localizedDescription] UTF8String]);
+    if (!p) fail("pipeline " + std::string(name) + ": " + [[error localizedDescription] UTF8String]);
     std::lock_guard<std::mutex> lk(pso_mu);
-    return pso.emplace(key, p).first->second;
+    return pso.emplace(PsoKey{std::string(name), fc}, p).first->second;
   }
 
   // Build many pipelines in parallel (first requests would otherwise pay for
@@ -410,7 +433,7 @@ struct Runtime {
     {
       std::lock_guard<std::mutex> lk(pso_mu);
       for (const auto& [n, fc] : list)
-        if (!pso.count(key_of(n, fc))) todo.push_back({n, fc});
+        if (pso.find(PsoView{n, fc}) == pso.end()) todo.push_back({n, fc});
     }
     std::sort(todo.begin(), todo.end());
     todo.erase(std::unique(todo.begin(), todo.end()), todo.end());
@@ -487,15 +510,15 @@ class Enc {
     for (id<MTLCommandBuffer> s : submitted_) [s waitUntilCompleted];  // a failed pass's submitted work
   }
 
-  void pipe(const std::string& name, int fc = 0) {
+  void pipe(std::string_view name, int fc = 0) {
     // ESPETERO_PIPE_LOG=1: every pipeline as it is encoded (with profiling on, each
     // dispatch runs and is waited for alone: the last line names a hung kernel).
     static const bool pipe_log = env_on("ESPETERO_PIPE_LOG");
-    if (pipe_log) std::fprintf(stderr, "[pipe] %s\n", name.c_str());
+    if (pipe_log) std::fprintf(stderr, "[pipe] %.*s\n", int(name.size()), name.data());
     [e setComputePipelineState:rt.kernel(name, fc)];
-    if (rt.profile) cur = name;
-    if (trace_) cur_name_ = name;
-    if (rt.fcheck.opt.on) last_pipe_ = name, last_fc_ = fc;
+    if (rt.profile) cur.assign(name.data(), name.size());
+    if (trace_) cur_name_.assign(name.data(), name.size());
+    if (rt.fcheck.opt.on) last_pipe_.assign(name.data(), name.size()), last_fc_ = fc;
   }
   // ESPETERO_CHECK_FINITE: scan a destination region just written (rows x
   // cols of dtype dt, row stride ld elements, from byte off) for NaN / Inf /
@@ -546,8 +569,14 @@ class Enc {
   void raw(int i, const void* p, size_t n) { [e setBytes:p length:n atIndex:i]; }
 
   // Declare the next dispatch's reads and writes (whole buffer by default).
-  void rd(id<MTLBuffer> b, size_t lo = 0, size_t hi = SIZE_MAX) { reads_.push_back({(__bridge const void*)b, lo, hi}); }
-  void wr(id<MTLBuffer> b, size_t lo = 0, size_t hi = SIZE_MAX) { writes_.push_back({(__bridge const void*)b, lo, hi}); }
+  void rd(id<MTLBuffer> b, size_t lo = 0, size_t hi = SIZE_MAX) {
+    if (rt.serial) return;
+    reads_.push_back({(__bridge const void*)b, lo, hi});
+  }
+  void wr(id<MTLBuffer> b, size_t lo = 0, size_t hi = SIZE_MAX) {
+    if (rt.serial) return;
+    writes_.push_back({(__bridge const void*)b, lo, hi});
+  }
   void rd(const Buf& b, size_t n = SIZE_MAX) { rd(b.b, b.off, n == SIZE_MAX ? SIZE_MAX : b.off + n); }
   void wr(const Buf& b, size_t n = SIZE_MAX) { wr(b.b, b.off, n == SIZE_MAX ? SIZE_MAX : b.off + n); }
 
@@ -721,7 +750,10 @@ class Enc {
  private:
   std::vector<Span> reads_, writes_, since_r_, since_w_;
   std::vector<id<MTLCommandBuffer>> submitted_;
-  bool trace_ = env_on("ESPETERO_TRACE_BARRIERS");
+  bool trace_ = [] {
+    static const bool on = env_on("ESPETERO_TRACE_BARRIERS");
+    return on;
+  }();
   std::string cur_name_;
   std::string last_pipe_;  // ESPETERO_CHECK_FINITE: restored after a check
   int last_fc_ = 0;

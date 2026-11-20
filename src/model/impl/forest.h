@@ -293,11 +293,12 @@ struct MoeVqParams {
 struct MoeCombineParams {
   int32_t D, k, norm;
   float eps;
-  int32_t slice;
+  int32_t slice, store;
 };
 struct MoeDownCombParams {
   int32_t D, N, N2, Ie, k, norm;
   float eps;
+  int32_t store;
 };
 
 // Diagnostic (the long-pass stall): the sort's tile table of a pooled
@@ -553,7 +554,7 @@ inline bool moe_down_comb_fits(const Model& m, const Layer& L, int rows, bool no
 // accumulated; with `nout`, the combine also writes the next norm's fp16 rows.
 // act: scratch of [rows, I_shared] halves for the shared expert.
 inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuffer> act, id<MTLBuffer> H, int rows,
-                    const NormLink* nout, size_t h_off = 0) {  // h_off: byte offset of the residual rows in H
+                    const NormLink* nout, size_t h_off = 0, bool store_y = false) {  // h_off: byte offset of the residual rows in H
   // A layer pruned to fewer experts than the config's (the scratch is sized for the config's)
   const Config* cfg_p = &m.cfg;
   Config c_layer;
@@ -948,7 +949,8 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const std::string name = moe_gemv_name(w, w2, fma_path, mm_rows, epi, route_name, ks, bm) +
                              (route_name && route_e512 ? "_e512" : "") +  // routes of 257-512 experts (Qwen4-Exp)
                              (fma_path && rows == 1 && m.moe_pf ? "_pf" : "");  // Fase 3: two K steps in flight
-    if (env_on("ESPETERO_MOE_LOG"))
+    static const bool moe_log = env_on("ESPETERO_MOE_LOG");
+    if (moe_log)
       std::fprintf(stderr, "moe: layer %d %s (w %d/%d bits fc %x, w2 %d bits, shared_tiles %d)\n", int(&L - m.layers.data()),
                    name.c_str(), w.bits, w.src_bits, w.fc(), w2 ? w2->bits : -1, shared_tiles ? 1 : 0);
     E.pipe(name, w.fc());
@@ -1084,7 +1086,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     const std::string name = moe_down_comb_name(w, w2, comb_ks) + (m.moe_pf ? "_pf" : "") + (fin ? "_f" + std::to_string(fin) : "");
     E.pipe(name, w.fc());
     gemm_tag(E, name, c.D, c.Ie, rows);
-    const MoeDownCombParams dp{c.D, w.out, w2.out, c.Ie, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f};
+    const MoeDownCombParams dp{c.D, w.out, w2.out, c.Ie, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f, store_y ? 1 : 0};
     E.set(0, z.act);
     E.set(1, w.wr);
     E.set(2, w.sb);
@@ -1107,7 +1109,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
     E.rd(z.w);
     E.rd(z.sgate);
     E.rd(z.slotpos);
-    E.rd(H, h_off, h_off + size_t(c.D) * 4);
+    if (!store_y) E.rd(H, h_off, h_off + size_t(c.D) * 4);
     E.wr(H, h_off, h_off + size_t(c.D) * 4);
     E.wr(z.cparts);
     E.rd(z.cctr);
@@ -1137,7 +1139,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   // Column slices of 512 (128 threads x float4): several threadgroups per row.
   const int slice = 512;
   const int nsl = std::min(64, (c.D + slice - 1) / slice);
-  const MoeCombineParams cp{c.D, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f, (c.D + nsl - 1) / nsl / 4 * 4};
+  const MoeCombineParams cp{c.D, c.k, nout ? 1 : 0, nout ? nout->eps : 0.0f, (c.D + nsl - 1) / nsl / 4 * 4, store_y ? 1 : 0};
   E.pipe("moe_combine");
   E.set(0, H, h_off);
   E.set(1, z.ys);
@@ -1157,7 +1159,7 @@ inline void moe_mlp(Model& m, Enc& E, const Layer& L, id<MTLBuffer> X, id<MTLBuf
   E.rd(z.sgate);
   E.set(9, z.cparts);
   E.set(10, z.cctr);
-  E.rd(H, h_off, h_off + size_t(rows) * size_t(c.D) * 4);
+  if (!store_y) E.rd(H, h_off, h_off + size_t(rows) * size_t(c.D) * 4);
   E.wr(H, h_off, h_off + size_t(rows) * size_t(c.D) * 4);
   E.wr(z.cparts);
   E.rd(z.cctr);
@@ -2860,11 +2862,11 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
     // Hkv x 2 head groups.
     const int hsplit = G > 8 ? G / 6 : 1, Gk = G / hsplit;
     AttnParams ap{c.H, c.Hkv * hsplit, qdim, kvd, ldf, bt, uint64_t(K.layer_base(kv_layer))};
-    // Single-row trees (plain decode): the GQA-row MMA kernel or the GEMV-style kernel; else the 8-row MMA tiles.
-    bool single = G <= 8 && !qsa;
+    // Single-row trees (plain decode): the GQA-row MMA kernel (including G=12 as 6x2) or the GEMV-style kernel; else 8-row MMA tiles.
+    bool single = (G <= 8 || (hsplit == 2 && Gk == 6)) && !qsa;
     for (const auto& t : plan.trees) single = single && t.M == 1;
     const bool gqa = single && m.attn_gqa;
-    const bool vec = single && !gqa && m.attn_vec;
+    const bool vec = single && !gqa && G <= 8 && m.attn_vec;
     const int nsg = gqa ? 4 : (G <= 4 ? 1 : 2) * 4;  // gqa: 2 pairs; vec: head halves (heads per simdgroup <= 4) x 4 key slices
     // Long prompt passes at long contexts: a dense attention layer over
     // 4096 rows at about 40K keys (Qwen3.8-Flash-Next) is ~1.5 s
@@ -4097,15 +4099,9 @@ inline void run_forest(Model& m, PassMeta& meta, const std::vector<TreeSpec>& sp
       } else if (m.xpool.empty()) {
         q4_experts(li);
       }
-      E.pipe("q4_zero");
-      const uint32_t ny = uint32_t(M) * uint32_t(c.D);
-      E.set(0, m.q4s.y);
-      E.bytes(1, ny);
-      E.wr(m.q4s.y);
-      E.threads(MTLSizeMake(ny, 1, 1), MTLSizeMake(256, 1, 1));
       if (!m.xpool.empty()) m.moe_after_route = q4_route;
       try {
-        moe_mlp(m, E, L, s.xn, s.act, m.q4s.y, M, nullptr);
+        moe_mlp(m, E, L, s.xn, s.act, m.q4s.y, M, nullptr, 0, true);
       } catch (...) {
         m.moe_after_route = nullptr;
         throw;
@@ -5413,13 +5409,7 @@ inline void run_draft_q4(Model& m, PassMeta& meta, const std::vector<DraftReques
     gemm(E, m.tune, L.out, s.O, 0, qdim, m.q4s.y, 0, c.D, R, 0);
     q4_hc_inject(m, E, meta.m_x.buf, Buf(m.q4s.y), Buf(m.q4s.inj), R);
     q4_hc_read(m, E, L.hcm, true, meta.m_x.buf, R, Buf(s.xn));
-    E.pipe("q4_zero");
-    const uint32_t ny = uint32_t(R) * uint32_t(c.D);
-    E.set(0, m.q4s.y);
-    E.bytes(1, ny);
-    E.wr(m.q4s.y);
-    E.threads(MTLSizeMake(ny, 1, 1), MTLSizeMake(256, 1, 1));
-    moe_mlp(m, E, L, s.xn, s.act, m.q4s.y, R, nullptr);  // resident 8-bit experts (no expert-cache hook)
+    moe_mlp(m, E, L, s.xn, s.act, m.q4s.y, R, nullptr, 0, true);  // resident 8-bit experts (no expert-cache hook)
     q4_hc_inject(m, E, meta.m_x.buf, Buf(m.q4s.y), Buf(m.q4s.inj), R);
   };
   // Head: the MTP mixer of `rows` of m_x -> LM head -> argmax into arg[k * nq]. As run_draft: the 4-bit head

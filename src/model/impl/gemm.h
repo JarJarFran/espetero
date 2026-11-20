@@ -430,10 +430,11 @@ inline std::string& hgemm_force() {
 }
 inline HTile hgemm_tile(int M, int N) {
   if (M <= 8) return HTile{"8x8", 8, 256};
+  if (hgemm_force() == "32x8") return HTile{"32x8", 32, 256};
   if (hgemm_force() == "32x4") return HTile{"32x4", 32, 128};
   if (hgemm_force() == "16x4") return HTile{"16x4", 16, 128};
-  // 32-row tiles from 256 rows (the vision tower's 3,888-row GEMMs: fc1 and fc2
-  // 19-31 % faster than 16-row tiles); 16-row tiles for short prompts.
+  // 32x8 for wide long prefill, 32x4 from 256 rows, 16x4 for short prompts.
+  if (N >= 8192 && M >= 256) return HTile{"32x8", 32, 256};
   return (N >= 8192 || M >= 256) ? HTile{"32x4", 32, 128} : HTile{"16x4", 16, 128};
 }
 
@@ -444,10 +445,27 @@ inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, i
                    int ldy, int M, int epi) {
   if (M <= 0) return;
   static const char* suffix[7] = {"store", "add", "gelu_tanh", "gelu_erf", "swiglu", "geglu", "geglu_erf"};
-  const HTile t = hgemm_tile(M, w.out);
   struct {
     int M, N, K, lda, ldy, has_bias;
   } p{M, w.out, w.kp, lda, ldy, w.has_bias ? 1 : 0};
+  const size_t elt = (epi == 0 || epi == 1) ? 4 : 2;
+  const int ncols = (epi == 4 || epi == 5 || epi == 6) ? w.out / 2 : w.out;
+  if (M <= 2 && hgemm_force().empty()) {
+    const std::string name = std::string("hgemv_") + std::to_string(M) + "_" + suffix[epi];
+    E.pipe(name);
+    gemm_tag(E, name, w.out, w.kp, M);
+    E.set(0, A, aoff);
+    E.set(1, w.wr);
+    if (w.has_bias) E.set(2, w.bias);
+    else E.set(2, w.wr);  // unread
+    E.set(4, Y, yoff);
+    E.bytes(5, p);
+    E.rd(A, aoff, aoff + (size_t(M - 1) * size_t(lda) + size_t(w.kp)) * 2);
+    E.wr(Y, yoff, yoff + (size_t(M - 1) * size_t(ldy) + size_t(ncols)) * elt);
+    E.groups(MTLSizeMake(size_t(w.out + 31) / 32, 1, 1), MTLSizeMake(256, 1, 1));
+    return;
+  }
+  const HTile t = hgemm_tile(M, w.out);
   const std::string name = std::string("hgemm_") + t.name + "_" + suffix[epi];
   E.pipe(name);
   gemm_tag(E, name, w.out, w.kp, M);
@@ -457,8 +475,6 @@ inline void gemm_h(Enc& E, const HW& w, id<MTLBuffer> A, size_t aoff, int lda, i
   else E.set(2, w.wr);  // unread
   E.set(4, Y, yoff);
   E.bytes(5, p);
-  const size_t elt = (epi == 0 || epi == 1) ? 4 : 2;
-  const int ncols = (epi == 4 || epi == 5 || epi == 6) ? w.out / 2 : w.out;
   E.rd(A, aoff, aoff + (size_t(M - 1) * size_t(lda) + size_t(w.kp)) * 2);
   E.wr(Y, yoff, yoff + (size_t(M - 1) * size_t(ldy) + size_t(ncols)) * elt);
   E.groups(MTLSizeMake(size_t(M + t.bm - 1) / size_t(t.bm), size_t(w.out + t.bn - 1) / size_t(t.bn), 1),
@@ -518,7 +534,8 @@ inline void gemm_runs(Enc& E, Tuner& T, const std::vector<Mat>& runs, id<MTLBuff
 }
 
 // Kernels a matrix may use (for building pipelines at load).
-inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>>& out, bool fma34 = false, int gemm_var = 0) {
+inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>>& out, bool fma34 = false, int gemm_var = 0,
+                           const Tuner* T = nullptr, bool fuse_gated = false) {
   if (m.out() <= 0) return;
   if (m.dense) {
     for (const char* t : {"8x8", "16x4", "32x4"})
@@ -527,21 +544,45 @@ inline void gemm_pipelines(const Mat& m, std::vector<std::pair<std::string, int>
     return;
   }
   const QW& w = m.q;
+  const int n_cfgs = T ? T->n_cfgs : kGemmBaseConfigs;
+  const bool want_widen6 = w.bits == 6 && (!T || T->widen6_m > 0);
+  // When autotune already populated T->table, only prewarm the tiles chosen
+  // for this shape plus the fallback tiles {0, 1, 2}. Unselected tiles still
+  // compile lazily via rt.kernel() if a debug option selects them later.
+  uint32_t cfg_mask = 0;
+  if (T) {
+    cfg_mask = (1u << 0) | (1u << 1) | (1u << 2);
+    if (auto it = T->table.find({w.out, w.in, w.bits, w.fc()}); it != T->table.end()) {
+      for (uint8_t choice : it->second) cfg_mask |= 1u << (choice & 15);
+    } else {
+      cfg_mask = (1u << n_cfgs) - 1u;
+    }
+  } else {
+    cfg_mask = (1u << n_cfgs) - 1u;
+  }
   for (int e = 0; e < 3; ++e)
-    for (int cfg = 0; cfg < kGemmBaseConfigs; ++cfg) {
+    for (int cfg = 0; cfg < n_cfgs; ++cfg) {
+      if (!(cfg_mask & (1u << cfg))) continue;
       out.push_back({rgemm_name(w.bits, cfg, e), w.fc()});
-      if (w.bits == 6) out.push_back({rgemm_name(8, cfg, e), w.fc()});  // widened prefill GEMMs
+      if (want_widen6) out.push_back({rgemm_name(8, cfg, e), w.fc()});  // widened prefill GEMMs
     }
   if (gemm_var > 0)  // the variants the dispatch maps the tuned tiles to
     for (int e = 0; e < 3; ++e)
       for (int cfg : {1, 2, 4}) out.push_back({rgemm_name(w.bits, gemm_variant_cfg(cfg, gemm_var), e), w.fc()});
-  if (w.bits == 6) out.push_back({"widen6_8", 0});
-  for (const char* v : {"_store", "_add", "_swiglu", "_addp", "_store_n", "_swiglu_n", "_add_g", "_addp_g"}) {
+  if (want_widen6) out.push_back({"widen6_8", 0});
+  for (const char* v : {"_store", "_add", "_swiglu", "_addp"}) {
     for (int mm = 1; mm <= kGemvInstM; ++mm)
       out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + v, w.fc()});
     if (fma34)
       for (int mm = 3; mm <= 4; ++mm) out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + "j" + v, w.fc()});
     out.push_back({"rgemv8r" + std::to_string(w.bits) + v, w.fc()});
+  }
+  if (fuse_gated) {
+    for (const char* v : {"_add_g", "_addp_g"}) {
+      for (int mm = 1; mm <= kGemvInstM; ++mm)
+        out.push_back({"rgemv" + std::to_string(w.bits) + "_" + std::to_string(mm) + v, w.fc()});
+      out.push_back({"rgemv8r" + std::to_string(w.bits) + v, w.fc()});
+    }
   }
 }
 

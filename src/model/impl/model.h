@@ -568,7 +568,7 @@ struct Model : Runtime {
   std::string format, path;
   std::set<std::string> dense_mats;
   int dn_rows = 0;           // 0: choose per dispatch
-  int dn_chunk = 0;          // segments this long use the chunked delta rule (0: never; measured slower so far)
+  int dn_chunk = 32;         // segments this long use the chunked delta rule (deltanet_chunk: -26% DeltaNet prefill time)
   bool prune_last = true;
   bool fuse_norm = true;     // decode passes: RMSNorm finalized by the producing GEMV (no norm dispatches)
   int fuse_norm_max_m = 2;   // ... for passes of at most this many rows: 3-8-row MMA GEMVs normalizing on load cost 2% on the 27B verify pass
@@ -691,7 +691,7 @@ struct Model : Runtime {
   // after its rows, instead of a root dispatch and a leaf dispatch that reads
   // that state back (one dispatch and one state read + write fewer per linear
   // layer; the same per-token arithmetic). ESPETERO_GDN_CHAIN=1, "gdn_chain".
-  bool gdn_chain = false;
+  bool gdn_chain = true;
   // Single-sequence verify leaves and commits run the fused GDN kernel with
   // 8 state rows per simdgroup (as single roots do) instead of 16: more,
   // thinner simdgroups for a latency-bound walk; the reduction tree is the

@@ -81,7 +81,63 @@ kernel void rmsnorm(
   threadgroup float partial[32];
   const int src_row = gather ? rows[row] : int(row);
   device const float4* x = (device const float4*)(X + ulong(src_row) * D);
+  device const float4* w = (device const float4*)Wt;
+  device half4* y = (device half4*)(Y + ulong(row) * D);
   const int D4 = D / 4;
+  if (D4 <= int(ntg) * 4) {
+    float4 xv[4];
+    float ss = 0.0f;
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) {
+        const float4 v = x[i];
+        xv[k] = v;
+        ss += dot(v, v);
+      }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) partial[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float t = (lane < (ntg + 31) / 32) ? partial[lane] : 0.0f;
+      t = simd_sum(t);
+      if (lane == 0) partial[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt(partial[0] / float(D) + eps);
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) y[i] = half4(xv[k] * inv * w[i]);
+    }
+    return;
+  }
+  if (D4 <= int(ntg) * 8) {
+    float4 xv[8];
+    float ss = 0.0f;
+    UNROLL for (int k = 0; k < 8; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) {
+        const float4 v = x[i];
+        xv[k] = v;
+        ss += dot(v, v);
+      }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) partial[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float t = (lane < (ntg + 31) / 32) ? partial[lane] : 0.0f;
+      t = simd_sum(t);
+      if (lane == 0) partial[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt(partial[0] / float(D) + eps);
+    UNROLL for (int k = 0; k < 8; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) y[i] = half4(xv[k] * inv * w[i]);
+    }
+    return;
+  }
   float ss = 0.0f;
   for (int i = tid; i < D4; i += ntg) {
     const float4 v = x[i];
@@ -97,8 +153,6 @@ kernel void rmsnorm(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = rsqrt(partial[0] / float(D) + eps);
-  device const float4* w = (device const float4*)Wt;
-  device half4* y = (device half4*)(Y + ulong(row) * D);
   for (int i = tid; i < D4; i += ntg) y[i] = half4(x[i] * inv * w[i]);
 }
 
@@ -177,7 +231,39 @@ kernel void rmsnorm_addk(
   threadgroup float partial[32];
   device float4* x = (device float4*)(X + ulong(row) * D);
   device const float* w0 = ws + ulong(row) * ldw;
+  device const float4* w = (device const float4*)Wt;
+  device half4* y = (device half4*)(Y + ulong(row) * D);
   const int D4 = D / 4;
+  if (D4 <= int(ntg) * 8) {
+    float4 xv[8];
+    float ss = 0.0f;
+    UNROLL for (int k = 0; k < 8; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) {
+        float4 acc = float4(0.0f);
+        for (int z = 0; z < splits; ++z) acc += *((device const float4*)(w0 + ulong(z) * ulong(z_stride)) + i);
+        const float4 v = x[i] + acc;
+        x[i] = v;
+        xv[k] = v;
+        ss += dot(v, v);
+      }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) partial[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float t = (lane < (ntg + 31) / 32) ? partial[lane] : 0.0f;
+      t = simd_sum(t);
+      if (lane == 0) partial[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt(partial[0] / float(D) + eps);
+    UNROLL for (int k = 0; k < 8; ++k) {
+      const int i = int(tid) + k * int(ntg);
+      if (i < D4) y[i] = half4(xv[k] * inv * w[i]);
+    }
+    return;
+  }
   float ss = 0.0f;
   for (int i = tid; i < D4; i += ntg) {
     float4 acc = float4(0.0f);
@@ -196,8 +282,6 @@ kernel void rmsnorm_addk(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = rsqrt(partial[0] / float(D) + eps);
-  device const float4* w = (device const float4*)Wt;
-  device half4* y = (device half4*)(Y + ulong(row) * D);
   for (int i = tid; i < D4; i += ntg) y[i] = half4(x[i] * inv * w[i]);
 }
 

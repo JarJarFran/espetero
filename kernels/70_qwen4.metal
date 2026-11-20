@@ -54,8 +54,43 @@ kernel void q4_stream_norm(
   const int s = tg.x;
   const ulong row = tg.y;
   device const float4* x = (device const float4*)(X + row * ulong(in_ld) + ulong(s) * D);
+  device const float4* ws = (device const float4*)(w + ulong(s) * D);
+  device half4* y = (device half4*)(Y + row * ulong(out_ld) + ulong(s) * D);
+  device float4* y32 = (device float4*)(Y32 + row * ulong(out_ld) + ulong(s) * D);
+  const int D4 = D / 4;
+  if (D4 <= int(ntg) * 4) {
+    float4 xv[4];
+    float acc = 0.0f;
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int j = int(tid) + k * int(ntg);
+      if (j < D4) {
+        const float4 vv = x[j];
+        xv[k] = vv;
+        acc += dot(vv, vv);
+      }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) red[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float t = lane < (ntg + 31) / 32 ? red[lane] : 0.0f;
+      t = simd_sum(t);
+      if (lane == 0) red[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt(red[0] / float(D) + eps);
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int j = int(tid) + k * int(ntg);
+      if (j < D4) {
+        const float4 v = xv[k] * inv * ws[j];
+        y[j] = half4(v);
+        if (out32) y32[j] = v;
+      }
+    }
+    return;
+  }
   float acc = 0.0f;
-  for (int j = int(tid); j < D / 4; j += int(ntg)) acc += dot(x[j], x[j]);
+  for (int j = int(tid); j < D4; j += int(ntg)) acc += dot(x[j], x[j]);
   acc = simd_sum(acc);
   if (lane == 0) red[sg] = acc;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -66,10 +101,7 @@ kernel void q4_stream_norm(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = rsqrt(red[0] / float(D) + eps);
-  device const float4* ws = (device const float4*)(w + ulong(s) * D);
-  device half4* y = (device half4*)(Y + row * ulong(out_ld) + ulong(s) * D);
-  device float4* y32 = (device float4*)(Y32 + row * ulong(out_ld) + ulong(s) * D);
-  for (int j = int(tid); j < D / 4; j += int(ntg)) {
+  for (int j = int(tid); j < D4; j += int(ntg)) {
     const float4 v = x[j] * inv * ws[j];
     y[j] = half4(v);
     if (out32) y32[j] = v;
@@ -171,9 +203,41 @@ kernel void q4_hc_inject_norm(
   const ulong row = tg.y;
   device float4* x = (device float4*)(H + row * ulong(S * D) + ulong(s) * D);
   device const float4* v = (device const float4*)(yv + row * ulong(D));
+  device const float4* ws = (device const float4*)(w + ulong(s) * D);
+  device half4* y = (device half4*)(Y + row * ulong(S * D) + ulong(s) * D);
   const float g = inj[row * ulong(S) + s];
+  const int D4 = D / 4;
+  if (D4 <= int(ntg) * 4) {
+    float4 hv[4];
+    float acc = 0.0f;
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int j = int(tid) + k * int(ntg);
+      if (j < D4) {
+        float4 h = x[j];
+        h += g * v[j];
+        x[j] = h;
+        hv[k] = h;
+        acc += dot(h, h);
+      }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) red[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float t = lane < (ntg + 31) / 32 ? red[lane] : 0.0f;
+      t = simd_sum(t);
+      if (lane == 0) red[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt(red[0] / float(D) + eps);
+    UNROLL for (int k = 0; k < 4; ++k) {
+      const int j = int(tid) + k * int(ntg);
+      if (j < D4) y[j] = half4(hv[k] * inv * ws[j]);
+    }
+    return;
+  }
   float acc = 0.0f;
-  for (int j = int(tid); j < D / 4; j += int(ntg)) {
+  for (int j = int(tid); j < D4; j += int(ntg)) {
     float4 h = x[j];
     h += g * v[j];
     x[j] = h;
@@ -189,9 +253,7 @@ kernel void q4_hc_inject_norm(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float inv = rsqrt(red[0] / float(D) + eps);
-  device const float4* ws = (device const float4*)(w + ulong(s) * D);
-  device half4* y = (device half4*)(Y + row * ulong(S * D) + ulong(s) * D);
-  for (int j = int(tid); j < D / 4; j += int(ntg)) y[j] = half4(x[j] * inv * ws[j]);
+  for (int j = int(tid); j < D4; j += int(ntg)) y[j] = half4(x[j] * inv * ws[j]);
 }
 
 kernel void q4_zero(device float* y [[buffer(0)]], constant uint& n [[buffer(1)]], uint gid [[thread_position_in_grid]]) {
@@ -401,12 +463,15 @@ kernel void repack_scales_at(
   v.z = half(half_src ? float(as_type<half>(Z[ulong(n) * KG + g])) : bf2f(Z[ulong(n) * KG + g]));
   v.y = half(half_src ? float(as_type<half>(S[ulong(n + 1) * KG + g])) : bf2f(S[ulong(n + 1) * KG + g]));
   v.w = half(half_src ? float(as_type<half>(Z[ulong(n + 1) * KG + g])) : bf2f(Z[ulong(n + 1) * KG + g]));
-  SB[ulong(g) * pool_pairs + pair0 + pair] = v;
+  const ulong p_all = ulong(pair0) + ulong(pair);
+  const ulong blk = p_all / 16, pr = p_all % 16;
+  const ulong slot = (pr & 3) * 4 + (pr >> 2);
+  SB[(blk * ulong(KG) + ulong(g)) * 16 + slot] = v;
 }
 
 // Copy expert `src_e` of a whole-layer matrix (E experts) into pool slot
-// `dst_s`: `rows` rows per expert, `row_bytes` code bytes per row (codes are
-// block-major, so a contiguous range), scales at each matrix's own pair stride.
+// `dst_s`: `rows` rows per expert, `row_bytes` code bytes per row (both codes
+// and block-major scales are one contiguous range per expert).
 // Grid x: max(code words, scale pairs * groups).
 kernel void q4_pool_admit(
     device const uint* src_w [[buffer(0)]],
@@ -423,11 +488,8 @@ kernel void q4_pool_admit(
     uint gid [[thread_position_in_grid]]) {
   const ulong words = ulong(rows) * ulong(row_bytes) / 4;
   if (gid < words) dst_w[ulong(dst_s) * words + gid] = src_w[ulong(src_e) * words + gid];
-  const int pairs = rows / 2;
-  if (gid < ulong(pairs) * ulong(groups)) {
-    const int g = int(gid) / pairs, p = int(gid) % pairs;
-    dst_sb[ulong(g) * dst_pairs + ulong(dst_s) * pairs + p] = src_sb[ulong(g) * src_pairs + ulong(src_e) * pairs + p];
-  }
+  const ulong sp = ulong(rows / 2) * ulong(groups);
+  if (gid < sp) dst_sb[ulong(dst_s) * sp + gid] = src_sb[ulong(src_e) * sp + gid];
 }
 
 // Dense fp16 router [E][D] (row-major) times the MoE input X [rows][D] (fp16)

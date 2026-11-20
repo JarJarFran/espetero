@@ -479,9 +479,7 @@ kernel void gdn_decode_fused_impl(
     ushort lane [[thread_index_in_simdgroup]]) {
   constexpr int Dk = 128, Dv = 128, LPR = 32 / R;
   constexpr int NSG = Dv / R;   // simdgroups per threadgroup: 8 (R=16) or 16 (R=8)
-  constexpr int NT = 32 * NSG;  // 256 or 512 threads
   threadgroup float qs[Dk], ks[Dk], vs[Dv], os[Dv], gs[2];
-  threadgroup float red[NSG];
   const int sg = int(tid) / 32;   // this simdgroup's R state rows start at sg * R
   const int n = int(tgpig.z);
   const int seg = n / p.Hv;
@@ -496,49 +494,42 @@ kernel void gdn_decode_fused_impl(
   device const float* state_in = pool + p.st_base + ulong(sgm.in_slot) * p.st_stride + head_off;
   float4 st[R];
   UNROLL for (int r = 0; r < R; ++r) st[r] = *((device const float4*)(state_in + ulong(r) * Dk));
-  // conv channels: q on threads 0..127, k on 128..255, v on 256..383 when the
-  // threadgroup has them (R=8), else on the q threads as a second channel.
-  const bool qk_thread = tid < 256;
-  const bool v_thread = NT >= 384 ? (tid >= 256 && tid < 384) : tid < 128;
-  const int cqk = (tid < 128) ? hk * Dk + int(tid) : k_off + hk * Dk + int(tid & 127);
-  const int cv = v_off + hv * Dv + int(tid & 127);
-  const float4 wqk = qk_thread ? *((device const float4*)(Wc + cqk * 4)) : float4(0.0f);
-  const float4 wv = v_thread ? *((device const float4*)(Wc + cv * 4)) : float4(0.0f);
+  // 1 simdgroup (32 lanes x float4 = 128 channels) each for q (sg 0), k (sg 1),
+  // v + gates (sg 2): matches conv_prep / gated_rmsnorm bit-for-bit and cuts
+  // barriers from 5 to 2 per token.
+  const int c4 = (sg == 0) ? (hk * Dk + int(lane) * 4)
+               : (sg == 1) ? (k_off + hk * Dk + int(lane) * 4)
+               : (sg == 2) ? (v_off + hv * Dv + int(lane) * 4)
+                           : 0;
   device const float* cstate = pool + p.conv_base + ulong(row_slot[sgm.row0]) * p.conv_stride;
 
   for (int t = 0; t < sgm.len; ++t) {
     const int row = sgm.row0 + t;
-    const int s0 = src[row * 3 + 0], s1 = src[row * 3 + 1], s2 = src[row * 3 + 2];
-    // Causal conv + SiLU for the thread's channels.
-    float aq = 0.0f;
-    if (qk_thread) {
-      aq = X[ulong(row) * p.ldx + cqk] * wqk.w + gdn_tap(X, cstate, s0, cqk, p.ldx, p.C) * wqk.z +
-           gdn_tap(X, cstate, s1, cqk, p.ldx, p.C) * wqk.y + gdn_tap(X, cstate, s2, cqk, p.ldx, p.C) * wqk.x;
-      aq = aq / (1.0f + exp(-aq));
+    if (sg < 3) {
+      const int s0 = src[row * 3 + 0], s1 = src[row * 3 + 1], s2 = src[row * 3 + 2];
+      threadgroup float* dst = (sg == 0) ? qs : (sg == 1) ? ks : vs;
+      float ss_lane = 0.0f;
+#pragma clang loop unroll(disable)
+      for (int ch = 0; ch < 4; ++ch) {
+        const int c = c4 + ch;
+        const float4 wc = *((device const float4*)(Wc + c * 4));
+        float a = X[ulong(row) * p.ldx + c] * wc.w + gdn_tap(X, cstate, s0, c, p.ldx, p.C) * wc.z +
+                  gdn_tap(X, cstate, s1, c, p.ldx, p.C) * wc.y + gdn_tap(X, cstate, s2, c, p.ldx, p.C) * wc.x;
+        a = a / (1.0f + exp(-a));
+        dst[int(lane) * 4 + ch] = a;
+        ss_lane += a * a;
+      }
+      if (sg < 2) {
+        const float scale =
+            rsqrt(simd_sum(ss_lane) / float(Dk) + p.eps) * ((sg == 0) ? (1.0f / float(Dk)) : rsqrt(float(Dk)));
+        *((threadgroup float4*)(dst + lane * 4)) *= scale;
+      } else if (lane == 0) {
+        const float x = X[ulong(row) * p.ldx + p.a_off + hv] + dt_bias[hv];
+        const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+        gs[0] = exp(-exp(A_log[hv]) * sp);
+        gs[1] = 1.0f / (1.0f + exp(-X[ulong(row) * p.ldx + p.a_off + p.Hv + hv]));
+      }
     }
-    float av = 0.0f;
-    if (v_thread) {
-      av = X[ulong(row) * p.ldx + cv] * wv.w + gdn_tap(X, cstate, s0, cv, p.ldx, p.C) * wv.z +
-           gdn_tap(X, cstate, s1, cv, p.ldx, p.C) * wv.y + gdn_tap(X, cstate, s2, cv, p.ldx, p.C) * wv.x;
-      av = av / (1.0f + exp(-av));
-    }
-    // q/k RMS norm over the head: simdgroups 0..3 hold q, 4..7 hold k.
-    const float ss = simd_sum(aq * aq);
-    if (lane == 0) red[sg] = ss;
-    if (tid == 0) {
-      const float x = X[ulong(row) * p.ldx + p.a_off + hv] + dt_bias[hv];
-      const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
-      gs[0] = exp(-exp(A_log[hv]) * sp);
-      gs[1] = 1.0f / (1.0f + exp(-X[ulong(row) * p.ldx + p.a_off + p.Hv + hv]));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (qk_thread) {
-      const float ssq = (tid < 128) ? red[0] + red[1] + red[2] + red[3] : red[4] + red[5] + red[6] + red[7];
-      const float scale = (tid < 128) ? 1.0f / float(Dk) : rsqrt(float(Dk));
-      const float normed = aq * rsqrt(ssq / float(Dk) + p.eps) * scale;
-      if (tid < 128) qs[tid] = normed; else ks[tid - 128] = normed;
-    }
-    if (v_thread) vs[tid & 127] = av;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Recurrence for this simdgroup's R rows.
     const float4 q = *((threadgroup const float4*)(qs + lane * 4));
@@ -560,23 +551,22 @@ kernel void gdn_decode_fused_impl(
     const float o = transpose_reduce<R>(part, lane);
     if (lane % LPR == 0) os[dv0 + my_row] = o;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Gated RMSNorm over the head's 128 outputs -> fp16 yn (simdgroups 0..3).
-    if (tid < 128) {
-      const float ov = os[tid];
-      const float s2n = simd_sum(ov * ov);
-      if (lane == 0) red[sg] = s2n;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 128) {
-      const float inv = rsqrt((red[0] + red[1] + red[2] + red[3]) / float(Dv) + p.eps);
-      const float z = X[ulong(row) * p.ldx + p.z_off + hv * Dv + tid];
-      Yn[ulong(row) * p.yn_ld + hv * Dv + tid] = half(os[tid] * inv * Wn[tid] * (z / (1.0f + exp(-z))));
+    // Gated RMSNorm over the head's 128 outputs -> fp16 yn (simdgroup 0).
+    if (sg == 0) {
+      const float4 ov = *((threadgroup const float4*)(os + lane * 4));
+      const float inv = rsqrt(simd_sum(dot(ov, ov)) / float(Dv) + p.eps);
+#pragma clang loop unroll(disable)
+      for (int ch = 0; ch < 4; ++ch) {
+        const int i = int(lane) * 4 + ch;
+        const float z = X[ulong(row) * p.ldx + p.z_off + hv * Dv + i];
+        Yn[ulong(row) * p.yn_ld + hv * Dv + i] = half(os[i] * inv * Wn[i] * (z / (1.0f + exp(-z))));
+      }
     }
     if (t + 1 == sgm.save_t) {
       device float* mid = pool + p.st_base + ulong(sgm.mid_slot) * p.st_stride + head_off;
       UNROLL for (int r = 0; r < R; ++r) *((device float4*)(mid + ulong(r) * Dk)) = st[r];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);  // qs/ks/vs/os/red reused by the next token
+    if (t + 1 < sgm.len) threadgroup_barrier(mem_flags::mem_threadgroup);  // qs/ks/vs/os reused by next token
   }
   if (sgm.write_state) {
     device float* out = pool + p.st_base + ulong(sgm.out_slot) * p.st_stride + head_off;

@@ -72,6 +72,7 @@ kernel void lse_rows(
 }
 
 // First index of the row maximum (matches argmax tie-breaking).
+// Single-pass vectorized float4 scan: half the memory traffic and one barrier.
 kernel void argmax_rows(
     device const float* logits [[buffer(0)]],
     device int* out [[buffer(1)]],
@@ -86,35 +87,40 @@ kernel void argmax_rows(
   threadgroup int redi[32];
   device const float* x = logits + ulong(row) * ld;
   float m = -INFINITY;
-  for (int i = tid; i < V; i += ntg) m = max(m, x[i]);
-  m = simd_max(m);
-  if (lane == 0) redf[sg] = m;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (sg == 0) {
-    float t = (lane < (ntg + 31) / 32) ? redf[lane] : -INFINITY;
-    t = simd_max(t);
-    if (lane == 0) redf[0] = t;
+  int best = INT_MAX;
+  const int V4 = V / 4;
+  device const float4* x4 = (device const float4*)x;
+  for (int i = int(tid); i < V4; i += int(ntg)) {
+    const float4 v = x4[i];
+    const int b = i * 4;
+    if (v.x > m || (v.x == m && b < best)) { m = v.x; best = b; }
+    if (v.y > m || (v.y == m && b + 1 < best)) { m = v.y; best = b + 1; }
+    if (v.z > m || (v.z == m && b + 2 < best)) { m = v.z; best = b + 2; }
+    if (v.w > m || (v.w == m && b + 3 < best)) { m = v.w; best = b + 3; }
+  }
+  for (int i = V4 * 4 + int(tid); i < V; i += int(ntg)) {
+    const float v = x[i];
+    if (v > m || (v == m && i < best)) { m = v; best = i; }
+  }
+  const float sm = simd_max(m);
+  const int sb = simd_min(m == sm ? best : INT_MAX);
+  if (lane == 0) {
+    redf[sg] = sm;
+    redi[sg] = sb;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float gm = redf[0];
-  int best = INT_MAX;
-  for (int i = tid; i < V; i += ntg)
-    if (x[i] == gm) {
-      best = i;
-      break;
-    }
-  best = simd_min(best);
-  if (lane == 0) redi[sg] = best;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sg == 0) {
-    int t = (lane < (ntg + 31) / 32) ? redi[lane] : INT_MAX;
-    t = simd_min(t);
-    if (lane == 0) out[row] = t;
+    const bool ok = int(lane) < int((ntg + 31) / 32);
+    const float fm = ok ? redf[lane] : -INFINITY;
+    const int fi = ok ? redi[lane] : INT_MAX;
+    const float gm = simd_max(fm);
+    const int gb = simd_min(fm == gm ? fi : INT_MAX);
+    if (lane == 0) out[row] = gb;
   }
 }
 
 // Best and runner-up ids of each row (lowest id on ties, like argmax_rows):
-// the MTP draft pass's candidates for sibling leaves.
+// the MTP draft pass's candidates for sibling leaves. Single float4 pass.
 kernel void argmax2_rows(
     device const float* logits [[buffer(0)]],
     device int* out [[buffer(1)]],
@@ -126,49 +132,57 @@ kernel void argmax2_rows(
     uint ntg [[threads_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float redf[32];
-  threadgroup int redi[32];
+  threadgroup float redf1[32], redf2[32];
+  threadgroup int redi1[32], redi2[32];
   device const float* x = logits + ulong(row) * ld;
   const int nsg = int(ntg + 31) / 32;
-  // max over ids other than `skip`, then the lowest id holding it
-  auto top = [&](int skip) -> int {
-    float m = -INFINITY;
-    for (int i = tid; i < V; i += ntg)
-      if (i != skip) m = max(m, x[i]);
-    m = simd_max(m);
-    if (lane == 0) redf[sg] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-      float t = (int(lane) < nsg) ? redf[lane] : -INFINITY;
-      t = simd_max(t);
-      if (lane == 0) redf[0] = t;
+  float m1 = -INFINITY, m2 = -INFINITY;
+  int i1 = INT_MAX, i2 = INT_MAX;
+  auto push = [&](float v, int idx) {
+    if (v > m1 || (v == m1 && idx < i1)) {
+      m2 = m1; i2 = i1;
+      m1 = v; i1 = idx;
+    } else if (v > m2 || (v == m2 && idx < i2)) {
+      m2 = v; i2 = idx;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float gm = redf[0];
-    int best = INT_MAX;
-    for (int i = tid; i < V; i += ntg)
-      if (i != skip && x[i] == gm) {
-        best = i;
-        break;
-      }
-    best = simd_min(best);
-    if (lane == 0) redi[sg] = best;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-      int t = (int(lane) < nsg) ? redi[lane] : INT_MAX;
-      t = simd_min(t);
-      if (lane == 0) redi[0] = t;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int r = redi[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);  // redf / redi are reused by the next call
-    return r;
   };
-  const int b = top(-1);
-  const int b2 = top(b);
-  if (tid == 0) {
-    out[row] = b;
-    out2[row] = b2 == INT_MAX ? b : b2;
+  const int V4 = V / 4;
+  device const float4* x4 = (device const float4*)x;
+  for (int i = int(tid); i < V4; i += int(ntg)) {
+    const float4 v = x4[i];
+    const int b = i * 4;
+    push(v.x, b);
+    push(v.y, b + 1);
+    push(v.z, b + 2);
+    push(v.w, b + 3);
+  }
+  for (int i = V4 * 4 + int(tid); i < V; i += int(ntg)) push(x[i], i);
+  // Best within simdgroup, then runner-up among all candidates != simd best.
+  const float sm1 = simd_max(m1);
+  const int si1 = simd_min(m1 == sm1 ? i1 : INT_MAX);
+  const float cand2 = (i1 == si1) ? m2 : m1;
+  const int candi2 = (i1 == si1) ? i2 : i1;
+  const float sm2 = simd_max(cand2);
+  const int si2 = simd_min(cand2 == sm2 ? candi2 : INT_MAX);
+  if (lane == 0) {
+    redf1[sg] = sm1; redi1[sg] = si1;
+    redf2[sg] = sm2; redi2[sg] = si2;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    const bool ok = int(lane) < nsg;
+    const float f1 = ok ? redf1[lane] : -INFINITY;
+    const int k1 = ok ? redi1[lane] : INT_MAX;
+    const float gm1 = simd_max(f1);
+    const int gi1 = simd_min(f1 == gm1 ? k1 : INT_MAX);
+    const float f2 = ok ? ((k1 == gi1) ? redf2[lane] : f1) : -INFINITY;
+    const int k2 = ok ? ((k1 == gi1) ? redi2[lane] : k1) : INT_MAX;
+    const float gm2 = simd_max(f2);
+    const int gi2 = simd_min(f2 == gm2 ? k2 : INT_MAX);
+    if (lane == 0) {
+      out[row] = gi1;
+      out2[row] = gi2 == INT_MAX ? gi1 : gi2;
+    }
   }
 }
 
@@ -463,23 +477,46 @@ static inline uint topk_key(float x) {
 }
 
 // Largest key t with #{keys >= t} >= need, over NPER keys per thread of a
-// 256-thread threadgroup (bitwise construction, 32 counting rounds).
+// 256-thread threadgroup: 4-pass 8-bit radix histogram (8 barriers vs 64).
 template <int NPER>
-static inline uint topk_threshold(thread const uint* k, int need, threadgroup int* red, uint sg, uint lane) {
-  uint t = 0;
-  for (int bit = 31; bit >= 0; --bit) {
-    const uint cand = t | (1u << bit);
-    int c = 0;
-    UNROLL for (int i = 0; i < NPER; ++i) c += k[i] >= cand ? 1 : 0;
-    c = simd_sum(c);
-    if (lane == 0) red[sg] = c;
+static inline uint topk_threshold(thread const uint* k, int need, threadgroup atomic_uint* hist,
+                                  threadgroup uint* sel, uint tid, uint sg, uint lane) {
+  if (need <= 0) return 0u;
+  uint prefix = 0u, pmask = 0u;
+  uint rem = uint(need);
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    int tot = 0;
-    UNROLL for (int s = 0; s < 8; ++s) tot += red[s];
+    UNROLL for (int i = 0; i < NPER; ++i)
+      if (k[i] != 0u && (k[i] & pmask) == prefix)
+        atomic_fetch_add_explicit(&hist[(k[i] >> shift) & 255u], 1u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tot >= need) t = cand;
+    if (sg == 0) {
+      if (lane == 0) sel[0] = 0u, sel[1] = 0u;
+      uint cnt[8], tot = 0u;
+      UNROLL for (int j = 0; j < 8; ++j) {
+        cnt[j] = atomic_load_explicit(&hist[255 - 8 * int(lane) - j], memory_order_relaxed);
+        tot += cnt[j];
+      }
+      const uint above = simd_prefix_exclusive_sum(tot);
+      if (above < rem && above + tot >= rem) {
+        uint a = above;
+        for (int j = 0; j < 8; ++j) {
+          if (a + cnt[j] >= rem) {
+            sel[0] = uint(255 - 8 * int(lane) - j);
+            sel[1] = a;
+            break;
+          }
+          a += cnt[j];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    prefix |= sel[0] << shift;
+    pmask |= 255u << shift;
+    rem -= sel[1];
   }
-  return t;
+  return prefix;
 }
 
 kernel void topk_part(
@@ -493,25 +530,39 @@ kernel void topk_part(
     uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int PER = 16;  // 256 threads x 16 = 4096 entries per part at most
+  constexpr int PER = 16;  // 256 threads x 4 float4s = 4096 entries per part at most
   threadgroup float redf[8];
   threadgroup int red[8];
-  threadgroup int scan[256];
+  threadgroup atomic_uint hist[256];
+  threadgroup uint sel[2];
   threadgroup atomic_int cnt;
   const int part = int(tg.x), row = int(tg.y);
   const float it = inv_t[row];
   const int c0 = part * p.chunk, c1 = min(p.V, c0 + p.chunk);
-  const int b0 = c0 + int(tid) * PER;  // contiguous per thread: thread order = id order
   device const float* L = logits + ulong(row) * ulong(p.V);
   float v[PER];
   uint k[PER];
   float lm = -INFINITY;
-  UNROLL for (int i = 0; i < PER; ++i) {
-    const int idx = b0 + i;
-    const bool ok = idx < c1;
-    v[i] = ok ? L[idx] * it : -INFINITY;
-    k[i] = ok ? topk_key(v[i]) : 0u;
-    lm = max(lm, v[i]);
+  // Coalesced float4 loads: stripe q in [0..3] covers 1024 contiguous floats.
+  UNROLL for (int q = 0; q < 4; ++q) {
+    const int base_i = c0 + q * 1024 + int(tid) * 4;
+    if (base_i + 4 <= c1) {
+      const float4 lv = *((device const float4*)(L + base_i)) * it;
+      v[4 * q + 0] = lv.x; k[4 * q + 0] = topk_key(lv.x);
+      v[4 * q + 1] = lv.y; k[4 * q + 1] = topk_key(lv.y);
+      v[4 * q + 2] = lv.z; k[4 * q + 2] = topk_key(lv.z);
+      v[4 * q + 3] = lv.w; k[4 * q + 3] = topk_key(lv.w);
+      lm = max(lm, max(max(lv.x, lv.y), max(lv.z, lv.w)));
+    } else {
+      UNROLL for (int j = 0; j < 4; ++j) {
+        const int idx = base_i + j;
+        const bool ok = idx < c1;
+        const float vv = ok ? L[idx] * it : -INFINITY;
+        v[4 * q + j] = vv;
+        k[4 * q + j] = ok ? topk_key(vv) : 0u;
+        lm = max(lm, vv);
+      }
+    }
   }
   lm = simd_max(lm);
   if (lane == 0) redf[sg] = lm;
@@ -520,8 +571,11 @@ kernel void topk_part(
   UNROLL for (int s = 1; s < 8; ++s) lm = max(lm, redf[s]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float ls = 0.0f;
-  UNROLL for (int i = 0; i < PER; ++i)
-    if (b0 + i < c1) ls += exp(v[i] - lm);
+  UNROLL for (int q = 0; q < 4; ++q) {
+    const int base_i = c0 + q * 1024 + int(tid) * 4;
+    UNROLL for (int j = 0; j < 4; ++j)
+      if (base_i + j < c1) ls += exp(v[4 * q + j] - lm);
+  }
   ls = simd_sum(ls);
   if (lane == 0) redf[sg] = ls;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -532,41 +586,54 @@ kernel void topk_part(
     atomic_store_explicit(&cnt, 0, memory_order_relaxed);
   }
   const int need = min(p.K, max(0, c1 - c0));
-  const uint t = topk_threshold<PER>(k, need, red, sg, lane);
+  const uint t = topk_threshold<PER>(k, need, hist, sel, tid, sg, lane);
   // Strictly above the threshold: all; at it: the lowest ids, up to K.
-  int gt = 0, eq = 0;
-  UNROLL for (int i = 0; i < PER; ++i) {
-    gt += (b0 + i < c1 && k[i] > t) ? 1 : 0;
-    eq += (b0 + i < c1 && k[i] == t) ? 1 : 0;
-  }
+  int gt = 0;
+  UNROLL for (int i = 0; i < PER; ++i) gt += (k[i] > t) ? 1 : 0;
   gt = simd_sum(gt);
   if (lane == 0) red[sg] = gt;
-  scan[tid] = eq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   int n_gt = 0;
   UNROLL for (int s = 0; s < 8; ++s) n_gt += red[s];
-  if (tid == 0) {
-    int a = 0;
-    for (int j = 0; j < 256; ++j) {
-      const int e = scan[j];
-      scan[j] = a;
-      a += e;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  int rank = scan[tid];
+  int eq_rem = need - n_gt;
   const ulong base = (ulong(row) * ulong(p.parts) + ulong(part)) * ulong(p.K);
-  UNROLL for (int i = 0; i < PER; ++i) {
-    if (b0 + i >= c1) continue;
-    bool take = k[i] > t;
-    if (k[i] == t) {
-      take = rank < need - n_gt;
-      ++rank;
+  // Emit strictly-greater entries directly; emit tied entries in ascending stripe (id) order.
+  UNROLL for (int q = 0; q < 4; ++q) {
+    const int base_i = c0 + q * 1024 + int(tid) * 4;
+    int eq_q = 0;
+    UNROLL for (int j = 0; j < 4; ++j) {
+      const int ii = 4 * q + j;
+      if (k[ii] > t) {
+        const int slot = atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed);
+        cand_x[base + slot] = v[ii];
+        cand_i[base + slot] = base_i + j;
+      } else if (k[ii] == t && k[ii] != 0u) {
+        ++eq_q;
+      }
     }
-    if (take) {
-      const int slot = atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed);
-      cand_x[base + slot] = v[i];
-      cand_i[base + slot] = b0 + i;
+    if (eq_rem > 0) {
+      const int ex_l = simd_prefix_exclusive_sum(eq_q);
+      if (lane == 31) red[sg] = ex_l + eq_q;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      int sg_off = 0, stripe_tot = 0;
+      UNROLL for (int s = 0; s < 8; ++s) {
+        if (s < int(sg)) sg_off += red[s];
+        stripe_tot += red[s];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      int rank = sg_off + ex_l;
+      UNROLL for (int j = 0; j < 4; ++j) {
+        const int ii = 4 * q + j;
+        if (k[ii] == t && k[ii] != 0u) {
+          if (rank < eq_rem) {
+            const int slot = atomic_fetch_add_explicit(&cnt, 1, memory_order_relaxed);
+            cand_x[base + slot] = v[ii];
+            cand_i[base + slot] = base_i + j;
+          }
+          ++rank;
+        }
+      }
+      eq_rem -= stripe_tot;
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -591,7 +658,8 @@ kernel void topk_merge(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   constexpr int PER = 8;  // 256 threads x 8 = 2048 candidates at most (parts * K)
-  threadgroup int red[8];
+  threadgroup atomic_uint hist[256];
+  threadgroup uint sel[2];
   threadgroup atomic_int cnt, n_tie;
   threadgroup float fx[kTopKMax];
   threadgroup int fi[kTopKMax];
@@ -613,7 +681,7 @@ kernel void topk_merge(
     atomic_store_explicit(&cnt, 0, memory_order_relaxed);
     atomic_store_explicit(&n_tie, 0, memory_order_relaxed);
   }
-  const uint t = topk_threshold<PER>(k, p.K, red, sg, lane);
+  const uint t = topk_threshold<PER>(k, p.K, hist, sel, tid, sg, lane);
   // Above the threshold: straight in; at it: gathered, then ranked by id.
   UNROLL for (int i = 0; i < PER; ++i) {
     if (k[i] == 0u) continue;

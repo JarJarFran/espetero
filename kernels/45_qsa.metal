@@ -304,18 +304,25 @@ kernel void qsa_select(
       if ((v & mask) == prefix) atomic_fetch_add_explicit(&hist[(v >> shift) & 255u], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      uint cum = 0, bin = 0;
-      for (int j = 255; j >= 0; --j) {
-        const uint h = atomic_load_explicit(&hist[j], memory_order_relaxed);
-        if (cum + h >= k) {
-          bin = uint(j);
-          break;
-        }
-        cum += h;
+    if (sg == 0) {
+      if (lane == 0) sh[0] = prefix, sh[1] = k;
+      uint cnt[8], tot = 0u;
+      UNROLL for (int j = 0; j < 8; ++j) {
+        cnt[j] = atomic_load_explicit(&hist[255 - 8 * int(lane) - j], memory_order_relaxed);
+        tot += cnt[j];
       }
-      sh[0] = prefix | (bin << shift);
-      sh[1] = k - cum;
+      const uint above = simd_prefix_exclusive_sum(tot);
+      if (above < k && above + tot >= k) {
+        uint cum = above;
+        for (int j = 0; j < 8; ++j) {
+          if (cum + cnt[j] >= k) {
+            sh[0] = prefix | (uint(255 - 8 * int(lane) - j) << shift);
+            sh[1] = k - cum;
+            break;
+          }
+          cum += cnt[j];
+        }
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     prefix = sh[0];
@@ -323,23 +330,18 @@ kernel void qsa_select(
     mask |= 255u << shift;
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  // Each simdgroup handles 1 bitmap word (32 consecutive blocks) per step with
+  // coalesced loads and simd_ballot (32 words per round across 32 simdgroups).
   const int nw = (nb + 31) / 32;
   uint running = 0;
-  for (int w0 = 0; w0 < p.nbw; w0 += NT) {
-    const int w = w0 + int(tid);
-    uint gt = 0, eq = 0;
-    if (w < nw) {
-      for (int bit = 0; bit < 32; ++bit) {
-        const int b = w * 32 + bit;
-        if (b >= nb) break;
-        const uint v = u[b];
-        gt |= uint(v > prefix) << bit;
-        eq |= uint(v == prefix) << bit;
-      }
-    }
-    const uint c = popcount(eq);
-    const uint incl = simd_prefix_inclusive_sum(c);
-    if (lane == 31) part[sg] = incl;
+  for (int w0 = 0; w0 < p.nbw; w0 += 32) {
+    const int w = w0 + int(sg);
+    const int b = w * 32 + int(lane);
+    const bool valid = w < nw && b < nb;
+    const uint v = valid ? u[b] : 0u;
+    const uint gt = uint(simd_vote::vote_t(simd_ballot(valid && v > prefix)));
+    uint eq = uint(simd_vote::vote_t(simd_ballot(valid && v == prefix)));
+    if (lane == 0) part[sg] = popcount(eq);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
       const uint t = part[lane];
@@ -348,16 +350,19 @@ kernel void qsa_select(
       if (lane == 31) sh[0] = ex + t;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint before = running + part[sg] + incl - c;
-    uint take = before >= k ? 0u : min(c, k - before);
-    uint word = gt;
-    while (take > 0) {
-      const uint lo = eq & (~eq + 1u);
-      word |= lo;
-      eq ^= lo;
-      --take;
+    if (lane == 0 && w < p.nbw) {
+      const uint c = popcount(eq);
+      const uint before = running + part[sg];
+      uint take = before >= k ? 0u : min(c, k - before);
+      uint word = gt;
+      while (take > 0) {
+        const uint lo = eq & (~eq + 1u);
+        word |= lo;
+        eq ^= lo;
+        --take;
+      }
+      sel[ulong(sr) * ulong(p.nbw) + ulong(w)] = word;
     }
-    if (w < p.nbw) sel[ulong(sr) * ulong(p.nbw) + ulong(w)] = word;
     running += sh[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

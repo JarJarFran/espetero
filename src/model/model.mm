@@ -1081,9 +1081,9 @@ class MetalModel final : public NativeModel {
     Model& m = m_;
     std::vector<std::pair<std::string, int>> list;
     auto add_layer = [&](const Layer& L) {
-      for (const Mat& r : L.in_proj) gemm_pipelines(r, list, m.fma34, m.tune.gemm_var);
+      for (const Mat& r : L.in_proj) gemm_pipelines(r, list, m.fma34, m.tune.gemm_var, &m.tune, m.fuse_gated);
       for (const Mat* x : {&L.gate_up, &L.gate, &L.up, &L.down, &L.out, &L.router, &L.shared_gate, &L.index_qk})
-        gemm_pipelines(*x, list, m.fma34, m.tune.gemm_var);
+        gemm_pipelines(*x, list, m.fma34, m.tune.gemm_var, &m.tune, m.fuse_gated);
       if (L.moe && !m.cfg.gemma && !m.cfg.q3moe) {
         moe_pipelines(m, L, list);  // the passes' own choice per layer (formats may differ by layer)
         for (const char* k : {"moe_topk", "moe_sort", "moe_combine"}) list.push_back({k, 0});
@@ -1101,8 +1101,8 @@ class MetalModel final : public NativeModel {
     for (const Layer& L : m.layers) add_layer(L);
     if (m.mtp.present) {
       add_layer(m.mtp.layer);
-      gemm_pipelines(m.mtp.fc, list, m.fma34, m.tune.gemm_var);
-      gemm_pipelines(m.mtp.head, list, m.fma34, m.tune.gemm_var);
+      gemm_pipelines(m.mtp.fc, list, m.fma34, m.tune.gemm_var, &m.tune, m.fuse_gated);
+      gemm_pipelines(m.mtp.head, list, m.fma34, m.tune.gemm_var, &m.tune, m.fuse_gated);
       if (m.mtp.coarse.out() > 0 && !m.mtp.coarse.dense) {
         for (const char* n : {"rgemv2_1_store", "rgemv2_2_store", "rgemv8r2_store"}) list.push_back({n, m.mtp.coarse.q.fc()});
         if (!m.lm_head.dense) {
@@ -1113,18 +1113,19 @@ class MetalModel final : public NativeModel {
         for (const char* k : {"block_max_rows", "topc_blocks", "argmax2_list"}) list.push_back({k, 0});
       }
     }
-    gemm_pipelines(m.lm_head, list, m.fma34, m.tune.gemm_var);
+    gemm_pipelines(m.lm_head, list, m.fma34, m.tune.gemm_var, &m.tune, m.fuse_gated);
     if (m.cfg.gemma) g4_pipelines(m, list);
     if (m.cfg.q3moe) q3m_pipelines(m, list);
     if (m.cfg.lfm2) lfm2_pipelines(m, list);
-    for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "rmsnorm_addk", "conv_prep", "conv_state_save",
+    for (const char* k : {"embed_q4", "embed_q8", "embed_f16", "rmsnorm", "conv_prep", "conv_state_save",
                           "gated_rmsnorm", "attn_prep", "attention_combine", "kv_save", "kv_copy_blocks",
                           "gather_rows_f32", "gather_rows_f16", "scatter_rows_f32", "lse_rows", "argmax_rows",
                           "gather_cands", "splitk_reduce_store", "splitk_reduce_add", "swiglu_f32", "mtp_prep",
                           "rows_to_pool", "pool_to_rows"})
       list.push_back({k, 0});
-    for (int R : {2, 4, 8, 16}) list.push_back({"deltanet_tr" + std::to_string(R), 0});
-    list.push_back({"deltanet_chunk", 0});
+    if (m.fuse_nrm) list.push_back({"rmsnorm_addk", 0});
+    for (int R : {8, 16}) list.push_back({"deltanet_tr" + std::to_string(R), 0});
+    if (m.dn_chunk > 0) list.push_back({"deltanet_chunk", 0});
     for (int R : {8, 16}) list.push_back({"gdn_decode_fused_tr" + std::to_string(R), 0});
     const int G = m.cfg.H / m.cfg.Hkv;
     list.push_back({G > 8 ? "flash_attention_g6s2" : "flash_attention_g" + std::to_string(G), 0});
@@ -1134,8 +1135,9 @@ class MetalModel final : public NativeModel {
         list.push_back({k, 0});
     // The single-row decode kernels exist for groups up to 8: the GQA-row one (default) has 8 MMA rows,
     // the vector one (opt-in, ESPETERO_ATTN_VEC) would need 37 KB of threadgroup memory at G = 12.
-    if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_vec_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
-    if (m.cfg.H / m.cfg.Hkv <= 8) list.push_back({"attn_decode_gqa_g" + std::to_string(m.cfg.H / m.cfg.Hkv), 0});
+    if (G <= 8 && m.attn_vec) list.push_back({"attn_decode_vec_g" + std::to_string(G), 0});
+    if (m.attn_gqa && (G <= 8 || G == 12))
+      list.push_back({G == 12 ? "attn_decode_gqa_g6s2" : "attn_decode_gqa_g" + std::to_string(G), 0});
     if (m.vis.c.present && m.vis.c.unified) {  // gemma_vision.h (unified)
       for (const char* k : {"layernorm", "g4u_embed_norm", "scatter_rows_f32"}) list.push_back({k, 0});
       for (const char* t : {"8x8", "16x4", "32x4"}) list.push_back({std::string("hgemm_") + t + "_store", 0});

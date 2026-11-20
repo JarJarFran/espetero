@@ -41,7 +41,7 @@
 namespace espetero::native {
 
 struct TileImage {
-  static constexpr int kVersion = 1;
+  static constexpr int kVersion = 2;
   static constexpr size_t kSegment = size_t(1) << 30;
   bool reading = false, writing = false;
   std::string json_path, bin_path;

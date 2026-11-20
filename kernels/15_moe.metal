@@ -248,30 +248,22 @@ kernel void moe_topk(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // k rounds of arg-max (value desc, index asc), removing the winner.
   float mine = e < p.E ? prob : -1.0f;
+  const int nsg = int((ntg + 31) / 32);
   for (int r = 0; r < p.k; ++r) {
-    float bv = mine;
-    int bi = e;
-    for (ushort off = 16; off > 0; off >>= 1) {
-      const float ov = simd_shuffle_down(bv, off);
-      const int oi = simd_shuffle_down(bi, off);
-      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
-    }
+    const float bv = simd_max(mine);
+    const int bi = simd_min(mine == bv ? e : 0x7fffffff);
     if (lane == 0) redf[sg] = bv, redi[sg] = bi;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
-      const bool live = lane < (ntg + 31) / 32;
-      float v = live ? redf[lane] : -2.0f;
-      int i = live ? redi[lane] : 0x7fffffff;
-      for (ushort off = 16; off > 0; off >>= 1) {
-        const float ov = simd_shuffle_down(v, off);
-        const int oi = simd_shuffle_down(i, off);
-        if (ov > v || (ov == v && oi < i)) v = ov, i = oi;
-      }
-      if (lane == 0) picked_p[r] = v, picked_i[r] = i;
+      const bool live = int(lane) < nsg;
+      const float v = live ? redf[lane] : -2.0f;
+      const int i = live ? redi[lane] : 0x7fffffff;
+      const float gm = simd_max(v);
+      const int gi = simd_min(v == gm ? i : 0x7fffffff);
+      if (lane == 0) picked_p[r] = gm, picked_i[r] = gi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (e == picked_i[r]) mine = -1.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   if (tid == 0) {
     float sum = 0.0f;
@@ -1903,6 +1895,7 @@ struct MoeCombineParams {
   int norm;   // 1: also write xn = rmsnorm(h) * wn
   float eps;
   int slice;  // columns per threadgroup
+  int store;  // 1: overwrite h instead of adding into it
 };
 
 kernel void moe_combine(
@@ -1925,20 +1918,27 @@ kernel void moe_combine(
     uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float red[32];
   threadgroup int last_tg;
+  threadgroup int spos[16];
+  threadgroup float sw[16];
   const uint ntg = ntg2.x;
   const int row = int(tgid.x), slice = int(tgid.y), nsl = int(tgpg.y);
+  if (int(tid) < p.k) {
+    spos[tid] = slotpos[row * p.k + int(tid)];
+    sw[tid] = w[row * p.k + int(tid)];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   const float g = 1.0f / (1.0f + exp(-sgate[row]));
   const int c0 = slice * p.slice, c1 = min(p.D, c0 + p.slice);
   float ss = 0.0f;
   for (int d4 = c0 / 4 + int(tid); d4 < c1 / 4; d4 += int(ntg)) {
     float4 acc = 0.0f;
     for (int s = 0; s < p.k; ++s) {
-      const int pos = slotpos[row * p.k + s];
-      acc += w[row * p.k + s] * ((device const float4*)(ys + ulong(pos) * p.D))[d4];
+      const int pos = spos[s];
+      acc += sw[s] * ((device const float4*)(ys + ulong(pos) * p.D))[d4];
     }
     acc += g * ((device const float4*)(shared + ulong(row) * p.D))[d4];
     device float* hp = h + ulong(row) * p.D + d4 * 4;
-    const float4 v = *((device float4*)hp) + acc;
+    const float4 v = p.store ? acc : (*((device float4*)hp) + acc);
     if (p.norm && nsl > 1) {
       // read back by the finalizing threadgroup inside this dispatch
       atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v.x), memory_order_relaxed);
@@ -2008,6 +2008,7 @@ struct MoeDownCombParams {
   int k;    // routed slots (<= 16)
   int norm;
   float eps;
+  int store;  // 1: overwrite h instead of adding into it
 };
 
 // Fase 3 variants (bit-identical sums): PF 1 runs moe_kloop with two K
@@ -2043,8 +2044,12 @@ kernel void moe_down_comb(
     uint ntg [[threads_per_threadgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float part[17 * KSX][32];
-  threadgroup half eqct_all[17 * KSX][64];  // codebook EQ: each simdgroup's block codebooks
+  // Each simdgroup uses only its own [sgid] slice: eqct_all during moe_kloop,
+  // then part after moe_kloop finishes, so the two alias safely.
+  threadgroup union {
+    float part[17 * KSX][32];
+    half eqct_all[17 * KSX][64];
+  } smem;
   threadgroup int last_tg;
   const int slot = int(sgid) / KSX, ksl = int(sgid) % KSX;
   const bool sh = slot == p.k;
@@ -2079,9 +2084,9 @@ kernel void moe_down_comb(
   float acc[8];
   UNROLL for (int c = 0; c < 8; ++c) acc[c] = 0.0f;
   if (sh)
-    moe_kloop<BITS2, 1, KSX, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, eqct_all[sgid]);
+    moe_kloop<BITS2, 1, KSX, PF>(Wr2, SB2, Wh2, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, smem.eqct_all[sgid]);
   else
-    moe_kloop<BITS, 1, KSX, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, eqct_all[sgid]);
+    moe_kloop<BITS, 1, KSX, PF>(Wr, SB, Wh, nb, KGall, g_begin, g_end, Np2, n0, 1, arow, arow, ushort(lane), fm, fn, acc, smem.eqct_all[sgid]);
   UNROLL for (int c = 0; c < 8; ++c) {
     float v = acc[c];
     v += simd_shuffle_xor(v, ushort(2));
@@ -2091,8 +2096,8 @@ kernel void moe_down_comb(
   }
   if (fm == 0) {
     UNROLL for (int j = 0; j < 4; ++j) {
-      part[sgid][j * 8 + fn] = acc[2 * j];
-      part[sgid][j * 8 + fn + 1] = acc[2 * j + 1];
+      smem.part[sgid][j * 8 + fn] = acc[2 * j];
+      smem.part[sgid][j * 8 + fn + 1] = acc[2 * j + 1];
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2104,15 +2109,16 @@ kernel void moe_down_comb(
       if (s < p.k) {
         const int t = tpos[s];  // simdgroups are laid out by tile
         float y = 0.0f;
-        UNROLL for (int q = 0; q < KSX; ++q) y += part[t * KSX + q][c];
+        UNROLL for (int q = 0; q < KSX; ++q) y += smem.part[t * KSX + q][c];
         routed += wsl[s] * y;
       }
     }
     float ysh = 0.0f;
-    UNROLL for (int q = 0; q < KSX; ++q) ysh += part[p.k * KSX + q][c];
+    UNROLL for (int q = 0; q < KSX; ++q) ysh += smem.part[p.k * KSX + q][c];
     const float g = 1.0f / (1.0f + exp(-sgl));
     device float* hp = h + nloc + c;
-    const float v = *hp + (routed + g * ysh);
+    const float sum = routed + g * ysh;
+    const float v = p.store ? sum : (*hp + sum);
     if (p.norm && ntgs > 1 && FIN != 2) atomic_store_explicit((device atomic_uint*)hp, as_type<uint>(v), memory_order_relaxed);
     else *hp = v;
     ss = simd_sum(v * v);

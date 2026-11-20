@@ -43,17 +43,13 @@ kernel void attn_prep(
   if (head >= p.H + p.Hkv) return;
   const bool is_q = head < p.H;
   const int h = is_q ? head : head - p.H;
-  device const float* src = X + row * p.ld + (is_q ? h * (2 * HD) : p.k_off + h * HD);
-  device const float* nw = is_q ? qn_w : kn_w;
-  float x[NPT];
-  float ss = 0.0f;
-  UNROLL for (int i = 0; i < NPT; ++i) {
-    x[i] = src[lane * NPT + i];
-    ss += x[i] * x[i];
-  }
-  ss = simd_sum(ss);
+  device const float4* src4 = (device const float4*)(X + row * p.ld + (is_q ? h * (2 * HD) : p.k_off + h * HD) + lane * NPT);
+  device const float4* nw4 = (device const float4*)((is_q ? qn_w : kn_w) + lane * NPT);
+  const float4 x0 = src4[0], x1 = src4[1];
+  const float ss = simd_sum(dot(x0, x0) + dot(x1, x1));
   const float inv = rsqrt(ss / float(HD) + p.eps);
-  UNROLL for (int i = 0; i < NPT; ++i) x[i] = x[i] * inv * nw[lane * NPT + i];
+  const float4 nx0 = x0 * inv * nw4[0], nx1 = x1 * inv * nw4[1];
+  float x[NPT] = {nx0.x, nx0.y, nx0.z, nx0.w, nx1.x, nx1.y, nx1.z, nx1.w};
   // M-RoPE: frequency f rotates by the position component rope_sel[f]
   // (0 temporal, 1 height, 2 width); text rows carry equal components.
   const int4 pr = pos[row];
@@ -64,25 +60,24 @@ kernel void attn_prep(
       const int sel = rope_sel[f];
       const float position = float(sel == 0 ? pr.x : (sel == 1 ? pr.y : pr.z));
       const float ang = position * inv_freq[f];
-      const float c = precise::cos(ang);
-      const float s = precise::sin(ang);
+      float c;
+      const float s = precise::sincos(ang, c);
       x[i] = (lane < 4) ? (x[i] * c - partner * s) : (x[i] * c + partner * s);
     }
   }
+  const half4 h0 = half4(x[0], x[1], x[2], x[3]);
+  const half4 h1 = half4(x[4], x[5], x[6], x[7]);
   if (is_q) {
-    device half* q = Q + row * p.q_ld + h * HD + lane * NPT;
-    UNROLL for (int i = 0; i < NPT; ++i) q[i] = half(x[i]);
+    device half4* q = (device half4*)(Q + row * p.q_ld + h * HD + lane * NPT);
+    q[0] = h0;
+    q[1] = h1;
   } else {
-    device half* k = Kb + row * p.kv_ld + h * HD + lane * NPT;
-    device const float* v = X + row * p.ld + p.k_off + p.Hkv * HD + h * HD + lane * NPT;
-    device half* vo = Vb + row * p.kv_ld + h * HD + lane * NPT;
-    half kh[NPT], vh[NPT];
-    UNROLL for (int i = 0; i < NPT; ++i) {
-      kh[i] = half(x[i]);
-      vh[i] = half(v[i]);
-      k[i] = kh[i];
-      vo[i] = vh[i];
-    }
+    device half4* k = (device half4*)(Kb + row * p.kv_ld + h * HD + lane * NPT);
+    device const float4* v4 = (device const float4*)(X + row * p.ld + p.k_off + p.Hkv * HD + h * HD + lane * NPT);
+    device half4* vo = (device half4*)(Vb + row * p.kv_ld + h * HD + lane * NPT);
+    const half4 vh0 = half4(v4[0]), vh1 = half4(v4[1]);
+    k[0] = h0; k[1] = h1;
+    vo[0] = vh0; vo[1] = vh1;
     // kv_save folded in: the same halves into the row's pool entries (a row
     // saved into two slots has two), so no copy dispatch follows the attention.
     if (p.save) {
@@ -92,10 +87,10 @@ kernel void attn_prep(
         const int b = w ? t.z : t.x, ps = w ? t.w : t.y;
         if (b < 0) continue;
         device half* dk = kv + p.kv_base + ulong(b) * 2 * blk + ulong(ps) * p.kv_ld + h * HD + lane * NPT;
-        UNROLL for (int i = 0; i < NPT; ++i) {
-          dk[i] = kh[i];
-          dk[blk + i] = vh[i];
-        }
+        ((device half4*)dk)[0] = h0;
+        ((device half4*)dk)[1] = h1;
+        ((device half4*)(dk + blk))[0] = vh0;
+        ((device half4*)(dk + blk))[1] = vh1;
       }
     }
   }
@@ -220,6 +215,8 @@ kernel void flash_attention(
   const int k_last = max(r_last, anc_max - 1);
 
   const ulong blk_halves = ulong(p.bt) * p.kv_ld;
+  const uint bt_shift = ctz(uint(p.bt));
+  const uint bt_mask = uint(p.bt) - 1u;
   device const half* kvl = kv + p.kv_base;
   const int n_slot_blocks = (tile.k1 - tile.k0 + FA_BK - 1) / FA_BK;
   const int n_batch_blocks = tile.last ? (k_last + 1 + FA_BK - 1) / FA_BK : 0;
@@ -232,6 +229,9 @@ kernel void flash_attention(
       const bool own_vis = (j0 + FA_BK - 1 >= seg_min) && (j0 <= r_last);
       if (!anc_vis && !own_vis) continue;
     }
+    // All FA_BK (16) aligned keys in a cached block share one KV pool block (p.bt = 64).
+    const ulong slot_b = in_slot ? ulong(blocks[tree.table + int(uint(j0) >> bt_shift)]) : 0ul;
+    const int slot_pos0 = int(uint(j0) & bt_mask);
     // Cooperative load of K and V blocks: 16 keys x 256 dims each.
     for (int c = tid; c < FA_BK * 32 * 2; c += NT) {
       const int which = c / (FA_BK * 32);
@@ -243,8 +243,7 @@ kernel void flash_attention(
       if (j < j_end) {
         device const half* src;
         if (in_slot) {
-          const ulong b = ulong(blocks[tree.table + j / p.bt]);
-          src = kvl + (b * 2 + which) * blk_halves + ulong(j % p.bt) * p.kv_ld + kvr * 256 + col;
+          src = kvl + (slot_b * 2 + which) * blk_halves + ulong(slot_pos0 + key) * p.kv_ld + kvr * 256 + col;
         } else {
           src = (which ? Vb : Kb) + ulong(tree.base + j) * p.kv_ld + kvr * 256 + col;
         }
@@ -287,7 +286,8 @@ kernel void flash_attention(
     mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
     mx = max(mx, simd_shuffle_xor(mx, ushort(8)));
     const float m_new = max(m_run, mx);
-    const float corr = (m_new == -INFINITY) ? 1.0f : exp(m_run - m_new);
+    const bool rescale = m_new > m_run && m_run > -INFINITY;
+    const float corr = rescale ? exp(m_run - m_new) : 1.0f;
     float ps = 0.0f;
     simdgroup_matrix<half, 8, 8> pf[2];
     UNROLL for (int kf = 0; kf < 2; ++kf) {
@@ -301,9 +301,11 @@ kernel void flash_attention(
     ps += simd_shuffle_xor(ps, ushort(8));
     l_run = l_run * corr + ps;
     m_run = m_new;
-    UNROLL for (int df = 0; df < 16; ++df) {
-      of[df].thread_elements()[0] *= corr;
-      of[df].thread_elements()[1] *= corr;
+    if (simd_any(rescale)) {
+      UNROLL for (int df = 0; df < 16; ++df) {
+        of[df].thread_elements()[0] *= corr;
+        of[df].thread_elements()[1] *= corr;
+      }
     }
     // O += P V over this simdgroup's 128 dims.
     UNROLL for (int kf = 0; kf < 2; ++kf) {
@@ -594,7 +596,7 @@ INSTANTIATE_AV(8)
 // its own KV region): 383 µs per layer at 32K keys (351 GB/s, what the same
 // loads reach without the MMAs) against 1613 µs for flash_attention.
 // ---------------------------------------------------------------------------
-template <int G>
+template <int G, int SPLIT = 1>
 kernel void attn_decode_gqa(
     device const half* Q [[buffer(0)]],
     device const half* Kb [[buffer(1)]],
@@ -615,6 +617,7 @@ kernel void attn_decode_gqa(
   threadgroup float mrg[KP - 1][G][258];
   threadgroup float2 xs[2][KP][2][32];  // [buffer][pair][dim half][lane]: partial scores
   const int kvh = tgid.x;
+  const int kvr = kvh / SPLIT;          // cached KV head (SPLIT groups share one KV head)
   const AttnTile tile = tiles[tgid.y];
   const AttnTree tree = trees[tile.tree];
   const int row = tile.r0;  // the tree's only row
@@ -643,17 +646,19 @@ kernel void attn_decode_gqa(
   float m_run = -INFINITY, l_run = 0.0f;
 
   const ulong blk_halves = ulong(p.bt) * p.kv_ld;
-  device const half* kvl = kv + p.kv_base + kvh * 256;
+  const uint bt_shift = ctz(uint(p.bt));
+  const uint bt_mask = uint(p.bt) - 1u;
+  device const half* kvl = kv + p.kv_base + kvr * 256;
   const int n_slot = tile.k1 - tile.k0;
   const int n_keys = n_slot + (tile.last ? 1 : 0);  // + the row's own key
   // Key (which 0) or value (1) row of tile key j < n_keys.
   auto key_row = [&](int j, int which) -> device const half* {
     if (j < n_slot) {
-      const int jj = tile.k0 + j;
-      const ulong b = ulong(blocks[tree.table + jj / p.bt]);
-      return kvl + (b * 2 + which) * blk_halves + ulong(jj % p.bt) * p.kv_ld;
+      const uint jj = uint(tile.k0 + j);
+      const ulong b = ulong(blocks[tree.table + int(jj >> bt_shift)]);
+      return kvl + (b * 2 + which) * blk_halves + ulong(jj & bt_mask) * p.kv_ld;
     }
-    return (which ? Vb : Kb) + ulong(tree.base) * p.kv_ld + kvh * 256;
+    return (which ? Vb : Kb) + ulong(tree.base) * p.kv_ld + kvr * 256;
   };
   const int n_iter = ((n_keys + 7) / 8 + KP - 1) / KP;  // the same in every simdgroup (barriers)
   for (int it = 0; it < n_iter; ++it) {
@@ -662,16 +667,27 @@ kernel void attn_decode_gqa(
     const int ja = j0 + fn, jb = j0 + fn + 1, jv = j0 + fm;
     uint4 va[4];
     if (live) {
-      // This lane's K elements: dims 64t + 8 fm + [0, 8) of keys fn and fn + 1; V
-      // elements: dims 32u + 4 fn + [0, 8) of key fm (zero past the keys).
-      device const half* pa = key_row(min(ja, n_keys - 1), 0) + 8 * fm;
-      device const half* pb = key_row(min(jb, n_keys - 1), 0) + 8 * fm;
+      // Fast path: all 8 aligned keys in [j0, j0+8) lie in one cached KV block.
+      device const half *pa, *pb, *vp;
+      if (j0 + 8 <= n_slot) {
+        const uint jj0 = uint(tile.k0 + j0);
+        const ulong b = ulong(blocks[tree.table + int(jj0 >> bt_shift)]);
+        const ulong p0 = ulong(jj0 & bt_mask);
+        device const half* kb_base = kvl + (b * 2) * blk_halves;
+        device const half* vb_base = kb_base + blk_halves;
+        pa = kb_base + (p0 + ulong(fn)) * p.kv_ld + 8 * fm;
+        pb = pa + p.kv_ld;
+        vp = vb_base + (p0 + ulong(fm)) * p.kv_ld + 4 * fn;
+      } else {
+        pa = key_row(min(ja, n_keys - 1), 0) + 8 * fm;
+        pb = key_row(min(jb, n_keys - 1), 0) + 8 * fm;
+        vp = key_row(min(jv, n_keys - 1), 1) + 4 * fn;
+      }
       uint4 ka[2], kb[2];
       UNROLL for (int tt = 0; tt < 2; ++tt) {
         ka[tt] = *((device const uint4*)(pa + 64 * (2 * dh + tt)));
         kb[tt] = *((device const uint4*)(pb + 64 * (2 * dh + tt)));
       }
-      device const half* vp = key_row(min(jv, n_keys - 1), 1) + 4 * fn;
       const bool v_ok = jv < n_keys;
       UNROLL for (int uu = 0; uu < 4; ++uu) va[uu] = v_ok ? *((device const uint4*)(vp + 32 * (4 * dh + uu))) : uint4(0);
       simdgroup_matrix<float, 8, 8> sf = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -695,7 +711,8 @@ kernel void attn_decode_gqa(
     mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
     mx = max(mx, simd_shuffle_xor(mx, ushort(8)));
     const float m_new = max(m_run, mx);  // finite: key j0 is always visible
-    const float corr = exp(m_run - m_new);
+    const bool rescale = m_new > m_run && m_run > -INFINITY;
+    const float corr = rescale ? exp(m_run - m_new) : 1.0f;
     const float p0 = exp(s0 - m_new), p1 = exp(s1 - m_new);
     float ps = p0 + p1;
     ps += simd_shuffle_xor(ps, ushort(1));
@@ -705,13 +722,16 @@ kernel void attn_decode_gqa(
     simdgroup_matrix<half, 8, 8> pf;
     pf.thread_elements()[0] = half(p0);
     pf.thread_elements()[1] = half(p1);
+    const bool do_scale = simd_any(rescale);
     UNROLL for (int uu = 0; uu < 4; ++uu) {
       UNROLL for (int v = 0; v < 4; ++v) {
         simdgroup_matrix<half, 8, 8> vf;
         vf.thread_elements()[0] = as_type<half2>(va[uu][v]).x;
         vf.thread_elements()[1] = as_type<half2>(va[uu][v]).y;
-        of[4 * uu + v].thread_elements()[0] *= corr;
-        of[4 * uu + v].thread_elements()[1] *= corr;
+        if (do_scale) {
+          of[4 * uu + v].thread_elements()[0] *= corr;
+          of[4 * uu + v].thread_elements()[1] *= corr;
+        }
         simdgroup_multiply_accumulate(of[4 * uu + v], pf, vf, of[4 * uu + v]);
       }
     }
@@ -781,7 +801,7 @@ kernel void attn_decode_gqa(
 }
 
 #define INSTANTIATE_AG(G)                                                          \
-  template [[host_name("attn_decode_gqa_g" #G)]] kernel void attn_decode_gqa<G>( \
+  template [[host_name("attn_decode_gqa_g" #G)]] kernel void attn_decode_gqa<G, 1>( \
       device const half*, device const half*, device const half*,                \
       device const half*, device const int*, device const int4*,                 \
       device const float*, device half*, constant AttnParams&,                   \
@@ -794,6 +814,12 @@ INSTANTIATE_AG(3)
 INSTANTIATE_AG(4)
 INSTANTIATE_AG(6)
 INSTANTIATE_AG(8)
+template [[host_name("attn_decode_gqa_g6s2")]] kernel void attn_decode_gqa<6, 2>(
+    device const half*, device const half*, device const half*,
+    device const half*, device const int*, device const int4*,
+    device const float*, device half*, constant AttnParams&,
+    device const AttnTile*, device const AttnTree*, device float*, uint2,
+    uint, uint);
 
 // Merge the split-K partial records of a tile: O = sum_s e^(m_s - M) O_s /
 // sum_s e^(m_s - M) l_s, then the output gate. One job per split tile group:

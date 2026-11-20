@@ -18,6 +18,63 @@
 
 namespace espetero::native {
 
+// Two reusable staging arenas ping-ponged across layers so CPU weight staging
+// overlaps with the GPU repack of the previous layer, avoiding a fresh 1 GB
+// Metal buffer allocation and GPU page-table mapping per layer.
+struct StageRing {
+  std::unique_ptr<Arena> a[2];
+  id<MTLCommandBuffer> cb[2] = {nil, nil};
+  int cur = 0;
+
+  explicit StageRing(id<MTLDevice> dev) {
+    a[0] = std::make_unique<Arena>(dev);
+    a[1] = std::make_unique<Arena>(dev);
+  }
+  ~StageRing() {
+    for (int i = 0; i < 2; ++i)
+      if (cb[i]) [cb[i] waitUntilCompleted];
+  }
+  StageRing(const StageRing&) = delete;
+  StageRing& operator=(const StageRing&) = delete;
+
+  Arena& next() {
+    if (cb[cur]) {
+      wait_cb(cb[cur]);
+      cb[cur] = nil;
+    }
+    a[cur]->reset();
+    return *a[cur];
+  }
+  void submit(id<MTLCommandBuffer> c) {
+    Residency::get().commit();
+    [c commit];
+    cb[cur] = c;
+    cur ^= 1;
+  }
+  void drain() {
+    for (int i = 0; i < 2; ++i) {
+      if (cb[i]) {
+        wait_cb(cb[i]);
+        cb[i] = nil;
+      }
+    }
+  }
+
+ private:
+  static void wait_cb(id<MTLCommandBuffer> c) {
+    struct WaitTimer {
+      std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+      ~WaitTimer() { load_trace().wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count(); }
+    } wait_timer;
+    [c waitUntilCompleted];
+    cb_log(c, "load repack");
+    if ([c status] != MTLCommandBufferStatusCompleted) {
+      NSError* err = [c error];
+      fail(std::string("GPU command buffer failed: ") + (err ? [[err localizedDescription] UTF8String] : "unknown"));
+    }
+  }
+};
+
 // A matrix in host layout before the GPU repack: quantized or dense fp16.
 struct HostMat {
   bool dense = false;
@@ -306,12 +363,40 @@ inline void load_embedding(Model& m, Arena& tmp, const WeightSource& src, const 
   Embed& E = m.embed;
   if (t.kind == TensorView::Dense) {
     E.kind = 2;
-    E.codes = m.arena->alloc(size_t(c.V) * c.D * 2);
-    Buf h = f16_from_view(tmp, t, c.V, c.D);
-    std::memcpy(ptr(E.codes), ptr(h), size_t(c.V) * c.D * 2);
+    E.codes = f16_from_view(*m.arena, t, c.V, c.D);
     return;
   }
   if (t.kind == TensorView::EQQuant) fail(name + ": EQ embeddings are not supported (espetero quantize keeps them MLX affine)");
+  if (t.kind == TensorView::MLXQuant && (t.bits == 4 || t.bits == 8) &&
+      (t.group == 16 || t.group == 32 || t.group == 64)) {
+    if (t.rows() != c.V || t.cols() != c.D)
+      fail(t.name + ": shape [" + std::to_string(t.rows()) + ", " + std::to_string(t.cols()) + "], expected [" +
+           std::to_string(c.V) + ", " + std::to_string(c.D) + "]");
+    E.kind = t.bits == 4 ? 0 : 1;
+    E.group = t.group;
+    E.codes = m.arena->copy(t.data, size_t(c.V) * size_t(c.D) * size_t(t.bits) / 8);
+    const size_t groups = size_t(c.V) * size_t(c.D / t.group);
+    if (t.dtype == "F16") {
+      E.s = m.arena->copy(t.scales, groups * 2);
+      E.z = m.arena->copy(t.biases, groups * 2);
+    } else {
+      E.s = m.arena->alloc(groups * 2);
+      E.z = m.arena->alloc(groups * 2);
+      const uint16_t* ss = reinterpret_cast<const uint16_t*>(t.scales);
+      const uint16_t* zz = reinterpret_cast<const uint16_t*>(t.biases);
+      uint16_t* sd = static_cast<uint16_t*>(ptr(E.s));
+      uint16_t* zd = static_cast<uint16_t*>(ptr(E.z));
+      const size_t chunk = 16384;
+      parallel_for((groups + chunk - 1) / chunk, [&](size_t b) {
+        const size_t i0 = b * chunk, i1 = std::min(groups, i0 + chunk);
+        for (size_t i = i0; i < i1; ++i) {
+          sd[i] = f32_to_f16_bits(bf16_to_f32(ss[i]));
+          zd[i] = f32_to_f16_bits(bf16_to_f32(zz[i]));
+        }
+      });
+    }
+    return;
+  }
   QW q = to_affine(tmp, qw_from_view(tmp, t, c.V, c.D));  // rows are gathered: affine
   if (q.src_bits != 4 && q.src_bits != 8) q = widen8(tmp, q);
   q = to_half_scales(tmp, q);
@@ -334,8 +419,9 @@ inline HW load_vdense(Model& m, id<MTLComputeCommandEncoder> e, Arena& tmp, cons
 
 inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const std::string& v = "vision_tower.") {
   c.validate(m.cfg.D);
-  Arena tmp(m.dev);
+  StageRing ring(m.dev);
   {
+    Arena& tmp = ring.next();
     id<MTLCommandBuffer> cb = [m.queue commandBuffer];
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     // Conv3d kernel: MLX [O, T, P, P, C] (or PyTorch [O, C, T, P, P]); the
@@ -354,13 +440,13 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const
     m.vis.m1 = load_vdense(m, e, tmp, src, v + "merger.linear_fc1", 4 * c.D, 4 * c.D);
     m.vis.m2 = load_vdense(m, e, tmp, src, v + "merger.linear_fc2", c.out, 4 * c.D);
     [e endEncoding];
-    commit_wait(cb);
+    ring.submit(cb);
   }
   m.vis.pos = vec(m, src, v + "pos_embed.weight", size_t(c.n_pos) * c.D);
   m.vis.mnw = vec(m, src, v + "merger.norm.weight", c.D);
   m.vis.mnb = vec(m, src, v + "merger.norm.bias", c.D);
   for (int i = 0; i < c.depth; ++i) {
-    Arena btmp(m.dev);
+    Arena& btmp = ring.next();
     const std::string b = v + "blocks." + std::to_string(i) + ".";
     VBlock B;
     B.n1w = vec(m, src, b + "norm1.weight", c.D);
@@ -374,12 +460,12 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const
     B.fc1 = load_vdense(m, e, btmp, src, b + "mlp.linear_fc1", c.I, c.D);
     B.fc2 = load_vdense(m, e, btmp, src, b + "mlp.linear_fc2", c.D, c.I);
     [e endEncoding];
-    commit_wait(cb);
+    ring.submit(cb);
     m.vis.blocks.push_back(B);
   }
   // DeepStack mergers (Qwen3-Omni): the 2x2 merged rows of blocks c.deepstack[j].
   for (size_t j = 0; j < c.deepstack.size(); ++j) {
-    Arena dtmp(m.dev);
+    Arena& dtmp = ring.next();
     const std::string b = v + "deepstack_merger_list." + std::to_string(j) + ".";
     VMerger D;
     D.nw = vec(m, src, b + "norm.weight", size_t(4 * c.D));
@@ -389,9 +475,10 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const
     D.fc1 = load_vdense(m, e, dtmp, src, b + "linear_fc1", 4 * c.D, 4 * c.D);
     D.fc2 = load_vdense(m, e, dtmp, src, b + "linear_fc2", c.out, 4 * c.D);
     [e endEncoding];
-    commit_wait(cb);
+    ring.submit(cb);
     m.vis.ds.push_back(D);
   }
+  ring.drain();
   m.vis.inv_freq = m.arena->alloc(sizeof(float) * (c.hd / 4));
   float* f = (float*)ptr(m.vis.inv_freq);
   const int dim = c.hd / 2;
@@ -403,7 +490,7 @@ inline void load_vision(Model& m, const WeightSource& src, VisionConfig c, const
 // ---------------------------------------------------------------- decoder
 // A MoE layer's router, shared-expert gate and stacked experts (MLX
 // switch_mlp tensors [E, out, in], read as [E * out, in]).
-inline void load_experts(Model& m, const WeightSource& src, const std::string& p, Layer& L) {
+inline void load_experts(Model& m, const WeightSource& src, const std::string& p, Layer& L, StageRing* ring = nullptr) {
   const Config& c = m.cfg;
   if (tiles_reading(m)) {
     L.router = tile_mat(m, p + "router");
@@ -415,7 +502,8 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
     L.moe = true;
     return;
   }
-  Arena tmp(m.dev);
+  std::unique_ptr<Arena> own_tmp;
+  Arena& tmp = ring ? ring->next() : *(own_tmp = std::make_unique<Arena>(m.dev));
   HostMat router = host_mat(m, tmp, src, p + "mlp.gate.weight", c.E, c.D);
   HostMat sgate = host_mat(m, tmp, src, p + "mlp.shared_expert_gate.weight", 1, c.D);
   // A dense (bf16) router stays dense: the parallel fused route reads it in
@@ -461,7 +549,8 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
     L.experts_gu = f16_experts(egu);
     L.experts_down = f16_experts(ed);
     [e endEncoding];
-    commit_wait(cb);
+    if (ring) ring->submit(cb);
+    else commit_wait(cb);
     m.moe_fma = false;
     m.moe_down_comb = false;
     m.route_in_gemv = false;
@@ -495,7 +584,8 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
   L.experts_gu = finish(m, e, tmp, egu, false, p + "experts_gu").q;
   L.experts_down = finish(m, e, tmp, ed, false, p + "experts_down").q;
   [e endEncoding];
-  commit_wait(cb);
+  if (ring) ring->submit(cb);
+  else commit_wait(cb);
   L.moe = true;
 }
 
@@ -503,7 +593,7 @@ inline void load_experts(Model& m, const WeightSource& src, const std::string& p
 // requant_bits (8): dense matrices of the layer become 8-bit affine copies
 // (the MTP layer of bf16 files); quantized ones stay as they are.
 inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p, bool linear, int index_in_kind,
-                        int requant_bits = 0, float norm_add = 0.0f) {
+                        int requant_bits = 0, float norm_add = 0.0f, StageRing* ring = nullptr) {
   const Config& c = m.cfg;
   Layer L;
   L.linear = linear;
@@ -511,7 +601,9 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   L.in_norm = vec(m, src, p + "input_layernorm.weight", c.D, norm_add);
   const bool has_mlp = src.has(p + "post_attention_layernorm.weight");
   if (has_mlp) L.post_norm = vec(m, src, p + "post_attention_layernorm.weight", c.D, norm_add);
-  Arena tmp(m.dev);
+  const bool img = tiles_reading(m);
+  std::unique_ptr<Arena> own_tmp;
+  Arena* tmp_p = img ? nullptr : (ring ? &ring->next() : (own_tmp = std::make_unique<Arena>(m.dev)).get());
   // MoE layers (detected by their expert tensors): the shared expert takes the
   // dense MLP's place; dense layers inside a MoE model keep intermediate_size
   // (or their tensors' width when the config lacks it).
@@ -525,9 +617,9 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   }
   // A tile image has this layer's matrices finished: only the small tensors
   // (norms, convolution taps, gates' parameters) are read below.
-  const bool img = tiles_reading(m);
   HostMat gate, up, down;
   if (has_mlp && !img) {
+    Arena& tmp = *tmp_p;
     gate = host_mat(m, tmp, src, mp + "gate_proj.weight", I, c.D);
     up = host_mat(m, tmp, src, mp + "up_proj.weight", I, c.D);
     down = host_mat(m, tmp, src, mp + "down_proj.weight", c.D, I);
@@ -537,6 +629,7 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   if (L.linear) {
     const std::string a = p + "linear_attn.";
     if (!img) {
+      Arena& tmp = *tmp_p;
       parts = {host_mat(m, tmp, src, a + "in_proj_qkv.weight", c.C(), c.D),
                host_mat(m, tmp, src, a + "in_proj_z.weight", c.Vd(), c.D),
                host_mat(m, tmp, src, a + "in_proj_a.weight", c.Hv, c.D),
@@ -550,6 +643,7 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   } else {
     const std::string a = p + "self_attn.";
     if (!img) {
+      Arena& tmp = *tmp_p;
       parts = {host_mat(m, tmp, src, a + "q_proj.weight", c.H * c.HD * 2, c.D),
                host_mat(m, tmp, src, a + "k_proj.weight", c.kv_dim(), c.D),
                host_mat(m, tmp, src, a + "v_proj.weight", c.kv_dim(), c.D)};
@@ -572,9 +666,10 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
     L.out = tile_mat(m, p + "out");
     for (int i = 0; m.tiles->has(p + "in_proj." + std::to_string(i)); ++i)
       L.in_proj.push_back(tile_mat(m, p + "in_proj." + std::to_string(i)));
-    if (moe) load_experts(m, src, p, L);
+    if (moe) load_experts(m, src, p, L, ring);
     return L;
   }
+  Arena& tmp = *tmp_p;
   if (requant_bits == 8) {
     if (has_mlp) {
       for (HostMat* h : {&gate, &up, &down})
@@ -610,8 +705,9 @@ inline Layer load_layer(Model& m, const WeightSource& src, const std::string& p,
   for (size_t i = 0; i < runs.size(); ++i)
     L.in_proj.push_back(finish(m, e, tmp, runs[i], dn("in_proj"), p + "in_proj." + std::to_string(i)));
   [e endEncoding];
-  commit_wait(cb);
-  if (moe) load_experts(m, src, p, L);
+  if (ring) ring->submit(cb);
+  else commit_wait(cb);
+  if (moe) load_experts(m, src, p, L, ring);
   return L;
 }
 
@@ -624,8 +720,9 @@ inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = fa
                            src.has("backbone.language_model.embed_tokens.weight");
   const std::string pre = hf_backbone ? "backbone.language_model." : "language_model.model.";
   const float norm_add = hf_backbone ? 1.0f : 0.0f;
+  StageRing ring(m.dev);
   {
-    Arena tmp(m.dev);
+    Arena& tmp = ring.next();
     load_embedding(m, tmp, src, pre + "embed_tokens.weight");
     const std::string head = c.tie ? pre + "embed_tokens.weight"
                                    : (src.has("language_model.lm_head.weight") ? "language_model.lm_head.weight" : "lm_head.weight");
@@ -653,14 +750,15 @@ inline void load_decoder(Model& m, const WeightSource& src, bool draft_head = fa
       }
       m.lm_head = finish(m, e, tmp, h, false, "lm_head");
       [e endEncoding];
-      commit_wait(cb);
+      ring.submit(cb);
     }
   }
   m.final_norm = vec(m, src, pre + "norm.weight", c.D, norm_add);
   int nf = 0, nl = 0;
   for (int i = 0; i < c.L; ++i)
     m.layers.push_back(load_layer(m, src, pre + "layers." + std::to_string(i) + ".", c.linear[i],
-                                  c.linear[i] ? nl++ : nf++, 0, norm_add));
+                                  c.linear[i] ? nl++ : nf++, 0, norm_add, &ring));
+  ring.drain();
   m.inv_freq = m.arena->alloc(sizeof(float) * (c.rot / 2));
   float* f = (float*)ptr(m.inv_freq);
   for (int i = 0; i < c.rot / 2; ++i) f[i] = float(1.0 / std::pow(c.theta, double(2 * i) / double(c.rot)));

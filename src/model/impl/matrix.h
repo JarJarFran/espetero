@@ -380,10 +380,14 @@ QW to_half_scales(Arena& ar, const QW& q) {
   const uint16_t* zz = (const uint16_t*)ptr(q.z);
   uint16_t* sd = (uint16_t*)ptr(o.s);
   uint16_t* zd = (uint16_t*)ptr(o.z);
-  for (size_t i = 0; i < n; ++i) {
-    sd[i] = f32_to_f16_bits(bf16_to_f32(ss[i]));
-    zd[i] = f32_to_f16_bits(bf16_to_f32(zz[i]));
-  }
+  const size_t chunk = 16384;
+  parallel_for((n + chunk - 1) / chunk, [&](size_t b) {
+    const size_t i0 = b * chunk, i1 = std::min(n, i0 + chunk);
+    for (size_t i = i0; i < i1; ++i) {
+      sd[i] = f32_to_f16_bits(bf16_to_f32(ss[i]));
+      zd[i] = f32_to_f16_bits(bf16_to_f32(zz[i]));
+    }
+  });
   o.half_scales = true;
   return o;
 }
@@ -402,8 +406,12 @@ QW regroup(Arena& ar, const QW& q_in, int g) {
   const uint16_t* zz = (const uint16_t*)ptr(q.z);
   uint16_t* sd = (uint16_t*)ptr(o.s);
   uint16_t* zd = (uint16_t*)ptr(o.z);
-  for (size_t i = 0; i < n; ++i)
-    for (int j = 0; j < k; ++j) sd[i * k + j] = ss[i], zd[i * k + j] = zz[i];
+  const size_t chunk = 16384;
+  parallel_for((n + chunk - 1) / chunk, [&](size_t b) {
+    const size_t i0 = b * chunk, i1 = std::min(n, i0 + chunk);
+    for (size_t i = i0; i < i1; ++i)
+      for (int j = 0; j < k; ++j) sd[i * k + j] = ss[i], zd[i * k + j] = zz[i];
+  });
   o.group = g;
   return o;
 }
@@ -449,9 +457,9 @@ QW concat_rows(Arena& ar, const std::vector<QW>& parts) {
   out.z = ar.alloc(zrow * out.out);
   size_t r = 0;
   for (const auto& p : parts) {
-    std::memcpy((uint8_t*)ptr(out.w) + r * wrow, ptr(p.w), wrow * p.out);
-    std::memcpy((uint8_t*)ptr(out.s) + r * srow, ptr(p.s), srow * p.out);
-    if (zrow) std::memcpy((uint8_t*)ptr(out.z) + r * zrow, ptr(p.z), zrow * p.out);
+    parallel_copy((uint8_t*)ptr(out.w) + r * wrow, ptr(p.w), wrow * p.out);
+    parallel_copy((uint8_t*)ptr(out.s) + r * srow, ptr(p.s), srow * p.out);
+    if (zrow) parallel_copy((uint8_t*)ptr(out.z) + r * zrow, ptr(p.z), zrow * p.out);
     r += size_t(p.out);
   }
   return out;
@@ -511,10 +519,13 @@ Buf interleave8_f16(Arena& ar, const Buf& a, const Buf& b, int out, int in) {
   if (out % 8) fail("interleave8_f16: rows not a multiple of 8");
   Buf o = ar.alloc(size_t(out) * 2 * size_t(in) * 2);
   const size_t row = size_t(in) * 2;
-  for (int blk = 0; blk < out / 8; ++blk)
-    for (int h = 0; h < 2; ++h)
-      std::memcpy((uint8_t*)ptr(o) + (size_t(blk) * 16 + h * 8) * row,
-                  (uint8_t*)ptr(h ? b : a) + size_t(blk) * 8 * row, row * 8);
+  const int blocks = out / 8;
+  parallel_for(size_t((blocks + 63) / 64), [&](size_t t) {
+    for (int blk = int(t) * 64; blk < std::min(blocks, int(t) * 64 + 64); ++blk)
+      for (int h = 0; h < 2; ++h)
+        std::memcpy((uint8_t*)ptr(o) + (size_t(blk) * 16 + h * 8) * row,
+                    (uint8_t*)ptr(h ? b : a) + size_t(blk) * 8 * row, row * 8);
+  });
   return o;
 }
 
@@ -636,12 +647,22 @@ void repack(Runtime& rt, id<MTLComputeCommandEncoder> e, QW& q, Arena& tmp, Aren
     Buf zs = tmp.alloc(sup * size_t(q.out)), cbs = tmp.alloc(size_t(Np / 8) * 32);
     std::memset(ptr(cbs), 0, size_t(Np / 8) * 32);
     const uint8_t* z = (const uint8_t*)ptr(q.z);
-    for (int r = 0; r < q.out; ++r) {
-      std::memcpy((uint8_t*)ptr(zs) + size_t(r) * sup, z + size_t(r) * zrow, sup);
-      if (r % 8 == 0) std::memcpy((uint8_t*)ptr(cbs) + size_t(r / 8) * 32, z + size_t(r) * zrow + sup, 32);
-      else if (std::memcmp(z + size_t(r) * zrow + sup, z + size_t(r - r % 8) * zrow + sup, 32))
-        fail("EQ codebooks differ within an 8-row group");
-    }
+    uint8_t* zs_p = (uint8_t*)ptr(zs);
+    uint8_t* cbs_p = (uint8_t*)ptr(cbs);
+    std::atomic<bool> mismatch{false};
+    const int groups8 = (q.out + 7) / 8;
+    parallel_for(size_t((groups8 + 63) / 64), [&](size_t t) {
+      for (int g8 = int(t) * 64; g8 < std::min(groups8, int(t) * 64 + 64); ++g8) {
+        const int r0 = g8 * 8, r1 = std::min(q.out, r0 + 8);
+        std::memcpy(cbs_p + size_t(g8) * 32, z + size_t(r0) * zrow + sup, 32);
+        for (int r = r0; r < r1; ++r) {
+          std::memcpy(zs_p + size_t(r) * sup, z + size_t(r) * zrow, sup);
+          if (r > r0 && std::memcmp(z + size_t(r) * zrow + sup, z + size_t(r0) * zrow + sup, 32))
+            mismatch.store(true, std::memory_order_relaxed);
+        }
+      }
+    });
+    if (mismatch.load(std::memory_order_relaxed)) fail("EQ codebooks differ within an 8-row group");
     [e setComputePipelineState:rt.kernel("repack_eq_scales")];
     [e setBuffer:q.s.b offset:q.s.off atIndex:0];
     [e setBuffer:zs.b offset:zs.off atIndex:1];

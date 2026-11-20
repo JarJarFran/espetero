@@ -133,49 +133,79 @@ static inline void kstep_scales(device const half4* SB, ulong g, int KGall, int 
         b2[gi * 4 + j] = half2(0.0h);
       }
   } else if (kQ6K) {
+    const ulong blk = ulong(pair0 >> 4);
+    const ulong slot0 = ulong(pair0 & 3) * 4;
+    const int KB = KGall / 4;
     device const uint2* SC = (device const uint2*)SB;
     device const half2* DD = (device const half2*)(SC + ulong(KGall) * Np2);
-    for (int j = 0; j < 4; ++j) {
-      const uint2 v = SC[g * Np2 + pair0 + j * 4];
-      const half2 d = DD[(g / 4) * Np2 + pair0 + j * 4];
-      const char4 lo = as_type<char4>(v.x), hi = as_type<char4>(v.y);  // byte = 2 * group + column
+    device const uint2* scp = SC + (blk * ulong(KGall) + g) * 16 + slot0;
+    device const half2* ddp = DD + (blk * ulong(KB) + g / 4) * 16 + slot0;
+    const uint4 sc01 = *((device const uint4*)(scp + 0));
+    const uint4 sc23 = *((device const uint4*)(scp + 2));
+    const uint2 sv[4] = {sc01.xy, sc01.zw, sc23.xy, sc23.zw};
+    const uint4 dv = *((device const uint4*)ddp);
+    const half2 d2[4] = {as_type<half2>(dv.x), as_type<half2>(dv.y), as_type<half2>(dv.z), as_type<half2>(dv.w)};
+    UNROLL for (int j = 0; j < 4; ++j) {
+      const char4 lo = as_type<char4>(sv[j].x), hi = as_type<char4>(sv[j].y);  // byte = 2 * group + column
+      const half2 d = d2[j];
       s2[0 * 4 + j] = d * half2(lo.xy);
       s2[1 * 4 + j] = d * half2(lo.zw);
       s2[2 * 4 + j] = d * half2(hi.xy);
       s2[3 * 4 + j] = d * half2(hi.zw);
-      for (int gi = 0; gi < 4; ++gi) b2[gi * 4 + j] = half2(0.0h);
+      UNROLL for (int gi = 0; gi < 4; ++gi) b2[gi * 4 + j] = half2(0.0h);
     }
   } else if (kScaleMode == 2) {
-    // Q8_0: half2 scale per 32 codes and column pair; bias = -128 * scale.
-    device const half2* S2 = (device const half2*)SB;
-    for (int gi = 0; gi < 2; ++gi)
-      for (int j = 0; j < 4; ++j) {
-        const half2 sc = S2[(g * 2 + gi) * Np2 + pair0 + j * 4];
-        s2[gi * 4 + j] = sc;
-        b2[gi * 4 + j] = sc * half2(-128.0h);
+    // Q8_0: block-major lane-ordered half2 scales per 32 codes; bias = -128 * scale.
+    const ulong blk = ulong(pair0 >> 4);
+    const ulong slot0 = ulong(pair0 & 3) * 4;
+    device const half2* S2 = (device const half2*)SB + (blk * ulong(KGall * 2) + g * 2) * 16 + slot0;
+    UNROLL for (int gi = 0; gi < 2; ++gi) {
+      const uint4 v = *((device const uint4*)(S2 + gi * 16));
+      const half2 sc[4] = {as_type<half2>(v.x), as_type<half2>(v.y), as_type<half2>(v.z), as_type<half2>(v.w)};
+      UNROLL for (int j = 0; j < 4; ++j) {
+        s2[gi * 4 + j] = sc[j];
+        b2[gi * 4 + j] = sc[j] * half2(-128.0h);
       }
+    }
   } else if (kScaleMode == 3) {
-    // Q4_K/Q5_K: (scale, min) bytes per 32 codes, then (d, dmin) per 256.
+    // Q4_K/Q5_K: block-major lane-ordered (scale, min) bytes per 32 codes, then (d, dmin) per 256.
+    const ulong blk = ulong(pair0 >> 4);
+    const ulong slot0 = ulong(pair0 & 3) * 4;
+    const int KB = KGall / 4;
     device const uint2* SC = (device const uint2*)SB;
     device const half4* DD = (device const half4*)(SC + ulong(KGall) * Np2);
-    for (int j = 0; j < 4; ++j) {
-      const uint2 v = SC[g * Np2 + pair0 + j * 4];
-      const half4 dd = DD[(g / 4) * Np2 + pair0 + j * 4];
-      const uchar4 sc = as_type<uchar4>(v.x), mn = as_type<uchar4>(v.y);  // byte = 2 * group + column
-      s2[0 * 4 + j] = dd.xy * half2(sc.xy);
-      s2[1 * 4 + j] = dd.xy * half2(sc.zw);
-      b2[0 * 4 + j] = -(dd.zw * half2(mn.xy));
-      b2[1 * 4 + j] = -(dd.zw * half2(mn.zw));
+    device const uint2* scp = SC + (blk * ulong(KGall) + g) * 16 + slot0;
+    device const half4* ddp = DD + (blk * ulong(KB) + g / 4) * 16 + slot0;
+    const uint4 sc01 = *((device const uint4*)(scp + 0));
+    const uint4 sc23 = *((device const uint4*)(scp + 2));
+    const uint2 sv[4] = {sc01.xy, sc01.zw, sc23.xy, sc23.zw};
+    const uint4 dd01 = *((device const uint4*)(ddp + 0));
+    const uint4 dd23 = *((device const uint4*)(ddp + 2));
+    const half4 dd[4] = {as_type<half4>(dd01.xy), as_type<half4>(dd01.zw), as_type<half4>(dd23.xy), as_type<half4>(dd23.zw)};
+    UNROLL for (int j = 0; j < 4; ++j) {
+      const uchar4 sc = as_type<uchar4>(sv[j].x), mn = as_type<uchar4>(sv[j].y);  // byte = 2 * group + column
+      s2[0 * 4 + j] = dd[j].xy * half2(sc.xy);
+      s2[1 * 4 + j] = dd[j].xy * half2(sc.zw);
+      b2[0 * 4 + j] = -(dd[j].zw * half2(mn.xy));
+      b2[1 * 4 + j] = -(dd[j].zw * half2(mn.zw));
     }
   } else {
+    // Affine: block-major lane-ordered half4(s0, s1, b0, b1); 4 pairs per lane are contiguous.
     const int NG = 64 / kGroup;
-    for (int gi = 0; gi < 4; ++gi)
-      if (gi < NG)
-        for (int j = 0; j < 4; ++j) {
-          const half4 sb = SB[(g * NG + gi) * Np2 + pair0 + j * 4];
-          s2[gi * 4 + j] = sb.xy;
-          b2[gi * 4 + j] = sb.zw;
-        }
+    const ulong blk = ulong(pair0 >> 4);
+    const ulong slot0 = ulong(pair0 & 3) * 4;
+    device const half4* sp = SB + (blk * ulong(KGall * NG) + g * ulong(NG)) * 16 + slot0;
+    UNROLL for (int gi = 0; gi < 4; ++gi)
+      if (gi < NG) {
+        const uint4 a = *((device const uint4*)(sp + gi * 16));
+        const uint4 b = *((device const uint4*)(sp + gi * 16 + 2));
+        const half4 sb0 = as_type<half4>(a.xy), sb1 = as_type<half4>(a.zw);
+        const half4 sb2 = as_type<half4>(b.xy), sb3 = as_type<half4>(b.zw);
+        s2[gi * 4 + 0] = sb0.xy; b2[gi * 4 + 0] = sb0.zw;
+        s2[gi * 4 + 1] = sb1.xy; b2[gi * 4 + 1] = sb1.zw;
+        s2[gi * 4 + 2] = sb2.xy; b2[gi * 4 + 2] = sb2.zw;
+        s2[gi * 4 + 3] = sb3.xy; b2[gi * 4 + 3] = sb3.zw;
+      }
   }
 }
 
@@ -615,10 +645,12 @@ kernel void repack_scales(
     v.y = half(scale_at(S, ulong(n + 1) * KG + g, half_src));
     v.w = half(scale_at(Z, ulong(n + 1) * KG + g, half_src));
   }
-  SB[ulong(g) * (Np / 2) + pair] = v;
+  const ulong blk = ulong(pair / 16), pr = ulong(pair % 16);
+  const ulong slot = (pr & 3) * 4 + (pr >> 2);
+  SB[(blk * ulong(KG) + ulong(g)) * 16 + slot] = v;
 }
 
-// Native GGUF Q8_0 scales: fp16 S [N][K/32] -> half2 per 32 codes and pair.
+// Native GGUF Q8_0 scales: fp16 S [N][K/32] -> block-major lane-ordered half2 per 32 codes.
 kernel void repack_q8_scales(
     device const half* S [[buffer(0)]],
     device half2* SB [[buffer(1)]],
@@ -627,17 +659,18 @@ kernel void repack_q8_scales(
     uint2 gid [[thread_position_in_grid]]) {
   const int pair = gid.x;
   const int g = gid.y;
+  const int KG32 = K / 32;
   const int Np = (N + 31) / 32 * 32;
-  if (pair * 2 >= Np || g >= K / 32) return;
+  if (pair * 2 >= Np || g >= KG32) return;
   const int n = pair * 2;
-  const half a = n < N ? S[ulong(n) * (K / 32) + g] : half(0);
-  const half b = n + 1 < N ? S[ulong(n + 1) * (K / 32) + g] : half(0);
-  SB[ulong(g) * (Np / 2) + pair] = half2(a, b);
+  const half a = n < N ? S[ulong(n) * KG32 + g] : half(0);
+  const half b = n + 1 < N ? S[ulong(n + 1) * KG32 + g] : half(0);
+  const ulong blk = ulong(pair / 16), pr = ulong(pair % 16);
+  const ulong slot = (pr & 3) * 4 + (pr >> 2);
+  SB[(blk * ulong(KG32) + ulong(g)) * 16 + slot] = half2(a, b);
 }
 
-// Native GGUF Q4_K/Q5_K scales: (scale, min) bytes S [N][K/32][2] and fp16
-// (d, dmin) D [N][K/256][2] -> per K step and column pair a uint2 (x: scales,
-// y: mins; byte = 2 * group + column), then half4 (d0, d1, dmin0, dmin1) per 256.
+// Native GGUF Q4_K/Q5_K scales: block-major lane-ordered uint2 per K step, then half4 per 256.
 kernel void repack_kq_scales(
     device const uchar* S [[buffer(0)]],
     device const half* D [[buffer(1)]],
@@ -660,20 +693,21 @@ kernel void repack_kq_scales(
       sc |= uint(sm[0]) << (16 * gi + 8 * c);
       mn |= uint(sm[1]) << (16 * gi + 8 * c);
     }
-  SC[ulong(g) * (Np / 2) + pair] = uint2(sc, mn);
+  const ulong blk = ulong(pair / 16), pr = ulong(pair % 16);
+  const ulong slot = (pr & 3) * 4 + (pr >> 2);
+  SC[(blk * ulong(KG) + ulong(g)) * 16 + slot] = uint2(sc, mn);
   if (g % 4 == 0) {
+    const int KB = KG / 4;
     device half4* DD = (device half4*)(SC + ulong(KG) * (Np / 2));
     half4 v = half4(0);
-    if (n < N) v.x = D[(ulong(n) * (K / 256) + g / 4) * 2], v.z = D[(ulong(n) * (K / 256) + g / 4) * 2 + 1];
+    if (n < N) v.x = D[(ulong(n) * KB + g / 4) * 2], v.z = D[(ulong(n) * KB + g / 4) * 2 + 1];
     if (n + 1 < N)
-      v.y = D[(ulong(n + 1) * (K / 256) + g / 4) * 2], v.w = D[(ulong(n + 1) * (K / 256) + g / 4) * 2 + 1];
-    DD[ulong(g / 4) * (Np / 2) + pair] = v;
+      v.y = D[(ulong(n + 1) * KB + g / 4) * 2], v.w = D[(ulong(n + 1) * KB + g / 4) * 2 + 1];
+    DD[(blk * ulong(KB) + ulong(g / 4)) * 16 + slot] = v;
   }
 }
 
-// Native GGUF Q6_K scales: int8 sub-scales S [N][K/16] and fp16 super-scales
-// D [N][K/256] -> per K step and column pair a uint2 of 4 x 2 sub-scales
-// (group-major, byte = 2 * group + column), then half2 super-scales per 256.
+// Native GGUF Q6_K scales: block-major lane-ordered uint2 per K step, then half2 per 256.
 kernel void repack_q6k_scales(
     device const char* S [[buffer(0)]],
     device const half* D [[buffer(1)]],
@@ -696,12 +730,15 @@ kernel void repack_q6k_scales(
       if (gi < 2) lo |= b << sh;
       else hi |= b << sh;
     }
-  SC[ulong(g) * (Np / 2) + pair] = uint2(lo, hi);
+  const ulong blk = ulong(pair / 16), pr = ulong(pair % 16);
+  const ulong slot = (pr & 3) * 4 + (pr >> 2);
+  SC[(blk * ulong(KG) + ulong(g)) * 16 + slot] = uint2(lo, hi);
   if (g % 4 == 0) {
+    const int KB = KG / 4;
     device half2* DD = (device half2*)(SC + ulong(KG) * (Np / 2));
-    const half d0 = n < N ? D[ulong(n) * (K / 256) + g / 4] : half(0);
-    const half d1 = n + 1 < N ? D[ulong(n + 1) * (K / 256) + g / 4] : half(0);
-    DD[ulong(g / 4) * (Np / 2) + pair] = half2(d0, d1);
+    const half d0 = n < N ? D[ulong(n) * KB + g / 4] : half(0);
+    const half d1 = n + 1 < N ? D[ulong(n + 1) * KB + g / 4] : half(0);
+    DD[(blk * ulong(KB) + ulong(g / 4)) * 16 + slot] = half2(d0, d1);
   }
 }
 
@@ -757,7 +794,8 @@ kernel void rgemm(
   constexpr int FM = BM / 8;
   constexpr int LDA = BK + 8;
   constexpr int AC = (BM * 8 + NT - 1) / NT;
-  threadgroup half As[BM * LDA];
+  constexpr bool DBL = (BM <= 32);
+  threadgroup half As[DBL ? 2 : 1][BM * LDA];
   threadgroup half eqct_all[WN][64];  // codebook EQ: each simdgroup's block codebooks (eqc_load)
   threadgroup half* eqct = eqct_all[sgid];
 
@@ -791,9 +829,18 @@ kernel void rgemm(
     a_col[c] = (idx % 8) * 8;
     a_ok[c] = a_live[c] && (m0 + a_row[c]) < p.M;
   }
-  uint4 ar[AC];
-  UNROLL for (int c = 0; c < AC; ++c)
-    ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + g_begin * 64 + a_col[c])) : uint4(0);
+  uint4 ar[DBL ? 1 : AC];
+  if (DBL) {
+    if (g_begin < g_end) {
+      UNROLL for (int c = 0; c < AC; ++c)
+        if (a_live[c])
+          *((threadgroup uint4*)(As[0] + a_row[c] * LDA + a_col[c])) =
+              a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + g_begin * 64 + a_col[c])) : uint4(0);
+    }
+  } else {
+    UNROLL for (int c = 0; c < AC; ++c)
+      ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + g_begin * 64 + a_col[c])) : uint4(0);
+  }
 
   // uint4 words per lane and K group: 2 for the nibble plane (4-, 5- and
   // 6-bit), 4 for 8-bit codes; 5/6-bit add a high-bit plane (2 or 4 words).
@@ -804,8 +851,12 @@ kernel void rgemm(
   if (eqc_on<BITS>()) eqc_load(SB, KGall, Np2, n_ok ? n0 / 32 : 0, eqct, ushort(lane));
 
   for (int g = g_begin; g < g_end; ++g) {
-    UNROLL for (int c = 0; c < AC; ++c)
-      if (a_live[c]) *((threadgroup uint4*)(As + a_row[c] * LDA + a_col[c])) = ar[c];
+    const int cur = DBL ? ((g - g_begin) & 1) : 0;
+    const int nxt = DBL ? (cur ^ 1) : 0;
+    if (!DBL) {
+      UNROLL for (int c = 0; c < AC; ++c)
+        if (a_live[c]) *((threadgroup uint4*)(As[0] + a_row[c] * LDA + a_col[c])) = ar[c];
+    }
     uint words[4 * WPL];
     UNROLL for (int i = 0; i < WPL; ++i) {
       const uint4 w = wp[ulong(g) * (32 * WPL) + i];
@@ -826,14 +877,21 @@ kernel void rgemm(
     kstep_scales(SB, ulong(g), KGall, Np2, n_ok ? (n0 + fn) / 2 : 0, fm, s2, b2);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (g + 1 < g_end) {
-      UNROLL for (int c = 0; c < AC; ++c)
-        ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      if (DBL) {
+        UNROLL for (int c = 0; c < AC; ++c)
+          if (a_live[c])
+            *((threadgroup uint4*)(As[nxt] + a_row[c] * LDA + a_col[c])) =
+                a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      } else {
+        UNROLL for (int c = 0; c < AC; ++c)
+          ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      }
     }
     UNROLL for (int jj = 0; jj < 8; ++jj) {
       simdgroup_matrix<half, 8, 8> a[FM];
       simdgroup_matrix<half, 8, 8> b[4];
       UNROLL for (int i = 0; i < FM; ++i) {
-        const half2 v = *((const threadgroup half2*)(As + (i * 8 + fm) * LDA + jj * 8 + fn));
+        const half2 v = *((const threadgroup half2*)(As[cur] + (i * 8 + fm) * LDA + jj * 8 + fn));
         a[i].thread_elements()[0] = v.x;
         a[i].thread_elements()[1] = v.y;
       }
@@ -863,7 +921,7 @@ kernel void rgemm(
         UNROLL for (int j = 0; j < 4; ++j)
           simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!DBL) threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   UNROLL for (int i = 0; i < FM; ++i) {
@@ -2234,7 +2292,8 @@ kernel void hgemm(
   constexpr int FM = BM / 8;
   constexpr int LDA = BK + 8;
   constexpr int AC = (BM * 8 + NT - 1) / NT;
-  threadgroup half As[BM * LDA];
+  constexpr bool DBL = (BM <= 32);
+  threadgroup half As[DBL ? 2 : 1][BM * LDA];
 
   const int m0 = tgid.x * BM;  // row blocks fastest (see rgemm)
   const int n0 = tgid.y * BN + sgid * 32;
@@ -2258,22 +2317,42 @@ kernel void hgemm(
     a_col[c] = (idx % 8) * 8;
     a_ok[c] = a_live[c] && (m0 + a_row[c]) < p.M;
   }
-  uint4 ar[AC];
-  UNROLL for (int c = 0; c < AC; ++c)
-    ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + a_col[c])) : uint4(0);
+  uint4 ar[DBL ? 1 : AC];
+  if (DBL) {
+    if (KG > 0) {
+      UNROLL for (int c = 0; c < AC; ++c)
+        if (a_live[c])
+          *((threadgroup uint4*)(As[0] + a_row[c] * LDA + a_col[c])) =
+              a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + a_col[c])) : uint4(0);
+    }
+  } else {
+    UNROLL for (int c = 0; c < AC; ++c)
+      ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + a_col[c])) : uint4(0);
+  }
   device const uint4* wp = Wr + ulong(n_ok ? n0 / 32 : 0) * KG * 256 + lane * 8;
 
   for (int g = 0; g < KG; ++g) {
-    UNROLL for (int c = 0; c < AC; ++c)
-      if (a_live[c]) *((threadgroup uint4*)(As + a_row[c] * LDA + a_col[c])) = ar[c];
+    const int cur = DBL ? (g & 1) : 0;
+    const int nxt = DBL ? (cur ^ 1) : 0;
+    if (!DBL) {
+      UNROLL for (int c = 0; c < AC; ++c)
+        if (a_live[c]) *((threadgroup uint4*)(As[0] + a_row[c] * LDA + a_col[c])) = ar[c];
+    }
     // Weight fragments are loaded WL sub-steps at a time: all 8 for tall
     // tiles, 2 for short ones (fewer live registers, higher occupancy).
     uint4 w[WL];
     UNROLL for (int i = 0; i < WL; ++i) w[i] = wp[ulong(g) * 256 + i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (g + 1 < KG) {
-      UNROLL for (int c = 0; c < AC; ++c)
-        ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      if (DBL) {
+        UNROLL for (int c = 0; c < AC; ++c)
+          if (a_live[c])
+            *((threadgroup uint4*)(As[nxt] + a_row[c] * LDA + a_col[c])) =
+                a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      } else {
+        UNROLL for (int c = 0; c < AC; ++c)
+          ar[c] = a_ok[c] ? *((device const uint4*)(A + ulong(m0 + a_row[c]) * p.lda + (g + 1) * 64 + a_col[c])) : uint4(0);
+      }
     }
     UNROLL for (int jj = 0; jj < 8; ++jj) {
       if (jj % WL == 0 && jj > 0) {
@@ -2282,7 +2361,7 @@ kernel void hgemm(
       simdgroup_matrix<half, 8, 8> a[FM];
       simdgroup_matrix<half, 8, 8> b[4];
       UNROLL for (int i = 0; i < FM; ++i) {
-        const half2 v = *((const threadgroup half2*)(As + (i * 8 + fm) * LDA + jj * 8 + fn));
+        const half2 v = *((const threadgroup half2*)(As[cur] + (i * 8 + fm) * LDA + jj * 8 + fn));
         a[i].thread_elements()[0] = v.x;
         a[i].thread_elements()[1] = v.y;
       }
@@ -2297,7 +2376,7 @@ kernel void hgemm(
         UNROLL for (int j = 0; j < 4; ++j)
           simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!DBL) threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   UNROLL for (int i = 0; i < FM; ++i) {
@@ -2370,9 +2449,133 @@ kernel void hgemm(
       device const half*, device const uint4*, device const float*, device void*,    \
       constant HGemmParams&, uint3, uint, uint, uint);
 
+INSTANTIATE_HGEMM("32x8", 32, 8, 8)
 INSTANTIATE_HGEMM("32x4", 32, 4, 8)
 INSTANTIATE_HGEMM("16x4", 16, 4, 2)
 INSTANTIATE_HGEMM("8x8", 8, 8, 8)
+
+// Dense fp16 GEMV for 1-2 rows: one 32-column block per threadgroup, 8
+// simdgroups splitting K (no K-loop barriers, 8x more threadgroups than
+// hgemm_8x8, coalesced uint4 fragment loads, fp32 FMA accumulation).
+template <int MM, int EPI>
+kernel void hgemv(
+    device const half* A [[buffer(0)]],
+    device const uint4* Wr [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device void* Yv [[buffer(4)]],
+    constant HGemmParams& p [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int KS = 8;
+  threadgroup float part[KS][MM][32];
+  const int n0 = int(tgid) * 32;
+  if (n0 >= p.N) return;
+  const int KG = p.K / 64;
+  const int per = (KG + KS - 1) / KS;
+  const int g_begin = int(sgid) * per;
+  const int g_end = min(KG, g_begin + per);
+  const short qid = lane / 4;
+  const short fm = (qid & 4) + ((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+  device const uint4* wp = Wr + ulong(n0 / 32) * KG * 256 + lane * 8;
+  float acc[MM][8];
+  UNROLL for (int m = 0; m < MM; ++m)
+    UNROLL for (int c = 0; c < 8; ++c) acc[m][c] = 0.0f;
+  for (int g = g_begin; g < g_end; ++g) {
+    UNROLL for (int jj = 0; jj < 8; ++jj) {
+      const uint4 wj = wp[ulong(g) * 256 + jj];
+      const half2 w0 = as_type<half2>(wj.x), w1 = as_type<half2>(wj.y);
+      const half2 w2 = as_type<half2>(wj.z), w3 = as_type<half2>(wj.w);
+      const int k = g * 64 + jj * 8 + fm;
+      UNROLL for (int m = 0; m < MM; ++m) {
+        const float a = m < p.M ? float(A[ulong(m) * p.lda + k]) : 0.0f;
+        acc[m][0] = fma(a, float(w0.x), acc[m][0]);
+        acc[m][1] = fma(a, float(w0.y), acc[m][1]);
+        acc[m][2] = fma(a, float(w1.x), acc[m][2]);
+        acc[m][3] = fma(a, float(w1.y), acc[m][3]);
+        acc[m][4] = fma(a, float(w2.x), acc[m][4]);
+        acc[m][5] = fma(a, float(w2.y), acc[m][5]);
+        acc[m][6] = fma(a, float(w3.x), acc[m][6]);
+        acc[m][7] = fma(a, float(w3.y), acc[m][7]);
+      }
+    }
+  }
+  UNROLL for (int m = 0; m < MM; ++m)
+    UNROLL for (int c = 0; c < 8; ++c) {
+      float v = acc[m][c];
+      v += simd_shuffle_xor(v, ushort(2));
+      v += simd_shuffle_xor(v, ushort(4));
+      v += simd_shuffle_xor(v, ushort(16));
+      acc[m][c] = v;
+    }
+  if (fm == 0) {
+    UNROLL for (int m = 0; m < MM; ++m)
+      UNROLL for (int j = 0; j < 4; ++j) {
+        part[sgid][m][j * 8 + fn] = acc[m][2 * j];
+        part[sgid][m][j * 8 + fn + 1] = acc[m][2 * j + 1];
+      }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgid != 0) return;
+  const int col = n0 + int(lane);
+  UNROLL for (int m = 0; m < MM; ++m) {
+    if (m >= p.M) continue;
+    if (EPI == HEPI_SWIGLU || EPI == HEPI_GEGLU || EPI == HEPI_GEGLU_ERF) {
+      if (lane < 16) {
+        const int g_in = int(lane / 8) * 16 + int(lane % 8);
+        const int u_in = g_in + 8;
+        const int out_col = (n0 / 2) + int(lane);
+        if (out_col < p.N / 2) {
+          float gv = 0.0f, uv = 0.0f;
+          UNROLL for (int s = 0; s < KS; ++s) {
+            gv += part[s][m][g_in];
+            uv += part[s][m][u_in];
+          }
+          const float r = EPI == HEPI_GEGLU ? gelu_tanh(gv) * uv
+                        : EPI == HEPI_GEGLU_ERF ? gelu_erf(gv) * uv
+                        : silu(gv) * uv;
+          ((device half*)Yv)[ulong(m) * p.ldy + out_col] = half(r);
+        }
+      }
+      continue;
+    }
+    if (col >= p.N) continue;
+    float v = 0.0f;
+    UNROLL for (int s = 0; s < KS; ++s) v += part[s][m][lane];
+    if (p.has_bias) v += bias[col];
+    if (EPI == HEPI_STORE) ((device float*)Yv)[ulong(m) * p.ldy + col] = v;
+    else if (EPI == HEPI_ADD) ((device float*)Yv)[ulong(m) * p.ldy + col] += v;
+    else if (EPI == HEPI_GELU_TANH) ((device half*)Yv)[ulong(m) * p.ldy + col] = half(gelu_tanh(v));
+    else ((device half*)Yv)[ulong(m) * p.ldy + col] = half(gelu_erf(v));
+  }
+}
+
+#define INSTANTIATE_HGEMV(MM)                                                       \
+  template [[host_name("hgemv_" #MM "_store")]] kernel void hgemv<MM, 0>(           \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_add")]] kernel void hgemv<MM, 1>(             \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_gelu_tanh")]] kernel void hgemv<MM, 2>(       \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_gelu_erf")]] kernel void hgemv<MM, 3>(        \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_swiglu")]] kernel void hgemv<MM, 4>(          \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_geglu")]] kernel void hgemv<MM, 5>(           \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);                                     \
+  template [[host_name("hgemv_" #MM "_geglu_erf")]] kernel void hgemv<MM, 6>(       \
+      device const half*, device const uint4*, device const float*, device void*,   \
+      constant HGemmParams&, uint, uint, uint);
+
+INSTANTIATE_HGEMV(1)
+INSTANTIATE_HGEMV(2)
 
 // dst[i] = src[i] (EQ4 codebooks into the tail of a scale buffer).
 kernel void copy_words(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]], constant uint& n [[buffer(2)]],

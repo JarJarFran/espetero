@@ -208,7 +208,7 @@ inline std::string record_meta(Model& m) {
   const ExpertLayer& X0 = m.xs.layers[0];
   size_t o[4];
   const size_t bytes = record_layout(c, X0.group, o);
-  std::string s = "espetero expert records v1\n" + std::to_string(c.E) + " " + std::to_string(c.L) + " " +
+  std::string s = "espetero expert records v2\n" + std::to_string(c.E) + " " + std::to_string(c.L) + " " +
                   std::to_string(c.Ie) + " " + std::to_string(c.D) + " " + std::to_string(X0.bits) + " " +
                   std::to_string(X0.group) + " " + std::to_string(bytes) + "\n";
   for (const std::string& f : m.xs.files) {
@@ -768,9 +768,9 @@ inline void build_expert_records(Model& m, const std::string& dir) {
         uint8_t* r = buf + i * stride;
         std::memset(r + R, 0, stride - R);
         std::memcpy(r + o[0], gw + ex * gwe, gwe);
-        for (size_t g = 0; g < gg; ++g) std::memcpy(r + o[1] + g * gp * 8, gs + (g * size_t(c.E) * gp + ex * gp) * 8, gp * 8);
+        std::memcpy(r + o[1], gs + ex * gp * gg * 8, gp * gg * 8);
         std::memcpy(r + o[2], dw + ex * dwe, dwe);
-        for (size_t g = 0; g < dg; ++g) std::memcpy(r + o[3] + g * dp * 8, ds + (g * size_t(c.E) * dp + ex * dp) * 8, dp * 8);
+        std::memcpy(r + o[3], ds + ex * dp * dg * 8, dp * dg * 8);
       });
       const uint8_t* p = buf;
       size_t left = size_t(n) * stride;
@@ -813,11 +813,9 @@ inline void build_expert_records(Model& m, const std::string& dir) {
         const uint8_t *pw = static_cast<const uint8_t*>(ptr(P.gu.wr)), *ps = static_cast<const uint8_t*>(ptr(P.gu.sb));
         const uint8_t *qw = static_cast<const uint8_t*>(ptr(P.dn.wr)), *qs = static_cast<const uint8_t*>(ptr(P.dn.sb));
         bool same = std::memcmp(rec.data() + o[0], pw + size_t(sl) * gwe, gwe) == 0 &&
-                    std::memcmp(rec.data() + o[2], qw + size_t(sl) * dwe, dwe) == 0;
-        for (size_t g = 0; g < gg; ++g)
-          same = same && std::memcmp(rec.data() + o[1] + g * gp * 8, ps + (g * size_t(P.S) * gp + size_t(sl) * gp) * 8, gp * 8) == 0;
-        for (size_t g = 0; g < dg; ++g)
-          same = same && std::memcmp(rec.data() + o[3] + g * dp * 8, qs + (g * size_t(P.S) * dp + size_t(sl) * dp) * 8, dp * 8) == 0;
+                    std::memcmp(rec.data() + o[1], ps + size_t(sl) * gp * gg * 8, gp * gg * 8) == 0 &&
+                    std::memcmp(rec.data() + o[2], qw + size_t(sl) * dwe, dwe) == 0 &&
+                    std::memcmp(rec.data() + o[3], qs + size_t(sl) * dp * dg * 8, dp * dg * 8) == 0;
         if (!same) {
           ::close(rfd);
           fail("expert records: layer 0 expert " + std::to_string(ex) + " differs from the per-expert load path");
